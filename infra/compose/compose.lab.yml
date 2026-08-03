@@ -7,8 +7,6 @@ services:
     restart: "no"
 
     ports:
-      # Localhost binding prevents other devices from reaching the
-      # deliberately vulnerable application.
       - "127.0.0.1:3000:3000"
 
     networks:
@@ -26,12 +24,14 @@ services:
 
     healthcheck:
       test:
-        [
-          "CMD",
-          "node",
-          "-e",
-          "fetch('http://127.0.0.1:3000').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
-        ]
+        - CMD
+        - /nodejs/bin/node
+        - -e
+        - >-
+          require('http')
+          .get('http://127.0.0.1:3000',
+          r=>process.exit(r.statusCode>=200&&r.statusCode<400?0:1))
+          .on('error',()=>process.exit(1))
       interval: 10s
       timeout: 5s
       retries: 12
