@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from webguard_contracts import (
+    CrawlTerminationReason,
     RequestAttempt,
     RequestAttemptOutcome,
     ScanStatus,
@@ -247,6 +248,9 @@ class CrawlScanTests(unittest.TestCase):
                 ),
             ),
             skipped_links=(),
+            termination_reason=(
+                CrawlTerminationReason.ROOT_REQUEST_FAILED
+            ),
         )
         result = run_passive_crawl_scan(
             target(),

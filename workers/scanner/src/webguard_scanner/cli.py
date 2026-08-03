@@ -6,9 +6,12 @@ import argparse
 import json
 import math
 import os
+import signal
 import stat
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from threading import current_thread, main_thread
 from typing import Sequence, TextIO
 from uuid import uuid4
 
@@ -23,12 +26,17 @@ from webguard_contracts import (
 
 from .crawl_scan import run_passive_crawl_scan
 from .crawler import (
+    CrawlCancellationToken,
     CrawlPolicy,
     CrawlPolicyError,
     CrawlQueryMode,
+    DEFAULT_CRAWL_EXECUTION_SECONDS,
+    DEFAULT_CRAWL_REQUEST_ATTEMPTS,
     MAXIMUM_CRAWL_DELAY_SECONDS,
     MAXIMUM_CRAWL_DEPTH,
+    MAXIMUM_CRAWL_EXECUTION_SECONDS,
     MAXIMUM_CRAWL_PAGES,
+    MAXIMUM_CRAWL_REQUEST_ATTEMPTS,
     MAXIMUM_LINKS_PER_PAGE,
 )
 from .passive_scan import ENGINE_VERSION, run_passive_header_scan
@@ -177,6 +185,8 @@ def _build_crawl_policy(args: argparse.Namespace) -> CrawlPolicy | None:
             args.crawl_maximum_links_per_page,
             args.crawl_minimum_delay_seconds,
             args.crawl_query_mode,
+            args.crawl_maximum_execution_seconds,
+            args.crawl_maximum_request_attempts,
         )
     )
 
@@ -210,6 +220,16 @@ def _build_crawl_policy(args: argparse.Namespace) -> CrawlPolicy | None:
                 0.1
                 if args.crawl_minimum_delay_seconds is None
                 else args.crawl_minimum_delay_seconds
+            ),
+            maximum_execution_seconds=(
+                DEFAULT_CRAWL_EXECUTION_SECONDS
+                if args.crawl_maximum_execution_seconds is None
+                else args.crawl_maximum_execution_seconds
+            ),
+            maximum_request_attempts=(
+                DEFAULT_CRAWL_REQUEST_ATTEMPTS
+                if args.crawl_maximum_request_attempts is None
+                else args.crawl_maximum_request_attempts
             ),
             query_mode=CrawlQueryMode(
                 "drop"
@@ -468,10 +488,16 @@ def _render_crawl_result(
     print(f"Engine: {result.engine} {result.engine_version}", file=stream)
     print("Mode: same-origin crawl", file=stream)
     print(
+        "Termination: "
+        f"{result.termination.reason.value}",
+        file=stream,
+    )
+    print(
         "Pages: "
         f"{result.coverage.pages_attempted} attempted, "
         f"{result.coverage.pages_succeeded} succeeded, "
-        f"{result.coverage.pages_failed} failed",
+        f"{result.coverage.pages_failed} failed, "
+        f"{result.coverage.pages_pending} pending",
         file=stream,
     )
     print(
@@ -519,6 +545,15 @@ def _render_crawl_result(
                 file=stream,
             )
 
+    termination_error = result.termination.error
+    if termination_error is not None:
+        print(
+            f"- [ERROR] {termination_error.stage}/"
+            f"{termination_error.code}: "
+            f"{termination_error.message}",
+            file=stream,
+        )
+
     for skipped in result.skipped_links:
         print(
             f"- [CRAWL SKIP] {skipped.reason}: {skipped.count}",
@@ -548,6 +583,33 @@ def _render_report(
             stream=stream,
             output_path=output_path,
         )
+
+
+@contextmanager
+def _graceful_crawl_cancellation(
+    token: CrawlCancellationToken,
+):
+    """Convert SIGINT into a bounded cancellation request."""
+
+    if (
+        current_thread() is not main_thread()
+        or not hasattr(signal, "SIGINT")
+    ):
+        yield
+        return
+
+    previous_handler = signal.getsignal(signal.SIGINT)
+
+    def request_cancellation(_signum, _frame) -> None:
+        token.cancel()
+
+    signal.signal(signal.SIGINT, request_cancellation)
+
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+
 
 def _scan_command(args: argparse.Namespace) -> int:
     scan_id = str(uuid4())
@@ -580,13 +642,18 @@ def _scan_command(args: argparse.Namespace) -> int:
             scan_id=scan_id,
         )
     else:
-        result = run_passive_crawl_scan(
-            target,
-            crawl_policy=crawl_policy,
-            fetch_policy=fetch_policy,
-            retry_policy=retry_policy,
-            scan_id=scan_id,
-        )
+        cancellation_token = CrawlCancellationToken()
+        with _graceful_crawl_cancellation(
+            cancellation_token
+        ):
+            result = run_passive_crawl_scan(
+                target,
+                crawl_policy=crawl_policy,
+                fetch_policy=fetch_policy,
+                retry_policy=retry_policy,
+                scan_id=scan_id,
+                cancellation_token=cancellation_token,
+            )
 
     _write_report(
         result,
@@ -755,6 +822,29 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Minimum delay between crawl pages (default: 0.1; "
             f"maximum: {MAXIMUM_CRAWL_DELAY_SECONDS:g})."
+        ),
+    )
+    scan.add_argument(
+        "--crawl-time-limit",
+        dest="crawl_maximum_execution_seconds",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Maximum total crawl execution time (default: "
+            f"{DEFAULT_CRAWL_EXECUTION_SECONDS:g}; maximum: "
+            f"{MAXIMUM_CRAWL_EXECUTION_SECONDS:g})."
+        ),
+    )
+    scan.add_argument(
+        "--crawl-request-budget",
+        dest="crawl_maximum_request_attempts",
+        type=int,
+        default=None,
+        metavar="COUNT",
+        help=(
+            "Maximum total HTTP request attempts across the crawl "
+            f"(default and maximum: {MAXIMUM_CRAWL_REQUEST_ATTEMPTS})."
         ),
     )
     scan.add_argument(

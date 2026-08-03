@@ -9,6 +9,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from typing import Any, Tuple
 from urllib.parse import urlsplit
 
@@ -34,10 +35,96 @@ MAXIMUM_CRAWL_REPORT_DEPTH = 3
 MAXIMUM_CRAWL_REPORT_LINKS_PER_PAGE = 500
 MAXIMUM_CRAWL_REPORT_URL_LENGTH = 2048
 MAXIMUM_CRAWL_REPORT_DELAY_SECONDS = 5.0
+MAXIMUM_CRAWL_REPORT_EXECUTION_SECONDS = 3600.0
+MAXIMUM_CRAWL_REPORT_REQUEST_ATTEMPTS = 150
+DEFAULT_CRAWL_REPORT_EXECUTION_SECONDS = 300.0
+DEFAULT_CRAWL_REPORT_REQUEST_ATTEMPTS = 150
 
 _MEDIA_TYPE = re.compile(
     r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$"
 )
+
+
+class CrawlTerminationReason(str, Enum):
+    """Why a bounded crawl stopped accepting new requests."""
+
+    COMPLETED = "completed"
+    PAGE_LIMIT_REACHED = "page_limit_reached"
+    ROOT_REQUEST_FAILED = "root_request_failed"
+    TIME_LIMIT_REACHED = "time_limit_reached"
+    REQUEST_ATTEMPT_LIMIT_REACHED = "request_attempt_limit_reached"
+    CANCELLED = "cancelled"
+
+
+_TERMINATION_ERRORS: dict[CrawlTerminationReason, tuple[str, str]] = {
+    CrawlTerminationReason.TIME_LIMIT_REACHED: (
+        "crawl_time_limit_reached",
+        "The crawl stopped after reaching its execution time limit.",
+    ),
+    CrawlTerminationReason.REQUEST_ATTEMPT_LIMIT_REACHED: (
+        "crawl_request_attempt_limit_reached",
+        "The crawl stopped after reaching its total request-attempt limit.",
+    ),
+    CrawlTerminationReason.CANCELLED: (
+        "crawl_cancelled",
+        "The crawl was cancelled before another request was started.",
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class CrawlScanTermination:
+    """Canonical crawl termination metadata."""
+
+    reason: CrawlTerminationReason = CrawlTerminationReason.COMPLETED
+    pages_pending: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, CrawlTerminationReason):
+            raise ScanContractValidationError(
+                "crawl_termination_reason_invalid",
+                "reason must be a CrawlTerminationReason value.",
+            )
+
+        _bounded_integer(
+            self.pages_pending,
+            "crawl_termination_pages_pending",
+            0,
+            MAXIMUM_CRAWL_REPORT_PAGES,
+        )
+
+        if (
+            self.reason
+            in {
+                CrawlTerminationReason.COMPLETED,
+                CrawlTerminationReason.ROOT_REQUEST_FAILED,
+            }
+            and self.pages_pending != 0
+        ):
+            raise ScanContractValidationError(
+                "crawl_termination_pending_pages_invalid",
+                "This termination reason cannot retain pending pages.",
+            )
+
+    @property
+    def error(self) -> ScanError | None:
+        metadata = _TERMINATION_ERRORS.get(self.reason)
+        if metadata is None:
+            return None
+
+        code, message = metadata
+        return ScanError(
+            code=code,
+            message=message,
+            stage="crawl",
+            retryable=False,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason.value,
+            "pages_pending": self.pages_pending,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +139,12 @@ class CrawlScanPolicy:
     query_mode: str
     allowed_content_types: Tuple[str, ...]
     blocked_path_segments: Tuple[str, ...]
+    maximum_execution_seconds: float = (
+        DEFAULT_CRAWL_REPORT_EXECUTION_SECONDS
+    )
+    maximum_request_attempts: int = (
+        DEFAULT_CRAWL_REPORT_REQUEST_ATTEMPTS
+    )
 
     def __post_init__(self) -> None:
         _bounded_integer(
@@ -78,6 +171,36 @@ class CrawlScanPolicy:
             128,
             MAXIMUM_CRAWL_REPORT_URL_LENGTH,
         )
+        _bounded_integer(
+            self.maximum_request_attempts,
+            "crawl_policy_maximum_request_attempts",
+            1,
+            MAXIMUM_CRAWL_REPORT_REQUEST_ATTEMPTS,
+        )
+
+        if (
+            isinstance(self.maximum_execution_seconds, bool)
+            or not isinstance(
+                self.maximum_execution_seconds,
+                (int, float),
+            )
+        ):
+            raise ScanContractValidationError(
+                "crawl_policy_execution_time_invalid",
+                "maximum_execution_seconds must be a finite positive number.",
+            )
+
+        execution_seconds = float(self.maximum_execution_seconds)
+        if (
+            not math.isfinite(execution_seconds)
+            or not 0 < execution_seconds
+            <= MAXIMUM_CRAWL_REPORT_EXECUTION_SECONDS
+        ):
+            raise ScanContractValidationError(
+                "crawl_policy_execution_time_invalid",
+                "maximum_execution_seconds must be greater than zero and "
+                "no more than 3600 seconds.",
+            )
 
         if (
             isinstance(self.minimum_delay_seconds, bool)
@@ -130,6 +253,11 @@ class CrawlScanPolicy:
                 "blocked_path_segments cannot be empty.",
             )
 
+        object.__setattr__(
+            self,
+            "maximum_execution_seconds",
+            execution_seconds,
+        )
         object.__setattr__(self, "minimum_delay_seconds", delay)
         object.__setattr__(self, "query_mode", query_mode)
         object.__setattr__(self, "allowed_content_types", allowed_types)
@@ -142,6 +270,8 @@ class CrawlScanPolicy:
             "maximum_links_per_page": self.maximum_links_per_page,
             "maximum_url_length": self.maximum_url_length,
             "minimum_delay_seconds": self.minimum_delay_seconds,
+            "maximum_execution_seconds": self.maximum_execution_seconds,
+            "maximum_request_attempts": self.maximum_request_attempts,
             "query_mode": self.query_mode,
             "allowed_content_types": list(self.allowed_content_types),
             "blocked_path_segments": list(self.blocked_path_segments),
@@ -483,6 +613,7 @@ class CrawlScanCoverage:
     pages_succeeded: int
     pages_completed_with_errors: int
     pages_failed: int
+    pages_pending: int
     requests_attempted: int
     requests_succeeded: int
     check_executions_planned: int
@@ -498,6 +629,7 @@ class CrawlScanCoverage:
                 self.pages_completed_with_errors,
             ),
             ("crawl_pages_failed", self.pages_failed),
+            ("crawl_pages_pending", self.pages_pending),
             ("crawl_requests_attempted", self.requests_attempted),
             ("crawl_requests_succeeded", self.requests_succeeded),
             (
@@ -545,6 +677,8 @@ class CrawlScanCoverage:
     def from_pages(
         cls,
         pages: Tuple[CrawlPageScanResult, ...],
+        *,
+        pages_pending: int = 0,
     ) -> "CrawlScanCoverage":
         succeeded = tuple(
             page
@@ -562,6 +696,7 @@ class CrawlScanCoverage:
                 page.status is ScanStatus.FAILED
                 for page in pages
             ),
+            pages_pending=pages_pending,
             requests_attempted=sum(
                 page.coverage.requests_attempted
                 for page in pages
@@ -609,6 +744,7 @@ class CrawlScanCoverage:
             "pages_succeeded": self.pages_succeeded,
             "pages_completed_with_errors": self.pages_completed_with_errors,
             "pages_failed": self.pages_failed,
+            "pages_pending": self.pages_pending,
             "requests_attempted": self.requests_attempted,
             "requests_succeeded": self.requests_succeeded,
             "check_executions_planned": self.check_executions_planned,
@@ -634,9 +770,12 @@ class CrawlScanResult:
     policy: CrawlScanPolicy
     pages: Tuple[CrawlPageScanResult, ...]
     skipped_links: Tuple[CrawlLinkSkip, ...] = ()
+    termination: CrawlScanTermination = field(
+        default_factory=CrawlScanTermination
+    )
 
     report_type: str = field(default="crawl_scan", init=False)
-    schema_version: str = field(default="1.0", init=False)
+    schema_version: str = field(default="1.1", init=False)
 
     def __post_init__(self) -> None:
         try:
@@ -655,6 +794,7 @@ class CrawlScanResult:
             ScanStatus.COMPLETED,
             ScanStatus.COMPLETED_WITH_ERRORS,
             ScanStatus.FAILED,
+            ScanStatus.CANCELLED,
         }:
             raise ScanContractValidationError(
                 "crawl_scan_status_invalid",
@@ -677,7 +817,6 @@ class CrawlScanResult:
             )
         if (
             not isinstance(self.pages, tuple)
-            or not self.pages
             or any(
                 not isinstance(item, CrawlPageScanResult)
                 for item in self.pages
@@ -685,23 +824,58 @@ class CrawlScanResult:
         ):
             raise ScanContractValidationError(
                 "crawl_scan_pages_invalid",
-                "pages must contain at least one CrawlPageScanResult.",
+                "pages must be a tuple of CrawlPageScanResult values.",
+            )
+        if not isinstance(self.termination, CrawlScanTermination):
+            raise ScanContractValidationError(
+                "crawl_scan_termination_invalid",
+                "termination must be a CrawlScanTermination value.",
+            )
+        if (
+            not self.pages
+            and self.termination.reason
+            not in {
+                CrawlTerminationReason.TIME_LIMIT_REACHED,
+                CrawlTerminationReason.REQUEST_ATTEMPT_LIMIT_REACHED,
+                CrawlTerminationReason.CANCELLED,
+            }
+        ):
+            raise ScanContractValidationError(
+                "crawl_scan_empty_pages_invalid",
+                "Only an early budget stop or cancellation may produce "
+                "a crawl report without attempted pages.",
             )
         if len(self.pages) > self.policy.maximum_pages:
             raise ScanContractValidationError(
                 "crawl_scan_page_limit_exceeded",
                 "The report contains more pages than the policy permits.",
             )
-        if self.pages[0].url != target or self.pages[0].depth != 0:
+        if self.pages and (
+            self.pages[0].url != target
+            or self.pages[0].depth != 0
+        ):
             raise ScanContractValidationError(
                 "crawl_scan_root_page_mismatch",
                 "The first page must be the depth-zero crawl target.",
+            )
+        if (
+            len(self.pages)
+            + self.termination.pages_pending
+            > self.policy.maximum_pages
+        ):
+            raise ScanContractValidationError(
+                "crawl_scan_pending_page_limit_exceeded",
+                "Attempted and pending pages exceed the configured page limit.",
             )
 
         target_origin = _target_origin(target)
         seen_pages: dict[str, CrawlPageScanResult] = {}
         fingerprints: set[str] = set()
-        planned_checks = self.pages[0].coverage.planned_checks
+        planned_checks = (
+            ()
+            if not self.pages
+            else self.pages[0].coverage.planned_checks
+        )
         previous_depth = -1
         previous_completed_at = started_at
 
@@ -785,7 +959,8 @@ class CrawlScanResult:
             skipped_by_reason[item.reason] = item
 
         if (
-            self.pages[0].status is ScanStatus.FAILED
+            self.pages
+            and self.pages[0].status is ScanStatus.FAILED
             and len(self.pages) != 1
         ):
             raise ScanContractValidationError(
@@ -793,18 +968,58 @@ class CrawlScanResult:
                 "A crawl cannot contain child pages after the root request failed.",
             )
 
-        expected_status = (
-            ScanStatus.FAILED
-            if self.pages[0].status is ScanStatus.FAILED
-            else (
-                ScanStatus.COMPLETED_WITH_ERRORS
-                if any(
-                    page.status is not ScanStatus.COMPLETED
-                    for page in self.pages
-                )
-                else ScanStatus.COMPLETED
+        if (
+            self.termination.reason
+            is CrawlTerminationReason.ROOT_REQUEST_FAILED
+            and (
+                not self.pages
+                or self.pages[0].status is not ScanStatus.FAILED
             )
-        )
+        ):
+            raise ScanContractValidationError(
+                "crawl_scan_root_failure_termination_invalid",
+                "root_request_failed requires one failed root page.",
+            )
+
+        if (
+            self.pages
+            and self.pages[0].status is ScanStatus.FAILED
+            and self.termination.reason
+            not in {
+                CrawlTerminationReason.ROOT_REQUEST_FAILED,
+                CrawlTerminationReason.TIME_LIMIT_REACHED,
+                CrawlTerminationReason.REQUEST_ATTEMPT_LIMIT_REACHED,
+                CrawlTerminationReason.CANCELLED,
+            }
+        ):
+            raise ScanContractValidationError(
+                "crawl_scan_root_failure_termination_missing",
+                "A failed root page requires an explicit root or budget "
+                "termination reason.",
+            )
+
+        if (
+            self.termination.reason
+            is CrawlTerminationReason.CANCELLED
+        ):
+            expected_status = ScanStatus.CANCELLED
+        elif self.termination.reason in {
+            CrawlTerminationReason.TIME_LIMIT_REACHED,
+            CrawlTerminationReason.REQUEST_ATTEMPT_LIMIT_REACHED,
+        }:
+            expected_status = ScanStatus.COMPLETED_WITH_ERRORS
+        elif (
+            self.pages
+            and self.pages[0].status is ScanStatus.FAILED
+        ):
+            expected_status = ScanStatus.FAILED
+        elif any(
+            page.status is not ScanStatus.COMPLETED
+            for page in self.pages
+        ):
+            expected_status = ScanStatus.COMPLETED_WITH_ERRORS
+        else:
+            expected_status = ScanStatus.COMPLETED
         if self.status is not expected_status:
             raise ScanContractValidationError(
                 "crawl_scan_status_inconsistent",
@@ -838,7 +1053,10 @@ class CrawlScanResult:
 
     @property
     def coverage(self) -> CrawlScanCoverage:
-        return CrawlScanCoverage.from_pages(self.pages)
+        return CrawlScanCoverage.from_pages(
+            self.pages,
+            pages_pending=self.termination.pages_pending,
+        )
 
     @property
     def findings(self) -> Tuple[NormalizedFinding, ...]:
@@ -855,11 +1073,15 @@ class CrawlScanResult:
 
     @property
     def errors(self) -> Tuple[ScanError, ...]:
-        return tuple(
+        page_errors = tuple(
             error
             for page in self.pages
             for error in page.errors
         )
+        termination_error = self.termination.error
+        if termination_error is None:
+            return page_errors
+        return (*page_errors, termination_error)
 
     @property
     def connected_addresses(self) -> Tuple[str, ...]:
@@ -925,6 +1147,7 @@ class CrawlScanResult:
             "started_at": _timestamp(self.started_at),
             "completed_at": _timestamp(self.completed_at),
             "policy": self.policy.to_dict(),
+            "termination": self.termination.to_dict(),
             "coverage": self.coverage.to_dict(),
             "page_count": len(self.pages),
             "pages": [page.to_dict() for page in self.pages],

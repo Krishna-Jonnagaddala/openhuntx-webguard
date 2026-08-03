@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from webguard_contracts import (
     CrawlScanResult,
+    CrawlTerminationReason,
     ScanStatus,
     load_crawl_scan_result_json,
 )
@@ -78,13 +79,26 @@ class CrawlScanLabIntegrationTests(unittest.TestCase):
         self.assertIsInstance(result, CrawlScanResult)
         self.assertIs(result.status, ScanStatus.COMPLETED)
         self.assertEqual(result.report_type, "crawl_scan")
-        self.assertEqual(result.schema_version, "1.0")
+        self.assertEqual(result.schema_version, "1.1")
         self.assertGreaterEqual(len(result.pages), 1)
         self.assertLessEqual(len(result.pages), 5)
         self.assertEqual(result.pages[0].url, result.target)
         self.assertEqual(result.pages[0].depth, 0)
         self.assertEqual(result.pages[0].parent_url, None)
         self.assertEqual(result.errors, ())
+        self.assertIs(
+            result.termination.reason,
+            CrawlTerminationReason.COMPLETED,
+        )
+        self.assertEqual(result.coverage.pages_pending, 0)
+        self.assertEqual(
+            result.policy.maximum_execution_seconds,
+            300.0,
+        )
+        self.assertEqual(
+            result.policy.maximum_request_attempts,
+            150,
+        )
 
         self.assertEqual(
             result.coverage.pages_attempted,

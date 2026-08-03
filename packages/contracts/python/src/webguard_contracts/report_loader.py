@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Mapping
 from datetime import datetime
@@ -18,10 +19,14 @@ from .findings import (
     Severity,
 )
 from .crawl_scans import (
+    DEFAULT_CRAWL_REPORT_EXECUTION_SECONDS,
+    DEFAULT_CRAWL_REPORT_REQUEST_ATTEMPTS,
     CrawlLinkSkip,
     CrawlPageScanResult,
     CrawlScanPolicy,
     CrawlScanResult,
+    CrawlScanTermination,
+    CrawlTerminationReason,
 )
 from .scans import (
     RequestAttempt,
@@ -687,8 +692,8 @@ def load_scan_result_file(path: str | Path) -> ScanResult:
     return load_scan_result_json(document)
 
 
-CURRENT_CRAWL_SCAN_SCHEMA_VERSION = "1.0"
-SUPPORTED_CRAWL_SCAN_SCHEMA_VERSIONS = ("1.0",)
+CURRENT_CRAWL_SCAN_SCHEMA_VERSION = "1.1"
+SUPPORTED_CRAWL_SCAN_SCHEMA_VERSIONS = ("1.0", "1.1")
 
 _CRAWL_ROOT_FIELDS = frozenset(
     {
@@ -703,6 +708,7 @@ _CRAWL_ROOT_FIELDS = frozenset(
         "started_at",
         "completed_at",
         "policy",
+        "termination",
         "coverage",
         "page_count",
         "pages",
@@ -722,6 +728,8 @@ _CRAWL_POLICY_FIELDS = frozenset(
         "maximum_links_per_page",
         "maximum_url_length",
         "minimum_delay_seconds",
+        "maximum_execution_seconds",
+        "maximum_request_attempts",
         "query_mode",
         "allowed_content_types",
         "blocked_path_segments",
@@ -733,6 +741,7 @@ _CRAWL_COVERAGE_FIELDS = frozenset(
         "pages_succeeded",
         "pages_completed_with_errors",
         "pages_failed",
+        "pages_pending",
         "requests_attempted",
         "requests_succeeded",
         "check_executions_planned",
@@ -765,6 +774,9 @@ _CRAWL_PAGE_FIELDS = frozenset(
     }
 )
 _CRAWL_SKIP_FIELDS = frozenset({"reason", "count"})
+_CRAWL_TERMINATION_FIELDS = frozenset(
+    {"reason", "pages_pending"}
+)
 _CRAWL_COMBINED_ATTEMPT_FIELDS = frozenset(
     {
         "sequence",
@@ -798,6 +810,92 @@ class UnsupportedCrawlSchemaVersionError(ScanReportLoadError):
         self.schema_version = schema_version
 
 
+def _migrate_crawl_report(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return a current-schema copy without mutating caller data."""
+
+    root = copy.deepcopy(dict(value))
+    schema_version = _text(
+        root.get("schema_version"),
+        "schema_version",
+    )
+
+    if schema_version not in SUPPORTED_CRAWL_SCAN_SCHEMA_VERSIONS:
+        raise UnsupportedCrawlSchemaVersionError(schema_version)
+
+    if schema_version == CURRENT_CRAWL_SCAN_SCHEMA_VERSION:
+        return root
+
+    policy = dict(_object(root.get("policy"), "policy"))
+    policy["maximum_execution_seconds"] = (
+        DEFAULT_CRAWL_REPORT_EXECUTION_SECONDS
+    )
+    policy["maximum_request_attempts"] = (
+        DEFAULT_CRAWL_REPORT_REQUEST_ATTEMPTS
+    )
+    root["policy"] = policy
+
+    coverage = dict(_object(root.get("coverage"), "coverage"))
+    coverage["pages_pending"] = 0
+    root["coverage"] = coverage
+
+    status = _text(root.get("status"), "status")
+    skipped_links = _list(
+        root.get("skipped_links"),
+        "skipped_links",
+    )
+
+    page_limit_observed = any(
+        isinstance(item, Mapping)
+        and item.get("reason") == "page_limit"
+        and isinstance(item.get("count"), int)
+        and item.get("count", 0) > 0
+        for item in skipped_links
+    )
+
+    if status == ScanStatus.FAILED.value:
+        reason = CrawlTerminationReason.ROOT_REQUEST_FAILED
+    elif page_limit_observed:
+        reason = CrawlTerminationReason.PAGE_LIMIT_REACHED
+    else:
+        reason = CrawlTerminationReason.COMPLETED
+
+    root["termination"] = {
+        "reason": reason.value,
+        "pages_pending": 0,
+    }
+    root["schema_version"] = CURRENT_CRAWL_SCAN_SCHEMA_VERSION
+    return root
+
+
+def _load_crawl_termination(
+    value: object,
+) -> CrawlScanTermination:
+    data = _strict_object(
+        value,
+        "termination",
+        _CRAWL_TERMINATION_FIELDS,
+    )
+    termination = CrawlScanTermination(
+        reason=_enum(
+            CrawlTerminationReason,
+            data["reason"],
+            "termination.reason",
+        ),
+        pages_pending=_integer(
+            data["pages_pending"],
+            "termination.pages_pending",
+        ),
+    )
+    if termination.to_dict() != data:
+        raise _malformed(
+            "crawl_scan_termination_inconsistent",
+            "termination contains non-canonical values.",
+        )
+    return termination
+
+
 def _load_crawl_policy(value: object) -> CrawlScanPolicy:
     data = _strict_object(value, "policy", _CRAWL_POLICY_FIELDS)
     policy = CrawlScanPolicy(
@@ -814,6 +912,14 @@ def _load_crawl_policy(value: object) -> CrawlScanPolicy:
         minimum_delay_seconds=_number(
             data["minimum_delay_seconds"],
             "policy.minimum_delay_seconds",
+        ),
+        maximum_execution_seconds=_number(
+            data["maximum_execution_seconds"],
+            "policy.maximum_execution_seconds",
+        ),
+        maximum_request_attempts=_integer(
+            data["maximum_request_attempts"],
+            "policy.maximum_request_attempts",
         ),
         query_mode=_text(data["query_mode"], "policy.query_mode"),
         allowed_content_types=_text_list(
@@ -952,16 +1058,18 @@ def load_crawl_scan_result(data: Mapping[str, Any]) -> CrawlScanResult:
     """Load and strictly validate one page-aware crawl scan report."""
 
     try:
-        root = _strict_object(data, "report", _CRAWL_ROOT_FIELDS)
+        initial = _object(data, "report")
+        root = _strict_object(
+            _migrate_crawl_report(initial),
+            "report",
+            _CRAWL_ROOT_FIELDS,
+        )
         report_type = _text(root["report_type"], "report_type")
         if report_type != "crawl_scan":
             raise _malformed(
                 "crawl_scan_report_type_invalid",
                 "report_type must be 'crawl_scan'.",
             )
-        schema_version = _text(root["schema_version"], "schema_version")
-        if schema_version not in SUPPORTED_CRAWL_SCAN_SCHEMA_VERSIONS:
-            raise UnsupportedCrawlSchemaVersionError(schema_version)
 
         pages = tuple(
             _load_crawl_page(item, index)
@@ -987,6 +1095,9 @@ def load_crawl_scan_result(data: Mapping[str, Any]) -> CrawlScanResult:
             policy=_load_crawl_policy(root["policy"]),
             pages=pages,
             skipped_links=skipped_links,
+            termination=_load_crawl_termination(
+                root["termination"]
+            ),
         )
 
         if _integer(root["page_count"], "page_count") != len(result.pages):

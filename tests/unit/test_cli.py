@@ -554,7 +554,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, cli.EXIT_SUCCESS)
         self.assertEqual(stderr, "")
         self.assertIn("Report type: crawl_scan", stdout)
-        self.assertIn("Normalized schema: 1.0", stdout)
+        self.assertIn("Normalized schema: 1.1", stdout)
 
     def test_report_inspect_renders_crawl_pages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

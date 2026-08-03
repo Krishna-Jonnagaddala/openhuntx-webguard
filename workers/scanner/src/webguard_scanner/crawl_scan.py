@@ -10,6 +10,8 @@ from webguard_contracts import (
     CrawlPageScanResult,
     CrawlScanPolicy,
     CrawlScanResult,
+    CrawlScanTermination,
+    CrawlTerminationReason,
     ScanCoverage,
     ScanError,
     ScanStatus,
@@ -24,6 +26,7 @@ from .analyzer_registry import (
     validate_analyzer_registry,
 )
 from .crawler import (
+    CrawlCancellationToken,
     CrawlPageOutcome,
     CrawlPolicy,
     CrawlQueryMode,
@@ -71,6 +74,8 @@ def _policy_snapshot(policy: CrawlPolicy) -> CrawlScanPolicy:
         maximum_links_per_page=policy.maximum_links_per_page,
         maximum_url_length=policy.maximum_url_length,
         minimum_delay_seconds=policy.minimum_delay_seconds,
+        maximum_execution_seconds=policy.maximum_execution_seconds,
+        maximum_request_attempts=policy.maximum_request_attempts,
         query_mode=policy.query_mode.value,
         allowed_content_types=tuple(sorted(policy.allowed_content_types)),
         blocked_path_segments=tuple(sorted(policy.blocked_path_segments)),
@@ -118,6 +123,7 @@ def run_passive_crawl_scan(
     analyzers: tuple[PassiveAnalyzer, ...] = DEFAULT_PASSIVE_ANALYZERS,
     scan_id: str | None = None,
     started_at: datetime | None = None,
+    cancellation_token: CrawlCancellationToken | None = None,
 ) -> CrawlScanResult:
     """Crawl and passively analyse bounded same-origin HTML pages.
 
@@ -155,6 +161,7 @@ def run_passive_crawl_scan(
         fetch_policy=fetch_policy,
         retry_policy=retry_policy,
         on_page=analyze_page,
+        cancellation_token=cancellation_token,
     )
 
     pages: list[CrawlPageScanResult] = []
@@ -231,15 +238,33 @@ def run_passive_crawl_scan(
             )
         )
 
-    status = (
-        ScanStatus.FAILED
-        if pages[0].status is ScanStatus.FAILED
-        else (
-            ScanStatus.COMPLETED_WITH_ERRORS
-            if any(page.status is not ScanStatus.COMPLETED for page in pages)
-            else ScanStatus.COMPLETED
-        )
+    termination = CrawlScanTermination(
+        reason=execution.termination_reason,
+        pages_pending=execution.pages_pending,
     )
+
+    if (
+        execution.termination_reason
+        is CrawlTerminationReason.CANCELLED
+    ):
+        status = ScanStatus.CANCELLED
+    elif execution.termination_reason in {
+        CrawlTerminationReason.TIME_LIMIT_REACHED,
+        CrawlTerminationReason.REQUEST_ATTEMPT_LIMIT_REACHED,
+    }:
+        status = ScanStatus.COMPLETED_WITH_ERRORS
+    elif (
+        pages
+        and pages[0].status is ScanStatus.FAILED
+    ):
+        status = ScanStatus.FAILED
+    elif any(
+        page.status is not ScanStatus.COMPLETED
+        for page in pages
+    ):
+        status = ScanStatus.COMPLETED_WITH_ERRORS
+    else:
+        status = ScanStatus.COMPLETED
 
     return CrawlScanResult(
         scan_id=effective_scan_id,
@@ -259,6 +284,7 @@ def run_passive_crawl_scan(
             )
             for item in execution.skipped_links
         ),
+        termination=termination,
     )
 
 

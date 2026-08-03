@@ -10,6 +10,8 @@ from webguard_contracts import (
     CrawlPageScanResult,
     CrawlScanPolicy,
     CrawlScanResult,
+    CrawlScanTermination,
+    CrawlTerminationReason,
     MalformedScanReportError,
     RequestAttempt,
     RequestAttemptOutcome,
@@ -151,7 +153,7 @@ class CrawlScanContractTests(unittest.TestCase):
     def test_completed_report_is_deterministic(self) -> None:
         result = completed_result()
         self.assertEqual(result.report_type, "crawl_scan")
-        self.assertEqual(result.schema_version, "1.0")
+        self.assertEqual(result.schema_version, "1.1")
         self.assertEqual(result.coverage.pages_attempted, 1)
         self.assertEqual(result.coverage.completion_percent, 50.0)
         self.assertEqual(result.request_attempt_count, 1)
@@ -198,6 +200,9 @@ class CrawlScanContractTests(unittest.TestCase):
             completed_at=END,
             policy=policy(),
             pages=(root,),
+            termination=CrawlScanTermination(
+                reason=CrawlTerminationReason.ROOT_REQUEST_FAILED,
+            ),
         )
         self.assertIs(result.status, ScanStatus.FAILED)
 

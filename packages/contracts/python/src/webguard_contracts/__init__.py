@@ -1,15 +1,21 @@
 """Shared OpenHuntX WebGuard data contracts."""
 
 from .crawl_scans import (
+    DEFAULT_CRAWL_REPORT_EXECUTION_SECONDS,
+    DEFAULT_CRAWL_REPORT_REQUEST_ATTEMPTS,
     CrawlLinkSkip,
     CrawlPageScanResult,
     CrawlScanCoverage,
     CrawlScanPolicy,
     CrawlScanResult,
+    CrawlScanTermination,
+    CrawlTerminationReason,
     MAXIMUM_CRAWL_REPORT_DELAY_SECONDS,
     MAXIMUM_CRAWL_REPORT_DEPTH,
+    MAXIMUM_CRAWL_REPORT_EXECUTION_SECONDS,
     MAXIMUM_CRAWL_REPORT_LINKS_PER_PAGE,
     MAXIMUM_CRAWL_REPORT_PAGES,
+    MAXIMUM_CRAWL_REPORT_REQUEST_ATTEMPTS,
     MAXIMUM_CRAWL_REPORT_URL_LENGTH,
 )
 from .findings import (
@@ -61,6 +67,10 @@ __all__ = [
     "Confidence",
     "ContractValidationError",
     "CrawlLinkSkip",
+    "CrawlScanTermination",
+    "CrawlTerminationReason",
+    "DEFAULT_CRAWL_REPORT_EXECUTION_SECONDS",
+    "DEFAULT_CRAWL_REPORT_REQUEST_ATTEMPTS",
     "CrawlPageScanResult",
     "CrawlScanCoverage",
     "CrawlScanPolicy",
@@ -70,8 +80,10 @@ __all__ = [
     "FindingIdentity",
     "MAXIMUM_CRAWL_REPORT_DELAY_SECONDS",
     "MAXIMUM_CRAWL_REPORT_DEPTH",
+    "MAXIMUM_CRAWL_REPORT_EXECUTION_SECONDS",
     "MAXIMUM_CRAWL_REPORT_LINKS_PER_PAGE",
     "MAXIMUM_CRAWL_REPORT_PAGES",
+    "MAXIMUM_CRAWL_REPORT_REQUEST_ATTEMPTS",
     "MAXIMUM_CRAWL_REPORT_URL_LENGTH",
     "MAXIMUM_SCAN_REPORT_BYTES",
     "MalformedScanReportError",
