@@ -13,8 +13,11 @@ from webguard_contracts import (
 )
 
 from webguard_scanner import (
+    CookieAnalysisError,
     FetchPolicy,
     HeaderAnalysisError,
+    PASSIVE_CHECKS,
+    PASSIVE_COOKIE_CHECKS,
     RetryPolicy,
     SafeHttpResponse,
     SafeRequestError,
@@ -150,7 +153,7 @@ class PassiveScanTests(unittest.TestCase):
         )
         self.assertEqual(
             result.coverage.completion_percent,
-            80.0,
+            92.31,
         )
         self.assertEqual(
             result.coverage.skipped_checks[0].check_id,
@@ -591,6 +594,126 @@ class PassiveScanTests(unittest.TestCase):
             RequestAttemptOutcome.SUCCEEDED,
         )
         analyze_mock.assert_called_once()
+        sleep_mock.assert_not_called()
+
+
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_cookie_findings_are_included_in_scan_result(
+        self,
+        fetch_mock,
+        _clock_mock,
+    ) -> None:
+        fetch_mock.return_value = response(
+            (
+                "X-Content-Type-Options",
+                "nosniff",
+            ),
+            (
+                "X-Frame-Options",
+                "DENY",
+            ),
+            (
+                "Set-Cookie",
+                "session=secret; Path=/",
+            ),
+        )
+
+        result = run_passive_header_scan(
+            target(),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        result_rules = {
+            item.identity.rule_id
+            for item in result.findings
+        }
+
+        self.assertIn(
+            "web.cookies.secure.missing",
+            result_rules,
+        )
+        self.assertIn(
+            "web.cookies.httponly.missing",
+            result_rules,
+        )
+        self.assertIn(
+            "web.cookies.samesite.missing",
+            result_rules,
+        )
+        self.assertIn(
+            "web.cookies.transport.insecure",
+            result_rules,
+        )
+        self.assertTrue(
+            set(PASSIVE_COOKIE_CHECKS).issubset(
+                result.coverage.executed_checks
+            )
+        )
+        self.assertEqual(
+            result.coverage.planned_checks,
+            tuple(sorted(PASSIVE_CHECKS)),
+        )
+
+    @patch(
+        "webguard_scanner.passive_scan.time.sleep",
+    )
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.analyze_cookies",
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_cookie_analysis_failure_is_not_retried(
+        self,
+        fetch_mock,
+        cookie_mock,
+        _clock_mock,
+        sleep_mock,
+    ) -> None:
+        fetch_mock.return_value = response()
+        cookie_mock.side_effect = CookieAnalysisError(
+            "validated_target_mismatch",
+            "The cookie analysis input was inconsistent.",
+        )
+
+        result = run_passive_header_scan(
+            target(),
+            retry_policy=RetryPolicy(
+                maximum_attempts=3,
+            ),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        self.assertIs(
+            result.status,
+            ScanStatus.FAILED,
+        )
+        self.assertEqual(
+            result.coverage.requests_attempted,
+            1,
+        )
+        self.assertEqual(
+            result.coverage.requests_succeeded,
+            1,
+        )
+        self.assertEqual(
+            result.errors[0].stage,
+            "analysis",
+        )
+        fetch_mock.assert_called_once()
+        cookie_mock.assert_called_once()
         sleep_mock.assert_not_called()
 
 

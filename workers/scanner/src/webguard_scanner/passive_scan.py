@@ -1,4 +1,4 @@
-"""Passive HTTP header scan orchestration for OpenHuntX WebGuard."""
+"""Passive HTTP response scan orchestration for OpenHuntX WebGuard."""
 
 from __future__ import annotations
 
@@ -16,6 +16,11 @@ from webguard_contracts import (
     SkippedCheck,
 )
 
+from .cookie_analyzer import (
+    COOKIE_CHECKS,
+    CookieAnalysisError,
+    analyze_cookies,
+)
 from .error_taxonomy import is_retryable_error
 from .header_analyzer import (
     HeaderAnalysisError,
@@ -40,6 +45,9 @@ PASSIVE_HEADER_CHECKS = (
     "web.headers.referrer_policy",
     "web.headers.x_content_type_options",
 )
+
+PASSIVE_COOKIE_CHECKS = COOKIE_CHECKS
+PASSIVE_CHECKS = PASSIVE_HEADER_CHECKS + PASSIVE_COOKIE_CHECKS
 
 
 def _utc_now() -> datetime:
@@ -82,12 +90,12 @@ def _successful_coverage(
 
     executed_checks = tuple(
         check_id
-        for check_id in PASSIVE_HEADER_CHECKS
+        for check_id in PASSIVE_CHECKS
         if check_id not in skipped_ids
     )
 
     return ScanCoverage(
-        planned_checks=PASSIVE_HEADER_CHECKS,
+        planned_checks=PASSIVE_CHECKS,
         executed_checks=executed_checks,
         skipped_checks=skipped_checks,
         requests_attempted=requests_attempted,
@@ -104,7 +112,7 @@ def _failed_coverage(
     """Build partial coverage for a controlled scan failure."""
 
     return ScanCoverage(
-        planned_checks=PASSIVE_HEADER_CHECKS,
+        planned_checks=PASSIVE_CHECKS,
         executed_checks=(),
         skipped_checks=_skipped_checks_for_target(target),
         requests_attempted=requests_attempted,
@@ -155,7 +163,7 @@ def run_passive_header_scan(
     scan_id: str | None = None,
     started_at: datetime | None = None,
 ) -> ScanResult:
-    """Run one bounded passive header scan and return a ScanResult.
+    """Run one bounded passive HTTP response scan and return a ScanResult.
 
     The target must already have passed the appropriate scope-validation
     policy. This function sends GET requests only, does not run active
@@ -251,11 +259,19 @@ def run_passive_header_scan(
         break
 
     try:
-        findings = analyze_security_headers(
+        header_findings = analyze_security_headers(
             target,
             response,
         )
-    except HeaderAnalysisError as exc:
+        cookie_findings = analyze_cookies(
+            target,
+            response,
+        )
+        findings = header_findings + cookie_findings
+    except (
+        HeaderAnalysisError,
+        CookieAnalysisError,
+    ) as exc:
         return _failed_result(
             scan_id=effective_scan_id,
             target=target,

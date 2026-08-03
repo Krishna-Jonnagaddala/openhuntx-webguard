@@ -1,5 +1,10 @@
 """OpenHuntX WebGuard scanner package."""
 
+from .cookie_analyzer import (
+    COOKIE_CHECKS,
+    CookieAnalysisError,
+    analyze_cookies,
+)
 from .error_taxonomy import (
     ErrorCategory,
     ErrorPolicy,
@@ -14,6 +19,8 @@ from .header_analyzer import (
 from .passive_scan import (
     ENGINE_NAME,
     ENGINE_VERSION,
+    PASSIVE_CHECKS,
+    PASSIVE_COOKIE_CHECKS,
     PASSIVE_HEADER_CHECKS,
     run_passive_header_scan,
 )
@@ -41,15 +48,19 @@ from .scope_validator import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "COOKIE_CHECKS",
     "ENGINE_NAME",
     "ENGINE_VERSION",
     "ErrorCategory",
     "ErrorPolicy",
+    "CookieAnalysisError",
     "FetchPolicy",
     "HeaderAnalysisError",
     "MAXIMUM_BACKOFF_MULTIPLIER",
     "MAXIMUM_BACKOFF_SECONDS",
     "MAXIMUM_REQUEST_ATTEMPTS",
+    "PASSIVE_CHECKS",
+    "PASSIVE_COOKIE_CHECKS",
     "PASSIVE_HEADER_CHECKS",
     "RetryPolicy",
     "SafeHttpResponse",
@@ -59,6 +70,7 @@ __all__ = [
     "ValidationMode",
     "ValidationPolicy",
     "__version__",
+    "analyze_cookies",
     "analyze_security_headers",
     "classify_error",
     "fetch_once",
