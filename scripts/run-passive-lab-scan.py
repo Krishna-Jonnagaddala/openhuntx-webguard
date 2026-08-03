@@ -13,6 +13,7 @@ from webguard_contracts import ScanStatus
 
 from webguard_scanner import (
     FetchPolicy,
+    RetryPolicy,
     TargetValidationError,
     ValidationMode,
     ValidationPolicy,
@@ -49,6 +50,15 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help=(
             "Explicitly allow an authorised lab hostname. May be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=1,
+        help=(
+            "Maximum total request attempts. The default of 1 disables "
+            "retries; the enforced maximum is 3."
         ),
     )
     return parser.parse_args()
@@ -114,6 +124,10 @@ def main() -> int:
                 allowed_lab_hosts=allowed_hosts,
             ),
         )
+
+        retry_policy = RetryPolicy(
+            maximum_attempts=args.max_attempts,
+        )
     except (
         TargetValidationError,
         ValueError,
@@ -146,6 +160,7 @@ def main() -> int:
             maximum_header_bytes=65_536,
             maximum_header_count=100,
         ),
+        retry_policy=retry_policy,
     )
 
     output_path = Path(args.output)
@@ -176,6 +191,11 @@ def main() -> int:
         f"{_display_values(result.http_statuses)}"
     )
     print(
+        "Requests: "
+        f"{result.coverage.requests_attempted} attempted, "
+        f"{result.coverage.requests_succeeded} succeeded"
+    )
+    print(
         "Coverage: "
         f"{result.coverage.completion_percent}% executed"
     )
@@ -197,7 +217,8 @@ def main() -> int:
     for error in result.errors:
         print(
             f"- [ERROR] {error.stage}/{error.code}: "
-            f"{error.message}"
+            f"{error.message} "
+            f"(retryable: {'yes' if error.retryable else 'no'})"
         )
 
     print(f"Saved report: {output_path}")

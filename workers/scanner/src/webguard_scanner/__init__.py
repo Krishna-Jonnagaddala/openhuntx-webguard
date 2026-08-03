@@ -17,6 +17,12 @@ from .passive_scan import (
     PASSIVE_HEADER_CHECKS,
     run_passive_header_scan,
 )
+from .retry_policy import (
+    MAXIMUM_BACKOFF_MULTIPLIER,
+    MAXIMUM_BACKOFF_SECONDS,
+    MAXIMUM_REQUEST_ATTEMPTS,
+    RetryPolicy,
+)
 from .safe_http import (
     FetchPolicy,
     SafeHttpResponse,
@@ -41,7 +47,11 @@ __all__ = [
     "ErrorPolicy",
     "FetchPolicy",
     "HeaderAnalysisError",
+    "MAXIMUM_BACKOFF_MULTIPLIER",
+    "MAXIMUM_BACKOFF_SECONDS",
+    "MAXIMUM_REQUEST_ATTEMPTS",
     "PASSIVE_HEADER_CHECKS",
+    "RetryPolicy",
     "SafeHttpResponse",
     "SafeRequestError",
     "TargetValidationError",

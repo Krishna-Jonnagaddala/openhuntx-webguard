@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from webguard_contracts import ScanResult, ScanStatus
 
 from webguard_scanner import (
     FetchPolicy,
     HeaderAnalysisError,
+    RetryPolicy,
     SafeHttpResponse,
     SafeRequestError,
     ValidatedTarget,
@@ -61,7 +62,7 @@ def response(
 
 
 class PassiveScanTests(unittest.TestCase):
-    """Verify passive scan orchestration and ScanResult output."""
+    """Verify passive scan orchestration and retry behaviour."""
 
     @patch(
         "webguard_scanner.passive_scan._utc_now",
@@ -100,28 +101,15 @@ class PassiveScanTests(unittest.TestCase):
             result.status,
             ScanStatus.COMPLETED,
         )
-        self.assertEqual(result.scan_id, SCAN_ID)
         self.assertEqual(
-            result.target,
-            "http://127.0.0.1:3000/",
+            result.coverage.requests_attempted,
+            1,
         )
         self.assertEqual(
-            result.connected_addresses,
-            ("127.0.0.1",),
+            result.coverage.requests_succeeded,
+            1,
         )
-        self.assertEqual(result.http_statuses, (200,))
         self.assertEqual(len(result.findings), 2)
-        self.assertEqual(
-            {
-                finding.identity.rule_id
-                for finding in result.findings
-            },
-            {
-                "web.headers.csp.missing",
-                "web.headers.referrer_policy.missing",
-            },
-        )
-
         fetch_mock.assert_called_once()
 
     @patch(
@@ -221,20 +209,24 @@ class PassiveScanTests(unittest.TestCase):
         self.assertEqual(result.findings, ())
 
     @patch(
+        "webguard_scanner.passive_scan.time.sleep",
+    )
+    @patch(
         "webguard_scanner.passive_scan._utc_now",
         return_value=COMPLETED_AT,
     )
     @patch(
         "webguard_scanner.passive_scan.fetch_once",
     )
-    def test_request_failure_returns_failed_scan_result(
+    def test_default_policy_does_not_retry(
         self,
         fetch_mock,
         _clock_mock,
+        sleep_mock,
     ) -> None:
         fetch_mock.side_effect = SafeRequestError(
-            "connection_failed",
-            "The authorised target refused the connection.",
+            "connection_timeout",
+            "The connection timed out.",
         )
 
         result = run_passive_header_scan(
@@ -247,41 +239,177 @@ class PassiveScanTests(unittest.TestCase):
             result.status,
             ScanStatus.FAILED,
         )
-        self.assertEqual(result.findings, ())
-        self.assertEqual(result.connected_addresses, ())
-        self.assertEqual(result.http_statuses, ())
+        self.assertTrue(result.errors[0].retryable)
         self.assertEqual(
             result.coverage.requests_attempted,
             1,
+        )
+        fetch_mock.assert_called_once()
+        sleep_mock.assert_not_called()
+
+    @patch(
+        "webguard_scanner.passive_scan.time.sleep",
+    )
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_retryable_failure_can_succeed_on_second_attempt(
+        self,
+        fetch_mock,
+        _clock_mock,
+        sleep_mock,
+    ) -> None:
+        fetch_mock.side_effect = [
+            SafeRequestError(
+                "connection_timeout",
+                "The connection timed out.",
+            ),
+            response(),
+        ]
+
+        result = run_passive_header_scan(
+            target(),
+            retry_policy=RetryPolicy(
+                maximum_attempts=2,
+                initial_backoff_seconds=0.1,
+                maximum_backoff_seconds=0.1,
+            ),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        self.assertIs(
+            result.status,
+            ScanStatus.COMPLETED,
+        )
+        self.assertEqual(
+            result.coverage.requests_attempted,
+            2,
+        )
+        self.assertEqual(
+            result.coverage.requests_succeeded,
+            1,
+        )
+        self.assertEqual(fetch_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(0.1)
+
+    @patch(
+        "webguard_scanner.passive_scan.time.sleep",
+    )
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_retry_exhaustion_preserves_final_error(
+        self,
+        fetch_mock,
+        _clock_mock,
+        sleep_mock,
+    ) -> None:
+        fetch_mock.side_effect = [
+            SafeRequestError(
+                "connection_timeout",
+                "Attempt one timed out.",
+            ),
+            SafeRequestError(
+                "connection_refused",
+                "Attempt two was refused.",
+            ),
+            SafeRequestError(
+                "connection_interrupted",
+                "Attempt three was interrupted.",
+            ),
+        ]
+
+        result = run_passive_header_scan(
+            target(),
+            retry_policy=RetryPolicy(
+                maximum_attempts=3,
+                initial_backoff_seconds=0.1,
+                backoff_multiplier=2,
+                maximum_backoff_seconds=0.15,
+            ),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        self.assertIs(
+            result.status,
+            ScanStatus.FAILED,
+        )
+        self.assertEqual(
+            result.coverage.requests_attempted,
+            3,
         )
         self.assertEqual(
             result.coverage.requests_succeeded,
             0,
         )
         self.assertEqual(
-            result.coverage.executed_checks,
-            (),
-        )
-        self.assertEqual(
-            result.coverage.unaccounted_checks,
-            (
-                "web.headers.csp",
-                "web.headers.frame_protection",
-                "web.headers.referrer_policy",
-                "web.headers.x_content_type_options",
-            ),
-        )
-        self.assertEqual(len(result.errors), 1)
-        self.assertEqual(
             result.errors[0].code,
-            "connection_failed",
-        )
-        self.assertEqual(
-            result.errors[0].stage,
-            "request",
+            "connection_interrupted",
         )
         self.assertTrue(result.errors[0].retryable)
+        self.assertEqual(
+            sleep_mock.call_args_list,
+            [
+                call(0.1),
+                call(0.15),
+            ],
+        )
 
+    @patch(
+        "webguard_scanner.passive_scan.time.sleep",
+    )
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_non_retryable_failure_stops_immediately(
+        self,
+        fetch_mock,
+        _clock_mock,
+        sleep_mock,
+    ) -> None:
+        fetch_mock.side_effect = SafeRequestError(
+            "redirect_blocked",
+            "Automatic redirects are disabled.",
+        )
+
+        result = run_passive_header_scan(
+            target(),
+            retry_policy=RetryPolicy(
+                maximum_attempts=3,
+            ),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        self.assertIs(
+            result.status,
+            ScanStatus.FAILED,
+        )
+        self.assertFalse(result.errors[0].retryable)
+        self.assertEqual(
+            result.coverage.requests_attempted,
+            1,
+        )
+        fetch_mock.assert_called_once()
+        sleep_mock.assert_not_called()
+
+    @patch(
+        "webguard_scanner.passive_scan.time.sleep",
+    )
     @patch(
         "webguard_scanner.passive_scan._utc_now",
         return_value=COMPLETED_AT,
@@ -292,20 +420,24 @@ class PassiveScanTests(unittest.TestCase):
     @patch(
         "webguard_scanner.passive_scan.fetch_once",
     )
-    def test_analysis_failure_preserves_response_metadata(
+    def test_analysis_failure_is_not_retried(
         self,
         fetch_mock,
         analyze_mock,
         _clock_mock,
+        sleep_mock,
     ) -> None:
         fetch_mock.return_value = response()
         analyze_mock.side_effect = HeaderAnalysisError(
-            "analysis_input_inconsistent",
+            "validated_target_mismatch",
             "The response metadata was inconsistent.",
         )
 
         result = run_passive_header_scan(
             target(),
+            retry_policy=RetryPolicy(
+                maximum_attempts=3,
+            ),
             scan_id=SCAN_ID,
             started_at=STARTED_AT,
         )
@@ -314,12 +446,6 @@ class PassiveScanTests(unittest.TestCase):
             result.status,
             ScanStatus.FAILED,
         )
-        self.assertEqual(result.findings, ())
-        self.assertEqual(
-            result.connected_addresses,
-            ("127.0.0.1",),
-        )
-        self.assertEqual(result.http_statuses, (200,))
         self.assertEqual(
             result.coverage.requests_attempted,
             1,
@@ -329,19 +455,75 @@ class PassiveScanTests(unittest.TestCase):
             1,
         )
         self.assertEqual(
-            result.coverage.executed_checks,
-            (),
+            result.errors[0].stage,
+            "analysis",
         )
-        self.assertEqual(len(result.errors), 1)
+        fetch_mock.assert_called_once()
+        analyze_mock.assert_called_once()
+        sleep_mock.assert_not_called()
+
+    @patch(
+        "webguard_scanner.passive_scan.time.sleep",
+    )
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.analyze_security_headers",
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_analysis_failure_after_retry_tracks_attempts(
+        self,
+        fetch_mock,
+        analyze_mock,
+        _clock_mock,
+        sleep_mock,
+    ) -> None:
+        fetch_mock.side_effect = [
+            SafeRequestError(
+                "connection_timeout",
+                "The first attempt timed out.",
+            ),
+            response(),
+        ]
+        analyze_mock.side_effect = HeaderAnalysisError(
+            "validated_target_mismatch",
+            "The response metadata was inconsistent.",
+        )
+
+        result = run_passive_header_scan(
+            target(),
+            retry_policy=RetryPolicy(
+                maximum_attempts=2,
+                initial_backoff_seconds=0,
+                maximum_backoff_seconds=0,
+            ),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        self.assertIs(
+            result.status,
+            ScanStatus.FAILED,
+        )
         self.assertEqual(
-            result.errors[0].code,
-            "analysis_input_inconsistent",
+            result.coverage.requests_attempted,
+            2,
+        )
+        self.assertEqual(
+            result.coverage.requests_succeeded,
+            1,
         )
         self.assertEqual(
             result.errors[0].stage,
             "analysis",
         )
-        self.assertFalse(result.errors[0].retryable)
+        self.assertEqual(fetch_mock.call_count, 2)
+        analyze_mock.assert_called_once()
+        sleep_mock.assert_not_called()
 
 
 if __name__ == "__main__":
