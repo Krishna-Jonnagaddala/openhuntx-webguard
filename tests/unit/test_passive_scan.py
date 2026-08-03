@@ -14,10 +14,14 @@ from webguard_contracts import (
 
 from webguard_scanner import (
     CookieAnalysisError,
+    CorsAnalysisError,
+    DisclosureAnalysisError,
     FetchPolicy,
     HeaderAnalysisError,
     PASSIVE_CHECKS,
     PASSIVE_COOKIE_CHECKS,
+    PASSIVE_CORS_CHECKS,
+    PASSIVE_DISCLOSURE_CHECKS,
     RetryPolicy,
     SafeHttpResponse,
     SafeRequestError,
@@ -153,7 +157,7 @@ class PassiveScanTests(unittest.TestCase):
         )
         self.assertEqual(
             result.coverage.completion_percent,
-            92.31,
+            95.83,
         )
         self.assertEqual(
             result.coverage.skipped_checks[0].check_id,
@@ -714,6 +718,201 @@ class PassiveScanTests(unittest.TestCase):
         )
         fetch_mock.assert_called_once()
         cookie_mock.assert_called_once()
+        sleep_mock.assert_not_called()
+
+
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_cors_findings_are_included_in_scan_result(
+        self,
+        fetch_mock,
+        _clock_mock,
+    ) -> None:
+        fetch_mock.return_value = response(
+            (
+                "X-Content-Type-Options",
+                "nosniff",
+            ),
+            (
+                "X-Frame-Options",
+                "DENY",
+            ),
+            (
+                "Access-Control-Allow-Origin",
+                "*",
+            ),
+        )
+
+        result = run_passive_header_scan(
+            target(),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        result_rules = {
+            item.identity.rule_id
+            for item in result.findings
+        }
+
+        self.assertIn(
+            "web.cors.allow_origin.wildcard",
+            result_rules,
+        )
+        self.assertTrue(
+            set(PASSIVE_CORS_CHECKS).issubset(
+                result.coverage.executed_checks
+            )
+        )
+
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_disclosure_findings_are_included_in_scan_result(
+        self,
+        fetch_mock,
+        _clock_mock,
+    ) -> None:
+        fetch_mock.return_value = response(
+            (
+                "X-Content-Type-Options",
+                "nosniff",
+            ),
+            (
+                "X-Frame-Options",
+                "DENY",
+            ),
+            (
+                "Server",
+                "nginx/1.25.4",
+            ),
+        )
+
+        result = run_passive_header_scan(
+            target(),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        result_rules = {
+            item.identity.rule_id
+            for item in result.findings
+        }
+
+        self.assertIn(
+            "web.disclosure.server.version",
+            result_rules,
+        )
+        self.assertTrue(
+            set(PASSIVE_DISCLOSURE_CHECKS).issubset(
+                result.coverage.executed_checks
+            )
+        )
+
+    @patch(
+        "webguard_scanner.passive_scan.time.sleep",
+    )
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.analyze_cors",
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_cors_analysis_failure_is_not_retried(
+        self,
+        fetch_mock,
+        cors_mock,
+        _clock_mock,
+        sleep_mock,
+    ) -> None:
+        fetch_mock.return_value = response()
+        cors_mock.side_effect = CorsAnalysisError(
+            "validated_target_mismatch",
+            "The CORS analysis input was inconsistent.",
+        )
+
+        result = run_passive_header_scan(
+            target(),
+            retry_policy=RetryPolicy(
+                maximum_attempts=3,
+            ),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        self.assertIs(result.status, ScanStatus.FAILED)
+        self.assertEqual(
+            result.coverage.requests_attempted,
+            1,
+        )
+        self.assertEqual(
+            result.coverage.requests_succeeded,
+            1,
+        )
+        self.assertEqual(result.errors[0].stage, "analysis")
+        fetch_mock.assert_called_once()
+        cors_mock.assert_called_once()
+        sleep_mock.assert_not_called()
+
+    @patch(
+        "webguard_scanner.passive_scan.time.sleep",
+    )
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.analyze_information_disclosure",
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_disclosure_analysis_failure_is_not_retried(
+        self,
+        fetch_mock,
+        disclosure_mock,
+        _clock_mock,
+        sleep_mock,
+    ) -> None:
+        fetch_mock.return_value = response()
+        disclosure_mock.side_effect = DisclosureAnalysisError(
+            "validated_target_mismatch",
+            "The disclosure analysis input was inconsistent.",
+        )
+
+        result = run_passive_header_scan(
+            target(),
+            retry_policy=RetryPolicy(
+                maximum_attempts=3,
+            ),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        self.assertIs(result.status, ScanStatus.FAILED)
+        self.assertEqual(
+            result.coverage.requests_attempted,
+            1,
+        )
+        self.assertEqual(
+            result.coverage.requests_succeeded,
+            1,
+        )
+        self.assertEqual(result.errors[0].stage, "analysis")
+        fetch_mock.assert_called_once()
+        disclosure_mock.assert_called_once()
         sleep_mock.assert_not_called()
 
 

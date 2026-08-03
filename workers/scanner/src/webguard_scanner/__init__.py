@@ -5,6 +5,16 @@ from .cookie_analyzer import (
     CookieAnalysisError,
     analyze_cookies,
 )
+from .cors_analyzer import (
+    CORS_CHECKS,
+    CorsAnalysisError,
+    analyze_cors,
+)
+from .disclosure_analyzer import (
+    DISCLOSURE_CHECKS,
+    DisclosureAnalysisError,
+    analyze_information_disclosure,
+)
 from .error_taxonomy import (
     ErrorCategory,
     ErrorPolicy,
@@ -21,6 +31,8 @@ from .passive_scan import (
     ENGINE_VERSION,
     PASSIVE_CHECKS,
     PASSIVE_COOKIE_CHECKS,
+    PASSIVE_CORS_CHECKS,
+    PASSIVE_DISCLOSURE_CHECKS,
     PASSIVE_HEADER_CHECKS,
     run_passive_header_scan,
 )
@@ -49,11 +61,15 @@ __version__ = "0.1.0"
 
 __all__ = [
     "COOKIE_CHECKS",
+    "CORS_CHECKS",
+    "DISCLOSURE_CHECKS",
     "ENGINE_NAME",
     "ENGINE_VERSION",
     "ErrorCategory",
     "ErrorPolicy",
     "CookieAnalysisError",
+    "CorsAnalysisError",
+    "DisclosureAnalysisError",
     "FetchPolicy",
     "HeaderAnalysisError",
     "MAXIMUM_BACKOFF_MULTIPLIER",
@@ -61,6 +77,8 @@ __all__ = [
     "MAXIMUM_REQUEST_ATTEMPTS",
     "PASSIVE_CHECKS",
     "PASSIVE_COOKIE_CHECKS",
+    "PASSIVE_CORS_CHECKS",
+    "PASSIVE_DISCLOSURE_CHECKS",
     "PASSIVE_HEADER_CHECKS",
     "RetryPolicy",
     "SafeHttpResponse",
@@ -71,6 +89,8 @@ __all__ = [
     "ValidationPolicy",
     "__version__",
     "analyze_cookies",
+    "analyze_cors",
+    "analyze_information_disclosure",
     "analyze_security_headers",
     "classify_error",
     "fetch_once",

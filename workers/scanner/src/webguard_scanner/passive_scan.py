@@ -21,6 +21,16 @@ from .cookie_analyzer import (
     CookieAnalysisError,
     analyze_cookies,
 )
+from .cors_analyzer import (
+    CORS_CHECKS,
+    CorsAnalysisError,
+    analyze_cors,
+)
+from .disclosure_analyzer import (
+    DISCLOSURE_CHECKS,
+    DisclosureAnalysisError,
+    analyze_information_disclosure,
+)
 from .error_taxonomy import is_retryable_error
 from .header_analyzer import (
     HeaderAnalysisError,
@@ -47,7 +57,14 @@ PASSIVE_HEADER_CHECKS = (
 )
 
 PASSIVE_COOKIE_CHECKS = COOKIE_CHECKS
-PASSIVE_CHECKS = PASSIVE_HEADER_CHECKS + PASSIVE_COOKIE_CHECKS
+PASSIVE_CORS_CHECKS = CORS_CHECKS
+PASSIVE_DISCLOSURE_CHECKS = DISCLOSURE_CHECKS
+PASSIVE_CHECKS = (
+    PASSIVE_HEADER_CHECKS
+    + PASSIVE_COOKIE_CHECKS
+    + PASSIVE_CORS_CHECKS
+    + PASSIVE_DISCLOSURE_CHECKS
+)
 
 
 def _utc_now() -> datetime:
@@ -267,10 +284,25 @@ def run_passive_header_scan(
             target,
             response,
         )
-        findings = header_findings + cookie_findings
+        cors_findings = analyze_cors(
+            target,
+            response,
+        )
+        disclosure_findings = analyze_information_disclosure(
+            target,
+            response,
+        )
+        findings = (
+            header_findings
+            + cookie_findings
+            + cors_findings
+            + disclosure_findings
+        )
     except (
         HeaderAnalysisError,
         CookieAnalysisError,
+        CorsAnalysisError,
+        DisclosureAnalysisError,
     ) as exc:
         return _failed_result(
             scan_id=effective_scan_id,
