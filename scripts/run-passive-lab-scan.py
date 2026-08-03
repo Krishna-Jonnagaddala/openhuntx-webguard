@@ -221,6 +221,22 @@ def main() -> int:
             f"(retryable: {'yes' if error.retryable else 'no'})"
         )
 
+    for attempt in result.request_attempts:
+        if attempt.outcome.value == "succeeded":
+            print(
+                f"- [ATTEMPT {attempt.attempt_number}] succeeded: "
+                f"{attempt.connected_address}, HTTP {attempt.http_status}, "
+                f"{attempt.duration_milliseconds} ms"
+            )
+        else:
+            print(
+                f"- [ATTEMPT {attempt.attempt_number}] failed: "
+                f"{attempt.error_code}; "
+                f"retry scheduled: "
+                f"{'yes' if attempt.retry_scheduled else 'no'}; "
+                f"backoff: {attempt.backoff_seconds} s"
+            )
+
     print(f"Saved report: {output_path}")
 
     if result.status is ScanStatus.FAILED:

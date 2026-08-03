@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from webguard_contracts import (
+    RequestAttempt,
+    RequestAttemptOutcome,
     ScanCoverage,
     ScanError,
     ScanResult,
@@ -120,6 +122,7 @@ def _failed_result(
     request_succeeded: bool,
     connected_addresses: tuple[str, ...] = (),
     http_statuses: tuple[int, ...] = (),
+    request_attempts: tuple[RequestAttempt, ...] = (),
 ) -> ScanResult:
     """Create a validated failed ScanResult."""
 
@@ -140,6 +143,7 @@ def _failed_result(
         errors=(error,),
         connected_addresses=connected_addresses,
         http_statuses=http_statuses,
+        request_attempts=request_attempts,
     )
 
 
@@ -164,10 +168,11 @@ def run_passive_header_scan(
 
     effective_scan_id = scan_id or str(uuid4())
     effective_started_at = started_at or _utc_now()
-    requests_attempted = 0
+    request_attempts: list[RequestAttempt] = []
 
     while True:
-        requests_attempted += 1
+        attempt_number = len(request_attempts) + 1
+        attempt_started_at = _utc_now()
 
         try:
             response = fetch_once(
@@ -176,17 +181,42 @@ def run_passive_header_scan(
                 policy=fetch_policy,
             )
         except SafeRequestError as exc:
+            attempt_completed_at = _utc_now()
             retryable = is_retryable_error(
                 stage="request",
                 code=exc.code,
             )
 
             attempts_exhausted = (
-                requests_attempted
+                attempt_number
                 >= retry_policy.maximum_attempts
             )
+            retry_scheduled = (
+                retryable
+                and not attempts_exhausted
+            )
+            delay = (
+                retry_policy.delay_after_failure(
+                    attempt_number
+                )
+                if retry_scheduled
+                else 0.0
+            )
 
-            if not retryable or attempts_exhausted:
+            request_attempts.append(
+                RequestAttempt(
+                    attempt_number=attempt_number,
+                    started_at=attempt_started_at,
+                    completed_at=attempt_completed_at,
+                    outcome=RequestAttemptOutcome.FAILED,
+                    error_code=exc.code,
+                    retryable=retryable,
+                    retry_scheduled=retry_scheduled,
+                    backoff_seconds=delay,
+                )
+            )
+
+            if not retry_scheduled:
                 return _failed_result(
                     scan_id=effective_scan_id,
                     target=target,
@@ -197,19 +227,27 @@ def run_passive_header_scan(
                         stage="request",
                         retryable=retryable,
                     ),
-                    requests_attempted=requests_attempted,
+                    requests_attempted=len(request_attempts),
                     request_succeeded=False,
+                    request_attempts=tuple(request_attempts),
                 )
-
-            delay = retry_policy.delay_after_failure(
-                requests_attempted
-            )
 
             if delay > 0:
                 time.sleep(delay)
 
             continue
 
+        attempt_completed_at = _utc_now()
+        request_attempts.append(
+            RequestAttempt(
+                attempt_number=attempt_number,
+                started_at=attempt_started_at,
+                completed_at=attempt_completed_at,
+                outcome=RequestAttemptOutcome.SUCCEEDED,
+                connected_address=response.connected_address,
+                http_status=response.status,
+            )
+        )
         break
 
     try:
@@ -231,7 +269,7 @@ def run_passive_header_scan(
                     code=exc.code,
                 ),
             ),
-            requests_attempted=requests_attempted,
+            requests_attempted=len(request_attempts),
             request_succeeded=True,
             connected_addresses=(
                 response.connected_address,
@@ -239,6 +277,7 @@ def run_passive_header_scan(
             http_statuses=(
                 response.status,
             ),
+            request_attempts=tuple(request_attempts),
         )
 
     return ScanResult(
@@ -252,7 +291,7 @@ def run_passive_header_scan(
         completed_at=_utc_now(),
         coverage=_successful_coverage(
             target,
-            requests_attempted=requests_attempted,
+            requests_attempted=len(request_attempts),
         ),
         findings=findings,
         connected_addresses=(
@@ -261,4 +300,5 @@ def run_passive_header_scan(
         http_statuses=(
             response.status,
         ),
+        request_attempts=tuple(request_attempts),
     )

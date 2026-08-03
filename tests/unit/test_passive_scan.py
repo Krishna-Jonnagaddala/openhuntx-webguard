@@ -6,7 +6,11 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import call, patch
 
-from webguard_contracts import ScanResult, ScanStatus
+from webguard_contracts import (
+    RequestAttemptOutcome,
+    ScanResult,
+    ScanStatus,
+)
 
 from webguard_scanner import (
     FetchPolicy,
@@ -110,6 +114,14 @@ class PassiveScanTests(unittest.TestCase):
             1,
         )
         self.assertEqual(len(result.findings), 2)
+        self.assertEqual(len(result.request_attempts), 1)
+        self.assertIs(
+            result.request_attempts[0].outcome,
+            RequestAttemptOutcome.SUCCEEDED,
+        )
+        self.assertFalse(
+            result.request_attempts[0].retry_scheduled
+        )
         fetch_mock.assert_called_once()
 
     @patch(
@@ -244,6 +256,14 @@ class PassiveScanTests(unittest.TestCase):
             result.coverage.requests_attempted,
             1,
         )
+        self.assertEqual(len(result.request_attempts), 1)
+        self.assertIs(
+            result.request_attempts[0].outcome,
+            RequestAttemptOutcome.FAILED,
+        )
+        self.assertFalse(
+            result.request_attempts[0].retry_scheduled
+        )
         fetch_mock.assert_called_once()
         sleep_mock.assert_not_called()
 
@@ -295,6 +315,23 @@ class PassiveScanTests(unittest.TestCase):
             1,
         )
         self.assertEqual(fetch_mock.call_count, 2)
+        self.assertEqual(
+            tuple(
+                item.outcome
+                for item in result.request_attempts
+            ),
+            (
+                RequestAttemptOutcome.FAILED,
+                RequestAttemptOutcome.SUCCEEDED,
+            ),
+        )
+        self.assertTrue(
+            result.request_attempts[0].retry_scheduled
+        )
+        self.assertEqual(
+            result.request_attempts[0].backoff_seconds,
+            0.1,
+        )
         sleep_mock.assert_called_once_with(0.1)
 
     @patch(
@@ -358,6 +395,24 @@ class PassiveScanTests(unittest.TestCase):
         )
         self.assertTrue(result.errors[0].retryable)
         self.assertEqual(
+            tuple(
+                item.error_code
+                for item in result.request_attempts
+            ),
+            (
+                "connection_timeout",
+                "connection_refused",
+                "connection_interrupted",
+            ),
+        )
+        self.assertEqual(
+            tuple(
+                item.retry_scheduled
+                for item in result.request_attempts
+            ),
+            (True, True, False),
+        )
+        self.assertEqual(
             sleep_mock.call_args_list,
             [
                 call(0.1),
@@ -403,6 +458,14 @@ class PassiveScanTests(unittest.TestCase):
         self.assertEqual(
             result.coverage.requests_attempted,
             1,
+        )
+        self.assertEqual(len(result.request_attempts), 1)
+        self.assertFalse(
+            result.request_attempts[0].retry_scheduled
+        )
+        self.assertEqual(
+            result.request_attempts[0].backoff_seconds,
+            0.0,
         )
         fetch_mock.assert_called_once()
         sleep_mock.assert_not_called()
@@ -522,6 +585,11 @@ class PassiveScanTests(unittest.TestCase):
             "analysis",
         )
         self.assertEqual(fetch_mock.call_count, 2)
+        self.assertEqual(len(result.request_attempts), 2)
+        self.assertIs(
+            result.request_attempts[-1].outcome,
+            RequestAttemptOutcome.SUCCEEDED,
+        )
         analyze_mock.assert_called_once()
         sleep_mock.assert_not_called()
 

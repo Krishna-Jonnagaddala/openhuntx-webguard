@@ -10,6 +10,8 @@ from .findings import (
     Severity,
 )
 from .scans import (
+    RequestAttempt,
+    RequestAttemptOutcome,
     ScanContractValidationError,
     ScanCoverage,
     ScanError,
@@ -27,6 +29,8 @@ __all__ = [
     "ExternalIdentifier",
     "FindingIdentity",
     "NormalizedFinding",
+    "RequestAttempt",
+    "RequestAttemptOutcome",
     "ScanContractValidationError",
     "ScanCoverage",
     "ScanError",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -450,6 +451,208 @@ class ScanError:
             )
 
 
+class RequestAttemptOutcome(str, Enum):
+    """Result of one bounded HTTP request attempt."""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class RequestAttempt:
+    """A bounded, non-secret audit record for one HTTP attempt."""
+
+    attempt_number: int
+    started_at: datetime
+    completed_at: datetime
+    outcome: RequestAttemptOutcome
+
+    connected_address: str | None = None
+    http_status: int | None = None
+    error_code: str | None = None
+    retryable: bool | None = None
+    retry_scheduled: bool = False
+    backoff_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.attempt_number, int)
+            or isinstance(self.attempt_number, bool)
+            or self.attempt_number < 1
+        ):
+            raise ScanContractValidationError(
+                "request_attempt_number_invalid",
+                "attempt_number must be a positive integer.",
+            )
+
+        if not isinstance(self.outcome, RequestAttemptOutcome):
+            raise ScanContractValidationError(
+                "request_attempt_outcome_invalid",
+                "outcome must be a RequestAttemptOutcome value.",
+            )
+
+        started_at = _aware_utc(
+            self.started_at,
+            "request_attempt_started_at",
+        )
+        completed_at = _aware_utc(
+            self.completed_at,
+            "request_attempt_completed_at",
+        )
+
+        if completed_at < started_at:
+            raise ScanContractValidationError(
+                "request_attempt_time_invalid",
+                "Request attempt completion cannot precede its start.",
+            )
+
+        connected_address: str | None = None
+
+        if self.connected_address is not None:
+            try:
+                connected_address = ipaddress.ip_address(
+                    _required_text(
+                        self.connected_address,
+                        "request_attempt_connected_address",
+                        128,
+                    )
+                ).compressed
+            except ValueError as exc:
+                raise ScanContractValidationError(
+                    "request_attempt_connected_address_invalid",
+                    "connected_address must be a valid IP address.",
+                ) from exc
+
+        if self.http_status is not None and (
+            not isinstance(self.http_status, int)
+            or isinstance(self.http_status, bool)
+            or not 100 <= self.http_status <= 599
+        ):
+            raise ScanContractValidationError(
+                "request_attempt_http_status_invalid",
+                "http_status must be an integer from 100 to 599.",
+            )
+
+        error_code = (
+            None
+            if self.error_code is None
+            else _identifier(
+                self.error_code,
+                "request_attempt_error_code",
+            )
+        )
+
+        if (
+            self.retryable is not None
+            and not isinstance(self.retryable, bool)
+        ):
+            raise ScanContractValidationError(
+                "request_attempt_retryable_invalid",
+                "retryable must be boolean or null.",
+            )
+
+        if not isinstance(self.retry_scheduled, bool):
+            raise ScanContractValidationError(
+                "request_attempt_retry_scheduled_invalid",
+                "retry_scheduled must be boolean.",
+            )
+
+        if (
+            isinstance(self.backoff_seconds, bool)
+            or not isinstance(self.backoff_seconds, (int, float))
+        ):
+            raise ScanContractValidationError(
+                "request_attempt_backoff_invalid",
+                "backoff_seconds must be a finite non-negative number.",
+            )
+
+        backoff_seconds = float(self.backoff_seconds)
+
+        if (
+            not math.isfinite(backoff_seconds)
+            or not 0 <= backoff_seconds <= 3600
+        ):
+            raise ScanContractValidationError(
+                "request_attempt_backoff_invalid",
+                "backoff_seconds must be between 0 and 3600 seconds.",
+            )
+
+        if self.outcome is RequestAttemptOutcome.SUCCEEDED:
+            if connected_address is None or self.http_status is None:
+                raise ScanContractValidationError(
+                    "request_attempt_success_metadata_required",
+                    "Successful attempts require an address and HTTP status.",
+                )
+
+            if error_code is not None or self.retryable is not None:
+                raise ScanContractValidationError(
+                    "request_attempt_success_error_invalid",
+                    "Successful attempts cannot contain error metadata.",
+                )
+
+            if self.retry_scheduled or backoff_seconds != 0:
+                raise ScanContractValidationError(
+                    "request_attempt_success_retry_invalid",
+                    "Successful attempts cannot schedule a retry.",
+                )
+        else:
+            if error_code is None or self.retryable is None:
+                raise ScanContractValidationError(
+                    "request_attempt_failure_error_required",
+                    "Failed attempts require error_code and retryable.",
+                )
+
+            if self.retry_scheduled and not self.retryable:
+                raise ScanContractValidationError(
+                    "request_attempt_retry_not_allowed",
+                    "A non-retryable failure cannot schedule a retry.",
+                )
+
+            if not self.retry_scheduled and backoff_seconds != 0:
+                raise ScanContractValidationError(
+                    "request_attempt_backoff_without_retry",
+                    "backoff_seconds must be zero when no retry is scheduled.",
+                )
+
+        object.__setattr__(self, "started_at", started_at)
+        object.__setattr__(self, "completed_at", completed_at)
+        object.__setattr__(
+            self,
+            "connected_address",
+            connected_address,
+        )
+        object.__setattr__(self, "error_code", error_code)
+        object.__setattr__(
+            self,
+            "backoff_seconds",
+            backoff_seconds,
+        )
+
+    @property
+    def duration_milliseconds(self) -> int:
+        """Return the elapsed wall-clock duration for this attempt."""
+
+        return int(
+            (self.completed_at - self.started_at).total_seconds()
+            * 1000
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt_number": self.attempt_number,
+            "started_at": _timestamp(self.started_at),
+            "completed_at": _timestamp(self.completed_at),
+            "duration_milliseconds": self.duration_milliseconds,
+            "outcome": self.outcome.value,
+            "connected_address": self.connected_address,
+            "http_status": self.http_status,
+            "error_code": self.error_code,
+            "retryable": self.retryable,
+            "retry_scheduled": self.retry_scheduled,
+            "backoff_seconds": self.backoff_seconds,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class ScanResult:
     """Versioned, scanner-independent result for one scan execution."""
@@ -468,9 +671,10 @@ class ScanResult:
     errors: Tuple[ScanError, ...] = ()
     connected_addresses: Tuple[str, ...] = ()
     http_statuses: Tuple[int, ...] = ()
+    request_attempts: Tuple[RequestAttempt, ...] = ()
 
     schema_version: str = field(
-        default="1.0",
+        default="1.1",
         init=False,
     )
 
@@ -655,6 +859,103 @@ class ScanResult:
 
             canonical_statuses.add(status_code)
 
+        if any(
+            not isinstance(item, RequestAttempt)
+            for item in self.request_attempts
+        ):
+            raise ScanContractValidationError(
+                "request_attempts_invalid",
+                "request_attempts contains an invalid value.",
+            )
+
+        request_attempts = tuple(
+            sorted(
+                self.request_attempts,
+                key=lambda item: item.attempt_number,
+            )
+        )
+
+        if request_attempts:
+            expected_numbers = tuple(
+                range(1, len(request_attempts) + 1)
+            )
+            actual_numbers = tuple(
+                item.attempt_number
+                for item in request_attempts
+            )
+
+            if actual_numbers != expected_numbers:
+                raise ScanContractValidationError(
+                    "request_attempt_sequence_invalid",
+                    "Request attempts must be uniquely numbered from one.",
+                )
+
+            if len(request_attempts) != self.coverage.requests_attempted:
+                raise ScanContractValidationError(
+                    "request_attempt_count_mismatch",
+                    "Request attempt history must match requests_attempted.",
+                )
+
+            successful_attempts = tuple(
+                item
+                for item in request_attempts
+                if item.outcome is RequestAttemptOutcome.SUCCEEDED
+            )
+
+            if len(successful_attempts) != self.coverage.requests_succeeded:
+                raise ScanContractValidationError(
+                    "request_attempt_success_count_mismatch",
+                    "Request attempt history must match requests_succeeded.",
+                )
+
+            for item in request_attempts:
+                if item.started_at < started_at:
+                    raise ScanContractValidationError(
+                        "request_attempt_before_scan",
+                        "Request attempts cannot begin before the scan.",
+                    )
+
+                if (
+                    completed_at is not None
+                    and item.completed_at > completed_at
+                ):
+                    raise ScanContractValidationError(
+                        "request_attempt_after_scan",
+                        "Request attempts cannot finish after the scan.",
+                    )
+
+            if (
+                self.status in terminal_statuses
+                and request_attempts[-1].retry_scheduled
+            ):
+                raise ScanContractValidationError(
+                    "request_attempt_terminal_retry_invalid",
+                    "A terminal scan cannot end with a scheduled retry.",
+                )
+
+            attempt_addresses = {
+                item.connected_address
+                for item in request_attempts
+                if item.connected_address is not None
+            }
+            attempt_statuses = {
+                item.http_status
+                for item in request_attempts
+                if item.http_status is not None
+            }
+
+            if attempt_addresses != canonical_addresses:
+                raise ScanContractValidationError(
+                    "request_attempt_address_mismatch",
+                    "Attempt addresses must match connected_addresses.",
+                )
+
+            if attempt_statuses != canonical_statuses:
+                raise ScanContractValidationError(
+                    "request_attempt_status_mismatch",
+                    "Attempt statuses must match http_statuses.",
+                )
+
         object.__setattr__(
             self,
             "scan_id",
@@ -735,6 +1036,11 @@ class ScanResult:
                 sorted(canonical_statuses)
             ),
         )
+        object.__setattr__(
+            self,
+            "request_attempts",
+            request_attempts,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -773,6 +1079,13 @@ class ScanResult:
             "http_statuses": list(
                 self.http_statuses
             ),
+            "request_attempt_count": len(
+                self.request_attempts
+            ),
+            "request_attempts": [
+                item.to_dict()
+                for item in self.request_attempts
+            ],
         }
 
     def to_json(self) -> str:

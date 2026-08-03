@@ -5,7 +5,11 @@ from __future__ import annotations
 import os
 import unittest
 
-from webguard_contracts import ScanResult, ScanStatus
+from webguard_contracts import (
+    RequestAttemptOutcome,
+    ScanResult,
+    ScanStatus,
+)
 
 from webguard_scanner import (
     FetchPolicy,
@@ -75,6 +79,11 @@ class PassiveScanLabIntegrationTests(unittest.TestCase):
         self.assertEqual(
             result.coverage.completion_percent,
             80.0,
+        )
+        self.assertEqual(len(result.request_attempts), 1)
+        self.assertIs(
+            result.request_attempts[0].outcome,
+            RequestAttemptOutcome.SUCCEEDED,
         )
 
 
