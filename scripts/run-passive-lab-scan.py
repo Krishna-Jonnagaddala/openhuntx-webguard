@@ -9,9 +9,10 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from webguard_contracts import ScanStatus
+
 from webguard_scanner import (
     FetchPolicy,
-    SafeRequestError,
     TargetValidationError,
     ValidationMode,
     ValidationPolicy,
@@ -83,6 +84,20 @@ def build_allowed_hosts(
     return allowed_hosts
 
 
+def _display_values(
+    values: tuple[object, ...],
+) -> str:
+    """Render result metadata without assuming a value is present."""
+
+    if not values:
+        return "none"
+
+    return ", ".join(
+        str(value)
+        for value in values
+    )
+
+
 def main() -> int:
     args = parse_args()
 
@@ -99,40 +114,39 @@ def main() -> int:
                 allowed_lab_hosts=allowed_hosts,
             ),
         )
-
-        result = run_passive_header_scan(
-            target,
-            fetch_policy=FetchPolicy(
-                timeout_seconds=5,
-                maximum_body_bytes=2_097_152,
-                maximum_header_bytes=65_536,
-                maximum_header_count=100,
-            ),
-        )
-
     except (
         TargetValidationError,
-        SafeRequestError,
         ValueError,
     ) as exc:
         error_code = getattr(
             exc,
             "code",
-            "lab_scan_failed",
+            "lab_preflight_failed",
         )
 
         print(
             json.dumps(
                 {
-                    "status": "failed",
+                    "status": "rejected",
                     "error_code": error_code,
                     "message": str(exc),
+                    "stage": "preflight",
                 },
                 sort_keys=True,
             ),
             file=sys.stderr,
         )
         return 1
+
+    result = run_passive_header_scan(
+        target,
+        fetch_policy=FetchPolicy(
+            timeout_seconds=5,
+            maximum_body_bytes=2_097_152,
+            maximum_header_bytes=65_536,
+            maximum_header_count=100,
+        ),
+    )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(
@@ -155,11 +169,11 @@ def main() -> int:
     print(f"Target: {result.target}")
     print(
         "Connected address: "
-        f"{result.connected_addresses[0]}"
+        f"{_display_values(result.connected_addresses)}"
     )
     print(
         "HTTP status: "
-        f"{result.http_statuses[0]}"
+        f"{_display_values(result.http_statuses)}"
     )
     print(
         "Coverage: "
@@ -180,7 +194,17 @@ def main() -> int:
             f"{skipped.reason}"
         )
 
+    for error in result.errors:
+        print(
+            f"- [ERROR] {error.stage}/{error.code}: "
+            f"{error.message}"
+        )
+
     print(f"Saved report: {output_path}")
+
+    if result.status is ScanStatus.FAILED:
+        return 1
+
     return 0
 
 

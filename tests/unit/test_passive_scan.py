@@ -10,7 +10,9 @@ from webguard_contracts import ScanResult, ScanStatus
 
 from webguard_scanner import (
     FetchPolicy,
+    HeaderAnalysisError,
     SafeHttpResponse,
+    SafeRequestError,
     ValidatedTarget,
     run_passive_header_scan,
 )
@@ -217,6 +219,129 @@ class PassiveScanTests(unittest.TestCase):
             (),
         )
         self.assertEqual(result.findings, ())
+
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_request_failure_returns_failed_scan_result(
+        self,
+        fetch_mock,
+        _clock_mock,
+    ) -> None:
+        fetch_mock.side_effect = SafeRequestError(
+            "connection_failed",
+            "The authorised target refused the connection.",
+        )
+
+        result = run_passive_header_scan(
+            target(),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        self.assertIs(
+            result.status,
+            ScanStatus.FAILED,
+        )
+        self.assertEqual(result.findings, ())
+        self.assertEqual(result.connected_addresses, ())
+        self.assertEqual(result.http_statuses, ())
+        self.assertEqual(
+            result.coverage.requests_attempted,
+            1,
+        )
+        self.assertEqual(
+            result.coverage.requests_succeeded,
+            0,
+        )
+        self.assertEqual(
+            result.coverage.executed_checks,
+            (),
+        )
+        self.assertEqual(
+            result.coverage.unaccounted_checks,
+            (
+                "web.headers.csp",
+                "web.headers.frame_protection",
+                "web.headers.referrer_policy",
+                "web.headers.x_content_type_options",
+            ),
+        )
+        self.assertEqual(len(result.errors), 1)
+        self.assertEqual(
+            result.errors[0].code,
+            "connection_failed",
+        )
+        self.assertEqual(
+            result.errors[0].stage,
+            "request",
+        )
+        self.assertFalse(result.errors[0].retryable)
+
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.analyze_security_headers",
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_analysis_failure_preserves_response_metadata(
+        self,
+        fetch_mock,
+        analyze_mock,
+        _clock_mock,
+    ) -> None:
+        fetch_mock.return_value = response()
+        analyze_mock.side_effect = HeaderAnalysisError(
+            "analysis_input_inconsistent",
+            "The response metadata was inconsistent.",
+        )
+
+        result = run_passive_header_scan(
+            target(),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        self.assertIs(
+            result.status,
+            ScanStatus.FAILED,
+        )
+        self.assertEqual(result.findings, ())
+        self.assertEqual(
+            result.connected_addresses,
+            ("127.0.0.1",),
+        )
+        self.assertEqual(result.http_statuses, (200,))
+        self.assertEqual(
+            result.coverage.requests_attempted,
+            1,
+        )
+        self.assertEqual(
+            result.coverage.requests_succeeded,
+            1,
+        )
+        self.assertEqual(
+            result.coverage.executed_checks,
+            (),
+        )
+        self.assertEqual(len(result.errors), 1)
+        self.assertEqual(
+            result.errors[0].code,
+            "analysis_input_inconsistent",
+        )
+        self.assertEqual(
+            result.errors[0].stage,
+            "analysis",
+        )
+        self.assertFalse(result.errors[0].retryable)
 
 
 if __name__ == "__main__":
