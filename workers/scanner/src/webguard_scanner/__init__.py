@@ -1,5 +1,11 @@
 """OpenHuntX WebGuard scanner package."""
 
+from .safe_http import (
+    FetchPolicy,
+    SafeHttpResponse,
+    SafeRequestError,
+    fetch_once,
+)
 from .scope_validator import (
     TargetValidationError,
     ValidatedTarget,
@@ -12,11 +18,15 @@ from .scope_validator import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "FetchPolicy",
+    "SafeHttpResponse",
+    "SafeRequestError",
     "TargetValidationError",
     "ValidatedTarget",
     "ValidationMode",
     "ValidationPolicy",
     "__version__",
+    "fetch_once",
     "resolve_host",
     "validate_target_url",
 ]

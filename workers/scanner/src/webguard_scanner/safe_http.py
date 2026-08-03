@@ -1,0 +1,494 @@
+"""Connection-time HTTP safety controls for OpenHuntX WebGuard."""
+
+from __future__ import annotations
+
+import http.client
+import ipaddress
+import socket
+import ssl
+import time
+from dataclasses import dataclass
+from typing import FrozenSet, Iterable, Tuple
+from urllib.parse import urlsplit
+
+from .scope_validator import ValidatedTarget
+
+
+@dataclass(frozen=True)
+class FetchPolicy:
+    """Limits applied to one HTTP request."""
+
+    timeout_seconds: float = 10.0
+    maximum_body_bytes: int = 1_048_576
+    maximum_header_bytes: int = 65_536
+    maximum_header_count: int = 100
+    allowed_methods: FrozenSet[str] = frozenset({"GET", "HEAD"})
+
+
+@dataclass(frozen=True)
+class SafeHttpResponse:
+    """Bounded HTTP response returned by the safe client."""
+
+    status: int
+    reason: str
+    headers: Tuple[Tuple[str, str], ...]
+    body: bytes
+    connected_address: str
+    elapsed_milliseconds: int
+
+
+class SafeRequestError(RuntimeError):
+    """Controlled failure raised by the safe HTTP client."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection pinned to an approved IP address.
+
+    The socket connects directly to connect_address while TLS certificate
+    validation and SNI continue to use server_hostname.
+    """
+
+    def __init__(
+        self,
+        connect_address: str,
+        server_hostname: str,
+        port: int,
+        timeout: float,
+        context: ssl.SSLContext,
+    ) -> None:
+        super().__init__(
+            host=server_hostname,
+            port=port,
+            timeout=timeout,
+            context=context,
+        )
+
+        self._connect_address = connect_address
+        self._server_hostname = server_hostname
+
+    def connect(self) -> None:
+        if self._tunnel_host is not None:
+            raise SafeRequestError(
+                "proxy_tunnel_not_allowed",
+                "Proxy tunnels are not supported.",
+            )
+
+        raw_socket = socket.create_connection(
+            (self._connect_address, self.port),
+            self.timeout,
+            self.source_address,
+        )
+
+        try:
+            raw_socket.setsockopt(
+                socket.IPPROTO_TCP,
+                socket.TCP_NODELAY,
+                1,
+            )
+        except OSError:
+            pass
+
+        try:
+            self.sock = self._context.wrap_socket(
+                raw_socket,
+                server_hostname=self._server_hostname,
+            )
+        except BaseException:
+            raw_socket.close()
+            raise
+
+
+def _validate_policy(policy: FetchPolicy) -> None:
+    if policy.timeout_seconds <= 0:
+        raise SafeRequestError(
+            "timeout_invalid",
+            "The request timeout must be greater than zero.",
+        )
+
+    if policy.maximum_body_bytes < 0:
+        raise SafeRequestError(
+            "body_limit_invalid",
+            "The response-body limit cannot be negative.",
+        )
+
+    if policy.maximum_header_bytes <= 0:
+        raise SafeRequestError(
+            "header_limit_invalid",
+            "The response-header limit must be greater than zero.",
+        )
+
+    if policy.maximum_header_count <= 0:
+        raise SafeRequestError(
+            "header_count_invalid",
+            "The response header-count limit must be greater than zero.",
+        )
+
+
+def _canonical_addresses(
+    addresses: Iterable[str],
+) -> Tuple[str, ...]:
+    canonical: list[str] = []
+
+    for address_text in addresses:
+        try:
+            address = ipaddress.ip_address(address_text)
+        except ValueError as exc:
+            raise SafeRequestError(
+                "validated_address_invalid",
+                f"Invalid approved address {address_text!r}.",
+            ) from exc
+
+        compressed = address.compressed
+
+        if compressed not in canonical:
+            canonical.append(compressed)
+
+    if not canonical:
+        raise SafeRequestError(
+            "validated_addresses_empty",
+            "The validated target has no approved addresses.",
+        )
+
+    return tuple(canonical)
+
+
+def _authority(
+    hostname: str,
+    port: int,
+    scheme: str,
+) -> str:
+    try:
+        address = ipaddress.ip_address(hostname)
+
+        formatted_hostname = (
+            f"[{hostname}]"
+            if isinstance(address, ipaddress.IPv6Address)
+            else hostname
+        )
+    except ValueError:
+        formatted_hostname = hostname
+
+    default_port = 443 if scheme == "https" else 80
+
+    if port == default_port:
+        return formatted_hostname
+
+    return f"{formatted_hostname}:{port}"
+
+
+def _request_path(target: ValidatedTarget) -> str:
+    parsed = urlsplit(target.normalised_url)
+
+    parsed_port = parsed.port
+
+    if parsed_port is None:
+        parsed_port = 443 if parsed.scheme == "https" else 80
+
+    if (
+        parsed.scheme != target.scheme
+        or parsed.hostname != target.hostname
+        or parsed_port != target.port
+    ):
+        raise SafeRequestError(
+            "validated_target_mismatch",
+            "The validated fields do not match the normalised URL.",
+        )
+
+    if parsed.fragment:
+        raise SafeRequestError(
+            "fragment_not_allowed",
+            "URL fragments cannot be sent in HTTP requests.",
+        )
+
+    path = parsed.path or "/"
+
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    return path
+
+
+def _make_connection(
+    target: ValidatedTarget,
+    address: str,
+    policy: FetchPolicy,
+) -> http.client.HTTPConnection:
+    if target.scheme == "http":
+        return http.client.HTTPConnection(
+            host=address,
+            port=target.port,
+            timeout=policy.timeout_seconds,
+        )
+
+    if target.scheme == "https":
+        return _PinnedHTTPSConnection(
+            connect_address=address,
+            server_hostname=target.hostname,
+            port=target.port,
+            timeout=policy.timeout_seconds,
+            context=ssl.create_default_context(),
+        )
+
+    raise SafeRequestError(
+        "scheme_not_allowed",
+        "Only HTTP and HTTPS requests are supported.",
+    )
+
+
+def _header_size(
+    headers: Tuple[Tuple[str, str], ...],
+    reason: str,
+) -> int:
+    status_line_size = (
+        len(reason.encode("latin-1", errors="replace")) + 16
+    )
+
+    fields_size = sum(
+        len(name.encode("latin-1", errors="replace"))
+        + len(value.encode("latin-1", errors="replace"))
+        + 4
+        for name, value in headers
+    )
+
+    return status_line_size + fields_size + 2
+
+
+def _declared_content_length(
+    response: http.client.HTTPResponse,
+) -> int | None:
+    values = response.msg.get_all("Content-Length", [])
+
+    if not values:
+        return None
+
+    tokens: list[str] = []
+
+    for value in values:
+        tokens.extend(
+            part.strip()
+            for part in value.split(",")
+        )
+
+    if not tokens or any(
+        not token.isdigit()
+        for token in tokens
+    ):
+        raise SafeRequestError(
+            "content_length_invalid",
+            "The server returned an invalid Content-Length.",
+        )
+
+    lengths = {
+        int(token)
+        for token in tokens
+    }
+
+    if len(lengths) != 1:
+        raise SafeRequestError(
+            "content_length_ambiguous",
+            "The server returned conflicting Content-Length values.",
+        )
+
+    return lengths.pop()
+
+
+def _read_bounded_body(
+    response: http.client.HTTPResponse,
+    maximum_body_bytes: int,
+) -> bytes:
+    declared_length = _declared_content_length(response)
+
+    if (
+        declared_length is not None
+        and declared_length > maximum_body_bytes
+    ):
+        raise SafeRequestError(
+            "response_body_too_large",
+            "The declared response body exceeds the limit.",
+        )
+
+    chunks: list[bytes] = []
+    total = 0
+
+    while True:
+        remaining_probe = maximum_body_bytes + 1 - total
+
+        if remaining_probe <= 0:
+            raise SafeRequestError(
+                "response_body_too_large",
+                "The response body exceeds the configured limit.",
+            )
+
+        chunk = response.read(
+            min(65_536, remaining_probe)
+        )
+
+        if not chunk:
+            break
+
+        total += len(chunk)
+
+        if total > maximum_body_bytes:
+            raise SafeRequestError(
+                "response_body_too_large",
+                "The response body exceeds the configured limit.",
+            )
+
+        chunks.append(chunk)
+
+    return b"".join(chunks)
+
+
+def _perform_request(
+    target: ValidatedTarget,
+    address: str,
+    method: str,
+    path: str,
+    policy: FetchPolicy,
+) -> SafeHttpResponse:
+    connection = _make_connection(
+        target,
+        address,
+        policy,
+    )
+
+    started = time.monotonic()
+
+    try:
+        connection.putrequest(
+            method,
+            path,
+            skip_host=True,
+            skip_accept_encoding=True,
+        )
+
+        connection.putheader(
+            "Host",
+            _authority(
+                target.hostname,
+                target.port,
+                target.scheme,
+            ),
+        )
+        connection.putheader(
+            "User-Agent",
+            "OpenHuntX-WebGuard/0.1",
+        )
+        connection.putheader("Accept", "*/*")
+        connection.putheader(
+            "Accept-Encoding",
+            "identity",
+        )
+        connection.putheader(
+            "Connection",
+            "close",
+        )
+        connection.endheaders()
+
+        response = connection.getresponse()
+        reason = response.reason or ""
+        headers = tuple(response.getheaders())
+
+        if len(headers) > policy.maximum_header_count:
+            raise SafeRequestError(
+                "response_headers_too_many",
+                "The response contains too many headers.",
+            )
+
+        if (
+            _header_size(headers, reason)
+            > policy.maximum_header_bytes
+        ):
+            raise SafeRequestError(
+                "response_headers_too_large",
+                "The response headers exceed the limit.",
+            )
+
+        if (
+            300 <= response.status < 400
+            and response.status != 304
+        ):
+            raise SafeRequestError(
+                "redirect_blocked",
+                "Automatic redirect following is disabled.",
+            )
+
+        body = (
+            b""
+            if method == "HEAD"
+            else _read_bounded_body(
+                response,
+                policy.maximum_body_bytes,
+            )
+        )
+
+        elapsed = int(
+            (time.monotonic() - started) * 1000
+        )
+
+        return SafeHttpResponse(
+            status=response.status,
+            reason=reason,
+            headers=headers,
+            body=body,
+            connected_address=address,
+            elapsed_milliseconds=elapsed,
+        )
+    finally:
+        connection.close()
+
+
+def fetch_once(
+    target: ValidatedTarget,
+    method: str = "GET",
+    policy: FetchPolicy = FetchPolicy(),
+) -> SafeHttpResponse:
+    """Make one bounded request to an already validated target."""
+
+    _validate_policy(policy)
+
+    normalised_method = method.upper()
+
+    if normalised_method not in policy.allowed_methods:
+        raise SafeRequestError(
+            "method_not_allowed",
+            f"HTTP method {normalised_method!r} is prohibited.",
+        )
+
+    path = _request_path(target)
+    addresses = _canonical_addresses(
+        target.resolved_addresses
+    )
+
+    connection_failures: list[str] = []
+
+    for address in addresses:
+        try:
+            return _perform_request(
+                target,
+                address,
+                normalised_method,
+                path,
+                policy,
+            )
+        except SafeRequestError:
+            raise
+        except (
+            OSError,
+            ssl.SSLError,
+            http.client.HTTPException,
+        ) as exc:
+            connection_failures.append(
+                f"{address}: {exc.__class__.__name__}"
+            )
+
+    raise SafeRequestError(
+        "connection_failed",
+        "All approved destination addresses failed: "
+        + ", ".join(connection_failures),
+    )
