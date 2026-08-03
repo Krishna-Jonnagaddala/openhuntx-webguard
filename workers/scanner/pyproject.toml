@@ -11,6 +11,9 @@ dependencies = [
     "openhuntx-webguard-contracts==0.1.0",
 ]
 
+[project.scripts]
+webguard = "webguard_scanner.cli:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
