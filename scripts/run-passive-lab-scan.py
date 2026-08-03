@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -16,8 +15,7 @@ from webguard_scanner import (
     TargetValidationError,
     ValidationMode,
     ValidationPolicy,
-    analyze_security_headers,
-    fetch_once,
+    run_passive_header_scan,
     validate_target_url,
 )
 
@@ -49,18 +47,24 @@ def parse_args() -> argparse.Namespace:
         dest="allowed_hosts",
         default=[],
         help=(
-            "Explicitly allow a lab hostname. May be repeated. "
-            "The target hostname is included automatically."
+            "Explicitly allow an authorised lab hostname. May be repeated."
         ),
     )
     return parser.parse_args()
 
 
-def build_allowed_hosts(target_url: str, configured: list[str]) -> frozenset[str]:
+def build_allowed_hosts(
+    target_url: str,
+    configured: list[str],
+) -> frozenset[str]:
+    """Build a restrictive lab allowlist."""
+
     parsed = urlsplit(target_url)
 
     if parsed.hostname is None:
-        raise ValueError("The target URL does not contain a hostname.")
+        raise ValueError(
+            "The target URL does not contain a hostname."
+        )
 
     allowed_hosts = frozenset(
         {
@@ -96,20 +100,14 @@ def main() -> int:
             ),
         )
 
-        response = fetch_once(
+        result = run_passive_header_scan(
             target,
-            method="GET",
-            policy=FetchPolicy(
+            fetch_policy=FetchPolicy(
                 timeout_seconds=5,
                 maximum_body_bytes=2_097_152,
                 maximum_header_bytes=65_536,
                 maximum_header_count=100,
             ),
-        )
-
-        findings = analyze_security_headers(
-            target,
-            response,
         )
 
     except (
@@ -122,6 +120,7 @@ def main() -> int:
             "code",
             "lab_scan_failed",
         )
+
         print(
             json.dumps(
                 {
@@ -135,25 +134,6 @@ def main() -> int:
         )
         return 1
 
-    document = {
-        "scan_schema_version": "0.1",
-        "scan_type": "passive-http-headers",
-        "generated_at": (
-            datetime.now(timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z")
-        ),
-        "target": target.normalised_url,
-        "connected_address": response.connected_address,
-        "http_status": response.status,
-        "elapsed_milliseconds": response.elapsed_milliseconds,
-        "finding_count": len(findings),
-        "findings": [
-            finding.to_dict()
-            for finding in findings
-        ],
-    }
-
     output_path = Path(args.output)
     output_path.parent.mkdir(
         parents=True,
@@ -161,7 +141,7 @@ def main() -> int:
     )
     output_path.write_text(
         json.dumps(
-            document,
+            result.to_dict(),
             indent=2,
             sort_keys=True,
             ensure_ascii=False,
@@ -170,19 +150,34 @@ def main() -> int:
         encoding="utf-8",
     )
 
-    print(f"Target: {document['target']}")
+    print(f"Scan ID: {result.scan_id}")
+    print(f"Status: {result.status.value}")
+    print(f"Target: {result.target}")
     print(
         "Connected address: "
-        f"{document['connected_address']}"
+        f"{result.connected_addresses[0]}"
     )
-    print(f"HTTP status: {document['http_status']}")
-    print(f"Findings: {document['finding_count']}")
+    print(
+        "HTTP status: "
+        f"{result.http_statuses[0]}"
+    )
+    print(
+        "Coverage: "
+        f"{result.coverage.completion_percent}% executed"
+    )
+    print(f"Findings: {len(result.findings)}")
 
-    for finding in findings:
+    for finding in result.findings:
         print(
             f"- [{finding.severity.value.upper()}] "
             f"{finding.title} "
             f"({finding.identity.rule_id})"
+        )
+
+    for skipped in result.coverage.skipped_checks:
+        print(
+            f"- [SKIPPED] {skipped.check_id}: "
+            f"{skipped.reason}"
         )
 
     print(f"Saved report: {output_path}")

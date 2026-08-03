@@ -4,6 +4,12 @@ from .header_analyzer import (
     HeaderAnalysisError,
     analyze_security_headers,
 )
+from .passive_scan import (
+    ENGINE_NAME,
+    ENGINE_VERSION,
+    PASSIVE_HEADER_CHECKS,
+    run_passive_header_scan,
+)
 from .safe_http import (
     FetchPolicy,
     SafeHttpResponse,
@@ -22,8 +28,11 @@ from .scope_validator import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "ENGINE_NAME",
+    "ENGINE_VERSION",
     "FetchPolicy",
     "HeaderAnalysisError",
+    "PASSIVE_HEADER_CHECKS",
     "SafeHttpResponse",
     "SafeRequestError",
     "TargetValidationError",
@@ -34,5 +43,6 @@ __all__ = [
     "analyze_security_headers",
     "fetch_once",
     "resolve_host",
+    "run_passive_header_scan",
     "validate_target_url",
 ]
