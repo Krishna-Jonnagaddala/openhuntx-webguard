@@ -13,6 +13,7 @@ from webguard_contracts import (
     SkippedCheck,
 )
 
+from .error_taxonomy import is_retryable_error
 from .header_analyzer import (
     HeaderAnalysisError,
     analyze_security_headers,
@@ -171,7 +172,10 @@ def run_passive_header_scan(
                 code=exc.code,
                 message=exc.message,
                 stage="request",
-                retryable=False,
+                retryable=is_retryable_error(
+                    stage="request",
+                    code=exc.code,
+                ),
             ),
             request_succeeded=False,
         )
@@ -190,7 +194,10 @@ def run_passive_header_scan(
                 code=exc.code,
                 message=exc.message,
                 stage="analysis",
-                retryable=False,
+                retryable=is_retryable_error(
+                    stage="analysis",
+                    code=exc.code,
+                ),
             ),
             request_succeeded=True,
             connected_addresses=(

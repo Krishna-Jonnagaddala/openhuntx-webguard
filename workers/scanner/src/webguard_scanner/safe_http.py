@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import http.client
 import ipaddress
 import socket
@@ -317,7 +318,6 @@ def _read_bounded_body(
 
     while True:
         remaining_probe = maximum_body_bytes + 1 - total
-
         if remaining_probe <= 0:
             raise SafeRequestError(
                 "response_body_too_large",
@@ -442,6 +442,115 @@ def _perform_request(
     finally:
         connection.close()
 
+@dataclass(frozen=True)
+class _ConnectionFailure:
+    """One bounded failure observed for an approved address."""
+
+    address: str
+    code: str
+    exception_name: str
+
+
+_RETRYABLE_CONNECTION_CODES = frozenset(
+    {
+        "connection_timeout",
+        "connection_refused",
+        "connection_interrupted",
+        "network_unreachable",
+        "connection_failed",
+    }
+)
+
+_INTERRUPTED_ERRNOS = frozenset(
+    value
+    for name in (
+        "ECONNRESET",
+        "ECONNABORTED",
+        "EPIPE",
+    )
+    if (value := getattr(errno, name, None)) is not None
+)
+
+_UNREACHABLE_ERRNOS = frozenset(
+    value
+    for name in (
+        "ENETUNREACH",
+        "EHOSTUNREACH",
+        "ENETDOWN",
+        "EHOSTDOWN",
+    )
+    if (value := getattr(errno, name, None)) is not None
+)
+
+
+def _connection_error_code(
+    exc: BaseException,
+) -> str:
+    """Map a transport exception to a stable controlled error code."""
+
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return "tls_certificate_invalid"
+
+    if isinstance(exc, ssl.SSLError):
+        return "tls_handshake_failed"
+
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "connection_timeout"
+
+    if isinstance(exc, ConnectionRefusedError):
+        return "connection_refused"
+
+    if isinstance(
+        exc,
+        (
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+        ),
+    ):
+        return "connection_interrupted"
+
+    if isinstance(exc, http.client.HTTPException):
+        return "http_protocol_error"
+
+    if isinstance(exc, OSError):
+        if exc.errno == errno.ECONNREFUSED:
+            return "connection_refused"
+
+        if exc.errno == errno.ETIMEDOUT:
+            return "connection_timeout"
+
+        if exc.errno in _INTERRUPTED_ERRNOS:
+            return "connection_interrupted"
+
+        if exc.errno in _UNREACHABLE_ERRNOS:
+            return "network_unreachable"
+
+        return "connection_failed"
+
+    return "connection_failed_mixed"
+
+
+def _aggregate_connection_error_code(
+    failures: tuple[_ConnectionFailure, ...],
+) -> str:
+    """Return one conservative code for all approved-address failures."""
+
+    codes = {
+        failure.code
+        for failure in failures
+    }
+
+    if len(codes) == 1:
+        return next(iter(codes))
+
+    if codes and codes.issubset(
+        _RETRYABLE_CONNECTION_CODES
+    ):
+        return "connection_failed"
+
+    return "connection_failed_mixed"
+
 
 def fetch_once(
     target: ValidatedTarget,
@@ -465,7 +574,7 @@ def fetch_once(
         target.resolved_addresses
     )
 
-    connection_failures: list[str] = []
+    connection_failures: list[_ConnectionFailure] = []
 
     for address in addresses:
         try:
@@ -484,11 +593,23 @@ def fetch_once(
             http.client.HTTPException,
         ) as exc:
             connection_failures.append(
-                f"{address}: {exc.__class__.__name__}"
+                _ConnectionFailure(
+                    address=address,
+                    code=_connection_error_code(exc),
+                    exception_name=exc.__class__.__name__,
+                )
             )
 
+    bounded_failures = tuple(connection_failures)
+    failure_code = _aggregate_connection_error_code(
+        bounded_failures
+    )
+
     raise SafeRequestError(
-        "connection_failed",
+        failure_code,
         "All approved destination addresses failed: "
-        + ", ".join(connection_failures),
+        + ", ".join(
+            f"{failure.address}: {failure.exception_name}"
+            for failure in bounded_failures
+        ),
     )

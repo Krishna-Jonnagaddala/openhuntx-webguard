@@ -280,7 +280,7 @@ class PassiveScanTests(unittest.TestCase):
             result.errors[0].stage,
             "request",
         )
-        self.assertFalse(result.errors[0].retryable)
+        self.assertTrue(result.errors[0].retryable)
 
     @patch(
         "webguard_scanner.passive_scan._utc_now",

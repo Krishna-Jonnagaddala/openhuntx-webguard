@@ -1,5 +1,12 @@
 """OpenHuntX WebGuard scanner package."""
 
+from .error_taxonomy import (
+    ErrorCategory,
+    ErrorPolicy,
+    classify_error,
+    is_retryable_error,
+    known_error_codes,
+)
 from .header_analyzer import (
     HeaderAnalysisError,
     analyze_security_headers,
@@ -30,6 +37,8 @@ __version__ = "0.1.0"
 __all__ = [
     "ENGINE_NAME",
     "ENGINE_VERSION",
+    "ErrorCategory",
+    "ErrorPolicy",
     "FetchPolicy",
     "HeaderAnalysisError",
     "PASSIVE_HEADER_CHECKS",
@@ -41,7 +50,10 @@ __all__ = [
     "ValidationPolicy",
     "__version__",
     "analyze_security_headers",
+    "classify_error",
     "fetch_once",
+    "is_retryable_error",
+    "known_error_codes",
     "resolve_host",
     "run_passive_header_scan",
     "validate_target_url",
