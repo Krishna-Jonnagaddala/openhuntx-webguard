@@ -16,6 +16,13 @@ from webguard_contracts import (
     SkippedCheck,
 )
 
+from .analyzer_registry import (
+    AnalyzerPipelineResult,
+    PassiveAnalyzer,
+    execute_analyzers,
+    registered_checks,
+    validate_analyzer_registry,
+)
 from .cookie_analyzer import (
     COOKIE_CHECKS,
     CookieAnalysisError,
@@ -59,12 +66,58 @@ PASSIVE_HEADER_CHECKS = (
 PASSIVE_COOKIE_CHECKS = COOKIE_CHECKS
 PASSIVE_CORS_CHECKS = CORS_CHECKS
 PASSIVE_DISCLOSURE_CHECKS = DISCLOSURE_CHECKS
-PASSIVE_CHECKS = (
-    PASSIVE_HEADER_CHECKS
-    + PASSIVE_COOKIE_CHECKS
-    + PASSIVE_CORS_CHECKS
-    + PASSIVE_DISCLOSURE_CHECKS
+
+
+def _run_header_analyzer(target, response):
+    return analyze_security_headers(target, response)
+
+
+def _run_cookie_analyzer(target, response):
+    return analyze_cookies(target, response)
+
+
+def _run_cors_analyzer(target, response):
+    return analyze_cors(target, response)
+
+
+def _run_disclosure_analyzer(target, response):
+    return analyze_information_disclosure(target, response)
+
+
+DEFAULT_PASSIVE_ANALYZERS = validate_analyzer_registry(
+    (
+        PassiveAnalyzer(
+            analyzer_id="headers",
+            checks=PASSIVE_HEADER_CHECKS,
+            finding_namespace="web.headers",
+            analyze=_run_header_analyzer,
+            controlled_error=HeaderAnalysisError,
+        ),
+        PassiveAnalyzer(
+            analyzer_id="cookies",
+            checks=PASSIVE_COOKIE_CHECKS,
+            finding_namespace="web.cookies",
+            analyze=_run_cookie_analyzer,
+            controlled_error=CookieAnalysisError,
+        ),
+        PassiveAnalyzer(
+            analyzer_id="cors",
+            checks=PASSIVE_CORS_CHECKS,
+            finding_namespace="web.cors",
+            analyze=_run_cors_analyzer,
+            controlled_error=CorsAnalysisError,
+        ),
+        PassiveAnalyzer(
+            analyzer_id="disclosure",
+            checks=PASSIVE_DISCLOSURE_CHECKS,
+            finding_namespace="web.disclosure",
+            analyze=_run_disclosure_analyzer,
+            controlled_error=DisclosureAnalysisError,
+        ),
+    )
 )
+
+PASSIVE_CHECKS = registered_checks(DEFAULT_PASSIVE_ANALYZERS)
 
 
 def _utc_now() -> datetime:
@@ -75,10 +128,14 @@ def _utc_now() -> datetime:
 
 def _skipped_checks_for_target(
     target: ValidatedTarget,
+    planned_checks: tuple[str, ...],
 ) -> tuple[SkippedCheck, ...]:
-    """Return checks that do not apply to the validated target."""
+    """Return registered checks that do not apply to the target."""
 
-    if target.scheme == "https":
+    if (
+        target.scheme == "https"
+        or "web.headers.hsts" not in planned_checks
+    ):
         return ()
 
     return (
@@ -92,64 +149,53 @@ def _skipped_checks_for_target(
     )
 
 
-def _successful_coverage(
+def _request_failure_coverage(
     target: ValidatedTarget,
     *,
+    planned_checks: tuple[str, ...],
     requests_attempted: int,
 ) -> ScanCoverage:
-    """Build coverage for a completed passive scan."""
-
-    skipped_checks = _skipped_checks_for_target(target)
-    skipped_ids = {
-        skipped.check_id
-        for skipped in skipped_checks
-    }
-
-    executed_checks = tuple(
-        check_id
-        for check_id in PASSIVE_CHECKS
-        if check_id not in skipped_ids
-    )
+    """Build coverage for a request that never produced a response."""
 
     return ScanCoverage(
-        planned_checks=PASSIVE_CHECKS,
-        executed_checks=executed_checks,
-        skipped_checks=skipped_checks,
+        planned_checks=planned_checks,
+        executed_checks=(),
+        skipped_checks=_skipped_checks_for_target(
+            target,
+            planned_checks,
+        ),
+        requests_attempted=requests_attempted,
+        requests_succeeded=0,
+    )
+
+
+def _analysis_coverage(
+    pipeline: AnalyzerPipelineResult,
+    *,
+    planned_checks: tuple[str, ...],
+    requests_attempted: int,
+) -> ScanCoverage:
+    """Build exact coverage from the registered analyser pipeline."""
+
+    return ScanCoverage(
+        planned_checks=planned_checks,
+        executed_checks=pipeline.executed_checks,
+        skipped_checks=pipeline.skipped_checks,
         requests_attempted=requests_attempted,
         requests_succeeded=1,
     )
 
 
-def _failed_coverage(
-    target: ValidatedTarget,
-    *,
-    requests_attempted: int,
-    request_succeeded: bool,
-) -> ScanCoverage:
-    """Build partial coverage for a controlled scan failure."""
-
-    return ScanCoverage(
-        planned_checks=PASSIVE_CHECKS,
-        executed_checks=(),
-        skipped_checks=_skipped_checks_for_target(target),
-        requests_attempted=requests_attempted,
-        requests_succeeded=int(request_succeeded),
-    )
-
-
-def _failed_result(
+def _request_failed_result(
     *,
     scan_id: str,
     target: ValidatedTarget,
     started_at: datetime,
     error: ScanError,
-    requests_attempted: int,
-    request_succeeded: bool,
-    connected_addresses: tuple[str, ...] = (),
-    http_statuses: tuple[int, ...] = (),
-    request_attempts: tuple[RequestAttempt, ...] = (),
+    planned_checks: tuple[str, ...],
+    request_attempts: tuple[RequestAttempt, ...],
 ) -> ScanResult:
-    """Create a validated failed ScanResult."""
+    """Create a validated failed result for request-stage failure."""
 
     return ScanResult(
         scan_id=scan_id,
@@ -160,14 +206,12 @@ def _failed_result(
         engine_version=ENGINE_VERSION,
         started_at=started_at,
         completed_at=_utc_now(),
-        coverage=_failed_coverage(
+        coverage=_request_failure_coverage(
             target,
-            requests_attempted=requests_attempted,
-            request_succeeded=request_succeeded,
+            planned_checks=planned_checks,
+            requests_attempted=len(request_attempts),
         ),
         errors=(error,),
-        connected_addresses=connected_addresses,
-        http_statuses=http_statuses,
         request_attempts=request_attempts,
     )
 
@@ -177,19 +221,24 @@ def run_passive_header_scan(
     *,
     fetch_policy: FetchPolicy = FetchPolicy(),
     retry_policy: RetryPolicy = RetryPolicy(),
+    analyzers: tuple[PassiveAnalyzer, ...] = DEFAULT_PASSIVE_ANALYZERS,
     scan_id: str | None = None,
     started_at: datetime | None = None,
 ) -> ScanResult:
-    """Run one bounded passive HTTP response scan and return a ScanResult.
+    """Run one bounded passive HTTP response scan.
 
-    The target must already have passed the appropriate scope-validation
-    policy. This function sends GET requests only, does not run active
-    payloads, and does not follow redirects.
+    The target must already have passed scope validation. One GET request is
+    made unless explicitly configured transient retries are required. The
+    response is then passed through the registered passive analyser pipeline.
 
-    Retries are disabled by default. When explicitly configured, only
-    taxonomy-approved request errors can be retried. Analysis failures
-    and unexpected exceptions are never retried.
+    Controlled analyser failures are isolated, their checks are accounted as
+    skipped, successful findings are preserved, and the result becomes
+    ``completed_with_errors``. Unexpected exceptions and output-contract
+    violations deliberately surface.
     """
+
+    registry = validate_analyzer_registry(analyzers)
+    planned_checks = registered_checks(registry)
 
     effective_scan_id = scan_id or str(uuid4())
     effective_started_at = started_at or _utc_now()
@@ -242,7 +291,7 @@ def run_passive_header_scan(
             )
 
             if not retry_scheduled:
-                return _failed_result(
+                return _request_failed_result(
                     scan_id=effective_scan_id,
                     target=target,
                     started_at=effective_started_at,
@@ -252,8 +301,7 @@ def run_passive_header_scan(
                         stage="request",
                         retryable=retryable,
                     ),
-                    requests_attempted=len(request_attempts),
-                    request_succeeded=False,
+                    planned_checks=planned_checks,
                     request_attempts=tuple(request_attempts),
                 )
 
@@ -275,78 +323,39 @@ def run_passive_header_scan(
         )
         break
 
-    try:
-        header_findings = analyze_security_headers(
+    pipeline = execute_analyzers(
+        target,
+        response,
+        analyzers=registry,
+        pre_skipped_checks=_skipped_checks_for_target(
             target,
-            response,
-        )
-        cookie_findings = analyze_cookies(
-            target,
-            response,
-        )
-        cors_findings = analyze_cors(
-            target,
-            response,
-        )
-        disclosure_findings = analyze_information_disclosure(
-            target,
-            response,
-        )
-        findings = (
-            header_findings
-            + cookie_findings
-            + cors_findings
-            + disclosure_findings
-        )
-    except (
-        HeaderAnalysisError,
-        CookieAnalysisError,
-        CorsAnalysisError,
-        DisclosureAnalysisError,
-    ) as exc:
-        return _failed_result(
-            scan_id=effective_scan_id,
-            target=target,
-            started_at=effective_started_at,
-            error=ScanError(
-                code=exc.code,
-                message=exc.message,
-                stage="analysis",
-                retryable=is_retryable_error(
-                    stage="analysis",
-                    code=exc.code,
-                ),
-            ),
-            requests_attempted=len(request_attempts),
-            request_succeeded=True,
-            connected_addresses=(
-                response.connected_address,
-            ),
-            http_statuses=(
-                response.status,
-            ),
-            request_attempts=tuple(request_attempts),
-        )
+            planned_checks,
+        ),
+    )
+
+    status = (
+        ScanStatus.COMPLETED_WITH_ERRORS
+        if pipeline.errors
+        else ScanStatus.COMPLETED
+    )
 
     return ScanResult(
         scan_id=effective_scan_id,
         scan_type="passive-http-headers",
-        status=ScanStatus.COMPLETED,
+        status=status,
         target=target.normalised_url,
         engine=ENGINE_NAME,
         engine_version=ENGINE_VERSION,
         started_at=effective_started_at,
         completed_at=_utc_now(),
-        coverage=_successful_coverage(
-            target,
+        coverage=_analysis_coverage(
+            pipeline,
+            planned_checks=planned_checks,
             requests_attempted=len(request_attempts),
         ),
-        findings=findings,
-        connected_addresses=(
-            response.connected_address,
-        ),
-        http_statuses=(
-            response.status,
-        ),
+        findings=pipeline.findings,
+        errors=pipeline.errors,
+        connected_addresses=(response.connected_address,),
+        http_statuses=(response.status,),
         request_attempts=tuple(request_attempts),
     )

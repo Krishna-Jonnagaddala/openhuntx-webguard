@@ -12,7 +12,9 @@ from webguard_contracts import (
 )
 
 from webguard_scanner import (
+    DEFAULT_PASSIVE_ANALYZERS,
     FetchPolicy,
+    PASSIVE_CHECKS,
     PASSIVE_COOKIE_CHECKS,
     PASSIVE_CORS_CHECKS,
     PASSIVE_DISCLOSURE_CHECKS,
@@ -75,10 +77,16 @@ class PassiveScanLabIntegrationTests(unittest.TestCase):
             ("127.0.0.1",),
         )
         self.assertEqual(result.http_statuses, (200,))
+        self.assertEqual(result.errors, ())
         self.assertEqual(
             result.coverage.unaccounted_checks,
             (),
         )
+        self.assertEqual(
+            result.coverage.planned_checks,
+            tuple(sorted(PASSIVE_CHECKS)),
+        )
+        self.assertEqual(len(DEFAULT_PASSIVE_ANALYZERS), 4)
         self.assertEqual(
             result.coverage.completion_percent,
             95.83,

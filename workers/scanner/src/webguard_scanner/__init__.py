@@ -1,5 +1,14 @@
 """OpenHuntX WebGuard scanner package."""
 
+from .analyzer_registry import (
+    AnalyzerOutputError,
+    AnalyzerPipelineResult,
+    AnalyzerRegistryError,
+    PassiveAnalyzer,
+    execute_analyzers,
+    registered_checks,
+    validate_analyzer_registry,
+)
 from .cookie_analyzer import (
     COOKIE_CHECKS,
     CookieAnalysisError,
@@ -27,6 +36,7 @@ from .header_analyzer import (
     analyze_security_headers,
 )
 from .passive_scan import (
+    DEFAULT_PASSIVE_ANALYZERS,
     ENGINE_NAME,
     ENGINE_VERSION,
     PASSIVE_CHECKS,
@@ -60,8 +70,12 @@ from .scope_validator import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "AnalyzerOutputError",
+    "AnalyzerPipelineResult",
+    "AnalyzerRegistryError",
     "COOKIE_CHECKS",
     "CORS_CHECKS",
+    "DEFAULT_PASSIVE_ANALYZERS",
     "DISCLOSURE_CHECKS",
     "ENGINE_NAME",
     "ENGINE_VERSION",
@@ -80,6 +94,7 @@ __all__ = [
     "PASSIVE_CORS_CHECKS",
     "PASSIVE_DISCLOSURE_CHECKS",
     "PASSIVE_HEADER_CHECKS",
+    "PassiveAnalyzer",
     "RetryPolicy",
     "SafeHttpResponse",
     "SafeRequestError",
@@ -93,10 +108,13 @@ __all__ = [
     "analyze_information_disclosure",
     "analyze_security_headers",
     "classify_error",
+    "execute_analyzers",
     "fetch_once",
     "is_retryable_error",
     "known_error_codes",
+    "registered_checks",
     "resolve_host",
     "run_passive_header_scan",
+    "validate_analyzer_registry",
     "validate_target_url",
 ]

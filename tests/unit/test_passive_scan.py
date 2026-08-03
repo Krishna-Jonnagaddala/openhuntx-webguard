@@ -22,6 +22,7 @@ from webguard_scanner import (
     PASSIVE_COOKIE_CHECKS,
     PASSIVE_CORS_CHECKS,
     PASSIVE_DISCLOSURE_CHECKS,
+    PASSIVE_HEADER_CHECKS,
     RetryPolicy,
     SafeHttpResponse,
     SafeRequestError,
@@ -505,28 +506,32 @@ class PassiveScanTests(unittest.TestCase):
 
         result = run_passive_header_scan(
             target(),
-            retry_policy=RetryPolicy(
-                maximum_attempts=3,
-            ),
+            retry_policy=RetryPolicy(maximum_attempts=3),
             scan_id=SCAN_ID,
             started_at=STARTED_AT,
         )
 
         self.assertIs(
             result.status,
-            ScanStatus.FAILED,
+            ScanStatus.COMPLETED_WITH_ERRORS,
         )
-        self.assertEqual(
-            result.coverage.requests_attempted,
-            1,
+        self.assertEqual(result.coverage.requests_attempted, 1)
+        self.assertEqual(result.coverage.requests_succeeded, 1)
+        self.assertEqual(result.errors[0].stage, "analysis.headers")
+        self.assertFalse(result.errors[0].retryable)
+        self.assertEqual(result.coverage.unaccounted_checks, ())
+        self.assertTrue(
+            set(PASSIVE_HEADER_CHECKS).issubset(
+                {
+                    item.check_id
+                    for item in result.coverage.skipped_checks
+                }
+            )
         )
-        self.assertEqual(
-            result.coverage.requests_succeeded,
-            1,
-        )
-        self.assertEqual(
-            result.errors[0].stage,
-            "analysis",
+        self.assertTrue(
+            set(PASSIVE_COOKIE_CHECKS).issubset(
+                result.coverage.executed_checks
+            )
         )
         fetch_mock.assert_called_once()
         analyze_mock.assert_called_once()
@@ -577,29 +582,20 @@ class PassiveScanTests(unittest.TestCase):
 
         self.assertIs(
             result.status,
-            ScanStatus.FAILED,
+            ScanStatus.COMPLETED_WITH_ERRORS,
         )
-        self.assertEqual(
-            result.coverage.requests_attempted,
-            2,
-        )
-        self.assertEqual(
-            result.coverage.requests_succeeded,
-            1,
-        )
-        self.assertEqual(
-            result.errors[0].stage,
-            "analysis",
-        )
+        self.assertEqual(result.coverage.requests_attempted, 2)
+        self.assertEqual(result.coverage.requests_succeeded, 1)
+        self.assertEqual(result.errors[0].stage, "analysis.headers")
         self.assertEqual(fetch_mock.call_count, 2)
         self.assertEqual(len(result.request_attempts), 2)
         self.assertIs(
             result.request_attempts[-1].outcome,
             RequestAttemptOutcome.SUCCEEDED,
         )
+        self.assertEqual(result.coverage.unaccounted_checks, ())
         analyze_mock.assert_called_once()
         sleep_mock.assert_not_called()
-
 
     @patch(
         "webguard_scanner.passive_scan._utc_now",
@@ -693,33 +689,31 @@ class PassiveScanTests(unittest.TestCase):
 
         result = run_passive_header_scan(
             target(),
-            retry_policy=RetryPolicy(
-                maximum_attempts=3,
-            ),
+            retry_policy=RetryPolicy(maximum_attempts=3),
             scan_id=SCAN_ID,
             started_at=STARTED_AT,
         )
 
         self.assertIs(
             result.status,
-            ScanStatus.FAILED,
+            ScanStatus.COMPLETED_WITH_ERRORS,
         )
-        self.assertEqual(
-            result.coverage.requests_attempted,
-            1,
+        self.assertEqual(result.coverage.requests_attempted, 1)
+        self.assertEqual(result.coverage.requests_succeeded, 1)
+        self.assertEqual(result.errors[0].stage, "analysis.cookies")
+        self.assertEqual(result.coverage.unaccounted_checks, ())
+        self.assertTrue(
+            set(PASSIVE_COOKIE_CHECKS).issubset(
+                {
+                    item.check_id
+                    for item in result.coverage.skipped_checks
+                }
+            )
         )
-        self.assertEqual(
-            result.coverage.requests_succeeded,
-            1,
-        )
-        self.assertEqual(
-            result.errors[0].stage,
-            "analysis",
-        )
+        self.assertTrue(result.findings)
         fetch_mock.assert_called_once()
         cookie_mock.assert_called_once()
         sleep_mock.assert_not_called()
-
 
     @patch(
         "webguard_scanner.passive_scan._utc_now",
@@ -845,23 +839,27 @@ class PassiveScanTests(unittest.TestCase):
 
         result = run_passive_header_scan(
             target(),
-            retry_policy=RetryPolicy(
-                maximum_attempts=3,
-            ),
+            retry_policy=RetryPolicy(maximum_attempts=3),
             scan_id=SCAN_ID,
             started_at=STARTED_AT,
         )
 
-        self.assertIs(result.status, ScanStatus.FAILED)
-        self.assertEqual(
-            result.coverage.requests_attempted,
-            1,
+        self.assertIs(
+            result.status,
+            ScanStatus.COMPLETED_WITH_ERRORS,
         )
-        self.assertEqual(
-            result.coverage.requests_succeeded,
-            1,
+        self.assertEqual(result.coverage.requests_attempted, 1)
+        self.assertEqual(result.coverage.requests_succeeded, 1)
+        self.assertEqual(result.errors[0].stage, "analysis.cors")
+        self.assertEqual(result.coverage.unaccounted_checks, ())
+        self.assertTrue(
+            set(PASSIVE_CORS_CHECKS).issubset(
+                {
+                    item.check_id
+                    for item in result.coverage.skipped_checks
+                }
+            )
         )
-        self.assertEqual(result.errors[0].stage, "analysis")
         fetch_mock.assert_called_once()
         cors_mock.assert_called_once()
         sleep_mock.assert_not_called()
@@ -894,26 +892,108 @@ class PassiveScanTests(unittest.TestCase):
 
         result = run_passive_header_scan(
             target(),
-            retry_policy=RetryPolicy(
-                maximum_attempts=3,
-            ),
+            retry_policy=RetryPolicy(maximum_attempts=3),
             scan_id=SCAN_ID,
             started_at=STARTED_AT,
         )
 
-        self.assertIs(result.status, ScanStatus.FAILED)
-        self.assertEqual(
-            result.coverage.requests_attempted,
-            1,
+        self.assertIs(
+            result.status,
+            ScanStatus.COMPLETED_WITH_ERRORS,
         )
-        self.assertEqual(
-            result.coverage.requests_succeeded,
-            1,
+        self.assertEqual(result.coverage.requests_attempted, 1)
+        self.assertEqual(result.coverage.requests_succeeded, 1)
+        self.assertEqual(result.errors[0].stage, "analysis.disclosure")
+        self.assertEqual(result.coverage.unaccounted_checks, ())
+        self.assertTrue(
+            set(PASSIVE_DISCLOSURE_CHECKS).issubset(
+                {
+                    item.check_id
+                    for item in result.coverage.skipped_checks
+                }
+            )
         )
-        self.assertEqual(result.errors[0].stage, "analysis")
         fetch_mock.assert_called_once()
         disclosure_mock.assert_called_once()
         sleep_mock.assert_not_called()
+
+
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.analyze_cors",
+    )
+    @patch(
+        "webguard_scanner.passive_scan.analyze_cookies",
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_multiple_controlled_failures_are_isolated(
+        self,
+        fetch_mock,
+        cookie_mock,
+        cors_mock,
+        _clock_mock,
+    ) -> None:
+        fetch_mock.return_value = response()
+        cookie_mock.side_effect = CookieAnalysisError(
+            "validated_target_mismatch",
+            "Cookie analysis failed.",
+        )
+        cors_mock.side_effect = CorsAnalysisError(
+            "validated_target_mismatch",
+            "CORS analysis failed.",
+        )
+
+        result = run_passive_header_scan(
+            target(),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+
+        self.assertIs(
+            result.status,
+            ScanStatus.COMPLETED_WITH_ERRORS,
+        )
+        self.assertEqual(
+            {error.stage for error in result.errors},
+            {"analysis.cookies", "analysis.cors"},
+        )
+        self.assertEqual(result.coverage.unaccounted_checks, ())
+        self.assertTrue(
+            set(PASSIVE_DISCLOSURE_CHECKS).issubset(
+                result.coverage.executed_checks
+            )
+        )
+
+    @patch(
+        "webguard_scanner.passive_scan.analyze_cookies",
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_unexpected_analysis_exception_surfaces(
+        self,
+        fetch_mock,
+        cookie_mock,
+    ) -> None:
+        fetch_mock.return_value = response()
+        cookie_mock.side_effect = RuntimeError(
+            "unexpected programming failure"
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "unexpected programming failure",
+        ):
+            run_passive_header_scan(
+                target(),
+                scan_id=SCAN_ID,
+                started_at=STARTED_AT,
+            )
 
 
 if __name__ == "__main__":
