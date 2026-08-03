@@ -9,6 +9,14 @@ from .findings import (
     NormalizedFinding,
     Severity,
 )
+from .scans import (
+    ScanContractValidationError,
+    ScanCoverage,
+    ScanError,
+    ScanResult,
+    ScanStatus,
+    SkippedCheck,
+)
 
 __version__ = "0.1.0"
 
@@ -19,6 +27,12 @@ __all__ = [
     "ExternalIdentifier",
     "FindingIdentity",
     "NormalizedFinding",
+    "ScanContractValidationError",
+    "ScanCoverage",
+    "ScanError",
+    "ScanResult",
+    "ScanStatus",
     "Severity",
+    "SkippedCheck",
     "__version__",
 ]
