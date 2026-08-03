@@ -16,12 +16,20 @@ from typing import Sequence, TextIO
 from uuid import uuid4
 
 from webguard_contracts import (
+    CrawlCheckpoint,
+    CrawlCheckpointError,
+    CrawlCheckpointFetchPolicy,
+    CrawlCheckpointRetryPolicy,
+    CrawlScanPolicy,
     CrawlScanResult,
     ScanReportLoadError,
     ScanResult,
     ScanStatus,
     WebGuardReport,
+    load_crawl_checkpoint_file,
+    load_crawl_checkpoint_key_file,
     load_webguard_report_file,
+    write_crawl_checkpoint_file,
 )
 
 from .crawl_scan import run_passive_crawl_scan
@@ -176,8 +184,11 @@ def _build_retry_policy(args: argparse.Namespace) -> RetryPolicy:
         ) from exc
 
 
-def _build_crawl_policy(args: argparse.Namespace) -> CrawlPolicy | None:
-    configured = any(
+
+def _crawl_limit_options_configured(
+    args: argparse.Namespace,
+) -> bool:
+    return any(
         value is not None
         for value in (
             args.crawl_maximum_pages,
@@ -189,6 +200,149 @@ def _build_crawl_policy(args: argparse.Namespace) -> CrawlPolicy | None:
             args.crawl_maximum_request_attempts,
         )
     )
+
+
+def _checkpoint_options_configured(
+    args: argparse.Namespace,
+) -> bool:
+    return any(
+        value is not None
+        for value in (
+            args.checkpoint,
+            args.resume_from,
+            args.checkpoint_key_file,
+        )
+    ) or bool(args.checkpoint_overwrite)
+
+
+def _crawl_policy_from_checkpoint(
+    policy: CrawlScanPolicy,
+) -> CrawlPolicy:
+    try:
+        return CrawlPolicy(
+            maximum_pages=policy.maximum_pages,
+            maximum_depth=policy.maximum_depth,
+            maximum_links_per_page=policy.maximum_links_per_page,
+            maximum_url_length=policy.maximum_url_length,
+            minimum_delay_seconds=policy.minimum_delay_seconds,
+            maximum_execution_seconds=(
+                policy.maximum_execution_seconds
+            ),
+            maximum_request_attempts=(
+                policy.maximum_request_attempts
+            ),
+            query_mode=CrawlQueryMode(policy.query_mode),
+            allowed_content_types=frozenset(
+                policy.allowed_content_types
+            ),
+            blocked_path_segments=frozenset(
+                policy.blocked_path_segments
+            ),
+        )
+    except (CrawlPolicyError, ValueError) as exc:
+        raise CliControlledError(
+            getattr(exc, "code", "checkpoint_policy_invalid"),
+            str(exc),
+            exit_code=EXIT_PREFLIGHT_FAILED,
+        ) from exc
+
+
+def _checkpoint_fetch_snapshot(
+    policy: FetchPolicy,
+) -> CrawlCheckpointFetchPolicy:
+    return CrawlCheckpointFetchPolicy(
+        timeout_seconds=policy.timeout_seconds,
+        maximum_body_bytes=policy.maximum_body_bytes,
+        maximum_header_bytes=policy.maximum_header_bytes,
+        maximum_header_count=policy.maximum_header_count,
+    )
+
+
+def _checkpoint_retry_snapshot(
+    policy: RetryPolicy,
+) -> CrawlCheckpointRetryPolicy:
+    return CrawlCheckpointRetryPolicy(
+        maximum_attempts=policy.maximum_attempts,
+        initial_backoff_seconds=policy.initial_backoff_seconds,
+        backoff_multiplier=policy.backoff_multiplier,
+        maximum_backoff_seconds=policy.maximum_backoff_seconds,
+    )
+
+
+def _load_checkpoint_key(path: Path) -> bytes:
+    try:
+        return load_crawl_checkpoint_key_file(path)
+    except CrawlCheckpointError as exc:
+        raise CliControlledError(
+            exc.code,
+            exc.message,
+            exit_code=EXIT_PREFLIGHT_FAILED,
+        ) from exc
+
+
+def _load_resume_checkpoint(
+    path: Path,
+    key: bytes,
+) -> CrawlCheckpoint:
+    try:
+        return load_crawl_checkpoint_file(path, key)
+    except CrawlCheckpointError as exc:
+        raise CliControlledError(
+            exc.code,
+            exc.message,
+            exit_code=EXIT_PREFLIGHT_FAILED,
+        ) from exc
+
+
+def _check_checkpoint_destination(
+    path: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    try:
+        exists = os.path.lexists(path)
+    except OSError as exc:
+        raise CliControlledError(
+            "checkpoint_path_inspection_failed",
+            f"Unable to inspect checkpoint path {path}.",
+            exit_code=EXIT_OUTPUT_FAILED,
+        ) from exc
+
+    if not exists:
+        return
+
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise CliControlledError(
+            "checkpoint_path_inspection_failed",
+            f"Unable to inspect checkpoint path {path}.",
+            exit_code=EXIT_OUTPUT_FAILED,
+        ) from exc
+
+    if stat.S_ISLNK(metadata.st_mode):
+        raise CliControlledError(
+            "checkpoint_symlink_not_allowed",
+            f"Refusing to use symbolic link {path} as a checkpoint.",
+            exit_code=EXIT_OUTPUT_FAILED,
+        )
+    if not stat.S_ISREG(metadata.st_mode):
+        raise CliControlledError(
+            "checkpoint_not_regular_file",
+            f"Checkpoint path {path} is not a regular file.",
+            exit_code=EXIT_OUTPUT_FAILED,
+        )
+    if not overwrite:
+        raise CliControlledError(
+            "checkpoint_exists",
+            f"Checkpoint file {path} already exists. Use "
+            "--checkpoint-overwrite to replace it.",
+            exit_code=EXIT_OUTPUT_FAILED,
+        )
+
+
+def _build_crawl_policy(args: argparse.Namespace) -> CrawlPolicy | None:
+    configured = _crawl_limit_options_configured(args)
 
     if not args.crawl:
         if configured:
@@ -612,15 +766,117 @@ def _graceful_crawl_cancellation(
 
 
 def _scan_command(args: argparse.Namespace) -> int:
-    scan_id = str(uuid4())
-    output_path = _normalise_output_path(args.output, scan_id=scan_id)
+    if _checkpoint_options_configured(args) and not args.crawl:
+        raise CliControlledError(
+            "checkpoint_option_requires_crawl",
+            "Checkpoint and resume options require --crawl.",
+            exit_code=EXIT_PREFLIGHT_FAILED,
+        )
 
+    if (
+        args.checkpoint_key_file is not None
+        and args.checkpoint is None
+        and args.resume_from is None
+    ):
+        raise CliControlledError(
+            "checkpoint_key_without_checkpoint",
+            "--checkpoint-key-file requires --checkpoint or --resume-from.",
+            exit_code=EXIT_PREFLIGHT_FAILED,
+        )
+
+    if (
+        (args.checkpoint is not None or args.resume_from is not None)
+        and args.checkpoint_key_file is None
+    ):
+        raise CliControlledError(
+            "checkpoint_key_required",
+            "Signed checkpoints require --checkpoint-key-file.",
+            exit_code=EXIT_PREFLIGHT_FAILED,
+        )
+
+    if (
+        args.checkpoint_overwrite
+        and args.checkpoint is None
+        and args.resume_from is None
+    ):
+        raise CliControlledError(
+            "checkpoint_overwrite_without_checkpoint",
+            "--checkpoint-overwrite requires --checkpoint or --resume-from.",
+            exit_code=EXIT_PREFLIGHT_FAILED,
+        )
+
+    checkpoint_key: bytes | None = None
+    resume_checkpoint: CrawlCheckpoint | None = None
+
+    if args.checkpoint_key_file is not None:
+        checkpoint_key = _load_checkpoint_key(
+            args.checkpoint_key_file
+        )
+
+    if args.resume_from is not None:
+        assert checkpoint_key is not None
+        resume_checkpoint = _load_resume_checkpoint(
+            args.resume_from,
+            checkpoint_key,
+        )
+        scan_id = resume_checkpoint.scan_id
+    else:
+        scan_id = str(uuid4())
+
+    output_path = _normalise_output_path(
+        args.output,
+        scan_id=scan_id,
+    )
     _check_output_path(output_path, overwrite=args.overwrite)
+
+    checkpoint_path: Path | None = None
+    if args.checkpoint is not None:
+        checkpoint_path = args.checkpoint.expanduser()
+    elif args.resume_from is not None:
+        checkpoint_path = args.resume_from.expanduser()
+
+    if checkpoint_path is not None:
+        try:
+            if checkpoint_path.resolve(strict=False) == output_path.resolve(
+                strict=False
+            ):
+                raise CliControlledError(
+                    "checkpoint_report_path_conflict",
+                    "Checkpoint and report paths must be different.",
+                    exit_code=EXIT_OUTPUT_FAILED,
+                )
+        except OSError as exc:
+            raise CliControlledError(
+                "checkpoint_path_invalid",
+                "Unable to resolve checkpoint or report path.",
+                exit_code=EXIT_OUTPUT_FAILED,
+            ) from exc
+
+        same_as_resume = (
+            args.resume_from is not None
+            and checkpoint_path == args.resume_from.expanduser()
+        )
+        _check_checkpoint_destination(
+            checkpoint_path,
+            overwrite=(
+                same_as_resume
+                or args.checkpoint_overwrite
+            ),
+        )
 
     validation_policy = _build_validation_policy(args)
     fetch_policy = _build_fetch_policy(args)
     retry_policy = _build_retry_policy(args)
-    crawl_policy = _build_crawl_policy(args)
+
+    if (
+        resume_checkpoint is not None
+        and not _crawl_limit_options_configured(args)
+    ):
+        crawl_policy = _crawl_policy_from_checkpoint(
+            resume_checkpoint.policy
+        )
+    else:
+        crawl_policy = _build_crawl_policy(args)
 
     try:
         target = validate_target_url(
@@ -643,17 +899,55 @@ def _scan_command(args: argparse.Namespace) -> int:
         )
     else:
         cancellation_token = CrawlCancellationToken()
-        with _graceful_crawl_cancellation(
-            cancellation_token
-        ):
-            result = run_passive_crawl_scan(
-                target,
-                crawl_policy=crawl_policy,
-                fetch_policy=fetch_policy,
-                retry_policy=retry_policy,
-                scan_id=scan_id,
-                cancellation_token=cancellation_token,
-            )
+
+        def persist_checkpoint(
+            checkpoint: CrawlCheckpoint,
+        ) -> None:
+            if checkpoint_path is None:
+                return
+            assert checkpoint_key is not None
+            try:
+                write_crawl_checkpoint_file(
+                    checkpoint,
+                    checkpoint_path,
+                    checkpoint_key,
+                    overwrite=True,
+                )
+            except CrawlCheckpointError as exc:
+                raise CliControlledError(
+                    exc.code,
+                    exc.message,
+                    exit_code=EXIT_OUTPUT_FAILED,
+                ) from exc
+
+        try:
+            with _graceful_crawl_cancellation(
+                cancellation_token
+            ):
+                result = run_passive_crawl_scan(
+                    target,
+                    crawl_policy=crawl_policy,
+                    fetch_policy=fetch_policy,
+                    retry_policy=retry_policy,
+                    scan_id=(
+                        None
+                        if resume_checkpoint is not None
+                        else scan_id
+                    ),
+                    cancellation_token=cancellation_token,
+                    resume_checkpoint=resume_checkpoint,
+                    checkpoint_callback=(
+                        persist_checkpoint
+                        if checkpoint_path is not None
+                        else None
+                    ),
+                )
+        except CrawlCheckpointError as exc:
+            raise CliControlledError(
+                exc.code,
+                exc.message,
+                exit_code=EXIT_PREFLIGHT_FAILED,
+            ) from exc
 
     _write_report(
         result,
@@ -665,6 +959,12 @@ def _scan_command(args: argparse.Namespace) -> int:
         stream=sys.stdout,
         output_path=output_path,
     )
+
+    if checkpoint_path is not None:
+        print(
+            f"Saved checkpoint: {checkpoint_path}",
+            file=sys.stdout,
+        )
 
     if result.status is ScanStatus.COMPLETED:
         return EXIT_SUCCESS
@@ -855,6 +1155,44 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Discovered-query handling in crawl mode: drop or reject "
             "(default: drop)."
+        ),
+    )
+    scan.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Atomically write a signed crawl checkpoint after each state "
+            "transition. Requires --crawl and --checkpoint-key-file."
+        ),
+    )
+    scan.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Authenticate, revalidate, and resume a signed crawl checkpoint. "
+            "Requires --crawl and --checkpoint-key-file."
+        ),
+    )
+    scan.add_argument(
+        "--checkpoint-key-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Private HMAC key file for checkpoint signing and verification. "
+            "On POSIX systems it must not grant group or other access."
+        ),
+    )
+    scan.add_argument(
+        "--checkpoint-overwrite",
+        action="store_true",
+        help=(
+            "Explicitly replace an existing checkpoint destination. "
+            "A resumed checkpoint may update its own file without this flag."
         ),
     )
     scan.add_argument(

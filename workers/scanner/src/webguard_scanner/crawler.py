@@ -665,10 +665,184 @@ PageVisitor = Callable[
 
 
 @dataclass(frozen=True, slots=True)
-class _QueuedPage:
+class CrawlPendingPage:
+    """One breadth-first page that has been discovered but not attempted."""
+
     url: str
     depth: int
     parent_url: str | None
+
+    def __post_init__(self) -> None:
+        url = _audit_url(self.url, "pending_page_url")
+        parent_url = (
+            None
+            if self.parent_url is None
+            else _audit_url(self.parent_url, "pending_parent_url")
+        )
+        _bounded_integer(
+            self.depth,
+            name="pending_page_depth",
+            minimum=0,
+            maximum=MAXIMUM_CRAWL_DEPTH,
+        )
+        if self.depth == 0 and parent_url is not None:
+            raise CrawlPolicyError(
+                "pending_root_parent_invalid",
+                "A depth-zero pending page cannot have a parent.",
+            )
+        if self.depth > 0 and parent_url is None:
+            raise CrawlPolicyError(
+                "pending_parent_required",
+                "A non-root pending page requires a parent.",
+            )
+        object.__setattr__(self, "url", url)
+        object.__setattr__(self, "parent_url", parent_url)
+
+
+@dataclass(frozen=True, slots=True)
+class CrawlResumeState:
+    """Validated non-secret crawler state used by signed checkpoints."""
+
+    root_url: str
+    pages: tuple[CrawlPageRecord, ...]
+    pending_pages: tuple[CrawlPendingPage, ...]
+    visited_urls: tuple[str, ...]
+    skipped_links: tuple[CrawlSkipSummary, ...] = ()
+    elapsed_execution_seconds: float = 0.0
+    attempts_used: int = 0
+
+    def __post_init__(self) -> None:
+        root_url = _audit_url(self.root_url, "resume_root_url")
+
+        if (
+            not isinstance(self.pages, tuple)
+            or any(not isinstance(item, CrawlPageRecord) for item in self.pages)
+        ):
+            raise CrawlPolicyError(
+                "resume_pages_invalid",
+                "pages must contain CrawlPageRecord values.",
+            )
+        if (
+            not isinstance(self.pending_pages, tuple)
+            or any(
+                not isinstance(item, CrawlPendingPage)
+                for item in self.pending_pages
+            )
+        ):
+            raise CrawlPolicyError(
+                "resume_pending_pages_invalid",
+                "pending_pages must contain CrawlPendingPage values.",
+            )
+        if (
+            not isinstance(self.skipped_links, tuple)
+            or any(
+                not isinstance(item, CrawlSkipSummary)
+                for item in self.skipped_links
+            )
+        ):
+            raise CrawlPolicyError(
+                "resume_skips_invalid",
+                "skipped_links contains an invalid value.",
+            )
+
+        attempted_urls = tuple(item.url for item in self.pages)
+        pending_urls = tuple(item.url for item in self.pending_pages)
+
+        if len(set(attempted_urls)) != len(attempted_urls):
+            raise CrawlPolicyError(
+                "resume_page_duplicate",
+                "Attempted pages contain duplicate URLs.",
+            )
+        if len(set(pending_urls)) != len(pending_urls):
+            raise CrawlPolicyError(
+                "resume_pending_duplicate",
+                "Pending pages contain duplicate URLs.",
+            )
+        if set(attempted_urls) & set(pending_urls):
+            raise CrawlPolicyError(
+                "resume_page_overlap",
+                "A URL cannot be both attempted and pending.",
+            )
+
+        if self.pages:
+            first = self.pages[0]
+            if (
+                first.url != root_url
+                or first.depth != 0
+                or first.parent_url is not None
+            ):
+                raise CrawlPolicyError(
+                    "resume_root_page_invalid",
+                    "The first attempted page must be the root.",
+                )
+        elif self.pending_pages:
+            first_pending = self.pending_pages[0]
+            if (
+                first_pending.url != root_url
+                or first_pending.depth != 0
+                or first_pending.parent_url is not None
+            ):
+                raise CrawlPolicyError(
+                    "resume_pending_root_invalid",
+                    "An unattempted resume state must begin with the root.",
+                )
+
+        expected_visited = tuple(
+            sorted(set(attempted_urls + pending_urls))
+        )
+        if (
+            not isinstance(self.visited_urls, tuple)
+            or tuple(self.visited_urls) != expected_visited
+        ):
+            raise CrawlPolicyError(
+                "resume_visited_inconsistent",
+                "visited_urls must be the sorted attempted and pending URL projection.",
+            )
+
+        if (
+            isinstance(self.elapsed_execution_seconds, bool)
+            or not isinstance(
+                self.elapsed_execution_seconds,
+                (int, float),
+            )
+            or not math.isfinite(float(self.elapsed_execution_seconds))
+            or float(self.elapsed_execution_seconds) < 0
+        ):
+            raise CrawlPolicyError(
+                "resume_elapsed_invalid",
+                "elapsed_execution_seconds must be a finite non-negative number.",
+            )
+
+        derived_attempts = sum(len(page.attempts) for page in self.pages)
+        if (
+            isinstance(self.attempts_used, bool)
+            or not isinstance(self.attempts_used, int)
+            or self.attempts_used != derived_attempts
+        ):
+            raise CrawlPolicyError(
+                "resume_attempts_inconsistent",
+                "attempts_used must match attempts stored by page records.",
+            )
+
+        object.__setattr__(self, "root_url", root_url)
+        object.__setattr__(
+            self,
+            "skipped_links",
+            tuple(
+                sorted(
+                    self.skipped_links,
+                    key=lambda item: item.reason.value,
+                )
+            ),
+        )
+        object.__setattr__(
+            self,
+            "elapsed_execution_seconds",
+            float(self.elapsed_execution_seconds),
+        )
+
+
+CheckpointObserver = Callable[[CrawlResumeState], None]
 
 
 @dataclass(slots=True)
@@ -1308,19 +1482,18 @@ def crawl_same_origin(
     retry_policy: RetryPolicy = RetryPolicy(),
     on_page: PageVisitor | None = None,
     cancellation_token: CrawlCancellationToken | None = None,
+    resume_state: CrawlResumeState | None = None,
+    on_checkpoint: CheckpointObserver | None = None,
 ) -> CrawlExecution:
-    """Fetch a budgeted breadth-first set of same-origin HTML pages.
+    """Fetch or resume a budgeted breadth-first same-origin HTML crawl.
 
-    Only anchor ``href`` values are considered. Forms, scripts, images,
-    JavaScript routes, and other active navigation mechanisms are ignored.
-    Discovered URLs never change origin, never retain fragments, and never
-    preserve query strings. Automatic redirects remain blocked by the safe
-    HTTP client.
+    Signed checkpoint persistence is implemented by the caller through
+    ``on_checkpoint``. The callback receives only canonical non-secret state:
+    completed page audit records, the pending queue, visited URLs, skipped-link
+    counters, elapsed execution time, and consumed request attempts.
 
-    Cancellation, the monotonic execution deadline, and the total
-    request-attempt budget are checked before every new HTTP request.
-    Response bodies are used only for bounded link extraction and the optional
-    synchronous ``on_page`` callback. They are not stored in CrawlExecution.
+    Response bodies remain transient. They are used only for bounded anchor
+    extraction and the synchronous ``on_page`` analyser callback.
     """
 
     if not isinstance(root_target, ValidatedTarget):
@@ -1328,19 +1501,21 @@ def crawl_same_origin(
             "root_target_invalid",
             "root_target must be a ValidatedTarget value.",
         )
-
     if not isinstance(crawl_policy, CrawlPolicy):
         raise CrawlPolicyError(
             "crawl_policy_invalid",
             "crawl_policy must be a CrawlPolicy value.",
         )
-
     if on_page is not None and not callable(on_page):
         raise CrawlPolicyError(
             "page_visitor_invalid",
             "on_page must be callable or null.",
         )
-
+    if on_checkpoint is not None and not callable(on_checkpoint):
+        raise CrawlPolicyError(
+            "checkpoint_observer_invalid",
+            "on_checkpoint must be callable or null.",
+        )
     if (
         cancellation_token is not None
         and not isinstance(
@@ -1351,6 +1526,14 @@ def crawl_same_origin(
         raise CrawlPolicyError(
             "cancellation_token_invalid",
             "cancellation_token must be a CrawlCancellationToken or null.",
+        )
+    if (
+        resume_state is not None
+        and not isinstance(resume_state, CrawlResumeState)
+    ):
+        raise CrawlPolicyError(
+            "resume_state_invalid",
+            "resume_state must be a CrawlResumeState or null.",
         )
 
     root_origin = _root_origin(root_target)
@@ -1372,30 +1555,109 @@ def crawl_same_origin(
             "The validated root URL is incompatible with the crawl policy.",
         )
 
-    queue = deque(
-        (
-            _QueuedPage(
-                url=root_url,
-                depth=0,
-                parent_url=None,
-            ),
+    if resume_state is None:
+        queue = deque(
+            (
+                CrawlPendingPage(
+                    url=root_url,
+                    depth=0,
+                    parent_url=None,
+                ),
+            )
         )
+        visited_urls = {root_url}
+        pages: list[CrawlPageRecord] = []
+        skip_counts: Counter[CrawlSkipReason] = Counter()
+        elapsed_before = 0.0
+        attempts_before = 0
+    else:
+        if resume_state.root_url != root_url:
+            raise CrawlPolicyError(
+                "resume_root_mismatch",
+                "Resume state belongs to a different crawl root.",
+            )
+        if (
+            len(resume_state.pages)
+            + len(resume_state.pending_pages)
+            > crawl_policy.maximum_pages
+        ):
+            raise CrawlPolicyError(
+                "resume_page_limit_exceeded",
+                "Resume state exceeds policy.maximum_pages.",
+            )
+        if any(
+            page.depth > crawl_policy.maximum_depth
+            for page in resume_state.pages
+        ) or any(
+            page.depth > crawl_policy.maximum_depth
+            for page in resume_state.pending_pages
+        ):
+            raise CrawlPolicyError(
+                "resume_depth_limit_exceeded",
+                "Resume state exceeds policy.maximum_depth.",
+            )
+        if (
+            resume_state.attempts_used
+            > crawl_policy.maximum_request_attempts
+        ):
+            raise CrawlPolicyError(
+                "resume_attempt_budget_exceeded",
+                "Resume state exceeds the request-attempt budget.",
+            )
+
+        queue = deque(resume_state.pending_pages)
+        visited_urls = set(resume_state.visited_urls)
+        pages = list(resume_state.pages)
+        skip_counts = Counter(
+            {
+                item.reason: item.count
+                for item in resume_state.skipped_links
+            }
+        )
+        elapsed_before = resume_state.elapsed_execution_seconds
+        attempts_before = resume_state.attempts_used
+
+    run_started = time.monotonic()
+    remaining_seconds = max(
+        0.0,
+        crawl_policy.maximum_execution_seconds - elapsed_before,
     )
-    queued_urls = {root_url}
-    pages: list[CrawlPageRecord] = []
-    skip_counts: Counter[CrawlSkipReason] = Counter()
     termination_reason = CrawlTerminationReason.COMPLETED
 
     budget = _ExecutionBudget(
-        deadline=(
-            time.monotonic()
-            + crawl_policy.maximum_execution_seconds
-        ),
+        deadline=run_started + remaining_seconds,
         maximum_request_attempts=(
             crawl_policy.maximum_request_attempts
         ),
         cancellation_token=cancellation_token,
+        attempts_used=attempts_before,
     )
+
+    def snapshot() -> CrawlResumeState:
+        elapsed = elapsed_before + max(
+            0.0,
+            time.monotonic() - run_started,
+        )
+        return CrawlResumeState(
+            root_url=root_url,
+            pages=tuple(pages),
+            pending_pages=tuple(queue),
+            visited_urls=tuple(sorted(visited_urls)),
+            skipped_links=tuple(
+                CrawlSkipSummary(reason=reason, count=count)
+                for reason, count in skip_counts.items()
+                if count > 0
+            ),
+            elapsed_execution_seconds=elapsed,
+            attempts_used=budget.attempts_used,
+        )
+
+    def emit_checkpoint() -> None:
+        if on_checkpoint is not None:
+            on_checkpoint(snapshot())
+
+    # Persist an initial root or resumed queue before the first new request.
+    emit_checkpoint()
 
     while queue and len(pages) < crawl_policy.maximum_pages:
         stop_reason = budget.stop_reason()
@@ -1437,12 +1699,19 @@ def crawl_same_origin(
                         retryable=fetch_outcome.retryable,
                     )
                 )
+            elif fetch_outcome.termination_reason is not None:
+                # No request began. Keep the page at the front so a valid
+                # checkpoint can resume it without losing queue order.
+                queue.appendleft(queued_page)
 
             if fetch_outcome.termination_reason is not None:
                 termination_reason = (
                     fetch_outcome.termination_reason
                 )
+                emit_checkpoint()
                 break
+
+            emit_checkpoint()
 
             if queued_page.depth == 0:
                 termination_reason = (
@@ -1502,7 +1771,7 @@ def crawl_same_origin(
                     continue
 
                 if (
-                    candidate in queued_urls
+                    candidate in visited_urls
                     or candidate in candidates
                 ):
                     skip_counts[
@@ -1525,13 +1794,13 @@ def crawl_same_origin(
                     continue
 
                 queue.append(
-                    _QueuedPage(
+                    CrawlPendingPage(
                         url=candidate,
                         depth=queued_page.depth + 1,
                         parent_url=queued_page.url,
                     )
                 )
-                queued_urls.add(candidate)
+                visited_urls.add(candidate)
                 queued_links += 1
 
         pages.append(
@@ -1548,6 +1817,7 @@ def crawl_same_origin(
                 queued_links=queued_links,
             )
         )
+        emit_checkpoint()
 
     pages_pending = 0
 
@@ -1559,6 +1829,9 @@ def crawl_same_origin(
         pages_pending = len(queue)
     elif queue:
         skip_counts[CrawlSkipReason.PAGE_LIMIT] += len(queue)
+        for pending in queue:
+            visited_urls.discard(pending.url)
+        queue.clear()
         termination_reason = (
             CrawlTerminationReason.PAGE_LIMIT_REACHED
         )
@@ -1566,6 +1839,9 @@ def crawl_same_origin(
         termination_reason = (
             CrawlTerminationReason.PAGE_LIMIT_REACHED
         )
+
+    # Persist final pending/visited projections after termination handling.
+    emit_checkpoint()
 
     return CrawlExecution(
         root_url=root_url,
@@ -1586,11 +1862,14 @@ def crawl_same_origin(
 __all__ = [
     "CrawlCancellationToken",
     "CrawlExecution",
+    "CheckpointObserver",
     "CrawlPageOutcome",
+    "CrawlPendingPage",
     "CrawlPageRecord",
     "CrawlPolicy",
     "CrawlPolicyError",
     "CrawlQueryMode",
+    "CrawlResumeState",
     "CrawlSkipReason",
     "CrawlSkipSummary",
     "DEFAULT_ALLOWED_CONTENT_TYPES",

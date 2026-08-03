@@ -1,5 +1,25 @@
 """OpenHuntX WebGuard scanner package."""
 
+from webguard_contracts import (
+    CRAWL_CHECKPOINT_INTEGRITY_ALGORITHM,
+    CRAWL_CHECKPOINT_TYPE,
+    CURRENT_CRAWL_CHECKPOINT_SCHEMA_VERSION,
+    CrawlCheckpoint,
+    CrawlCheckpointError,
+    CrawlCheckpointFetchPolicy,
+    CrawlCheckpointIntegrityError,
+    CrawlCheckpointLoadError,
+    CrawlCheckpointPendingPage,
+    CrawlCheckpointResumeError,
+    CrawlCheckpointRetryPolicy,
+    CrawlCheckpointValidationError,
+    load_crawl_checkpoint_file,
+    load_crawl_checkpoint_json,
+    load_crawl_checkpoint_key_file,
+    validate_crawl_checkpoint_resume,
+    write_crawl_checkpoint_file,
+)
+
 from .analyzer_registry import (
     AnalyzerOutputError,
     AnalyzerPipelineResult,
@@ -22,11 +42,14 @@ from .cors_analyzer import (
 from .crawler import (
     CrawlCancellationToken,
     CrawlExecution,
+    CheckpointObserver,
     CrawlPageOutcome,
+    CrawlPendingPage,
     CrawlPageRecord,
     CrawlPolicy,
     CrawlPolicyError,
     CrawlQueryMode,
+    CrawlResumeState,
     CrawlSkipReason,
     CrawlSkipSummary,
     CrawlTerminationReason,
@@ -44,7 +67,7 @@ from .crawler import (
     PageVisitor,
     crawl_same_origin,
 )
-from .crawl_scan import run_passive_crawl_scan
+from .crawl_scan import CheckpointCallback, run_passive_crawl_scan
 from .disclosure_analyzer import (
     DISCLOSURE_CHECKS,
     DisclosureAnalysisError,
@@ -167,4 +190,25 @@ __all__ = [
     "run_passive_header_scan",
     "validate_analyzer_registry",
     "validate_target_url",
+    "CRAWL_CHECKPOINT_INTEGRITY_ALGORITHM",
+    "CRAWL_CHECKPOINT_TYPE",
+    "CURRENT_CRAWL_CHECKPOINT_SCHEMA_VERSION",
+    "CheckpointCallback",
+    "CheckpointObserver",
+    "CrawlCheckpoint",
+    "CrawlCheckpointError",
+    "CrawlCheckpointFetchPolicy",
+    "CrawlCheckpointIntegrityError",
+    "CrawlCheckpointLoadError",
+    "CrawlCheckpointPendingPage",
+    "CrawlCheckpointResumeError",
+    "CrawlCheckpointRetryPolicy",
+    "CrawlCheckpointValidationError",
+    "CrawlPendingPage",
+    "CrawlResumeState",
+    "load_crawl_checkpoint_file",
+    "load_crawl_checkpoint_json",
+    "load_crawl_checkpoint_key_file",
+    "validate_crawl_checkpoint_resume",
+    "write_crawl_checkpoint_file",
 ]
