@@ -7,7 +7,9 @@ name = "openhuntx-webguard-scanner"
 version = "0.1.0"
 description = "Isolated scanning components for OpenHuntX WebGuard"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "openhuntx-webguard-contracts==0.1.0",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

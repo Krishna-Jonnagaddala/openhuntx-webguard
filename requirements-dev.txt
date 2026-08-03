@@ -1,0 +1,2 @@
+-e packages/contracts/python
+-e workers/scanner
