@@ -1,0 +1,54 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Node.js
+node_modules/
+.next/
+coverage/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# IDE and operating system
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Scanner output
+scan-results/
+reports/
+zap-data/
+artifacts/
+*.har
+
+# Local infrastructure
+minio-data/
+postgres-data/
+redis-data/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.log
