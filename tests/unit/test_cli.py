@@ -11,11 +11,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from webguard_contracts import (
+    CrawlPageScanResult,
+    CrawlScanPolicy,
+    CrawlScanResult,
+    RequestAttempt,
+    RequestAttemptOutcome,
     ScanCoverage,
     ScanError,
     ScanResult,
     ScanStatus,
     load_scan_result_file,
+    load_webguard_report_file,
 )
 from webguard_scanner import cli
 from webguard_scanner.scope_validator import ValidatedTarget, ValidationMode
@@ -63,6 +69,54 @@ def _failed_result(scan_id: str) -> ScanResult:
                 message="The connection timed out.",
                 stage="request",
                 retryable=True,
+            ),
+        ),
+    )
+
+
+def _completed_crawl_result(scan_id: str) -> CrawlScanResult:
+    return CrawlScanResult(
+        scan_id=scan_id,
+        scan_type="passive-http-crawl",
+        status=ScanStatus.COMPLETED,
+        target="https://example.com/",
+        engine="webguard-native",
+        engine_version="0.1.0",
+        started_at=_NOW,
+        completed_at=_NOW,
+        policy=CrawlScanPolicy(
+            maximum_pages=5,
+            maximum_depth=1,
+            maximum_links_per_page=50,
+            maximum_url_length=2048,
+            minimum_delay_seconds=0.2,
+            query_mode="reject",
+            allowed_content_types=("text/html",),
+            blocked_path_segments=("delete",),
+        ),
+        pages=(
+            CrawlPageScanResult(
+                url="https://example.com/",
+                depth=0,
+                parent_url=None,
+                status=ScanStatus.COMPLETED,
+                coverage=ScanCoverage(
+                    requests_attempted=1,
+                    requests_succeeded=1,
+                ),
+                request_attempts=(
+                    RequestAttempt(
+                        attempt_number=1,
+                        started_at=_NOW,
+                        completed_at=_NOW,
+                        outcome=RequestAttemptOutcome.SUCCEEDED,
+                        connected_address="93.184.216.34",
+                        http_status=200,
+                    ),
+                ),
+                content_type="text/html",
+                connected_address="93.184.216.34",
+                http_status=200,
             ),
         ),
     )
@@ -406,6 +460,118 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, cli.EXIT_SUCCESS)
         self.assertEqual(stderr, "")
         self.assertEqual(json.loads(stdout), result.to_dict())
+
+
+    def test_crawl_mode_uses_crawl_orchestrator_and_safe_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "crawl.json"
+            with patch.object(
+                cli,
+                "validate_target_url",
+                return_value=_TARGET,
+            ), patch.object(
+                cli,
+                "run_passive_header_scan",
+            ) as single_scan, patch.object(
+                cli,
+                "run_passive_crawl_scan",
+                side_effect=lambda *args, **kwargs: _completed_crawl_result(
+                    kwargs["scan_id"]
+                ),
+            ) as crawl_scan:
+                exit_code, stdout, stderr = self._run(
+                    [
+                        "scan",
+                        "https://example.com",
+                        "--crawl",
+                        "--crawl-max-pages",
+                        "5",
+                        "--crawl-max-depth",
+                        "1",
+                        "--crawl-max-links",
+                        "50",
+                        "--crawl-delay",
+                        "0.2",
+                        "--crawl-query-mode",
+                        "reject",
+                        "-o",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+            self.assertEqual(stderr, "")
+            self.assertIn("Mode: same-origin crawl", stdout)
+            single_scan.assert_not_called()
+            crawl_scan.assert_called_once()
+            crawl_policy = crawl_scan.call_args.kwargs["crawl_policy"]
+            self.assertEqual(crawl_policy.maximum_pages, 5)
+            self.assertEqual(crawl_policy.maximum_depth, 1)
+            self.assertEqual(crawl_policy.maximum_links_per_page, 50)
+            self.assertEqual(crawl_policy.minimum_delay_seconds, 0.2)
+            self.assertEqual(crawl_policy.query_mode.value, "reject")
+            loaded = load_webguard_report_file(output)
+            self.assertIsInstance(loaded, CrawlScanResult)
+
+    def test_crawl_option_without_crawl_is_rejected(self) -> None:
+        exit_code, stdout, stderr = self._run(
+            [
+                "scan",
+                "https://example.com",
+                "--crawl-max-pages",
+                "5",
+            ]
+        )
+        self.assertEqual(exit_code, cli.EXIT_PREFLIGHT_FAILED)
+        self.assertEqual(stdout, "")
+        self.assertIn("crawl_option_requires_crawl", stderr)
+
+    def test_crawl_policy_limit_is_enforced(self) -> None:
+        exit_code, _, stderr = self._run(
+            [
+                "scan",
+                "https://example.com",
+                "--crawl",
+                "--crawl-max-pages",
+                "51",
+            ]
+        )
+        self.assertEqual(exit_code, cli.EXIT_PREFLIGHT_FAILED)
+        self.assertIn("maximum_pages_invalid", stderr)
+
+    def test_report_validate_accepts_crawl_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "crawl.json"
+            path.write_text(
+                _completed_crawl_result(
+                    "7625f9a7-5a1b-4d8f-ac41-ece77f3e3026"
+                ).to_json(),
+                encoding="utf-8",
+            )
+            exit_code, stdout, stderr = self._run(
+                ["report", "validate", str(path)]
+            )
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        self.assertEqual(stderr, "")
+        self.assertIn("Report type: crawl_scan", stdout)
+        self.assertIn("Normalized schema: 1.0", stdout)
+
+    def test_report_inspect_renders_crawl_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "crawl.json"
+            path.write_text(
+                _completed_crawl_result(
+                    "f5d4f4aa-639f-4b74-bf76-a883963a148d"
+                ).to_json(),
+                encoding="utf-8",
+            )
+            exit_code, stdout, stderr = self._run(
+                ["report", "inspect", str(path)]
+            )
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        self.assertEqual(stderr, "")
+        self.assertIn("Mode: same-origin crawl", stdout)
+        self.assertIn("[PAGE depth=0] completed", stdout)
 
 
 if __name__ == "__main__":

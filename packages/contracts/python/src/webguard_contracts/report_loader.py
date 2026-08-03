@@ -17,6 +17,12 @@ from .findings import (
     NormalizedFinding,
     Severity,
 )
+from .crawl_scans import (
+    CrawlLinkSkip,
+    CrawlPageScanResult,
+    CrawlScanPolicy,
+    CrawlScanResult,
+)
 from .scans import (
     RequestAttempt,
     RequestAttemptOutcome,
@@ -679,3 +685,467 @@ def load_scan_result_file(path: str | Path) -> ScanResult:
         ) from exc
 
     return load_scan_result_json(document)
+
+
+CURRENT_CRAWL_SCAN_SCHEMA_VERSION = "1.0"
+SUPPORTED_CRAWL_SCAN_SCHEMA_VERSIONS = ("1.0",)
+
+_CRAWL_ROOT_FIELDS = frozenset(
+    {
+        "report_type",
+        "schema_version",
+        "scan_id",
+        "scan_type",
+        "status",
+        "target",
+        "engine",
+        "engine_version",
+        "started_at",
+        "completed_at",
+        "policy",
+        "coverage",
+        "page_count",
+        "pages",
+        "skipped_links",
+        "finding_count",
+        "error_count",
+        "connected_addresses",
+        "http_statuses",
+        "request_attempt_count",
+        "request_attempts",
+    }
+)
+_CRAWL_POLICY_FIELDS = frozenset(
+    {
+        "maximum_pages",
+        "maximum_depth",
+        "maximum_links_per_page",
+        "maximum_url_length",
+        "minimum_delay_seconds",
+        "query_mode",
+        "allowed_content_types",
+        "blocked_path_segments",
+    }
+)
+_CRAWL_COVERAGE_FIELDS = frozenset(
+    {
+        "pages_attempted",
+        "pages_succeeded",
+        "pages_completed_with_errors",
+        "pages_failed",
+        "requests_attempted",
+        "requests_succeeded",
+        "check_executions_planned",
+        "check_executions_executed",
+        "check_executions_skipped",
+        "unaccounted_check_executions",
+        "completion_percent",
+    }
+)
+_CRAWL_PAGE_FIELDS = frozenset(
+    {
+        "url",
+        "depth",
+        "parent_url",
+        "status",
+        "started_at",
+        "completed_at",
+        "content_type",
+        "connected_address",
+        "http_status",
+        "discovered_links",
+        "queued_links",
+        "coverage",
+        "finding_count",
+        "findings",
+        "error_count",
+        "errors",
+        "request_attempt_count",
+        "request_attempts",
+    }
+)
+_CRAWL_SKIP_FIELDS = frozenset({"reason", "count"})
+_CRAWL_COMBINED_ATTEMPT_FIELDS = frozenset(
+    {
+        "sequence",
+        "page_url",
+        "page_attempt_number",
+        "started_at",
+        "completed_at",
+        "duration_milliseconds",
+        "outcome",
+        "connected_address",
+        "http_status",
+        "error_code",
+        "retryable",
+        "retry_scheduled",
+        "backoff_seconds",
+    }
+)
+
+
+class UnsupportedCrawlSchemaVersionError(ScanReportLoadError):
+    """Raised when a crawl report uses an unsupported schema version."""
+
+    def __init__(self, schema_version: object) -> None:
+        super().__init__(
+            "crawl_scan_schema_version_unsupported",
+            "Unsupported crawl scan report schema_version "
+            f"{schema_version!r}. Supported versions are "
+            + ", ".join(SUPPORTED_CRAWL_SCAN_SCHEMA_VERSIONS)
+            + ".",
+        )
+        self.schema_version = schema_version
+
+
+def _load_crawl_policy(value: object) -> CrawlScanPolicy:
+    data = _strict_object(value, "policy", _CRAWL_POLICY_FIELDS)
+    policy = CrawlScanPolicy(
+        maximum_pages=_integer(data["maximum_pages"], "policy.maximum_pages"),
+        maximum_depth=_integer(data["maximum_depth"], "policy.maximum_depth"),
+        maximum_links_per_page=_integer(
+            data["maximum_links_per_page"],
+            "policy.maximum_links_per_page",
+        ),
+        maximum_url_length=_integer(
+            data["maximum_url_length"],
+            "policy.maximum_url_length",
+        ),
+        minimum_delay_seconds=_number(
+            data["minimum_delay_seconds"],
+            "policy.minimum_delay_seconds",
+        ),
+        query_mode=_text(data["query_mode"], "policy.query_mode"),
+        allowed_content_types=_text_list(
+            data["allowed_content_types"],
+            "policy.allowed_content_types",
+        ),
+        blocked_path_segments=_text_list(
+            data["blocked_path_segments"],
+            "policy.blocked_path_segments",
+        ),
+    )
+    if policy.to_dict() != data:
+        raise _malformed(
+            "crawl_scan_policy_inconsistent",
+            "policy contains non-canonical values or ordering.",
+        )
+    return policy
+
+
+def _load_crawl_page(value: object, index: int) -> CrawlPageScanResult:
+    path = f"pages[{index}]"
+    data = _strict_object(value, path, _CRAWL_PAGE_FIELDS)
+    findings = tuple(
+        _load_finding(item, finding_index)
+        for finding_index, item in enumerate(
+            _list(data["findings"], f"{path}.findings")
+        )
+    )
+    errors = tuple(
+        _load_error(item, error_index)
+        for error_index, item in enumerate(
+            _list(data["errors"], f"{path}.errors")
+        )
+    )
+    attempts = tuple(
+        _load_attempt(item, attempt_index)
+        for attempt_index, item in enumerate(
+            _list(data["request_attempts"], f"{path}.request_attempts")
+        )
+    )
+
+    if _integer(data["finding_count"], f"{path}.finding_count") != len(findings):
+        raise _malformed(
+            "crawl_page_finding_count_mismatch",
+            f"{path}.finding_count does not match findings.",
+        )
+    if _integer(data["error_count"], f"{path}.error_count") != len(errors):
+        raise _malformed(
+            "crawl_page_error_count_mismatch",
+            f"{path}.error_count does not match errors.",
+        )
+    if _integer(
+        data["request_attempt_count"],
+        f"{path}.request_attempt_count",
+    ) != len(attempts):
+        raise _malformed(
+            "crawl_page_attempt_count_mismatch",
+            f"{path}.request_attempt_count does not match request_attempts.",
+        )
+
+    _timestamp(data["started_at"], f"{path}.started_at")
+    _timestamp(data["completed_at"], f"{path}.completed_at")
+
+    page = CrawlPageScanResult(
+        url=_text(data["url"], f"{path}.url"),
+        depth=_integer(data["depth"], f"{path}.depth"),
+        parent_url=_optional_text(data["parent_url"], f"{path}.parent_url"),
+        status=_enum(ScanStatus, data["status"], f"{path}.status"),
+        coverage=_load_coverage(data["coverage"]),
+        request_attempts=attempts,
+        findings=findings,
+        errors=errors,
+        content_type=_optional_text(
+            data["content_type"],
+            f"{path}.content_type",
+        ),
+        connected_address=_optional_text(
+            data["connected_address"],
+            f"{path}.connected_address",
+        ),
+        http_status=_optional_integer(
+            data["http_status"],
+            f"{path}.http_status",
+        ),
+        discovered_links=_integer(
+            data["discovered_links"],
+            f"{path}.discovered_links",
+        ),
+        queued_links=_integer(
+            data["queued_links"],
+            f"{path}.queued_links",
+        ),
+    )
+    if page.to_dict() != data:
+        raise _malformed(
+            "crawl_page_inconsistent",
+            f"{path} contains incorrect derived values or non-canonical ordering.",
+        )
+    return page
+
+
+def _load_crawl_skip(value: object, index: int) -> CrawlLinkSkip:
+    path = f"skipped_links[{index}]"
+    data = _strict_object(value, path, _CRAWL_SKIP_FIELDS)
+    skip = CrawlLinkSkip(
+        reason=_text(data["reason"], f"{path}.reason"),
+        count=_integer(data["count"], f"{path}.count"),
+    )
+    if skip.to_dict() != data:
+        raise _malformed(
+            "crawl_skip_inconsistent",
+            f"{path} contains non-canonical values.",
+        )
+    return skip
+
+
+def _validate_crawl_projection(root: dict[str, Any]) -> None:
+    _strict_object(root["coverage"], "coverage", _CRAWL_COVERAGE_FIELDS)
+    for index, item in enumerate(
+        _list(root["request_attempts"], "request_attempts")
+    ):
+        data = _strict_object(
+            item,
+            f"request_attempts[{index}]",
+            _CRAWL_COMBINED_ATTEMPT_FIELDS,
+        )
+        _integer(data["sequence"], f"request_attempts[{index}].sequence")
+        _text(data["page_url"], f"request_attempts[{index}].page_url")
+        _integer(
+            data["page_attempt_number"],
+            f"request_attempts[{index}].page_attempt_number",
+        )
+
+
+def load_crawl_scan_result(data: Mapping[str, Any]) -> CrawlScanResult:
+    """Load and strictly validate one page-aware crawl scan report."""
+
+    try:
+        root = _strict_object(data, "report", _CRAWL_ROOT_FIELDS)
+        report_type = _text(root["report_type"], "report_type")
+        if report_type != "crawl_scan":
+            raise _malformed(
+                "crawl_scan_report_type_invalid",
+                "report_type must be 'crawl_scan'.",
+            )
+        schema_version = _text(root["schema_version"], "schema_version")
+        if schema_version not in SUPPORTED_CRAWL_SCAN_SCHEMA_VERSIONS:
+            raise UnsupportedCrawlSchemaVersionError(schema_version)
+
+        pages = tuple(
+            _load_crawl_page(item, index)
+            for index, item in enumerate(_list(root["pages"], "pages"))
+        )
+        skipped_links = tuple(
+            _load_crawl_skip(item, index)
+            for index, item in enumerate(
+                _list(root["skipped_links"], "skipped_links")
+            )
+        )
+        _validate_crawl_projection(root)
+
+        result = CrawlScanResult(
+            scan_id=_text(root["scan_id"], "scan_id"),
+            scan_type=_text(root["scan_type"], "scan_type"),
+            status=_enum(ScanStatus, root["status"], "status"),
+            target=_text(root["target"], "target"),
+            engine=_text(root["engine"], "engine"),
+            engine_version=_text(root["engine_version"], "engine_version"),
+            started_at=_timestamp(root["started_at"], "started_at"),
+            completed_at=_timestamp(root["completed_at"], "completed_at"),
+            policy=_load_crawl_policy(root["policy"]),
+            pages=pages,
+            skipped_links=skipped_links,
+        )
+
+        if _integer(root["page_count"], "page_count") != len(result.pages):
+            raise _malformed(
+                "crawl_scan_page_count_mismatch",
+                "page_count does not match pages.",
+            )
+        if _integer(root["finding_count"], "finding_count") != len(result.findings):
+            raise _malformed(
+                "crawl_scan_finding_count_mismatch",
+                "finding_count does not match page findings.",
+            )
+        if _integer(root["error_count"], "error_count") != len(result.errors):
+            raise _malformed(
+                "crawl_scan_error_count_mismatch",
+                "error_count does not match page errors.",
+            )
+        if _integer(
+            root["request_attempt_count"],
+            "request_attempt_count",
+        ) != result.request_attempt_count:
+            raise _malformed(
+                "crawl_scan_attempt_count_mismatch",
+                "request_attempt_count does not match page attempts.",
+            )
+
+        if result.to_dict() != root:
+            raise _malformed(
+                "crawl_scan_report_non_canonical",
+                "The crawl scan report contains inconsistent derived values or non-canonical ordering.",
+            )
+        return result
+
+    except (
+        UnsupportedCrawlSchemaVersionError,
+        MalformedScanReportError,
+    ):
+        raise
+    except (ContractValidationError, ScanContractValidationError) as exc:
+        raise _malformed(
+            "crawl_scan_report_contract_invalid",
+            f"The crawl scan report violates the contract: {exc}",
+        ) from exc
+    except (TypeError, ValueError, KeyError) as exc:
+        raise _malformed(
+            "crawl_scan_report_malformed",
+            f"The crawl scan report is malformed: {exc}",
+        ) from exc
+
+
+def _parse_report_document(document: str | bytes | bytearray) -> dict[str, Any]:
+    if isinstance(document, str):
+        try:
+            encoded_size = len(document.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise _malformed(
+                "scan_report_encoding_invalid",
+                "The scan report must be valid UTF-8.",
+            ) from exc
+        text = document
+    elif isinstance(document, (bytes, bytearray)):
+        encoded_size = len(document)
+        try:
+            text = bytes(document).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _malformed(
+                "scan_report_encoding_invalid",
+                "The scan report must be valid UTF-8.",
+            ) from exc
+    else:
+        raise _malformed(
+            "scan_report_document_invalid",
+            "The scan report document must be text or UTF-8 bytes.",
+        )
+
+    if encoded_size > MAXIMUM_SCAN_REPORT_BYTES:
+        raise _malformed(
+            "scan_report_too_large",
+            "The scan report exceeds the maximum permitted size.",
+        )
+
+    try:
+        parsed = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except _DuplicateJsonKeyError as exc:
+        raise _malformed(
+            "scan_report_duplicate_key",
+            f"The scan report contains duplicate JSON key {exc.args[0]!r}.",
+        ) from exc
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise _malformed(
+            "scan_report_json_invalid",
+            "The scan report is not valid strict JSON.",
+        ) from exc
+
+    return _object(parsed, "report")
+
+
+def _read_report_document(path: str | Path) -> bytes:
+    try:
+        report_path = Path(path)
+    except (TypeError, ValueError) as exc:
+        raise _malformed(
+            "scan_report_path_invalid",
+            "The scan report path is invalid.",
+        ) from exc
+    try:
+        size = report_path.stat().st_size
+        if size > MAXIMUM_SCAN_REPORT_BYTES:
+            raise _malformed(
+                "scan_report_too_large",
+                "The scan report exceeds the maximum permitted size.",
+            )
+        return report_path.read_bytes()
+    except MalformedScanReportError:
+        raise
+    except OSError as exc:
+        raise _malformed(
+            "scan_report_file_read_failed",
+            f"Unable to read scan report file {report_path}.",
+        ) from exc
+
+
+def load_crawl_scan_result_json(
+    document: str | bytes | bytearray,
+) -> CrawlScanResult:
+    return load_crawl_scan_result(_parse_report_document(document))
+
+
+def load_crawl_scan_result_file(path: str | Path) -> CrawlScanResult:
+    return load_crawl_scan_result_json(_read_report_document(path))
+
+
+WebGuardReport = ScanResult | CrawlScanResult
+
+
+def load_webguard_report(data: Mapping[str, Any]) -> WebGuardReport:
+    """Load either a legacy single-page report or a crawl scan report."""
+
+    root = _object(data, "report")
+    if "report_type" not in root:
+        return load_scan_result(root)
+    report_type = _text(root["report_type"], "report_type")
+    if report_type == "crawl_scan":
+        return load_crawl_scan_result(root)
+    raise _malformed(
+        "scan_report_type_unsupported",
+        f"Unsupported report_type {report_type!r}.",
+    )
+
+
+def load_webguard_report_json(
+    document: str | bytes | bytearray,
+) -> WebGuardReport:
+    return load_webguard_report(_parse_report_document(document))
+
+
+def load_webguard_report_file(path: str | Path) -> WebGuardReport:
+    return load_webguard_report_json(_read_report_document(path))

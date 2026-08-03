@@ -13,12 +13,24 @@ from typing import Sequence, TextIO
 from uuid import uuid4
 
 from webguard_contracts import (
+    CrawlScanResult,
     ScanReportLoadError,
     ScanResult,
     ScanStatus,
-    load_scan_result_file,
+    WebGuardReport,
+    load_webguard_report_file,
 )
 
+from .crawl_scan import run_passive_crawl_scan
+from .crawler import (
+    CrawlPolicy,
+    CrawlPolicyError,
+    CrawlQueryMode,
+    MAXIMUM_CRAWL_DELAY_SECONDS,
+    MAXIMUM_CRAWL_DEPTH,
+    MAXIMUM_CRAWL_PAGES,
+    MAXIMUM_LINKS_PER_PAGE,
+)
 from .passive_scan import ENGINE_VERSION, run_passive_header_scan
 from .retry_policy import RetryPolicy
 from .safe_http import FetchPolicy
@@ -156,6 +168,63 @@ def _build_retry_policy(args: argparse.Namespace) -> RetryPolicy:
         ) from exc
 
 
+def _build_crawl_policy(args: argparse.Namespace) -> CrawlPolicy | None:
+    configured = any(
+        value is not None
+        for value in (
+            args.crawl_maximum_pages,
+            args.crawl_maximum_depth,
+            args.crawl_maximum_links_per_page,
+            args.crawl_minimum_delay_seconds,
+            args.crawl_query_mode,
+        )
+    )
+
+    if not args.crawl:
+        if configured:
+            raise CliControlledError(
+                "crawl_option_requires_crawl",
+                "Crawl limit options require --crawl.",
+                exit_code=EXIT_PREFLIGHT_FAILED,
+            )
+        return None
+
+    try:
+        return CrawlPolicy(
+            maximum_pages=(
+                10
+                if args.crawl_maximum_pages is None
+                else args.crawl_maximum_pages
+            ),
+            maximum_depth=(
+                1
+                if args.crawl_maximum_depth is None
+                else args.crawl_maximum_depth
+            ),
+            maximum_links_per_page=(
+                100
+                if args.crawl_maximum_links_per_page is None
+                else args.crawl_maximum_links_per_page
+            ),
+            minimum_delay_seconds=(
+                0.1
+                if args.crawl_minimum_delay_seconds is None
+                else args.crawl_minimum_delay_seconds
+            ),
+            query_mode=CrawlQueryMode(
+                "drop"
+                if args.crawl_query_mode is None
+                else args.crawl_query_mode
+            ),
+        )
+    except (CrawlPolicyError, ValueError) as exc:
+        raise CliControlledError(
+            getattr(exc, "code", "crawl_policy_invalid"),
+            str(exc),
+            exit_code=EXIT_PREFLIGHT_FAILED,
+        ) from exc
+
+
 def _build_validation_policy(args: argparse.Namespace) -> ValidationPolicy:
     allowed_hosts = frozenset(args.allowed_hosts)
 
@@ -247,7 +316,7 @@ def _check_output_path(path: Path, *, overwrite: bool) -> None:
 
 
 def _write_report(
-    result: ScanResult,
+    result: WebGuardReport,
     path: Path,
     *,
     overwrite: bool,
@@ -380,6 +449,106 @@ def _render_scan_result(
         print(f"Saved report: {output_path}", file=stream)
 
 
+def _render_crawl_result(
+    result: CrawlScanResult,
+    *,
+    stream: TextIO,
+    output_path: Path | None = None,
+) -> None:
+    completion = result.coverage.completion_percent
+    completion_text = (
+        "not applicable"
+        if completion is None
+        else f"{completion}%"
+    )
+
+    print(f"Scan ID: {result.scan_id}", file=stream)
+    print(f"Status: {result.status.value}", file=stream)
+    print(f"Target: {result.target}", file=stream)
+    print(f"Engine: {result.engine} {result.engine_version}", file=stream)
+    print("Mode: same-origin crawl", file=stream)
+    print(
+        "Pages: "
+        f"{result.coverage.pages_attempted} attempted, "
+        f"{result.coverage.pages_succeeded} succeeded, "
+        f"{result.coverage.pages_failed} failed",
+        file=stream,
+    )
+    print(
+        "Requests: "
+        f"{result.coverage.requests_attempted} attempted, "
+        f"{result.coverage.requests_succeeded} succeeded",
+        file=stream,
+    )
+    print(f"Coverage: {completion_text}", file=stream)
+    print(f"Findings: {len(result.findings)}", file=stream)
+    print(f"Errors: {len(result.errors)}", file=stream)
+    print(
+        "Connected addresses: "
+        f"{_display_values(result.connected_addresses)}",
+        file=stream,
+    )
+    print(
+        f"HTTP statuses: {_display_values(result.http_statuses)}",
+        file=stream,
+    )
+
+    for page in result.pages:
+        page_coverage = page.coverage.completion_percent
+        page_coverage_text = (
+            "not applicable"
+            if page_coverage is None
+            else f"{page_coverage}%"
+        )
+        print(
+            f"- [PAGE depth={page.depth}] {page.status.value}: "
+            f"{page.url}; coverage {page_coverage_text}; "
+            f"findings {len(page.findings)}; errors {len(page.errors)}",
+            file=stream,
+        )
+        for finding in page.findings:
+            print(
+                f"  - [{finding.severity.value.upper()}] "
+                f"{finding.title} ({finding.identity.rule_id})",
+                file=stream,
+            )
+        for error in page.errors:
+            print(
+                f"  - [ERROR] {error.stage}/{error.code}: "
+                f"{error.message}",
+                file=stream,
+            )
+
+    for skipped in result.skipped_links:
+        print(
+            f"- [CRAWL SKIP] {skipped.reason}: {skipped.count}",
+            file=stream,
+        )
+
+    if output_path is not None:
+        print(f"Saved report: {output_path}", file=stream)
+
+
+
+def _render_report(
+    result: WebGuardReport,
+    *,
+    stream: TextIO,
+    output_path: Path | None = None,
+) -> None:
+    if isinstance(result, CrawlScanResult):
+        _render_crawl_result(
+            result,
+            stream=stream,
+            output_path=output_path,
+        )
+    else:
+        _render_scan_result(
+            result,
+            stream=stream,
+            output_path=output_path,
+        )
+
 def _scan_command(args: argparse.Namespace) -> int:
     scan_id = str(uuid4())
     output_path = _normalise_output_path(args.output, scan_id=scan_id)
@@ -389,6 +558,7 @@ def _scan_command(args: argparse.Namespace) -> int:
     validation_policy = _build_validation_policy(args)
     fetch_policy = _build_fetch_policy(args)
     retry_policy = _build_retry_policy(args)
+    crawl_policy = _build_crawl_policy(args)
 
     try:
         target = validate_target_url(
@@ -402,19 +572,28 @@ def _scan_command(args: argparse.Namespace) -> int:
             exit_code=EXIT_PREFLIGHT_FAILED,
         ) from exc
 
-    result = run_passive_header_scan(
-        target,
-        fetch_policy=fetch_policy,
-        retry_policy=retry_policy,
-        scan_id=scan_id,
-    )
+    if crawl_policy is None:
+        result: WebGuardReport = run_passive_header_scan(
+            target,
+            fetch_policy=fetch_policy,
+            retry_policy=retry_policy,
+            scan_id=scan_id,
+        )
+    else:
+        result = run_passive_crawl_scan(
+            target,
+            crawl_policy=crawl_policy,
+            fetch_policy=fetch_policy,
+            retry_policy=retry_policy,
+            scan_id=scan_id,
+        )
 
     _write_report(
         result,
         output_path,
         overwrite=args.overwrite,
     )
-    _render_scan_result(
+    _render_report(
         result,
         stream=sys.stdout,
         output_path=output_path,
@@ -426,9 +605,9 @@ def _scan_command(args: argparse.Namespace) -> int:
     return EXIT_SCAN_FAILED
 
 
-def _load_report(path: Path) -> ScanResult:
+def _load_report(path: Path) -> WebGuardReport:
     try:
-        return load_scan_result_file(path)
+        return load_webguard_report_file(path)
     except ScanReportLoadError as exc:
         raise CliControlledError(
             exc.code,
@@ -441,6 +620,14 @@ def _report_validate_command(args: argparse.Namespace) -> int:
     result = _load_report(args.report)
 
     print(f"Valid report: {args.report}")
+    print(
+        "Report type: "
+        + (
+            "crawl_scan"
+            if isinstance(result, CrawlScanResult)
+            else "single_scan"
+        )
+    )
     print(f"Normalized schema: {result.schema_version}")
     print(f"Scan ID: {result.scan_id}")
     print(f"Status: {result.status.value}")
@@ -455,7 +642,7 @@ def _report_inspect_command(args: argparse.Namespace) -> int:
         print(result.to_json())
     else:
         print(f"Report: {args.report}")
-        _render_scan_result(result, stream=sys.stdout)
+        _render_report(result, stream=sys.stdout)
 
     return EXIT_SUCCESS
 
@@ -483,7 +670,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan = commands.add_parser(
         "scan",
-        help="Run a passive HTTP security-header scan.",
+        help="Run an authorised passive HTTP response scan.",
     )
     scan.add_argument("target", help="Authorised HTTP or HTTPS target URL.")
     scan.add_argument(
@@ -516,6 +703,68 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Explicitly allow an authorised laboratory hostname. "
             "May be repeated and is valid only with --lab."
+        ),
+    )
+    scan.add_argument(
+        "--crawl",
+        action="store_true",
+        help=(
+            "Safely crawl and passively analyse bounded same-origin HTML "
+            "pages. No forms, JavaScript routes, or redirects are followed."
+        ),
+    )
+    scan.add_argument(
+        "--crawl-max-pages",
+        dest="crawl_maximum_pages",
+        type=int,
+        default=None,
+        metavar="COUNT",
+        help=(
+            "Maximum pages in crawl mode (default: 10; "
+            f"maximum: {MAXIMUM_CRAWL_PAGES})."
+        ),
+    )
+    scan.add_argument(
+        "--crawl-max-depth",
+        dest="crawl_maximum_depth",
+        type=int,
+        default=None,
+        metavar="DEPTH",
+        help=(
+            "Maximum link depth in crawl mode (default: 1; "
+            f"maximum: {MAXIMUM_CRAWL_DEPTH})."
+        ),
+    )
+    scan.add_argument(
+        "--crawl-max-links",
+        dest="crawl_maximum_links_per_page",
+        type=int,
+        default=None,
+        metavar="COUNT",
+        help=(
+            "Maximum anchor links considered per page (default: 100; "
+            f"maximum: {MAXIMUM_LINKS_PER_PAGE})."
+        ),
+    )
+    scan.add_argument(
+        "--crawl-delay",
+        dest="crawl_minimum_delay_seconds",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Minimum delay between crawl pages (default: 0.1; "
+            f"maximum: {MAXIMUM_CRAWL_DELAY_SECONDS:g})."
+        ),
+    )
+    scan.add_argument(
+        "--crawl-query-mode",
+        choices=tuple(item.value for item in CrawlQueryMode),
+        default=None,
+        metavar="MODE",
+        help=(
+            "Discovered-query handling in crawl mode: drop or reject "
+            "(default: drop)."
         ),
     )
     scan.add_argument(

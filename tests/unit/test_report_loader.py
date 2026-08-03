@@ -28,6 +28,8 @@ from webguard_contracts import (
     load_scan_result,
     load_scan_result_file,
     load_scan_result_json,
+    load_webguard_report,
+    load_webguard_report_json,
 )
 
 
@@ -360,6 +362,23 @@ class ReportLoaderTests(unittest.TestCase):
         load_scan_result(report)
 
         self.assertEqual(report, original)
+
+
+    def test_generic_loader_preserves_single_page_compatibility(self) -> None:
+        loaded = load_webguard_report_json(result().to_json())
+        self.assertEqual(loaded, result())
+
+    def test_generic_loader_rejects_unknown_report_type(self) -> None:
+        report = current_report()
+        report["report_type"] = "unknown"
+
+        with self.assertRaises(MalformedScanReportError) as context:
+            load_webguard_report(report)
+
+        self.assertEqual(
+            context.exception.code,
+            "scan_report_type_unsupported",
+        )
 
 
 if __name__ == "__main__":

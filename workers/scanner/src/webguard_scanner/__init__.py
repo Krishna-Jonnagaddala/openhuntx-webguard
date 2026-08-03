@@ -38,6 +38,7 @@ from .crawler import (
     PageVisitor,
     crawl_same_origin,
 )
+from .crawl_scan import run_passive_crawl_scan
 from .disclosure_analyzer import (
     DISCLOSURE_CHECKS,
     DisclosureAnalysisError,
@@ -150,6 +151,7 @@ __all__ = [
     "known_error_codes",
     "registered_checks",
     "resolve_host",
+    "run_passive_crawl_scan",
     "run_passive_header_scan",
     "validate_analyzer_registry",
     "validate_target_url",
