@@ -38,6 +38,7 @@ pnpm-debug.log*
 # Scanner output
 scan-results/
 reports/
+authorizations/*.json
 zap-data/
 artifacts/
 *.har

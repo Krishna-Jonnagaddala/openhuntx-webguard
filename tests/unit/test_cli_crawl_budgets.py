@@ -96,6 +96,9 @@ class CrawlBudgetCliTests(unittest.TestCase):
                     [
                         "scan",
                         "https://example.com",
+                        "--lab",
+                        "--allow-host",
+                        "example.com",
                         "--crawl",
                         "--crawl-time-limit",
                         "45",
@@ -202,6 +205,9 @@ class CrawlBudgetCliTests(unittest.TestCase):
                     [
                         "scan",
                         "https://example.com",
+                        "--lab",
+                        "--allow-host",
+                        "example.com",
                         "--crawl",
                         "-o",
                         str(output),

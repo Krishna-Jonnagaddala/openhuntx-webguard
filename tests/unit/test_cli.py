@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,12 +14,14 @@ from webguard_contracts import (
     CrawlPageScanResult,
     CrawlScanPolicy,
     CrawlScanResult,
+    OwnedTargetAuthorization,
     RequestAttempt,
     RequestAttemptOutcome,
     ScanCoverage,
     ScanError,
     ScanResult,
     ScanStatus,
+    write_owned_target_authorization_file,
     load_scan_result_file,
     load_webguard_report_file,
 )
@@ -28,6 +30,7 @@ from webguard_scanner.scope_validator import ValidatedTarget, ValidationMode
 
 
 _NOW = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
+_AUTHORIZATION_ID = "441f8778-e8c9-4af7-90c0-4e8eb4979777"
 _TARGET = ValidatedTarget(
     original_url="https://example.com/",
     normalised_url="https://example.com/",
@@ -130,6 +133,24 @@ class CliTests(unittest.TestCase):
             exit_code = cli.main(argv)
         return exit_code, stdout.getvalue(), stderr.getvalue()
 
+    def _authorization_file(self, directory: str) -> Path:
+        now = datetime.now(timezone.utc)
+        path = Path(directory) / "authorization.json"
+        write_owned_target_authorization_file(
+            OwnedTargetAuthorization(
+                authorization_id=_AUTHORIZATION_ID,
+                organization="Example Ltd",
+                authorized_by="Security Owner",
+                target="https://example.com/",
+                allowed_hosts=("example.com",),
+                issued_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=30),
+                purpose="Unit-test owned-target passive assessment",
+            ),
+            path,
+        )
+        return path
+
     def test_version_uses_engine_version(self) -> None:
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
@@ -142,6 +163,7 @@ class CliTests(unittest.TestCase):
     def test_scan_uses_commercial_mode_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "report.json"
+            authorization = self._authorization_file(directory)
 
             with patch.object(
                 cli,
@@ -155,7 +177,16 @@ class CliTests(unittest.TestCase):
                 ),
             ) as scan:
                 exit_code, stdout, stderr = self._run(
-                    ["scan", "https://example.com", "-o", str(output)]
+                    [
+                        "scan",
+                        "https://example.com",
+                        "--authorization-file",
+                        str(authorization),
+                        "--confirm-authorization",
+                        _AUTHORIZATION_ID,
+                        "-o",
+                        str(output),
+                    ]
                 )
 
             self.assertEqual(exit_code, cli.EXIT_SUCCESS)
@@ -272,6 +303,9 @@ class CliTests(unittest.TestCase):
                     [
                         "scan",
                         "https://example.com",
+                        "--lab",
+                        "--allow-host",
+                        "example.com",
                         "-o",
                         str(output),
                         "--overwrite",
@@ -328,6 +362,7 @@ class CliTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "report.json"
+            authorization = self._authorization_file(directory)
             with patch.object(
                 cli,
                 "validate_target_url",
@@ -337,7 +372,16 @@ class CliTests(unittest.TestCase):
                 ),
             ):
                 exit_code, _, stderr = self._run(
-                    ["scan", "https://example.com", "-o", str(output)]
+                    [
+                        "scan",
+                        "https://example.com",
+                        "--authorization-file",
+                        str(authorization),
+                        "--confirm-authorization",
+                        _AUTHORIZATION_ID,
+                        "-o",
+                        str(output),
+                    ]
                 )
 
         self.assertEqual(exit_code, cli.EXIT_PREFLIGHT_FAILED)
@@ -359,7 +403,15 @@ class CliTests(unittest.TestCase):
                 ),
             ):
                 exit_code, stdout, stderr = self._run(
-                    ["scan", "https://example.com", "-o", str(output)]
+                    [
+                        "scan",
+                        "https://example.com",
+                        "--lab",
+                        "--allow-host",
+                        "example.com",
+                        "-o",
+                        str(output),
+                    ]
                 )
 
             self.assertEqual(exit_code, cli.EXIT_SCAN_FAILED)
@@ -387,7 +439,13 @@ class CliTests(unittest.TestCase):
                     ),
                 ):
                     exit_code, stdout, _ = self._run(
-                        ["scan", "https://example.com"]
+                        [
+                            "scan",
+                            "https://example.com",
+                            "--lab",
+                            "--allow-host",
+                            "example.com",
+                        ]
                     )
             finally:
                 cli.DEFAULT_OUTPUT_DIRECTORY = original_directory
@@ -483,6 +541,9 @@ class CliTests(unittest.TestCase):
                     [
                         "scan",
                         "https://example.com",
+                        "--lab",
+                        "--allow-host",
+                        "example.com",
                         "--crawl",
                         "--crawl-max-pages",
                         "5",

@@ -235,6 +235,9 @@ class CrawlCheckpointCliTests(unittest.TestCase):
                     [
                         "scan",
                         "https://example.com/",
+                        "--lab",
+                        "--allow-host",
+                        "example.com",
                         "--crawl",
                         "--crawl-max-pages",
                         "5",
@@ -283,6 +286,9 @@ class CrawlCheckpointCliTests(unittest.TestCase):
                     [
                         "scan",
                         "https://example.com/",
+                        "--lab",
+                        "--allow-host",
+                        "example.com",
                         "--crawl",
                         "--resume-from",
                         str(checkpoint_path),
