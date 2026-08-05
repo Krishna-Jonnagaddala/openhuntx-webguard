@@ -21,6 +21,7 @@ from webguard_scanner import (
     HeaderAnalysisError,
     PassiveAnalyzer,
     SafeHttpResponse,
+    TlsConnectionInfo,
     ValidatedTarget,
     run_passive_crawl_scan,
 )
@@ -39,6 +40,36 @@ def target() -> ValidatedTarget:
         hostname="127.0.0.1",
         port=3000,
         resolved_addresses=("127.0.0.1",),
+    )
+
+
+def https_target() -> ValidatedTarget:
+    return ValidatedTarget(
+        original_url="https://example.com/",
+        normalised_url="https://example.com/",
+        scheme="https",
+        hostname="example.com",
+        port=443,
+        resolved_addresses=("93.184.216.34",),
+    )
+
+
+def tls_info(
+    *,
+    protocol: str = "TLSv1.3",
+) -> TlsConnectionInfo:
+    return TlsConnectionInfo(
+        protocol=protocol,
+        cipher_name="TLS_AES_256_GCM_SHA384",
+        cipher_bits=256,
+        server_hostname="example.com",
+        certificate_not_before=START - timedelta(days=30),
+        certificate_not_after=START + timedelta(days=120),
+        certificate_sha256="a" * 64,
+        subject_alt_names=("DNS:example.com",),
+        certificate_verified=True,
+        hostname_validated=True,
+        verified_chain_length=3,
     )
 
 
@@ -66,7 +97,11 @@ def attempt(
     )
 
 
-def response() -> SafeHttpResponse:
+def response(
+    *,
+    tls: TlsConnectionInfo | None = None,
+    connected_address: str = "127.0.0.1",
+) -> SafeHttpResponse:
     return SafeHttpResponse(
         status=200,
         reason="OK",
@@ -74,10 +109,14 @@ def response() -> SafeHttpResponse:
             ("Content-Type", "text/html; charset=utf-8"),
             ("X-Content-Type-Options", "nosniff"),
             ("X-Frame-Options", "DENY"),
+            ("Strict-Transport-Security", "max-age=31536000"),
+            ("Content-Security-Policy", "frame-ancestors 'none'"),
+            ("Referrer-Policy", "no-referrer"),
         ),
         body=b"<html></html>",
-        connected_address="127.0.0.1",
+        connected_address=connected_address,
         elapsed_milliseconds=10,
+        tls=tls,
     )
 
 
@@ -136,10 +175,10 @@ class CrawlScanTests(unittest.TestCase):
         self.assertEqual(len(result.pages), 1)
         self.assertEqual(result.coverage.pages_succeeded, 1)
         self.assertEqual(result.coverage.requests_attempted, 1)
-        self.assertEqual(result.coverage.check_executions_planned, 33)
+        self.assertEqual(result.coverage.check_executions_planned, 40)
         self.assertEqual(result.coverage.check_executions_executed, 32)
-        self.assertEqual(result.coverage.check_executions_skipped, 1)
-        self.assertTrue(result.findings)
+        self.assertEqual(result.coverage.check_executions_skipped, 8)
+        self.assertEqual(result.findings, ())
         crawl_mock.assert_called_once()
 
     @patch("webguard_scanner.crawl_scan._utc_now", return_value=END)
@@ -185,7 +224,7 @@ class CrawlScanTests(unittest.TestCase):
             ScanStatus.COMPLETED_WITH_ERRORS,
         )
         self.assertEqual(result.pages[0].errors[0].stage, "analysis.headers")
-        self.assertEqual(len(result.pages[0].coverage.skipped_checks), 5)
+        self.assertEqual(len(result.pages[0].coverage.skipped_checks), 12)
 
     @patch("webguard_scanner.crawl_scan._utc_now", return_value=END)
     @patch("webguard_scanner.crawl_scan.crawl_same_origin")
@@ -298,6 +337,77 @@ class CrawlScanTests(unittest.TestCase):
                 scan_id=SCAN_ID,
                 started_at=START,
             )
+
+
+    @patch("webguard_scanner.crawl_scan._utc_now", return_value=END)
+    @patch("webguard_scanner.tls_analyzer._utc_now", return_value=START)
+    @patch("webguard_scanner.crawl_scan.crawl_same_origin")
+    def test_https_page_uses_existing_tls_metadata_without_second_fetch(
+        self,
+        crawl_mock,
+        _tls_clock_mock,
+        _clock_mock,
+    ) -> None:
+        page = CrawlPageRecord(
+            url="https://example.com/",
+            depth=0,
+            parent_url=None,
+            outcome=CrawlPageOutcome.SUCCEEDED,
+            attempts=(
+                RequestAttempt(
+                    attempt_number=1,
+                    started_at=START + timedelta(milliseconds=10),
+                    completed_at=START + timedelta(milliseconds=20),
+                    outcome=RequestAttemptOutcome.SUCCEEDED,
+                    connected_address="93.184.216.34",
+                    http_status=200,
+                ),
+            ),
+            content_type="text/html",
+            connected_address="93.184.216.34",
+            http_status=200,
+        )
+        execution = CrawlExecution(
+            root_url="https://example.com/",
+            pages=(page,),
+            skipped_links=(),
+        )
+
+        def run(_root, *, on_page, **_kwargs):
+            on_page(
+                https_target(),
+                response(
+                    tls=tls_info(protocol="TLSv1.1"),
+                    connected_address="93.184.216.34",
+                ),
+                0,
+                None,
+            )
+            return execution
+
+        crawl_mock.side_effect = run
+        result = run_passive_crawl_scan(
+            https_target(),
+            crawl_policy=CrawlPolicy(
+                maximum_depth=0,
+                minimum_delay_seconds=0,
+            ),
+            scan_id=SCAN_ID,
+            started_at=START,
+        )
+        self.assertIn(
+            "web.tls.protocol.deprecated",
+            {item.identity.rule_id for item in result.findings},
+        )
+        self.assertEqual(
+            result.pages[0].coverage.completion_percent,
+            100.0,
+        )
+        self.assertEqual(
+            result.coverage.check_executions_planned,
+            40,
+        )
+        crawl_mock.assert_called_once()
 
 
 if __name__ == "__main__":

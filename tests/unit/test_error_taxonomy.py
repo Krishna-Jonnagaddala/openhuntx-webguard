@@ -9,6 +9,7 @@ from pathlib import Path
 
 import webguard_scanner.header_analyzer as header_analyzer_module
 import webguard_scanner.safe_http as safe_http_module
+import webguard_scanner.tls_analyzer as tls_analyzer_module
 
 from webguard_scanner import (
     ErrorCategory,
@@ -80,6 +81,10 @@ class ErrorTaxonomyTests(unittest.TestCase):
         for code in (
             "tls_certificate_invalid",
             "tls_handshake_failed",
+            "tls_context_insecure",
+            "tls_metadata_unavailable",
+            "tls_certificate_metadata_invalid",
+            "tls_certificate_metadata_too_large",
         ):
             with self.subTest(code=code):
                 policy = classify_error(
@@ -178,6 +183,14 @@ class ErrorTaxonomyTests(unittest.TestCase):
 
         self.assertEqual(
             emitted_codes - reviewed_codes,
+            set(),
+        )
+        tls_emitted_codes = _literal_error_codes(
+            tls_analyzer_module,
+            "TlsAnalysisError",
+        )
+        self.assertEqual(
+            tls_emitted_codes - reviewed_codes,
             set(),
         )
 

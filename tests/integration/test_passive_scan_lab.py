@@ -19,6 +19,7 @@ from webguard_scanner import (
     PASSIVE_CORS_CHECKS,
     PASSIVE_DISCLOSURE_CHECKS,
     PASSIVE_HTML_CHECKS,
+    PASSIVE_TLS_CHECKS,
     ValidationMode,
     ValidationPolicy,
     run_passive_header_scan,
@@ -87,10 +88,10 @@ class PassiveScanLabIntegrationTests(unittest.TestCase):
             result.coverage.planned_checks,
             tuple(sorted(PASSIVE_CHECKS)),
         )
-        self.assertEqual(len(DEFAULT_PASSIVE_ANALYZERS), 5)
+        self.assertEqual(len(DEFAULT_PASSIVE_ANALYZERS), 6)
         self.assertEqual(
             result.coverage.completion_percent,
-            96.97,
+            80.0,
         )
         self.assertTrue(
             set(PASSIVE_COOKIE_CHECKS).issubset(
@@ -110,6 +111,14 @@ class PassiveScanLabIntegrationTests(unittest.TestCase):
         self.assertTrue(
             set(PASSIVE_HTML_CHECKS).issubset(
                 result.coverage.executed_checks
+            )
+        )
+        self.assertTrue(
+            set(PASSIVE_TLS_CHECKS).issubset(
+                {
+                    item.check_id
+                    for item in result.coverage.skipped_checks
+                }
             )
         )
         self.assertEqual(len(result.request_attempts), 1)

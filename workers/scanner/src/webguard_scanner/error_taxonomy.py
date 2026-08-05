@@ -113,6 +113,22 @@ _REQUEST_POLICIES: dict[str, ErrorPolicy] = {
         ErrorCategory.TLS,
         _NON_RETRYABLE,
     ),
+    "tls_context_insecure": ErrorPolicy(
+        ErrorCategory.TLS,
+        _NON_RETRYABLE,
+    ),
+    "tls_metadata_unavailable": ErrorPolicy(
+        ErrorCategory.TLS,
+        _NON_RETRYABLE,
+    ),
+    "tls_certificate_metadata_invalid": ErrorPolicy(
+        ErrorCategory.TLS,
+        _NON_RETRYABLE,
+    ),
+    "tls_certificate_metadata_too_large": ErrorPolicy(
+        ErrorCategory.TLS,
+        _NON_RETRYABLE,
+    ),
     "http_protocol_error": ErrorPolicy(
         ErrorCategory.HTTP_PROTOCOL,
         _NON_RETRYABLE,
@@ -153,6 +169,22 @@ _REQUEST_POLICIES: dict[str, ErrorPolicy] = {
 
 _ANALYSIS_POLICIES: dict[str, ErrorPolicy] = {
     "validated_target_mismatch": ErrorPolicy(
+        ErrorCategory.ANALYSIS,
+        _NON_RETRYABLE,
+    ),
+    "tls_metadata_missing": ErrorPolicy(
+        ErrorCategory.ANALYSIS,
+        _NON_RETRYABLE,
+    ),
+    "tls_metadata_inconsistent": ErrorPolicy(
+        ErrorCategory.ANALYSIS,
+        _NON_RETRYABLE,
+    ),
+    "tls_certificate_time_invalid": ErrorPolicy(
+        ErrorCategory.ANALYSIS,
+        _NON_RETRYABLE,
+    ),
+    "tls_target_not_https": ErrorPolicy(
         ErrorCategory.ANALYSIS,
         _NON_RETRYABLE,
     ),

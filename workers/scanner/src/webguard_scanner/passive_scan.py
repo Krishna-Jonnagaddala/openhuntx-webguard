@@ -48,6 +48,11 @@ from .html_analyzer import (
     HtmlAnalysisError,
     analyze_html_security,
 )
+from .tls_analyzer import (
+    TLS_CHECKS,
+    TlsAnalysisError,
+    analyze_tls_security,
+)
 from .retry_policy import RetryPolicy
 from .safe_http import (
     FetchPolicy,
@@ -72,6 +77,7 @@ PASSIVE_COOKIE_CHECKS = COOKIE_CHECKS
 PASSIVE_CORS_CHECKS = CORS_CHECKS
 PASSIVE_DISCLOSURE_CHECKS = DISCLOSURE_CHECKS
 PASSIVE_HTML_CHECKS = HTML_CHECKS
+PASSIVE_TLS_CHECKS = TLS_CHECKS
 
 
 def _run_header_analyzer(target, response):
@@ -92,6 +98,10 @@ def _run_disclosure_analyzer(target, response):
 
 def _run_html_analyzer(target, response):
     return analyze_html_security(target, response)
+
+
+def _run_tls_analyzer(target, response):
+    return analyze_tls_security(target, response)
 
 
 DEFAULT_PASSIVE_ANALYZERS = validate_analyzer_registry(
@@ -131,6 +141,13 @@ DEFAULT_PASSIVE_ANALYZERS = validate_analyzer_registry(
             analyze=_run_html_analyzer,
             controlled_error=HtmlAnalysisError,
         ),
+        PassiveAnalyzer(
+            analyzer_id="tls",
+            checks=PASSIVE_TLS_CHECKS,
+            finding_namespace="web.tls",
+            analyze=_run_tls_analyzer,
+            controlled_error=TlsAnalysisError,
+        ),
     )
 )
 
@@ -149,21 +166,35 @@ def _skipped_checks_for_target(
 ) -> tuple[SkippedCheck, ...]:
     """Return registered checks that do not apply to the target."""
 
-    if (
-        target.scheme == "https"
-        or "web.headers.hsts" not in planned_checks
-    ):
+    if target.scheme == "https":
         return ()
 
-    return (
-        SkippedCheck(
-            check_id="web.headers.hsts",
-            reason=(
-                "HSTS applies only to HTTPS responses and was not "
-                "evaluated for this HTTP target."
-            ),
-        ),
-    )
+    skipped: list[SkippedCheck] = []
+
+    if "web.headers.hsts" in planned_checks:
+        skipped.append(
+            SkippedCheck(
+                check_id="web.headers.hsts",
+                reason=(
+                    "HSTS applies only to HTTPS responses and was not "
+                    "evaluated for this HTTP target."
+                ),
+            )
+        )
+
+    for check_id in PASSIVE_TLS_CHECKS:
+        if check_id in planned_checks:
+            skipped.append(
+                SkippedCheck(
+                    check_id=check_id,
+                    reason=(
+                        "TLS connection and certificate analysis applies only "
+                        "to HTTPS targets."
+                    ),
+                )
+            )
+
+    return tuple(sorted(skipped, key=lambda item: item.check_id))
 
 
 def _request_failure_coverage(

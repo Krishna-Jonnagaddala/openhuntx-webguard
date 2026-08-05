@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import http.client
 import ipaddress
 import socket
 import ssl
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import FrozenSet, Iterable, Tuple
 from urllib.parse import urlsplit
 
@@ -26,6 +28,23 @@ class FetchPolicy:
     allowed_methods: FrozenSet[str] = frozenset({"GET", "HEAD"})
 
 
+@dataclass(frozen=True, slots=True)
+class TlsConnectionInfo:
+    """Bounded non-secret metadata from one verified TLS connection."""
+
+    protocol: str
+    cipher_name: str
+    cipher_bits: int
+    server_hostname: str
+    certificate_not_before: datetime
+    certificate_not_after: datetime
+    certificate_sha256: str
+    subject_alt_names: Tuple[str, ...]
+    certificate_verified: bool
+    hostname_validated: bool
+    verified_chain_length: int | None = None
+
+
 @dataclass(frozen=True)
 class SafeHttpResponse:
     """Bounded HTTP response returned by the safe client."""
@@ -36,6 +55,7 @@ class SafeHttpResponse:
     body: bytes
     connected_address: str
     elapsed_milliseconds: int
+    tls: TlsConnectionInfo | None = None
 
 
 class SafeRequestError(RuntimeError):
@@ -45,6 +65,184 @@ class SafeRequestError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+
+
+_MAXIMUM_TLS_NAME_ENTRIES = 256
+_MAXIMUM_TLS_NAME_LENGTH = 512
+_MAXIMUM_TLS_CHAIN_CERTIFICATES = 32
+_MAXIMUM_TLS_TEXT_LENGTH = 256
+
+
+def _bounded_tls_text(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise SafeRequestError(
+            "tls_certificate_metadata_invalid",
+            f"TLS {name} metadata is not text.",
+        )
+
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > _MAXIMUM_TLS_TEXT_LENGTH:
+        raise SafeRequestError(
+            "tls_certificate_metadata_invalid",
+            f"TLS {name} metadata is missing or too long.",
+        )
+    return cleaned
+
+
+def _certificate_time(value: object, name: str) -> datetime:
+    text = _bounded_tls_text(value, name)
+    try:
+        timestamp = ssl.cert_time_to_seconds(text)
+    except (TypeError, ValueError) as exc:
+        raise SafeRequestError(
+            "tls_certificate_metadata_invalid",
+            f"TLS certificate {name} is invalid.",
+        ) from exc
+    return datetime.fromtimestamp(timestamp, timezone.utc)
+
+
+def _subject_alt_names(certificate: dict[str, object]) -> Tuple[str, ...]:
+    raw = certificate.get("subjectAltName", ())
+    if not isinstance(raw, (tuple, list)):
+        raise SafeRequestError(
+            "tls_certificate_metadata_invalid",
+            "TLS certificate subjectAltName metadata is invalid.",
+        )
+    if len(raw) > _MAXIMUM_TLS_NAME_ENTRIES:
+        raise SafeRequestError(
+            "tls_certificate_metadata_too_large",
+            "TLS certificate contains too many subject alternative names.",
+        )
+
+    names: list[str] = []
+    for item in raw:
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not isinstance(item[1], str)
+        ):
+            raise SafeRequestError(
+                "tls_certificate_metadata_invalid",
+                "TLS certificate subjectAltName entry is invalid.",
+            )
+        kind, value = item
+        cleaned = value.strip()
+        if len(cleaned) > _MAXIMUM_TLS_NAME_LENGTH:
+            raise SafeRequestError(
+                "tls_certificate_metadata_too_large",
+                "TLS certificate subject alternative name is too long.",
+            )
+        if kind in {"DNS", "IP Address"} and cleaned:
+            rendered = f"{kind}:{cleaned}"
+            if rendered not in names:
+                names.append(rendered)
+    return tuple(sorted(names))
+
+
+def _verified_chain_length(sock: object) -> int | None:
+    getter = getattr(sock, "get_verified_chain", None)
+    if not callable(getter):
+        return None
+    try:
+        chain = getter()
+    except (AttributeError, NotImplementedError, ssl.SSLError):
+        return None
+    if chain is None:
+        return None
+    if not isinstance(chain, (tuple, list)):
+        raise SafeRequestError(
+            "tls_certificate_metadata_invalid",
+            "TLS verified-chain metadata is invalid.",
+        )
+    if len(chain) > _MAXIMUM_TLS_CHAIN_CERTIFICATES:
+        raise SafeRequestError(
+            "tls_certificate_metadata_too_large",
+            "TLS verified chain contains too many certificates.",
+        )
+    return len(chain)
+
+
+def _tls_connection_info(
+    connection: http.client.HTTPConnection,
+    target: ValidatedTarget,
+) -> TlsConnectionInfo:
+    sock = getattr(connection, "sock", None)
+    context = getattr(connection, "_context", None)
+
+    if sock is None or context is None:
+        raise SafeRequestError(
+            "tls_metadata_unavailable",
+            "The verified TLS socket metadata is unavailable.",
+        )
+
+    certificate_verified = (
+        getattr(context, "verify_mode", None) == ssl.CERT_REQUIRED
+    )
+    hostname_validated = bool(
+        getattr(context, "check_hostname", False)
+    )
+    if not certificate_verified or not hostname_validated:
+        raise SafeRequestError(
+            "tls_context_insecure",
+            "The HTTPS connection did not enforce certificate and hostname "
+            "verification.",
+        )
+
+    try:
+        certificate = sock.getpeercert(binary_form=False)
+        certificate_der = sock.getpeercert(binary_form=True)
+        protocol = sock.version()
+        cipher = sock.cipher()
+    except (AttributeError, OSError, ssl.SSLError) as exc:
+        raise SafeRequestError(
+            "tls_metadata_unavailable",
+            "Unable to read verified TLS connection metadata.",
+        ) from exc
+
+    if not isinstance(certificate, dict) or not certificate:
+        raise SafeRequestError(
+            "tls_certificate_metadata_invalid",
+            "The peer certificate metadata is unavailable.",
+        )
+    if not isinstance(certificate_der, bytes) or not certificate_der:
+        raise SafeRequestError(
+            "tls_certificate_metadata_invalid",
+            "The peer certificate DER data is unavailable.",
+        )
+    if (
+        not isinstance(cipher, tuple)
+        or len(cipher) != 3
+        or isinstance(cipher[2], bool)
+        or not isinstance(cipher[2], int)
+        or cipher[2] < 0
+    ):
+        raise SafeRequestError(
+            "tls_certificate_metadata_invalid",
+            "The negotiated TLS cipher metadata is invalid.",
+        )
+
+    return TlsConnectionInfo(
+        protocol=_bounded_tls_text(protocol, "protocol"),
+        cipher_name=_bounded_tls_text(cipher[0], "cipher"),
+        cipher_bits=cipher[2],
+        server_hostname=target.hostname,
+        certificate_not_before=_certificate_time(
+            certificate.get("notBefore"),
+            "notBefore",
+        ),
+        certificate_not_after=_certificate_time(
+            certificate.get("notAfter"),
+            "notAfter",
+        ),
+        certificate_sha256=hashlib.sha256(certificate_der).hexdigest(),
+        subject_alt_names=_subject_alt_names(certificate),
+        certificate_verified=True,
+        hostname_validated=True,
+        verified_chain_length=_verified_chain_length(sock),
+    )
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -389,6 +587,11 @@ def _perform_request(
             "close",
         )
         connection.endheaders()
+        tls = (
+            _tls_connection_info(connection, target)
+            if target.scheme == "https"
+            else None
+        )
 
         response = connection.getresponse()
         reason = response.reason or ""
@@ -438,6 +641,7 @@ def _perform_request(
             body=body,
             connected_address=address,
             elapsed_milliseconds=elapsed,
+            tls=tls,
         )
     finally:
         connection.close()

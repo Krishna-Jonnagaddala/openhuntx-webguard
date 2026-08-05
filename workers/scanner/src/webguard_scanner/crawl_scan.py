@@ -48,6 +48,7 @@ from .passive_scan import (
     DEFAULT_PASSIVE_ANALYZERS,
     ENGINE_NAME,
     ENGINE_VERSION,
+    PASSIVE_TLS_CHECKS,
 )
 from .retry_policy import RetryPolicy
 from .safe_http import FetchPolicy
@@ -65,21 +66,35 @@ def _skipped_checks_for_target(
     target: ValidatedTarget,
     planned_checks: tuple[str, ...],
 ) -> tuple[SkippedCheck, ...]:
-    if (
-        target.scheme == "https"
-        or "web.headers.hsts" not in planned_checks
-    ):
+    if target.scheme == "https":
         return ()
 
-    return (
-        SkippedCheck(
-            check_id="web.headers.hsts",
-            reason=(
-                "HSTS applies only to HTTPS responses and was not "
-                "evaluated for this HTTP target."
-            ),
-        ),
-    )
+    skipped: list[SkippedCheck] = []
+
+    if "web.headers.hsts" in planned_checks:
+        skipped.append(
+            SkippedCheck(
+                check_id="web.headers.hsts",
+                reason=(
+                    "HSTS applies only to HTTPS responses and was not "
+                    "evaluated for this HTTP target."
+                ),
+            )
+        )
+
+    for check_id in PASSIVE_TLS_CHECKS:
+        if check_id in planned_checks:
+            skipped.append(
+                SkippedCheck(
+                    check_id=check_id,
+                    reason=(
+                        "TLS connection and certificate analysis applies only "
+                        "to HTTPS targets."
+                    ),
+                )
+            )
+
+    return tuple(sorted(skipped, key=lambda item: item.check_id))
 
 
 def _policy_snapshot(policy: CrawlPolicy) -> CrawlScanPolicy:

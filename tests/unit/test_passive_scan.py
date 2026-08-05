@@ -23,8 +23,11 @@ from webguard_scanner import (
     PASSIVE_CORS_CHECKS,
     PASSIVE_DISCLOSURE_CHECKS,
     PASSIVE_HEADER_CHECKS,
+    PASSIVE_TLS_CHECKS,
     RetryPolicy,
     SafeHttpResponse,
+    TlsAnalysisError,
+    TlsConnectionInfo,
     SafeRequestError,
     ValidatedTarget,
     run_passive_header_scan,
@@ -60,8 +63,34 @@ def target(
     )
 
 
+def tls_info(
+    *,
+    protocol: str = "TLSv1.3",
+    cipher_name: str = "TLS_AES_256_GCM_SHA384",
+    cipher_bits: int = 256,
+) -> TlsConnectionInfo:
+    return TlsConnectionInfo(
+        protocol=protocol,
+        cipher_name=cipher_name,
+        cipher_bits=cipher_bits,
+        server_hostname="example.com",
+        certificate_not_before=(
+            STARTED_AT - timedelta(days=30)
+        ),
+        certificate_not_after=(
+            STARTED_AT + timedelta(days=120)
+        ),
+        certificate_sha256="a" * 64,
+        subject_alt_names=("DNS:example.com",),
+        certificate_verified=True,
+        hostname_validated=True,
+        verified_chain_length=3,
+    )
+
+
 def response(
     *headers: tuple[str, str],
+    tls: TlsConnectionInfo | None = None,
 ) -> SafeHttpResponse:
     return SafeHttpResponse(
         status=200,
@@ -70,6 +99,7 @@ def response(
         body=b"<html></html>",
         connected_address="127.0.0.1",
         elapsed_milliseconds=10,
+        tls=tls,
     )
 
 
@@ -158,11 +188,15 @@ class PassiveScanTests(unittest.TestCase):
         )
         self.assertEqual(
             result.coverage.completion_percent,
-            96.97,
+            80.0,
         )
-        self.assertEqual(
-            result.coverage.skipped_checks[0].check_id,
-            "web.headers.hsts",
+        skipped_ids = {
+            item.check_id
+            for item in result.coverage.skipped_checks
+        }
+        self.assertIn("web.headers.hsts", skipped_ids)
+        self.assertTrue(
+            set(PASSIVE_TLS_CHECKS).issubset(skipped_ids)
         )
 
     @patch(
@@ -201,6 +235,7 @@ class PassiveScanTests(unittest.TestCase):
             body=b"<html></html>",
             connected_address="93.184.216.34",
             elapsed_milliseconds=10,
+            tls=tls_info(),
         )
 
         https_target = ValidatedTarget(
@@ -994,6 +1029,97 @@ class PassiveScanTests(unittest.TestCase):
                 scan_id=SCAN_ID,
                 started_at=STARTED_AT,
             )
+
+
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.tls_analyzer._utc_now",
+        return_value=STARTED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_tls_findings_are_included_in_https_scan(
+        self,
+        fetch_mock,
+        _tls_clock_mock,
+        _clock_mock,
+    ) -> None:
+        fetch_mock.return_value = response(
+            ("Strict-Transport-Security", "max-age=31536000"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Content-Security-Policy", "frame-ancestors 'none'"),
+            ("Referrer-Policy", "no-referrer"),
+            tls=tls_info(protocol="TLSv1.1"),
+        )
+        result = run_passive_header_scan(
+            target(
+                scheme="https",
+                url="https://example.com/",
+                hostname="example.com",
+                port=443,
+            ),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+        self.assertIn(
+            "web.tls.protocol.deprecated",
+            {item.identity.rule_id for item in result.findings},
+        )
+        self.assertTrue(
+            set(PASSIVE_TLS_CHECKS).issubset(
+                result.coverage.executed_checks
+            )
+        )
+        self.assertEqual(result.coverage.completion_percent, 100.0)
+
+    @patch(
+        "webguard_scanner.passive_scan._utc_now",
+        return_value=COMPLETED_AT,
+    )
+    @patch(
+        "webguard_scanner.passive_scan.analyze_tls_security",
+    )
+    @patch(
+        "webguard_scanner.passive_scan.fetch_once",
+    )
+    def test_tls_analysis_failure_is_isolated(
+        self,
+        fetch_mock,
+        tls_mock,
+        _clock_mock,
+    ) -> None:
+        fetch_mock.return_value = response(
+            tls=tls_info(),
+        )
+        tls_mock.side_effect = TlsAnalysisError(
+            "tls_metadata_inconsistent",
+            "TLS metadata was inconsistent.",
+        )
+        result = run_passive_header_scan(
+            target(
+                scheme="https",
+                url="https://example.com/",
+                hostname="example.com",
+                port=443,
+            ),
+            scan_id=SCAN_ID,
+            started_at=STARTED_AT,
+        )
+        self.assertIs(
+            result.status,
+            ScanStatus.COMPLETED_WITH_ERRORS,
+        )
+        self.assertEqual(result.errors[0].stage, "analysis.tls")
+        self.assertTrue(
+            set(PASSIVE_TLS_CHECKS).issubset(
+                {item.check_id for item in result.coverage.skipped_checks}
+            )
+        )
+        self.assertEqual(result.coverage.unaccounted_checks, ())
 
 
 if __name__ == "__main__":

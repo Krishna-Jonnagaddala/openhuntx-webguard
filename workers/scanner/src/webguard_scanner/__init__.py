@@ -96,6 +96,14 @@ from .html_analyzer import (
     MAXIMUM_HTML_VISIBLE_TEXT_CHARACTERS,
     analyze_html_security,
 )
+from .tls_analyzer import (
+    CERTIFICATE_EXPIRY_CRITICAL_DAYS,
+    CERTIFICATE_EXPIRY_WARNING_DAYS,
+    MINIMUM_ACCEPTABLE_CIPHER_BITS,
+    TLS_CHECKS,
+    TlsAnalysisError,
+    analyze_tls_security,
+)
 from .passive_scan import (
     DEFAULT_PASSIVE_ANALYZERS,
     ENGINE_NAME,
@@ -106,6 +114,7 @@ from .passive_scan import (
     PASSIVE_DISCLOSURE_CHECKS,
     PASSIVE_HEADER_CHECKS,
     PASSIVE_HTML_CHECKS,
+    PASSIVE_TLS_CHECKS,
     run_passive_header_scan,
 )
 from .retry_policy import (
@@ -118,6 +127,7 @@ from .safe_http import (
     FetchPolicy,
     SafeHttpResponse,
     SafeRequestError,
+    TlsConnectionInfo,
     fetch_once,
 )
 from .scope_validator import (
@@ -137,6 +147,8 @@ __all__ = [
     "AnalyzerRegistryError",
     "COOKIE_CHECKS",
     "CORS_CHECKS",
+    "CERTIFICATE_EXPIRY_CRITICAL_DAYS",
+    "CERTIFICATE_EXPIRY_WARNING_DAYS",
     "CrawlCancellationToken",
     "CrawlExecution",
     "CrawlPageOutcome",
@@ -180,6 +192,7 @@ __all__ = [
     "MAXIMUM_HTML_REFERENCES",
     "MAXIMUM_HTML_VISIBLE_TEXT_CHARACTERS",
     "MAXIMUM_LINKS_PER_PAGE",
+    "MINIMUM_ACCEPTABLE_CIPHER_BITS",
     "MAXIMUM_REQUEST_ATTEMPTS",
     "PASSIVE_CHECKS",
     "PASSIVE_COOKIE_CHECKS",
@@ -187,11 +200,15 @@ __all__ = [
     "PASSIVE_DISCLOSURE_CHECKS",
     "PASSIVE_HEADER_CHECKS",
     "PASSIVE_HTML_CHECKS",
+    "PASSIVE_TLS_CHECKS",
     "PageVisitor",
     "PassiveAnalyzer",
     "RetryPolicy",
     "SafeHttpResponse",
     "SafeRequestError",
+    "TLS_CHECKS",
+    "TlsAnalysisError",
+    "TlsConnectionInfo",
     "TargetValidationError",
     "ValidatedTarget",
     "ValidationMode",
@@ -202,6 +219,7 @@ __all__ = [
     "analyze_information_disclosure",
     "analyze_html_security",
     "analyze_security_headers",
+    "analyze_tls_security",
     "classify_error",
     "crawl_same_origin",
     "execute_analyzers",
