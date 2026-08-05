@@ -16,6 +16,7 @@ from webguard_scanner import (
     CrawlPolicy,
     FetchPolicy,
     PASSIVE_CHECKS,
+    PASSIVE_HTML_CHECKS,
     ValidationMode,
     ValidationPolicy,
     run_passive_crawl_scan,
@@ -123,7 +124,7 @@ class CrawlScanLabIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             result.coverage.completion_percent,
-            95.83,
+            96.97,
         )
 
         root_origin = (
@@ -157,6 +158,11 @@ class CrawlScanLabIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 page.coverage.unaccounted_checks,
                 (),
+            )
+            self.assertTrue(
+                set(PASSIVE_HTML_CHECKS).issubset(
+                    page.coverage.executed_checks
+                )
             )
 
         loaded = load_crawl_scan_result_json(

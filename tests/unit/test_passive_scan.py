@@ -158,7 +158,7 @@ class PassiveScanTests(unittest.TestCase):
         )
         self.assertEqual(
             result.coverage.completion_percent,
-            95.83,
+            96.97,
         )
         self.assertEqual(
             result.coverage.skipped_checks[0].check_id,

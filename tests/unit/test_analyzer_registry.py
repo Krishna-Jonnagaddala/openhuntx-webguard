@@ -195,13 +195,13 @@ class AnalyzerRegistryTests(unittest.TestCase):
                 item.analyzer_id
                 for item in DEFAULT_PASSIVE_ANALYZERS
             ),
-            ("headers", "cookies", "cors", "disclosure"),
+            ("headers", "cookies", "cors", "disclosure", "html"),
         )
         self.assertEqual(
             registered_checks(DEFAULT_PASSIVE_ANALYZERS),
             PASSIVE_CHECKS,
         )
-        self.assertEqual(len(PASSIVE_CHECKS), 24)
+        self.assertEqual(len(PASSIVE_CHECKS), 33)
 
     def test_rejects_empty_registry(self) -> None:
         with self.assertRaises(AnalyzerRegistryError) as context:

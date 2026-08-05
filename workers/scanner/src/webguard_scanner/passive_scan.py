@@ -43,6 +43,11 @@ from .header_analyzer import (
     HeaderAnalysisError,
     analyze_security_headers,
 )
+from .html_analyzer import (
+    HTML_CHECKS,
+    HtmlAnalysisError,
+    analyze_html_security,
+)
 from .retry_policy import RetryPolicy
 from .safe_http import (
     FetchPolicy,
@@ -66,6 +71,7 @@ PASSIVE_HEADER_CHECKS = (
 PASSIVE_COOKIE_CHECKS = COOKIE_CHECKS
 PASSIVE_CORS_CHECKS = CORS_CHECKS
 PASSIVE_DISCLOSURE_CHECKS = DISCLOSURE_CHECKS
+PASSIVE_HTML_CHECKS = HTML_CHECKS
 
 
 def _run_header_analyzer(target, response):
@@ -82,6 +88,10 @@ def _run_cors_analyzer(target, response):
 
 def _run_disclosure_analyzer(target, response):
     return analyze_information_disclosure(target, response)
+
+
+def _run_html_analyzer(target, response):
+    return analyze_html_security(target, response)
 
 
 DEFAULT_PASSIVE_ANALYZERS = validate_analyzer_registry(
@@ -113,6 +123,13 @@ DEFAULT_PASSIVE_ANALYZERS = validate_analyzer_registry(
             finding_namespace="web.disclosure",
             analyze=_run_disclosure_analyzer,
             controlled_error=DisclosureAnalysisError,
+        ),
+        PassiveAnalyzer(
+            analyzer_id="html",
+            checks=PASSIVE_HTML_CHECKS,
+            finding_namespace="web.html",
+            analyze=_run_html_analyzer,
+            controlled_error=HtmlAnalysisError,
         ),
     )
 )
