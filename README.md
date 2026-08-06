@@ -2,32 +2,237 @@
 
 Continuous web vulnerability discovery and security assurance for authorised targets.
 
-## Status
+> **Development status:** Private commercial product under active development.  
+> WebGuard is not yet a publicly hosted production service.
 
-Private commercial product under active development. The native scanner currently supports bounded passive single-page and same-origin crawl assessments, strict report contracts, signed crawl checkpoints, an external owned-target readiness gate, and professional HTML reporting with remediation comparison.
+## Overview
 
-## Safety
+OpenHuntX WebGuard is a security-assurance platform for organisations that need controlled, repeatable visibility into web security posture across assets they own or are explicitly authorised to assess.
+
+The current platform combines:
+
+- strict target and network-scope validation
+- bounded passive single-page and same-origin crawl assessments
+- passive HTTP, HTML, cookie, CORS, disclosure, TLS, and certificate analysis
+- deterministic finding contracts and fingerprints
+- signed crawl checkpoints and safe resume
+- professional HTML reporting and remediation comparison
+- a local scanner-service API with a persistent job queue
+- organisation isolation, API authentication, and role-based access control
+- request correlation, audit events, and rate-limit foundations
+
+WebGuard does not claim to identify every vulnerability. Its current external scan mode is intentionally conservative and passive.
+
+## Current milestone
+
+**Milestone 1.27 — Organisations, API authentication, and RBAC**
+
+The current implementation adds a multi-tenant control-plane foundation on top of the scanner and reporting engine:
+
+- organisation-scoped principals, authorisations, jobs, and artefacts
+- users and service accounts
+- `owner`, `administrator`, `analyst`, and `viewer` roles
+- Bearer API tokens
+- scrypt-hashed token storage
+- token expiry and revocation
+- organisation-scoped authorisation assignment
+- cross-tenant access controls
+- request correlation IDs
+- security audit events
+- local per-token rate-limit foundations
+- API version `0.2.0`
+
+The API remains loopback-only and must not be exposed directly to the public internet.
+
+## Safety and authorisation
 
 OpenHuntX WebGuard must only assess systems that the customer owns or is explicitly authorised to test.
 
-Laboratory scans require `--lab` and an explicit host allowlist. External scans require a validated owned-target authorization document plus an exact operator confirmation before WebGuard sends an HTTP request. External scans are HTTPS-only, public-address-only, passive, bounded, and audited.
+Laboratory scans require:
 
-A locally generated authorization document records operator approval and limits. It does not independently prove legal ownership. Production service releases must add server-side customer identity, asset ownership verification, and centrally controlled authorization.
+- `--lab`
+- an explicit host allowlist
+- an isolated authorised target such as OWASP Juice Shop
+
+External scans require:
+
+- a validated owned-target authorisation document
+- an exact operator confirmation
+- an HTTPS target
+- public-address resolution
+- bounded passive execution
+- an authorisation audit record
+
+A locally generated authorisation document records operator approval and scan limits. It does not independently prove legal ownership. A future production release must add centrally controlled customer identity, asset ownership verification, and production-grade authorisation workflows.
+
+External execution currently performs no:
+
+- form submission
+- JavaScript execution
+- active payload injection
+- exploitation
+- brute force
+- directory enumeration
+- redirect following
+
+## Capabilities
+
+### Target and transport safety
+
+- canonical URL validation
+- public/private/loopback address policy enforcement
+- DNS-result validation
+- cloud metadata and ambiguous-address protection
+- redirect blocking
+- validated destination connection
+- safe `Host` header construction
+- response-size limits
+- conflicting `Content-Length` protection
+- approved-method enforcement
+- retry and request-attempt audit trails
+
+### Passive assessment
+
+- security-header analysis
+- cookie security analysis
+- CORS analysis
+- information-disclosure analysis
+- passive HTML security analysis
+- TLS and certificate analysis
+- single-page assessment
+- bounded same-origin crawling
+- crawl cancellation and execution budgets
+- validated checkpoints and safe resume
+
+### Findings and reporting
+
+- strict versioned scan and finding contracts
+- deterministic JSON serialisation
+- stable SHA-256 finding fingerprints
+- severity, confidence, evidence, references, and remediation
+- coverage and skipped-check accounting
+- self-contained JavaScript-free HTML reports
+- baseline comparison
+- new, remaining, and fixed finding classification
+- remediation-verification reporting
+- owner-only report-file permissions
+
+### Service foundation
+
+- loopback-only HTTP API
+- persistent SQLite job queue
+- background scanner execution
+- idempotent job submission
+- safe relative artefact references
+- server-side authorisation reload and revalidation
+- organisation isolation
+- authenticated `/v1` API
+- role-based permissions
+- audit events
+- request IDs
+- token rate-limit foundations
+
+## Architecture
+
+```text
+Operator / local client
+        |
+        | Bearer token
+        v
+Loopback control-plane API
+        |
+        +--> identity, organisation, RBAC, and audit controls
+        |
+        +--> SQLite job and identity store
+        |
+        v
+Background scanner worker
+        |
+        +--> target-scope and authorisation validation
+        +--> safe HTTP client
+        +--> bounded passive analyzers and crawler
+        |
+        v
+Private JSON, audit, comparison, and HTML artefacts
+```
 
 ## Repository structure
 
-- `apps/api` — control-plane API
-- `apps/web` — customer dashboard
-- `workers/scanner` — isolated scanner workers
-- `packages/contracts` — shared API and finding contracts
-- `infra/compose` — local infrastructure
-- `infra/zap` — ZAP automation plans
-- `docs` — product, architecture, and security documentation
-- `tests` — automated tests and safe fixtures
+- `apps/api` — local control-plane API
+- `apps/web` — future customer dashboard
+- `workers/scanner` — isolated scanner components
+- `packages/contracts` — shared API, scan, finding, and tenancy contracts
+- `infra/compose` — local infrastructure and authorised lab target
+- `infra/zap` — future controlled ZAP automation plans
+- `docs` — product, architecture, security, and ADR documentation
+- `scripts` — local verification and development utilities
+- `tests/unit` — deterministic unit tests
+- `tests/integration` — opt-in authorised integration tests
 
-## Current scanner milestone
+## Requirements
 
-Milestone 1.26 adds a local-only control-plane API, persistent SQLite scan-job queue, and background worker while preserving the CLI scanner and strict report contracts.
+- Python 3.11 or later
+- Git
+- Docker with Docker Compose for authorised integration tests
+
+GitHub CI currently verifies unit tests on Python 3.11, 3.13, and 3.14, plus the authorised OWASP Juice Shop integration suite.
+
+## Development setup
+
+```bash
+git clone https://github.com/Krishna-Jonnagaddala/openhuntx-webguard.git
+cd openhuntx-webguard
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install --requirement requirements-dev.txt
+```
+
+Run the local verification gate:
+
+```bash
+./scripts/verify.sh
+```
+
+At Milestone 1.27, the repository contains:
+
+- 742 unit tests
+- 11 opt-in authorised integration tests
+- CI validation across three Python versions
+- an authorised Juice Shop integration job
+
+## Authorised lab integration
+
+Start the isolated OWASP Juice Shop target:
+
+```bash
+docker compose \
+  -f infra/compose/compose.lab.yml \
+  up -d
+```
+
+Run the authorised integration suite:
+
+```bash
+WEBGUARD_RUN_INTEGRATION=1 \
+WEBGUARD_LAB_TARGET=http://127.0.0.1:3000/ \
+python -m unittest discover \
+  -s tests/integration \
+  -p "test_*.py" \
+  -v
+```
+
+Stop the laboratory environment:
+
+```bash
+docker compose \
+  -f infra/compose/compose.lab.yml \
+  down
+```
+
+## Professional reporting
 
 Render a self-contained customer-facing HTML report:
 
@@ -39,7 +244,7 @@ webguard report render scan-results/current.json \
   --output scan-results/current.html
 ```
 
-Compare a current scan with an earlier baseline and include new, remaining, and fixed findings:
+Compare a current scan with an earlier baseline:
 
 ```bash
 webguard report compare \
@@ -49,70 +254,66 @@ webguard report compare \
 
 webguard report validate-comparison \
   scan-results/comparison.json
+```
 
+Render a remediation-verification report:
+
+```bash
 webguard report render scan-results/current.json \
   --baseline scan-results/baseline.json \
   --organization "Example Ltd" \
   --output scan-results/remediation-verification.html
 ```
 
-The HTML is self-contained, JavaScript-free, escaped, and written with owner-only permissions. Comparison uses stable finding fingerprints and requires both reports to use the same canonical target.
+The generated HTML is self-contained, JavaScript-free, escaped, and written with owner-only permissions. Comparison requires both reports to use the same canonical target and uses stable finding fingerprints to classify new, remaining, and fixed findings.
 
-The Milestone 1.23 owned-target readiness gate remains mandatory for external scans. External execution remains passive: no form submission, JavaScript execution, active payload injection, redirect following, brute force, or directory enumeration.
+## Local authenticated API
 
-
-## Local scanner service foundation
-
-Initialize the private SQLite job store:
-
-```bash
-webguard-api init
-```
-
-Run the loopback-only API and one background scanner worker:
-
-```bash
-webguard-api serve \
-  --host 127.0.0.1 \
-  --port 8765 \
-  --database var/webguard-api/jobs.sqlite3 \
-  --authorizations authorizations \
-  --artifacts scan-results/service
-```
-
-Submit an owned-target job with an idempotency key:
-
-```bash
-curl --fail-with-body \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: internstack-20260806-001' \
-  --data '{"target":"https://internstack.in/","authorization_id":"<AUTHORIZATION-UUID>","confirm_authorization":"<AUTHORIZATION-UUID>","mode":"crawl"}' \
-  http://127.0.0.1:8765/v1/jobs
-```
-
-The initial service binds only to a loopback IP literal. It returns job metadata and safe relative artifact references, not authorization documents or report bodies. The worker reloads and revalidates the server-side authorization immediately before execution, writes the authorization audit first, and uses the conservative owned-target scan policy.
-
-## Authenticated local API and organization RBAC
-
-Milestone 1.27 adds organization isolation, Bearer API tokens, users and service accounts, role-based permissions, target-authorization assignment, request correlation IDs, security audit events, and a local per-token rate-limit foundation.
-
-Initialize the private service database and create the first organization owner:
+### 1. Initialise the private service database
 
 ```bash
 webguard-api init \
   --database var/webguard-api/jobs.sqlite3 \
   --authorizations authorizations \
   --artifacts scan-results/service
+```
 
+### 2. Bootstrap the first organisation owner
+
+```bash
 webguard-api bootstrap \
-  --organization "OpenHuntX" \
-  --principal "Krishna Jonnagaddala" \
+  --organization "Example Organisation" \
+  --principal "Initial Owner" \
   --database var/webguard-api/jobs.sqlite3 \
   --authorizations authorizations \
   --artifacts scan-results/service
 ```
 
-The bootstrap command prints one API token once. Store it outside the repository. Assign an owned-target authorization to the organization before submitting jobs:
+The bootstrap command prints a raw API token once.
+
+Do not:
+
+- commit the token
+- paste it into documentation
+- include it in screenshots
+- store it in shell history
+- place it in source-controlled environment files
+
+For local development, load it without echoing the value:
+
+```bash
+unset WEBGUARD_API_TOKEN
+
+printf "Paste WebGuard API token: "
+IFS= read -r -s WEBGUARD_API_TOKEN
+printf "\n"
+
+export WEBGUARD_API_TOKEN
+```
+
+Production deployments must use a dedicated secrets manager.
+
+### 3. Assign an owned-target authorisation
 
 ```bash
 webguard-api authorization assign \
@@ -124,7 +325,7 @@ webguard-api authorization assign \
   --artifacts scan-results/service
 ```
 
-Start the loopback-only authenticated API:
+### 4. Start the loopback-only API
 
 ```bash
 webguard-api serve \
@@ -135,7 +336,7 @@ webguard-api serve \
   --artifacts scan-results/service
 ```
 
-Use the token through the Bearer scheme:
+### 5. Verify the authenticated principal
 
 ```bash
 curl --fail-with-body \
@@ -143,4 +344,108 @@ curl --fail-with-body \
   http://127.0.0.1:8765/v1/me
 ```
 
-Roles are `owner`, `administrator`, `analyst`, and `viewer`. The API remains a local control-plane foundation and must not be exposed directly to the public internet.
+Responses include correlation and rate-limit headers such as `X-Request-ID` and `RateLimit-*`.
+
+### 6. Submit an authorised scan job
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: owned-target-001" \
+  --data '{
+    "target": "https://security.example/",
+    "authorization_id": "AUTHORIZATION_UUID",
+    "confirm_authorization": "AUTHORIZATION_UUID",
+    "mode": "crawl"
+  }' \
+  http://127.0.0.1:8765/v1/jobs
+```
+
+The service returns job metadata and safe relative artefact references. It does not return authorisation documents or report bodies through the API.
+
+Before execution, the worker:
+
+1. reloads the server-side authorisation
+2. validates organisation and principal scope
+3. revalidates the target and authorisation limits
+4. writes the authorisation audit record
+5. executes the conservative owned-target policy
+
+## Token lifecycle
+
+API tokens are stored as scrypt hashes rather than raw values and support expiry and revocation.
+
+Create separate tokens for separate operators or service accounts. Revoke a token immediately when it is exposed, replaced, or no longer required.
+
+Never use a shared production token for multiple customers or organisations.
+
+## Data handling
+
+The following paths contain private runtime material and must remain outside source control:
+
+- `authorizations/`
+- `scan-results/`
+- `var/`
+- SQLite databases
+- generated audit records
+- raw API tokens
+
+Scan reports may contain sensitive target metadata and security findings. Treat them as confidential customer records.
+
+## Current limitations
+
+The current release is a local engineering foundation, not a complete hosted SaaS platform.
+
+Known limitations include:
+
+- loopback-only API deployment
+- SQLite persistence
+- single-node execution
+- no distributed worker coordination
+- no customer dashboard
+- no production identity provider
+- no automated asset-ownership verification
+- no recurring scan scheduler
+- no email or webhook notifications
+- no billing, subscriptions, or usage metering
+- local rather than distributed rate limiting
+- no high-availability or disaster-recovery design
+- passive assessment only
+
+## Roadmap
+
+Upcoming engineering priorities include:
+
+- production-grade persistence and schema migrations
+- reliable worker leasing, recovery, and concurrency controls
+- scan scheduling and recurring assessments
+- customer dashboard and organisation administration
+- target and authorisation management workflows
+- findings search, filtering, comparison, and export
+- notifications and customer remediation workflows
+- production secrets, observability, backups, and deployment controls
+- usage quotas, metering, and commercial billing
+- production security review and independent penetration testing
+
+## Security principles
+
+WebGuard development follows these principles:
+
+- authorised targets only
+- deny by default
+- validate before connecting
+- revalidate before execution
+- minimise network capability
+- keep scans passive and bounded
+- isolate customer data by organisation
+- never store raw API tokens
+- produce deterministic evidence
+- preserve auditable execution records
+- do not overstate security assurance
+
+## Responsible use
+
+OpenHuntX WebGuard is intended for defensive security assurance on authorised systems.
+
+Do not use this software against systems you do not own or lack explicit permission to assess.
