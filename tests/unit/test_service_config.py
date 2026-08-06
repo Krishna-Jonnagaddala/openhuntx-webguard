@@ -34,6 +34,43 @@ class ServiceConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ServiceConfigError, "0.01"):
             ServiceConfig(worker_poll_seconds=0)
 
+    def test_worker_lease_defaults_are_consistent(self) -> None:
+        config = ServiceConfig()
+        self.assertEqual(config.worker_lease_seconds, 30.0)
+        self.assertEqual(config.worker_heartbeat_seconds, 10.0)
+        self.assertEqual(config.worker_maximum_attempts, 3)
+        self.assertLess(
+            config.worker_heartbeat_seconds,
+            config.worker_lease_seconds,
+        )
+
+    def test_worker_heartbeat_must_be_less_than_lease(self) -> None:
+        with self.assertRaises(ServiceConfigError) as context:
+            ServiceConfig(
+                worker_lease_seconds=10,
+                worker_heartbeat_seconds=10,
+            )
+        self.assertEqual(
+            context.exception.code,
+            "service_worker_heartbeat_invalid",
+        )
+
+    def test_worker_attempts_are_bounded(self) -> None:
+        with self.assertRaises(ServiceConfigError) as context:
+            ServiceConfig(worker_maximum_attempts=0)
+        self.assertEqual(
+            context.exception.code,
+            "service_worker_attempts_invalid",
+        )
+
+    def test_worker_id_is_trimmed_and_validated(self) -> None:
+        self.assertEqual(
+            ServiceConfig(worker_id="  worker-a  ").worker_id,
+            "worker-a",
+        )
+        with self.assertRaises(ServiceConfigError):
+            ServiceConfig(worker_id="worker id with spaces")
+
     def test_path_conflict_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "same"

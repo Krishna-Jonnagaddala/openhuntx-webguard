@@ -17,32 +17,31 @@ The current platform combines:
 - deterministic finding contracts and fingerprints
 - signed crawl checkpoints and safe resume
 - professional HTML reporting and remediation comparison
-- a local scanner-service API with a persistent job queue
+- a local scanner-service API with a persistent, lease-aware job queue
 - organisation isolation, API authentication, and role-based access control
-- request correlation, audit events, and rate-limit foundations
+- request correlation, audit events, rate-limit foundations, and crash recovery
 
 WebGuard does not claim to identify every vulnerability. Its current external scan mode is intentionally conservative and passive.
 
 ## Current milestone
 
-**Milestone 1.27 — Organisations, API authentication, and RBAC**
+**Milestone 1.28 — Durable worker leases and crash recovery**
 
-The current implementation adds a multi-tenant control-plane foundation on top of the scanner and reporting engine:
+The current implementation adds a fenced execution lease to every service-run scan job:
 
-- organisation-scoped principals, authorisations, jobs, and artefacts
-- users and service accounts
-- `owner`, `administrator`, `analyst`, and `viewer` roles
-- Bearer API tokens
-- scrypt-hashed token storage
-- token expiry and revocation
-- organisation-scoped authorisation assignment
-- cross-tenant access controls
-- request correlation IDs
-- security audit events
-- local per-token rate-limit foundations
-- API version `0.2.0`
+- versioned SQLite job-store migration from schema `1` to schema `2`
+- atomic worker identity, lease token, expiry, heartbeat, and attempt metadata
+- renewable leases while scanner execution is active
+- stale-worker fencing on completion, failure, and cancellation transitions
+- automatic recovery of expired running jobs
+- requeue of recoverable jobs without preserving stale execution state
+- terminal cancellation recovery when a customer already requested cancellation
+- controlled failure after the configured maximum number of attempts
+- safe migration of legacy running jobs during database upgrade
+- configurable worker IDs, lease durations, heartbeat intervals, and attempt limits
+- API version `0.3.0`
 
-The API remains loopback-only and must not be exposed directly to the public internet.
+Milestone 1.27 organisation isolation, authentication, RBAC, audit events, and rate-limit foundations remain in force. The API remains loopback-only and must not be exposed directly to the public internet.
 
 ## Safety and authorisation
 
@@ -120,7 +119,10 @@ External execution currently performs no:
 ### Service foundation
 
 - loopback-only HTTP API
-- persistent SQLite job queue
+- persistent SQLite job queue with versioned schema migrations
+- renewable worker leases and heartbeat updates
+- stale-worker fencing and expired-lease recovery
+- bounded retry attempts after worker-process interruption
 - background scanner execution
 - idempotent job submission
 - safe relative artefact references
@@ -144,9 +146,11 @@ Loopback control-plane API
         +--> identity, organisation, RBAC, and audit controls
         |
         +--> SQLite job and identity store
+        |      +--> versioned migrations
+        |      +--> job leases, heartbeats, and attempt counters
         |
         v
-Background scanner worker
+Lease-aware background scanner worker
         |
         +--> target-scope and authorisation validation
         +--> safe HTTP client
@@ -196,9 +200,9 @@ Run the local verification gate:
 ./scripts/verify.sh
 ```
 
-At Milestone 1.27, the repository contains:
+At Milestone 1.28, the repository contains:
 
-- 742 unit tests
+- 768 unit tests
 - 11 opt-in authorised integration tests
 - CI validation across three Python versions
 - an authorised Juice Shop integration job
@@ -333,8 +337,13 @@ webguard-api serve \
   --port 8765 \
   --database var/webguard-api/jobs.sqlite3 \
   --authorizations authorizations \
-  --artifacts scan-results/service
+  --artifacts scan-results/service \
+  --worker-lease-seconds 30 \
+  --worker-heartbeat-seconds 10 \
+  --worker-maximum-attempts 3
 ```
+
+The service generates a unique worker ID unless `--worker-id` is supplied. While a scan is running, the worker renews its lease. A replacement worker may recover an expired lease, but the previous worker cannot write a stale terminal result after losing ownership.
 
 ### 5. Verify the authenticated principal
 
@@ -400,9 +409,9 @@ The current release is a local engineering foundation, not a complete hosted Saa
 Known limitations include:
 
 - loopback-only API deployment
-- SQLite persistence
-- single-node execution
-- no distributed worker coordination
+- SQLite persistence on one host
+- no PostgreSQL or shared production database backend
+- no cross-host distributed worker coordination
 - no customer dashboard
 - no production identity provider
 - no automated asset-ownership verification
@@ -417,8 +426,8 @@ Known limitations include:
 
 Upcoming engineering priorities include:
 
-- production-grade persistence and schema migrations
-- reliable worker leasing, recovery, and concurrency controls
+- PostgreSQL-backed shared persistence and production migrations
+- distributed worker coordination and database-backed scheduling
 - scan scheduling and recurring assessments
 - customer dashboard and organisation administration
 - target and authorisation management workflows
@@ -442,6 +451,7 @@ WebGuard development follows these principles:
 - never store raw API tokens
 - produce deterministic evidence
 - preserve auditable execution records
+- fence stale workers before terminal state changes
 - do not overstate security assurance
 
 ## Responsible use
