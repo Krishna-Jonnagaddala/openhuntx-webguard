@@ -27,6 +27,7 @@ from webguard_contracts import (
     OwnedTargetAuthorization,
     OwnedTargetContractError,
     OwnedTargetLimits,
+    ReportComparisonError,
     ScanReportLoadError,
     ScanResult,
     ScanStatus,
@@ -36,6 +37,7 @@ from webguard_contracts import (
     canonicalize_owned_target_hostname,
     canonicalize_owned_target_url,
     load_owned_target_authorization_file,
+    load_report_comparison_file,
     load_webguard_report_file,
     write_crawl_checkpoint_file,
     write_owned_target_audit_file,
@@ -69,6 +71,14 @@ from .owned_target import (
     validate_owned_target_preflight,
 )
 from .passive_scan import ENGINE_VERSION, run_passive_header_scan
+from .professional_report import (
+    DEFAULT_REPORT_CLASSIFICATION,
+    DEFAULT_REPORT_TITLE,
+    ProfessionalReportError,
+    ProfessionalReportProfile,
+    build_report_comparison,
+    render_professional_html,
+)
 from .retry_policy import RetryPolicy
 from .safe_http import FetchPolicy
 from .scope_validator import (
@@ -750,6 +760,62 @@ def _write_report(
     finally:
         if file_descriptor is not None:
             os.close(file_descriptor)
+
+
+def _write_text_output(
+    content: str,
+    path: Path,
+    *,
+    overwrite: bool,
+) -> None:
+    """Write a UTF-8 report artifact without following symbolic links."""
+
+    _check_output_path(path, overwrite=overwrite)
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise CliControlledError(
+            "output_directory_create_failed",
+            f"Unable to create output directory {path.parent}.",
+            exit_code=EXIT_OUTPUT_FAILED,
+        ) from exc
+
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= os.O_TRUNC if overwrite else os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(
+            descriptor,
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as output_file:
+            descriptor = None
+            output_file.write(content)
+            if not content.endswith("\n"):
+                output_file.write("\n")
+    except FileExistsError as exc:
+        raise CliControlledError(
+            "output_exists",
+            f"Output file {path} already exists.",
+            exit_code=EXIT_OUTPUT_FAILED,
+        ) from exc
+    except OSError as exc:
+        raise CliControlledError(
+            "output_write_failed",
+            f"Unable to write report artifact {path}.",
+            exit_code=EXIT_OUTPUT_FAILED,
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _display_values(values: tuple[object, ...]) -> str:
@@ -1490,6 +1556,113 @@ def _report_inspect_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _report_render_command(args: argparse.Namespace) -> int:
+    result = _load_report(args.report)
+    comparison = None
+    if args.baseline is not None:
+        baseline = _load_report(args.baseline)
+        try:
+            comparison = build_report_comparison(
+                baseline,
+                result,
+                generated_at=_utc_now(),
+            )
+        except ProfessionalReportError as exc:
+            raise CliControlledError(
+                exc.code,
+                exc.message,
+                exit_code=EXIT_REPORT_INVALID,
+            ) from exc
+
+    try:
+        profile = ProfessionalReportProfile(
+            organization=args.organization,
+            report_title=args.title,
+            prepared_by=args.prepared_by,
+            classification=args.classification,
+            generated_at=_utc_now(),
+        )
+        rendered = render_professional_html(
+            result,
+            profile,
+            comparison=comparison,
+        )
+    except ProfessionalReportError as exc:
+        raise CliControlledError(
+            exc.code,
+            exc.message,
+            exit_code=EXIT_REPORT_INVALID,
+        ) from exc
+
+    output = args.output.expanduser()
+    _write_text_output(rendered, output, overwrite=args.overwrite)
+    print(f"Professional HTML report: {output}")
+    print(f"Scan ID: {result.scan_id}")
+    print(f"Findings: {len(result.findings)}")
+    if comparison is not None:
+        print(
+            "Remediation comparison: "
+            f"{comparison.new_count} new, "
+            f"{comparison.remaining_count} remaining, "
+            f"{comparison.fixed_count} fixed"
+        )
+    return EXIT_SUCCESS
+
+
+def _report_compare_command(args: argparse.Namespace) -> int:
+    baseline = _load_report(args.baseline)
+    current = _load_report(args.current)
+    try:
+        comparison = build_report_comparison(
+            baseline,
+            current,
+            generated_at=_utc_now(),
+        )
+    except ProfessionalReportError as exc:
+        raise CliControlledError(
+            exc.code,
+            exc.message,
+            exit_code=EXIT_REPORT_INVALID,
+        ) from exc
+
+    output = args.output.expanduser()
+    _write_text_output(
+        comparison.to_json(),
+        output,
+        overwrite=args.overwrite,
+    )
+    print(f"Comparison report: {output}")
+    print(f"Baseline scan: {comparison.baseline_scan_id}")
+    print(f"Current scan: {comparison.current_scan_id}")
+    print(f"New findings: {comparison.new_count}")
+    print(f"Remaining findings: {comparison.remaining_count}")
+    print(f"Fixed findings: {comparison.fixed_count}")
+    print(f"Presentation changes: {comparison.changed_count}")
+    return EXIT_SUCCESS
+
+
+def _report_comparison_validate_command(args: argparse.Namespace) -> int:
+    try:
+        comparison = load_report_comparison_file(args.comparison)
+    except ReportComparisonError as exc:
+        raise CliControlledError(
+            exc.code,
+            exc.message,
+            exit_code=EXIT_REPORT_INVALID,
+        ) from exc
+    print(f"Valid comparison: {args.comparison}")
+    print(f"Normalized schema: {comparison.schema_version}")
+    print(f"Baseline scan: {comparison.baseline_scan_id}")
+    print(f"Current scan: {comparison.current_scan_id}")
+    print(
+        "Summary: "
+        f"{comparison.new_count} new, "
+        f"{comparison.remaining_count} remaining, "
+        f"{comparison.fixed_count} fixed"
+    )
+    return EXIT_SUCCESS
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the public WebGuard argument parser."""
 
@@ -1950,7 +2123,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = commands.add_parser(
         "report",
-        help="Validate or inspect a saved scan report.",
+        help="Validate, inspect, render, or compare scan reports.",
     )
     report_commands = report.add_subparsers(
         dest="report_command",
@@ -1976,6 +2149,78 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print canonical normalized JSON instead of a human summary.",
     )
     inspect.set_defaults(handler=_report_inspect_command)
+
+    render = report_commands.add_parser(
+        "render",
+        help="Render a self-contained professional HTML report.",
+    )
+    render.add_argument("report", type=Path)
+    render.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Destination HTML file.",
+    )
+    render.add_argument(
+        "--organization",
+        required=True,
+        help="Customer or asset-owning organization displayed in the report.",
+    )
+    render.add_argument(
+        "--title",
+        default=DEFAULT_REPORT_TITLE,
+        help="Customer-facing report title.",
+    )
+    render.add_argument(
+        "--prepared-by",
+        default="OpenHuntX",
+        help="Report preparer displayed on the cover.",
+    )
+    render.add_argument(
+        "--classification",
+        default=DEFAULT_REPORT_CLASSIFICATION,
+        help="Document classification displayed on the cover.",
+    )
+    render.add_argument(
+        "--baseline",
+        type=Path,
+        default=None,
+        help="Optional earlier compatible report for remediation verification.",
+    )
+    render.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Explicitly replace an existing regular HTML file.",
+    )
+    render.set_defaults(handler=_report_render_command)
+
+    compare = report_commands.add_parser(
+        "compare",
+        help="Compare baseline and current findings by stable fingerprint.",
+    )
+    compare.add_argument("baseline", type=Path)
+    compare.add_argument("current", type=Path)
+    compare.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Destination canonical comparison JSON file.",
+    )
+    compare.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Explicitly replace an existing regular comparison file.",
+    )
+    compare.set_defaults(handler=_report_compare_command)
+
+    comparison_validate = report_commands.add_parser(
+        "validate-comparison",
+        help="Strictly validate a saved remediation comparison document.",
+    )
+    comparison_validate.add_argument("comparison", type=Path)
+    comparison_validate.set_defaults(
+        handler=_report_comparison_validate_command
+    )
 
     return parser
 

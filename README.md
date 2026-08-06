@@ -4,7 +4,7 @@ Continuous web vulnerability discovery and security assurance for authorised tar
 
 ## Status
 
-Private commercial product under active development. The native scanner currently supports bounded passive single-page and same-origin crawl assessments, strict report contracts, signed crawl checkpoints, and an external owned-target readiness gate.
+Private commercial product under active development. The native scanner currently supports bounded passive single-page and same-origin crawl assessments, strict report contracts, signed crawl checkpoints, an external owned-target readiness gate, and professional HTML reporting with remediation comparison.
 
 ## Safety
 
@@ -27,24 +27,35 @@ A locally generated authorization document records operator approval and limits.
 
 ## Current scanner milestone
 
-Milestone 1.23 adds the external owned-target readiness gate. Before any external scan, operators can create, validate, inspect, and explicitly confirm a bounded passive authorization.
+Milestone 1.25 adds professional security reporting and remediation verification while preserving the strict machine-readable scan reports.
+
+Render a self-contained customer-facing HTML report:
 
 ```bash
-webguard authorization create https://example.com/ \
+webguard report render scan-results/current.json \
   --organization "Example Ltd" \
-  --authorized-by "Security Owner" \
-  --purpose "Controlled passive security assessment" \
-  --output authorizations/example.com.json
+  --prepared-by "OpenHuntX" \
+  --classification "Confidential" \
+  --output scan-results/current.html
 ```
 
-A readiness-only run performs strict authorization and scope validation, including DNS resolution, but sends no HTTP request and writes no report, audit, or checkpoint files:
+Compare a current scan with an earlier baseline and include new, remaining, and fixed findings:
 
 ```bash
-webguard scan https://example.com/ \
-  --authorization-file authorizations/example.com.json \
-  --confirm-authorization <AUTHORIZATION_UUID> \
-  --crawl \
-  --preflight-only
+webguard report compare \
+  scan-results/baseline.json \
+  scan-results/current.json \
+  --output scan-results/comparison.json
+
+webguard report validate-comparison \
+  scan-results/comparison.json
+
+webguard report render scan-results/current.json \
+  --baseline scan-results/baseline.json \
+  --organization "Example Ltd" \
+  --output scan-results/remediation-verification.html
 ```
 
-External execution remains passive: no form submission, JavaScript execution, active payload injection, redirect following, brute force, or directory enumeration.
+The HTML is self-contained, JavaScript-free, escaped, and written with owner-only permissions. Comparison uses stable finding fingerprints and requires both reports to use the same canonical target.
+
+The Milestone 1.23 owned-target readiness gate remains mandatory for external scans. External execution remains passive: no form submission, JavaScript execution, active payload injection, redirect following, brute force, or directory enumeration.

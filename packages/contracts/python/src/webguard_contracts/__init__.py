@@ -95,6 +95,18 @@ from .report_loader import (
     load_webguard_report_file,
     load_webguard_report_json,
 )
+from .reporting import (
+    CURRENT_REPORT_COMPARISON_SCHEMA_VERSION,
+    MAXIMUM_REPORT_COMPARISON_BYTES,
+    REPORT_COMPARISON_TYPE,
+    ComparedFinding,
+    FindingDisposition,
+    ReportComparison,
+    ReportComparisonError,
+    load_report_comparison,
+    load_report_comparison_file,
+    load_report_comparison_json,
+)
 from .scans import (
     RequestAttempt,
     RequestAttemptOutcome,
@@ -203,4 +215,14 @@ __all__ = [
     "load_owned_target_authorization_json",
     "write_owned_target_audit_file",
     "write_owned_target_authorization_file",
+    "CURRENT_REPORT_COMPARISON_SCHEMA_VERSION",
+    "MAXIMUM_REPORT_COMPARISON_BYTES",
+    "REPORT_COMPARISON_TYPE",
+    "ComparedFinding",
+    "FindingDisposition",
+    "ReportComparison",
+    "ReportComparisonError",
+    "load_report_comparison",
+    "load_report_comparison_file",
+    "load_report_comparison_json",
 ]
