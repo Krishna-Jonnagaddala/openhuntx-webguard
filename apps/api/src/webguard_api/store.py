@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -18,7 +19,31 @@ from webguard_contracts import (
 )
 
 
-DATABASE_SCHEMA_VERSION = 1
+DATABASE_SCHEMA_VERSION = 2
+
+
+@dataclass(frozen=True, slots=True)
+class LeasedScanJob:
+    """One running job fenced to a specific worker lease."""
+
+    record: ScanJobRecord
+    worker_id: str
+    lease_token: str
+    lease_expires_at: datetime
+    attempt_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseRecoverySummary:
+    """Counts returned after recovering expired worker leases."""
+
+    requeued: int = 0
+    cancelled: int = 0
+    failed: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.requeued + self.cancelled + self.failed
 
 
 class JobStoreError(ValueError):
@@ -149,14 +174,21 @@ class ScanJobStore:
                 COMMIT;
                 """
             )
-            row = connection.execute(
-                "SELECT value FROM service_metadata WHERE key = 'schema_version'"
-            ).fetchone()
-            if row is None or int(row["value"]) != DATABASE_SCHEMA_VERSION:
+            version = self._read_schema_version(connection)
+            if version == 1:
+                self._migrate_v1_to_v2(connection)
+                version = 2
+            if version != DATABASE_SCHEMA_VERSION:
                 raise JobStoreError(
                     "job_store_schema_unsupported",
                     "The job-store schema version is unsupported.",
                 )
+        except JobStoreError:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
         except sqlite3.Error as exc:
             try:
                 connection.execute("ROLLBACK")
@@ -175,6 +207,70 @@ class ScanJobStore:
                 "job_store_permissions_failed",
                 "Unable to apply owner-only database permissions.",
             ) from exc
+
+    @staticmethod
+    def _read_schema_version(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT value FROM service_metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        if row is None:
+            raise JobStoreError(
+                "job_store_schema_unsupported",
+                "The job-store schema version is missing.",
+            )
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError) as exc:
+            raise JobStoreError(
+                "job_store_schema_unsupported",
+                "The job-store schema version is invalid.",
+            ) from exc
+
+    @staticmethod
+    def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+        """Add durable worker leases and recover legacy running jobs."""
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("ALTER TABLE scan_jobs ADD COLUMN worker_id TEXT")
+            connection.execute("ALTER TABLE scan_jobs ADD COLUMN lease_token TEXT")
+            connection.execute("ALTER TABLE scan_jobs ADD COLUMN lease_expires_at TEXT")
+            connection.execute("ALTER TABLE scan_jobs ADD COLUMN heartbeat_at TEXT")
+            connection.execute(
+                "ALTER TABLE scan_jobs ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+            connection.execute(
+                """
+                UPDATE scan_jobs
+                SET state = ?, completed_at = updated_at, revision = revision + 1
+                WHERE state = ? AND cancellation_requested = 1
+                """,
+                (ScanJobState.CANCELLED.value, ScanJobState.RUNNING.value),
+            )
+            connection.execute(
+                """
+                UPDATE scan_jobs
+                SET state = ?, started_at = NULL, revision = revision + 1
+                WHERE state = ?
+                """,
+                (ScanJobState.QUEUED.value, ScanJobState.RUNNING.value),
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_scan_jobs_expired_lease
+                ON scan_jobs(state, lease_expires_at, job_id)
+                """
+            )
+            connection.execute(
+                "UPDATE service_metadata SET value = '2' WHERE key = 'schema_version'"
+            )
+            connection.execute("COMMIT")
+        except sqlite3.Error:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
 
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> ScanJobRecord:
@@ -210,6 +306,65 @@ class ScanJobStore:
             error_code=row["error_code"],
             error_message=row["error_message"],
         )
+
+    @classmethod
+    def _lease_from_row(cls, row: sqlite3.Row) -> LeasedScanJob:
+        expires_at = _parse_timestamp(row["lease_expires_at"])
+        if (
+            row["worker_id"] is None
+            or row["lease_token"] is None
+            or expires_at is None
+        ):
+            raise JobStoreError(
+                "job_lease_metadata_invalid",
+                "The running job does not contain complete lease metadata.",
+            )
+        return LeasedScanJob(
+            record=cls._record_from_row(row),
+            worker_id=row["worker_id"],
+            lease_token=row["lease_token"],
+            lease_expires_at=expires_at,
+            attempt_count=int(row["attempt_count"]),
+        )
+
+    @staticmethod
+    def _worker_id(value: object) -> str:
+        if not isinstance(value, str):
+            raise JobStoreError(
+                "job_worker_id_invalid",
+                "worker_id must be a non-empty string.",
+            )
+        result = value.strip()
+        if not result or len(result) > 128 or any(ord(char) < 33 or ord(char) > 126 for char in result):
+            raise JobStoreError(
+                "job_worker_id_invalid",
+                "worker_id must contain 1 to 128 visible ASCII characters.",
+            )
+        return result
+
+    @staticmethod
+    def _lease_seconds(value: object) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise JobStoreError(
+                "job_lease_duration_invalid",
+                "lease_seconds must be numeric.",
+            )
+        result = float(value)
+        if not 0.1 <= result <= 3600.0:
+            raise JobStoreError(
+                "job_lease_duration_invalid",
+                "lease_seconds must be from 0.1 to 3600 seconds.",
+            )
+        return result
+
+    @staticmethod
+    def _maximum_attempts(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
+            raise JobStoreError(
+                "job_maximum_attempts_invalid",
+                "maximum_attempts must be from 1 to 100.",
+            )
+        return value
 
     def submit(
         self,
@@ -426,6 +581,297 @@ class ScanJobStore:
         finally:
             connection.close()
 
+    def claim_next_leased(
+        self,
+        *,
+        now: datetime,
+        worker_id: str,
+        lease_seconds: float,
+    ) -> LeasedScanJob | None:
+        """Atomically claim the oldest queued job with a fenced worker lease."""
+
+        effective_worker_id = self._worker_id(worker_id)
+        duration = self._lease_seconds(lease_seconds)
+        timestamp = _timestamp(now)
+        expires_at = now + timedelta(seconds=duration)
+        expires_text = _timestamp(expires_at)
+        lease_token = str(uuid4())
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM scan_jobs
+                WHERE state = ? AND cancellation_requested = 0
+                ORDER BY submitted_at, job_id
+                LIMIT 1
+                """,
+                (ScanJobState.QUEUED.value,),
+            ).fetchone()
+            if row is None:
+                connection.execute("COMMIT")
+                return None
+            revision = int(row["revision"]) + 1
+            updated = connection.execute(
+                """
+                UPDATE scan_jobs
+                SET state = ?, started_at = ?, updated_at = ?, revision = ?,
+                    worker_id = ?, lease_token = ?, lease_expires_at = ?,
+                    heartbeat_at = ?, attempt_count = attempt_count + 1
+                WHERE job_id = ? AND state = ? AND revision = ?
+                """,
+                (
+                    ScanJobState.RUNNING.value,
+                    timestamp,
+                    timestamp,
+                    revision,
+                    effective_worker_id,
+                    lease_token,
+                    expires_text,
+                    timestamp,
+                    row["job_id"],
+                    ScanJobState.QUEUED.value,
+                    row["revision"],
+                ),
+            )
+            if updated.rowcount != 1:
+                connection.execute("ROLLBACK")
+                return None
+            claimed = connection.execute(
+                "SELECT * FROM scan_jobs WHERE job_id = ?",
+                (row["job_id"],),
+            ).fetchone()
+            connection.execute("COMMIT")
+            assert claimed is not None
+            return self._lease_from_row(claimed)
+        except sqlite3.Error as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "job_store_claim_failed",
+                "Unable to claim the next scan job with a worker lease.",
+            ) from exc
+        finally:
+            connection.close()
+
+    def renew_lease(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+        now: datetime,
+        lease_seconds: float,
+    ) -> LeasedScanJob:
+        """Extend one unexpired lease owned by the same worker and token."""
+
+        effective_worker_id = self._worker_id(worker_id)
+        duration = self._lease_seconds(lease_seconds)
+        timestamp = _timestamp(now)
+        expires_text = _timestamp(now + timedelta(seconds=duration))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM scan_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise JobStoreError("job_not_found", "Scan job was not found.")
+            self._require_active_lease(
+                row,
+                worker_id=effective_worker_id,
+                lease_token=lease_token,
+                now=now,
+            )
+            revision = int(row["revision"]) + 1
+            updated = connection.execute(
+                """
+                UPDATE scan_jobs
+                SET heartbeat_at = ?, lease_expires_at = ?,
+                    updated_at = ?, revision = ?
+                WHERE job_id = ? AND state = ? AND revision = ?
+                    AND worker_id = ? AND lease_token = ?
+                """,
+                (
+                    timestamp,
+                    expires_text,
+                    timestamp,
+                    revision,
+                    job_id,
+                    ScanJobState.RUNNING.value,
+                    row["revision"],
+                    effective_worker_id,
+                    lease_token,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise JobStoreError(
+                    "job_lease_lost",
+                    "The worker lease is no longer current.",
+                )
+            renewed = connection.execute(
+                "SELECT * FROM scan_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+            assert renewed is not None
+            return self._lease_from_row(renewed)
+        except JobStoreError:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        except sqlite3.Error as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "job_store_lease_renew_failed",
+                "Unable to renew the worker lease.",
+            ) from exc
+        finally:
+            connection.close()
+
+    def recover_expired_leases(
+        self,
+        *,
+        now: datetime,
+        maximum_attempts: int,
+    ) -> LeaseRecoverySummary:
+        """Requeue, cancel, or fail running jobs whose worker lease expired."""
+
+        limit = self._maximum_attempts(maximum_attempts)
+        timestamp = _timestamp(now)
+        requeued = cancelled = failed = 0
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT * FROM scan_jobs
+                WHERE state = ?
+                    AND lease_expires_at IS NOT NULL
+                    AND lease_expires_at <= ?
+                ORDER BY lease_expires_at, job_id
+                """,
+                (ScanJobState.RUNNING.value, timestamp),
+            ).fetchall()
+            for row in rows:
+                revision = int(row["revision"]) + 1
+                common = (
+                    timestamp,
+                    revision,
+                    row["job_id"],
+                    ScanJobState.RUNNING.value,
+                    row["revision"],
+                    row["lease_token"],
+                )
+                if bool(row["cancellation_requested"]):
+                    result = connection.execute(
+                        """
+                        UPDATE scan_jobs
+                        SET state = ?, completed_at = ?, updated_at = ?,
+                            revision = ?, worker_id = NULL, lease_token = NULL,
+                            lease_expires_at = NULL, heartbeat_at = NULL
+                        WHERE job_id = ? AND state = ? AND revision = ?
+                            AND lease_token = ?
+                        """,
+                        (ScanJobState.CANCELLED.value, timestamp, *common),
+                    )
+                    cancelled += result.rowcount
+                elif int(row["attempt_count"]) >= limit:
+                    result = connection.execute(
+                        """
+                        UPDATE scan_jobs
+                        SET state = ?, completed_at = ?, updated_at = ?,
+                            revision = ?, worker_id = NULL, lease_token = NULL,
+                            lease_expires_at = NULL, heartbeat_at = NULL,
+                            error_code = ?, error_message = ?
+                        WHERE job_id = ? AND state = ? AND revision = ?
+                            AND lease_token = ?
+                        """,
+                        (
+                            ScanJobState.FAILED.value,
+                            timestamp,
+                            timestamp,
+                            revision,
+                            "worker_lease_attempts_exhausted",
+                            "The scan job exceeded the permitted worker recovery attempts.",
+                            row["job_id"],
+                            ScanJobState.RUNNING.value,
+                            row["revision"],
+                            row["lease_token"],
+                        ),
+                    )
+                    failed += result.rowcount
+                else:
+                    result = connection.execute(
+                        """
+                        UPDATE scan_jobs
+                        SET state = ?, started_at = NULL, updated_at = ?,
+                            revision = ?, worker_id = NULL, lease_token = NULL,
+                            lease_expires_at = NULL, heartbeat_at = NULL
+                        WHERE job_id = ? AND state = ? AND revision = ?
+                            AND lease_token = ?
+                        """,
+                        (
+                            ScanJobState.QUEUED.value,
+                            timestamp,
+                            revision,
+                            row["job_id"],
+                            ScanJobState.RUNNING.value,
+                            row["revision"],
+                            row["lease_token"],
+                        ),
+                    )
+                    requeued += result.rowcount
+            connection.execute("COMMIT")
+            return LeaseRecoverySummary(
+                requeued=requeued,
+                cancelled=cancelled,
+                failed=failed,
+            )
+        except sqlite3.Error as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "job_store_lease_recovery_failed",
+                "Unable to recover expired worker leases.",
+            ) from exc
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _require_active_lease(
+        row: sqlite3.Row,
+        *,
+        worker_id: str,
+        lease_token: str,
+        now: datetime,
+    ) -> None:
+        if (
+            row["state"] != ScanJobState.RUNNING.value
+            or row["worker_id"] != worker_id
+            or row["lease_token"] != lease_token
+        ):
+            raise JobStoreError(
+                "job_lease_lost",
+                "The worker lease is no longer current.",
+            )
+        expires_at = _parse_timestamp(row["lease_expires_at"])
+        if expires_at is None or expires_at <= now.astimezone(timezone.utc):
+            raise JobStoreError(
+                "job_lease_expired",
+                "The worker lease has expired.",
+            )
+
     def request_cancellation(
         self,
         job_id: str,
@@ -535,6 +981,43 @@ class ScanJobStore:
             audit_ref=audit_ref,
         )
 
+    def finish_result_leased(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+        scan_id: str,
+        result_status: ScanStatus,
+        report_ref: str,
+        audit_ref: str,
+        now: datetime,
+    ) -> ScanJobRecord:
+        state_by_status = {
+            ScanStatus.COMPLETED: ScanJobState.COMPLETED,
+            ScanStatus.COMPLETED_WITH_ERRORS: ScanJobState.COMPLETED_WITH_ERRORS,
+            ScanStatus.FAILED: ScanJobState.FAILED,
+            ScanStatus.CANCELLED: ScanJobState.CANCELLED,
+        }
+        try:
+            state = state_by_status[result_status]
+        except KeyError as exc:
+            raise JobStoreError(
+                "job_store_result_status_invalid",
+                "Queued or running scan results cannot finish a job.",
+            ) from exc
+        return self._terminal_update(
+            job_id,
+            state=state,
+            now=now,
+            worker_id=worker_id,
+            lease_token=lease_token,
+            scan_id=scan_id,
+            result_status=result_status,
+            report_ref=report_ref,
+            audit_ref=audit_ref,
+        )
+
     def complete(
         self,
         job_id: str,
@@ -595,12 +1078,50 @@ class ScanJobStore:
             now=now,
         )
 
+    def fail_leased(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+        error_code: str,
+        error_message: str,
+        now: datetime,
+    ) -> ScanJobRecord:
+        return self._terminal_update(
+            job_id,
+            state=ScanJobState.FAILED,
+            now=now,
+            worker_id=worker_id,
+            lease_token=lease_token,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+    def cancel_running_leased(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        lease_token: str,
+        now: datetime,
+    ) -> ScanJobRecord:
+        return self._terminal_update(
+            job_id,
+            state=ScanJobState.CANCELLED,
+            now=now,
+            worker_id=worker_id,
+            lease_token=lease_token,
+        )
+
     def _terminal_update(
         self,
         job_id: str,
         *,
         state: ScanJobState,
         now: datetime,
+        worker_id: str | None = None,
+        lease_token: str | None = None,
         scan_id: str | None = None,
         result_status: ScanStatus | None = None,
         report_ref: str | None = None,
@@ -608,6 +1129,14 @@ class ScanJobStore:
         error_code: str | None = None,
         error_message: str | None = None,
     ) -> ScanJobRecord:
+        if (worker_id is None) != (lease_token is None):
+            raise JobStoreError(
+                "job_lease_credentials_invalid",
+                "worker_id and lease_token must be supplied together.",
+            )
+        effective_worker_id = (
+            None if worker_id is None else self._worker_id(worker_id)
+        )
         timestamp = _timestamp(now)
         connection = self._connect()
         try:
@@ -624,31 +1153,62 @@ class ScanJobStore:
                     "job_state_transition_invalid",
                     "Only running jobs can enter a terminal worker state.",
                 )
+            if row["lease_token"] is not None:
+                if effective_worker_id is None or lease_token is None:
+                    raise JobStoreError(
+                        "job_lease_required",
+                        "A current worker lease is required for this transition.",
+                    )
+                self._require_active_lease(
+                    row,
+                    worker_id=effective_worker_id,
+                    lease_token=lease_token,
+                    now=now,
+                )
+            elif effective_worker_id is not None:
+                raise JobStoreError(
+                    "job_lease_lost",
+                    "The worker lease is no longer current.",
+                )
+
             revision = record.revision + 1
-            connection.execute(
-                """
+            parameters = [
+                state.value,
+                timestamp,
+                timestamp,
+                revision,
+                scan_id,
+                None if result_status is None else result_status.value,
+                report_ref,
+                audit_ref,
+                error_code,
+                error_message,
+                job_id,
+                ScanJobState.RUNNING.value,
+                record.revision,
+            ]
+            lease_predicate = ""
+            if effective_worker_id is not None:
+                lease_predicate = " AND worker_id = ? AND lease_token = ?"
+                parameters.extend([effective_worker_id, lease_token])
+            updated_count = connection.execute(
+                f"""
                 UPDATE scan_jobs
                 SET state = ?, completed_at = ?, updated_at = ?, revision = ?,
                     scan_id = ?, result_status = ?, report_ref = ?, audit_ref = ?,
-                    error_code = ?, error_message = ?
-                WHERE job_id = ? AND state = ? AND revision = ?
+                    error_code = ?, error_message = ?, worker_id = NULL,
+                    lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL
+                WHERE job_id = ? AND state = ? AND revision = ?{lease_predicate}
                 """,
-                (
-                    state.value,
-                    timestamp,
-                    timestamp,
-                    revision,
-                    scan_id,
-                    None if result_status is None else result_status.value,
-                    report_ref,
-                    audit_ref,
-                    error_code,
-                    error_message,
-                    job_id,
-                    ScanJobState.RUNNING.value,
-                    record.revision,
-                ),
+                tuple(parameters),
             )
+            if updated_count.rowcount != 1:
+                raise JobStoreError(
+                    "job_lease_lost" if effective_worker_id is not None else "job_state_transition_conflict",
+                    "The worker lease is no longer current."
+                    if effective_worker_id is not None
+                    else "The scan-job state changed before the transition completed.",
+                )
             updated = connection.execute(
                 "SELECT * FROM scan_jobs WHERE job_id = ?",
                 (job_id,),
@@ -678,5 +1238,7 @@ class ScanJobStore:
 __all__ = [
     "DATABASE_SCHEMA_VERSION",
     "JobStoreError",
+    "LeaseRecoverySummary",
+    "LeasedScanJob",
     "ScanJobStore",
 ]

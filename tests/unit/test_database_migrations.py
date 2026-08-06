@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+import sqlite3
+import tempfile
+import unittest
+from datetime import timedelta
+from pathlib import Path
+
+from webguard_api import DATABASE_SCHEMA_VERSION, JobStoreError, ScanJobStore
+from webguard_contracts import ScanJobMode, ScanJobRequest, ScanJobState
+
+from tests.unit.service_test_support import AUTH_ID, NOW, TARGET
+
+
+JOB_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+
+def request() -> ScanJobRequest:
+    return ScanJobRequest(
+        idempotency_key="migration-test",
+        target=TARGET,
+        authorization_id=AUTH_ID,
+        authorization_sha256="a" * 64,
+        mode=ScanJobMode.CRAWL,
+        submitted_at=NOW,
+    )
+
+
+def timestamp(value) -> str:
+    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def create_v1_database(
+    path: Path,
+    *,
+    state: ScanJobState = ScanJobState.QUEUED,
+    cancellation_requested: bool = False,
+) -> None:
+    value = request()
+    started_at = None
+    if state is ScanJobState.RUNNING:
+        started_at = timestamp(NOW + timedelta(seconds=1))
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE service_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE scan_jobs (
+                job_id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                request_fingerprint TEXT NOT NULL,
+                target TEXT NOT NULL,
+                authorization_id TEXT NOT NULL,
+                authorization_sha256 TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                submitted_at TEXT NOT NULL,
+                state TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                cancellation_requested INTEGER NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                scan_id TEXT,
+                result_status TEXT,
+                report_ref TEXT,
+                audit_ref TEXT,
+                error_code TEXT,
+                error_message TEXT
+            );
+            CREATE TABLE job_scopes (
+                job_id TEXT PRIMARY KEY,
+                organization_id TEXT NOT NULL,
+                submitted_by TEXT NOT NULL,
+                FOREIGN KEY (job_id) REFERENCES scan_jobs(job_id) ON DELETE CASCADE
+            );
+            INSERT INTO service_metadata(key, value)
+                VALUES ('schema_version', '1');
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO scan_jobs (
+                job_id, idempotency_key, request_fingerprint,
+                target, authorization_id, authorization_sha256, mode,
+                submitted_at, state, updated_at, revision,
+                cancellation_requested, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                JOB_ID,
+                value.idempotency_key,
+                value.fingerprint,
+                value.target,
+                value.authorization_id,
+                value.authorization_sha256,
+                value.mode.value,
+                timestamp(value.submitted_at),
+                state.value,
+                timestamp(NOW + timedelta(seconds=1)),
+                4,
+                int(cancellation_requested),
+                started_at,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+class DatabaseMigrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.path = Path(self.temporary.name) / "jobs.sqlite3"
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_v1_database_migrates_to_v2_without_losing_queued_job(self) -> None:
+        create_v1_database(self.path)
+        store = ScanJobStore(self.path)
+        record = store.get(JOB_ID)
+        self.assertIs(record.state, ScanJobState.QUEUED)
+        self.assertEqual(record.revision, 4)
+        connection = sqlite3.connect(self.path)
+        try:
+            version = connection.execute(
+                "SELECT value FROM service_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(version, (str(DATABASE_SCHEMA_VERSION),))
+
+    def test_legacy_running_job_is_requeued_during_migration(self) -> None:
+        create_v1_database(self.path, state=ScanJobState.RUNNING)
+        store = ScanJobStore(self.path)
+        record = store.get(JOB_ID)
+        self.assertIs(record.state, ScanJobState.QUEUED)
+        self.assertIsNone(record.started_at)
+        self.assertEqual(record.revision, 5)
+
+    def test_legacy_running_cancellation_becomes_terminal(self) -> None:
+        create_v1_database(
+            self.path,
+            state=ScanJobState.RUNNING,
+            cancellation_requested=True,
+        )
+        store = ScanJobStore(self.path)
+        record = store.get(JOB_ID)
+        self.assertIs(record.state, ScanJobState.CANCELLED)
+        self.assertTrue(record.cancellation_requested)
+        self.assertIsNotNone(record.completed_at)
+        self.assertEqual(record.revision, 5)
+
+    def test_future_schema_version_is_rejected(self) -> None:
+        create_v1_database(self.path)
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                "UPDATE service_metadata SET value = '999' WHERE key = 'schema_version'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(JobStoreError) as context:
+            ScanJobStore(self.path)
+        self.assertEqual(context.exception.code, "job_store_schema_unsupported")
+
+
+if __name__ == "__main__":
+    unittest.main()

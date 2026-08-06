@@ -20,6 +20,9 @@ from .config import (
     DEFAULT_API_PORT,
     DEFAULT_RATE_LIMIT_REQUESTS,
     DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+    DEFAULT_WORKER_HEARTBEAT_SECONDS,
+    DEFAULT_WORKER_LEASE_SECONDS,
+    DEFAULT_WORKER_MAXIMUM_ATTEMPTS,
     DEFAULT_WORKER_POLL_SECONDS,
     ServiceConfig,
     ServiceConfigError,
@@ -55,6 +58,10 @@ def _config(args: argparse.Namespace) -> ServiceConfig:
         artifact_directory=args.artifacts,
         maximum_request_bytes=args.maximum_request_bytes,
         worker_poll_seconds=args.worker_poll_seconds,
+        worker_id=args.worker_id,
+        worker_lease_seconds=args.worker_lease_seconds,
+        worker_heartbeat_seconds=args.worker_heartbeat_seconds,
+        worker_maximum_attempts=args.worker_maximum_attempts,
         rate_limit_requests=args.rate_limit_requests,
         rate_limit_window_seconds=args.rate_limit_window_seconds,
     )
@@ -83,6 +90,10 @@ def _components(config: ServiceConfig):
         store=store,
         executor=executor,
         poll_seconds=config.worker_poll_seconds,
+        worker_id=config.worker_id,
+        lease_seconds=config.worker_lease_seconds,
+        heartbeat_seconds=config.worker_heartbeat_seconds,
+        maximum_attempts=config.worker_maximum_attempts,
     )
     authenticator = ApiTokenAuthenticator(identity)
     limiter = FixedWindowRateLimiter(
@@ -195,6 +206,13 @@ def _worker_command(args: argparse.Namespace) -> int:
     _, _, _, worker, _, _ = _components(config)
     if args.once:
         processed = worker.run_once()
+        recovery = worker.last_recovery_summary
+        if recovery.total:
+            print(
+                "Recovered expired leases: "
+                f"requeued={recovery.requeued}, "
+                f"cancelled={recovery.cancelled}, failed={recovery.failed}."
+            )
         print("Processed one job." if processed else "No queued job was available.")
         return EXIT_SUCCESS
     stop_event = threading.Event()
@@ -204,7 +222,14 @@ def _worker_command(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    print("WebGuard worker started. Press Ctrl+C to stop.")
+    print(f"WebGuard worker started: {worker.worker_id}")
+    print(
+        "Lease: "
+        f"{worker.lease_seconds:g}s; heartbeat: "
+        f"{worker.heartbeat_seconds:g}s; maximum attempts: "
+        f"{worker.maximum_attempts}."
+    )
+    print("Press Ctrl+C to stop.")
     worker.run_forever(stop_event)
     print("WebGuard worker stopped.")
     return EXIT_SUCCESS
@@ -239,6 +264,10 @@ def _serve_command(args: argparse.Namespace) -> int:
     bound_host, bound_port = server.server_address[:2]
     print(f"WebGuard API listening on http://{bound_host}:{bound_port}")
     print("Bearer authentication and organization RBAC are enabled.")
+    print(
+        f"Worker {worker.worker_id} uses renewable database leases "
+        f"({worker.lease_seconds:g}s)."
+    )
     print("Binding is loopback-only. Press Ctrl+C to stop.")
     try:
         server.serve_forever(poll_interval=0.25)
@@ -262,6 +291,22 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--worker-poll-seconds", type=float, default=DEFAULT_WORKER_POLL_SECONDS
     )
+    parser.add_argument("--worker-id")
+    parser.add_argument(
+        "--worker-lease-seconds",
+        type=float,
+        default=DEFAULT_WORKER_LEASE_SECONDS,
+    )
+    parser.add_argument(
+        "--worker-heartbeat-seconds",
+        type=float,
+        default=DEFAULT_WORKER_HEARTBEAT_SECONDS,
+    )
+    parser.add_argument(
+        "--worker-maximum-attempts",
+        type=int,
+        default=DEFAULT_WORKER_MAXIMUM_ATTEMPTS,
+    )
     parser.add_argument(
         "--rate-limit-requests", type=int, default=DEFAULT_RATE_LIMIT_REQUESTS
     )
@@ -275,7 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="webguard-api",
         description="Authenticated local WebGuard control-plane API and scanner queue.",
     )
-    parser.add_argument("--version", action="version", version="webguard-api 0.2.0")
+    parser.add_argument("--version", action="version", version="webguard-api 0.3.0")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="Initialize service and identity tables.")

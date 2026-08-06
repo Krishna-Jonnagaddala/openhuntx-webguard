@@ -16,6 +16,25 @@ class ApiCliTests(unittest.TestCase):
             namespace = parser.parse_args([command])
             self.assertEqual(namespace.command, command)
 
+    def test_worker_lease_options_are_available(self) -> None:
+        namespace = build_parser().parse_args(
+            [
+                "worker",
+                "--worker-id",
+                "worker-a",
+                "--worker-lease-seconds",
+                "45",
+                "--worker-heartbeat-seconds",
+                "15",
+                "--worker-maximum-attempts",
+                "5",
+            ]
+        )
+        self.assertEqual(namespace.worker_id, "worker-a")
+        self.assertEqual(namespace.worker_lease_seconds, 45.0)
+        self.assertEqual(namespace.worker_heartbeat_seconds, 15.0)
+        self.assertEqual(namespace.worker_maximum_attempts, 5)
+
     def test_init_creates_private_database(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -107,8 +126,8 @@ class ApiIdentityCliTests(unittest.TestCase):
             with redirect_stdout(output):
                 result = main([
                     "bootstrap",
-                    "--organization", "InternStack",
-                    "--principal", "Krishna Jonnagaddala",
+                    "--organization", "Example Organisation",
+                    "--principal", "Initial Owner",
                     "--database", str(root / "jobs.sqlite3"),
                     "--authorizations", str(root / "authorizations"),
                     "--artifacts", str(root / "artifacts"),
@@ -122,7 +141,7 @@ class ApiIdentityCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             args = [
-                "bootstrap", "--organization", "InternStack", "--principal", "Owner",
+                "bootstrap", "--organization", "Example Organisation", "--principal", "Owner",
                 "--database", str(root / "jobs.sqlite3"),
                 "--authorizations", str(root / "authorizations"),
                 "--artifacts", str(root / "artifacts"),
