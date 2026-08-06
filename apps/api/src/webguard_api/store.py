@@ -136,6 +136,14 @@ class ScanJobStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_scan_jobs_queue
                     ON scan_jobs(state, submitted_at, job_id);
+                CREATE TABLE IF NOT EXISTS job_scopes (
+                    job_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    submitted_by TEXT NOT NULL,
+                    FOREIGN KEY (job_id) REFERENCES scan_jobs(job_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_job_scopes_organization
+                    ON job_scopes(organization_id, job_id);
                 INSERT OR IGNORE INTO service_metadata(key, value)
                     VALUES ('schema_version', '1');
                 COMMIT;
@@ -208,6 +216,8 @@ class ScanJobStore:
         request: ScanJobRequest,
         *,
         job_id: str | None = None,
+        organization_id: str | None = None,
+        submitted_by: str | None = None,
     ) -> tuple[ScanJobRecord, bool]:
         """Insert a queued job or return the idempotent existing job."""
 
@@ -215,6 +225,11 @@ class ScanJobStore:
             raise JobStoreError(
                 "job_store_request_invalid",
                 "request must be a ScanJobRequest value.",
+            )
+        if (organization_id is None) != (submitted_by is None):
+            raise JobStoreError(
+                "job_scope_invalid",
+                "organization_id and submitted_by must be supplied together.",
             )
         effective_job_id = str(uuid4()) if job_id is None else job_id
         record = ScanJobRecord(
@@ -237,6 +252,16 @@ class ScanJobStore:
                         "job_idempotency_conflict",
                         "The idempotency key was already used for a different request.",
                     )
+                if organization_id is not None:
+                    scope = connection.execute(
+                        "SELECT organization_id, submitted_by FROM job_scopes WHERE job_id = ?",
+                        (existing_record.job_id,),
+                    ).fetchone()
+                    if scope is None or scope["organization_id"] != organization_id:
+                        raise JobStoreError(
+                            "job_idempotency_conflict",
+                            "The idempotency key was already used outside this organization.",
+                        )
                 connection.execute("COMMIT")
                 return existing_record, False
             connection.execute(
@@ -263,6 +288,11 @@ class ScanJobStore:
                     0,
                 ),
             )
+            if organization_id is not None:
+                connection.execute(
+                    "INSERT INTO job_scopes(job_id, organization_id, submitted_by) VALUES (?, ?, ?)",
+                    (record.job_id, organization_id, submitted_by),
+                )
             connection.execute("COMMIT")
             return record, True
         except JobStoreError:
@@ -300,6 +330,45 @@ class ScanJobStore:
         if row is None:
             raise JobStoreError("job_not_found", "Scan job was not found.")
         return self._record_from_row(row)
+
+    def get_scope(self, job_id: str) -> tuple[str, str] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT organization_id, submitted_by FROM job_scopes WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "job_store_read_failed",
+                "Unable to read scan-job scope metadata.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return row["organization_id"], row["submitted_by"]
+
+    def get_scoped(self, job_id: str, organization_id: str) -> ScanJobRecord:
+        record = self.get(job_id)
+        scope = self.get_scope(job_id)
+        if scope is None or scope[0] != organization_id:
+            raise JobStoreError("job_not_found", "Scan job was not found.")
+        return record
+
+    def request_cancellation_scoped(
+        self,
+        job_id: str,
+        organization_id: str,
+        *,
+        now: datetime,
+    ) -> ScanJobRecord:
+        self.get_scoped(job_id, organization_id)
+        return self.request_cancellation(job_id, now=now)
+
+    def organization_id_for_job(self, job_id: str) -> str | None:
+        scope = self.get_scope(job_id)
+        return None if scope is None else scope[0]
 
     def claim_next(self, *, now: datetime) -> ScanJobRecord | None:
         timestamp = _timestamp(now)

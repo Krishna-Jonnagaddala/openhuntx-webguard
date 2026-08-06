@@ -14,6 +14,10 @@ DEFAULT_API_MAXIMUM_REQUEST_BYTES = 64 * 1024
 DEFAULT_WORKER_POLL_SECONDS = 0.25
 MAXIMUM_API_REQUEST_BYTES = 128 * 1024
 MAXIMUM_WORKER_POLL_SECONDS = 5.0
+DEFAULT_RATE_LIMIT_REQUESTS = 120
+DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
+MAXIMUM_RATE_LIMIT_REQUESTS = 10_000
+MAXIMUM_RATE_LIMIT_WINDOW_SECONDS = 3_600
 
 
 class ServiceConfigError(ValueError):
@@ -52,6 +56,8 @@ class ServiceConfig:
     artifact_directory: Path = Path("scan-results/service")
     maximum_request_bytes: int = DEFAULT_API_MAXIMUM_REQUEST_BYTES
     worker_poll_seconds: float = DEFAULT_WORKER_POLL_SECONDS
+    rate_limit_requests: int = DEFAULT_RATE_LIMIT_REQUESTS
+    rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS
 
     def __post_init__(self) -> None:
         if not isinstance(self.host, str):
@@ -70,7 +76,7 @@ class ServiceConfig:
         if not address.is_loopback:
             raise ServiceConfigError(
                 "service_non_loopback_binding_rejected",
-                "Milestone 1.26 permits loopback API binding only.",
+                "Milestone 1.27 permits loopback API binding only.",
             )
         object.__setattr__(self, "host", address.compressed)
 
@@ -128,6 +134,25 @@ class ServiceConfig:
             )
         object.__setattr__(self, "worker_poll_seconds", interval)
 
+        if (
+            isinstance(self.rate_limit_requests, bool)
+            or not isinstance(self.rate_limit_requests, int)
+            or not 1 <= self.rate_limit_requests <= MAXIMUM_RATE_LIMIT_REQUESTS
+        ):
+            raise ServiceConfigError(
+                "service_rate_limit_invalid",
+                "rate_limit_requests must be from 1 to 10000.",
+            )
+        if (
+            isinstance(self.rate_limit_window_seconds, bool)
+            or not isinstance(self.rate_limit_window_seconds, int)
+            or not 1 <= self.rate_limit_window_seconds <= MAXIMUM_RATE_LIMIT_WINDOW_SECONDS
+        ):
+            raise ServiceConfigError(
+                "service_rate_window_invalid",
+                "rate_limit_window_seconds must be from 1 to 3600.",
+            )
+
         resolved = [
             self.database_path.resolve(strict=False),
             self.authorization_directory.resolve(strict=False),
@@ -145,8 +170,12 @@ __all__ = [
     "DEFAULT_API_MAXIMUM_REQUEST_BYTES",
     "DEFAULT_API_PORT",
     "DEFAULT_WORKER_POLL_SECONDS",
+    "DEFAULT_RATE_LIMIT_REQUESTS",
+    "DEFAULT_RATE_LIMIT_WINDOW_SECONDS",
     "MAXIMUM_API_REQUEST_BYTES",
     "MAXIMUM_WORKER_POLL_SECONDS",
+    "MAXIMUM_RATE_LIMIT_REQUESTS",
+    "MAXIMUM_RATE_LIMIT_WINDOW_SECONDS",
     "ServiceConfig",
     "ServiceConfigError",
 ]

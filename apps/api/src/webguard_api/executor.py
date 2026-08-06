@@ -143,12 +143,14 @@ class ScanJobExecutor:
         clock: Callable[[], datetime] = _utc_now,
         single_scanner: Callable[..., WebGuardReport] = run_passive_header_scan,
         crawl_scanner: Callable[..., WebGuardReport] = run_passive_crawl_scan,
+        organization_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self.authorizations = authorizations
         self.artifact_directory = Path(artifact_directory).expanduser()
         self.clock = clock
         self.single_scanner = single_scanner
         self.crawl_scanner = crawl_scanner
+        self.organization_resolver = organization_resolver
 
     def _policies(self, authorization, mode: ScanJobMode):
         limits = authorization.limits
@@ -253,7 +255,16 @@ class ScanJobExecutor:
                 "The job was cancelled before scanner execution.",
             )
 
-        relative_directory = Path("jobs") / record.job_id
+        organization_id = (
+            None
+            if self.organization_resolver is None
+            else self.organization_resolver(record.job_id)
+        )
+        relative_directory = (
+            Path("jobs") / record.job_id
+            if organization_id is None
+            else Path("organizations") / organization_id / "jobs" / record.job_id
+        )
         report_ref = (relative_directory / "report.json").as_posix()
         audit_ref = (relative_directory / "authorization-audit.json").as_posix()
         _prepare_private_directory(self.artifact_directory)

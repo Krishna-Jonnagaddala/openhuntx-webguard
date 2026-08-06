@@ -91,3 +91,56 @@ curl --fail-with-body \
 ```
 
 The initial service binds only to a loopback IP literal. It returns job metadata and safe relative artifact references, not authorization documents or report bodies. The worker reloads and revalidates the server-side authorization immediately before execution, writes the authorization audit first, and uses the conservative owned-target scan policy.
+
+## Authenticated local API and organization RBAC
+
+Milestone 1.27 adds organization isolation, Bearer API tokens, users and service accounts, role-based permissions, target-authorization assignment, request correlation IDs, security audit events, and a local per-token rate-limit foundation.
+
+Initialize the private service database and create the first organization owner:
+
+```bash
+webguard-api init \
+  --database var/webguard-api/jobs.sqlite3 \
+  --authorizations authorizations \
+  --artifacts scan-results/service
+
+webguard-api bootstrap \
+  --organization "OpenHuntX" \
+  --principal "Krishna Jonnagaddala" \
+  --database var/webguard-api/jobs.sqlite3 \
+  --authorizations authorizations \
+  --artifacts scan-results/service
+```
+
+The bootstrap command prints one API token once. Store it outside the repository. Assign an owned-target authorization to the organization before submitting jobs:
+
+```bash
+webguard-api authorization assign \
+  --organization-id ORGANIZATION_UUID \
+  --principal-id OWNER_PRINCIPAL_UUID \
+  --authorization-id AUTHORIZATION_UUID \
+  --database var/webguard-api/jobs.sqlite3 \
+  --authorizations authorizations \
+  --artifacts scan-results/service
+```
+
+Start the loopback-only authenticated API:
+
+```bash
+webguard-api serve \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --database var/webguard-api/jobs.sqlite3 \
+  --authorizations authorizations \
+  --artifacts scan-results/service
+```
+
+Use the token through the Bearer scheme:
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  http://127.0.0.1:8765/v1/me
+```
+
+Roles are `owner`, `administrator`, `analyst`, and `viewer`. The API remains a local control-plane foundation and must not be exposed directly to the public internet.

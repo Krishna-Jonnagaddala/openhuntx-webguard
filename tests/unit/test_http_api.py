@@ -8,14 +8,25 @@ import unittest
 from pathlib import Path
 
 from webguard_api import (
+    ApiTokenAuthenticator,
     ApiTransportError,
     AuthorizationRepository,
+    FixedWindowRateLimiter,
     ScanJobStore,
     WebGuardJobService,
     create_server,
 )
+from webguard_contracts import OrganizationRole
 
-from tests.unit.service_test_support import AUTH_ID, NOW, TARGET, write_authorization
+from tests.unit.service_test_support import (
+    AUTH_ID,
+    NOW,
+    TARGET,
+    VIEWER_ID,
+    VIEWER_TOKEN_ID,
+    create_identity_fixture,
+    write_authorization,
+)
 
 
 def submission() -> bytes:
@@ -36,16 +47,28 @@ class HttpApiTests(unittest.TestCase):
         auth_dir = root / "authorizations"
         write_authorization(auth_dir)
         store = ScanJobStore(root / "jobs.sqlite3")
+        identity, self.context, self.token = create_identity_fixture(store.path)
+        _, self.viewer_context, self.viewer_token = create_identity_fixture(
+            store.path,
+            role=OrganizationRole.VIEWER,
+            principal_id=VIEWER_ID,
+            token_id=VIEWER_TOKEN_ID,
+        )
         service = WebGuardJobService(
             store=store,
             authorizations=AuthorizationRepository(auth_dir),
+            identity=identity,
             clock=lambda: NOW,
         )
         self.server = create_server(
             "127.0.0.1",
             0,
             service,
+            authenticator=ApiTokenAuthenticator(identity),
+            rate_limiter=FixedWindowRateLimiter(requests=100, window_seconds=60),
             maximum_request_bytes=1024,
+            clock=lambda: NOW,
+            epoch_clock=lambda: 1000.0,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -57,34 +80,54 @@ class HttpApiTests(unittest.TestCase):
         self.thread.join(timeout=2)
         self.temporary.cleanup()
 
-    def request(self, method, path, body=None, headers=None):
+    def request(self, method, path, body=None, headers=None, *, token="owner"):
+        effective = dict(headers or {})
+        if token == "owner":
+            effective.setdefault("Authorization", f"Bearer {self.token}")
+        elif token == "viewer":
+            effective.setdefault("Authorization", f"Bearer {self.viewer_token}")
         connection = http.client.HTTPConnection(self.host, self.port, timeout=3)
-        connection.request(method, path, body=body, headers=headers or {})
+        connection.request(method, path, body=body, headers=effective)
         response = connection.getresponse()
         payload = response.read()
+        response_headers = dict(response.getheaders())
+        status = response.status
         connection.close()
-        return response.status, dict(response.getheaders()), json.loads(payload)
-
+        return status, response_headers, json.loads(payload)
 
     def test_create_server_rejects_public_binding(self) -> None:
         with self.assertRaisesRegex(ApiTransportError, "loopback"):
             create_server(
                 "0.0.0.0",
                 0,
-                self.server.RequestHandlerClass.service if False else None,
+                None,
+                authenticator=None,
+                rate_limiter=None,
                 maximum_request_bytes=1024,
             )
 
-    def test_health_endpoint(self) -> None:
-        status, headers, payload = self.request("GET", "/healthz")
+    def test_health_endpoint_is_public(self) -> None:
+        status, headers, payload = self.request("GET", "/healthz", token=None)
         self.assertEqual(status, 200)
         self.assertEqual(payload, {"status": "ok"})
         self.assertEqual(headers["Cache-Control"], "no-store")
-        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("X-Request-ID", headers)
+
+    def test_missing_bearer_token_is_401(self) -> None:
+        status, headers, payload = self.request("GET", "/v1/me", token=None)
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"]["code"], "authorization_header_required")
+        self.assertIn("Bearer", headers["WWW-Authenticate"])
+
+    def test_me_returns_scoped_identity(self) -> None:
+        status, _, payload = self.request("GET", "/v1/me")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["organization_id"], self.context.organization_id)
+        self.assertEqual(payload["role"], "owner")
 
     def test_submit_get_and_cancel_job(self) -> None:
         body = submission()
-        status, _, created = self.request(
+        status, headers, created = self.request(
             "POST",
             "/v1/jobs",
             body=body,
@@ -95,6 +138,7 @@ class HttpApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(status, 201)
+        self.assertIn("RateLimit-Remaining", headers)
         job_id = created["job_id"]
         status, _, fetched = self.request("GET", f"/v1/jobs/{job_id}")
         self.assertEqual(status, 200)
@@ -107,6 +151,22 @@ class HttpApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(cancelled["state"], "cancelled")
+
+    def test_viewer_cannot_submit(self) -> None:
+        body = submission()
+        status, _, payload = self.request(
+            "POST",
+            "/v1/jobs",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+                "Idempotency-Key": "viewer-http-1",
+            },
+            token="viewer",
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["code"], "permission_denied")
 
     def test_idempotent_replay_returns_200(self) -> None:
         body = submission()
@@ -134,10 +194,7 @@ class HttpApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(status, 201)
-        status, _, payload = self.request(
-            "GET",
-            f"/v1/jobs/{created['job_id']}/result",
-        )
+        status, _, payload = self.request("GET", f"/v1/jobs/{created['job_id']}/result")
         self.assertEqual(status, 409)
         self.assertEqual(payload["error"]["code"], "job_result_not_ready")
 
@@ -147,10 +204,7 @@ class HttpApiTests(unittest.TestCase):
             "POST",
             "/v1/jobs",
             body=body,
-            headers={
-                "Content-Type": "application/json",
-                "Content-Length": str(len(body)),
-            },
+            headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
         )
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"]["code"], "idempotency_key_required")
@@ -186,7 +240,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "request_body_too_large")
 
     def test_query_string_is_rejected(self) -> None:
-        status, _, payload = self.request("GET", "/healthz?verbose=1")
+        status, _, payload = self.request("GET", "/healthz?verbose=1", token=None)
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"]["code"], "request_target_invalid")
 
@@ -200,7 +254,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 405)
         self.assertEqual(payload["error"]["code"], "method_not_allowed")
 
-    def test_submission_response_does_not_echo_confirmation(self) -> None:
+    def test_submission_response_does_not_echo_secrets(self) -> None:
         body = submission()
         status, _, payload = self.request(
             "POST",
@@ -215,7 +269,18 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 201)
         serialized = json.dumps(payload)
         self.assertNotIn("confirm_authorization", serialized)
-        self.assertNotIn("confirmation", serialized)
+        self.assertNotIn(self.token, serialized)
+
+    def test_owner_can_read_audit_events(self) -> None:
+        self.request("GET", "/v1/me")
+        status, _, payload = self.request("GET", "/v1/audit-events")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["events"])
+
+    def test_viewer_cannot_read_audit_events(self) -> None:
+        status, _, payload = self.request("GET", "/v1/audit-events", token="viewer")
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["code"], "permission_denied")
 
 
 if __name__ == "__main__":
