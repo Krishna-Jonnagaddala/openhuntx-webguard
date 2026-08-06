@@ -1,4 +1,4 @@
-"""Command-line entry point for the local WebGuard control-plane service."""
+"""Command-line entry point for the local authenticated WebGuard API."""
 
 from __future__ import annotations
 
@@ -6,20 +6,32 @@ import argparse
 import signal
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-from .authorizations import AuthorizationRepository
+from webguard_contracts import OrganizationRole, PrincipalType
+
+from .auth import ApiTokenAuthenticator
+from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .config import (
     DEFAULT_API_HOST,
     DEFAULT_API_MAXIMUM_REQUEST_BYTES,
     DEFAULT_API_PORT,
+    DEFAULT_RATE_LIMIT_REQUESTS,
+    DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
     DEFAULT_WORKER_POLL_SECONDS,
     ServiceConfig,
     ServiceConfigError,
 )
 from .executor import ScanJobExecutor
 from .http_api import create_server
+from .identity import (
+    DEFAULT_TOKEN_VALIDITY_DAYS,
+    IdentityStore,
+    IdentityStoreError,
+)
+from .rate_limit import FixedWindowRateLimiter
 from .service import WebGuardJobService
 from .store import JobStoreError, ScanJobStore
 from .worker import ScanJobWorker
@@ -28,6 +40,10 @@ from .worker import ScanJobWorker
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _config(args: argparse.Namespace) -> ServiceConfig:
@@ -39,37 +55,144 @@ def _config(args: argparse.Namespace) -> ServiceConfig:
         artifact_directory=args.artifacts,
         maximum_request_bytes=args.maximum_request_bytes,
         worker_poll_seconds=args.worker_poll_seconds,
+        rate_limit_requests=args.rate_limit_requests,
+        rate_limit_window_seconds=args.rate_limit_window_seconds,
     )
 
 
+def _stores(config: ServiceConfig) -> tuple[ScanJobStore, IdentityStore]:
+    jobs = ScanJobStore(config.database_path)
+    identity = IdentityStore(config.database_path)
+    return jobs, identity
+
+
 def _components(config: ServiceConfig):
-    store = ScanJobStore(config.database_path)
+    store, identity = _stores(config)
     authorizations = AuthorizationRepository(config.authorization_directory)
     executor = ScanJobExecutor(
         authorizations=authorizations,
         artifact_directory=config.artifact_directory,
+        organization_resolver=store.organization_id_for_job,
     )
-    service = WebGuardJobService(store=store, authorizations=authorizations)
+    service = WebGuardJobService(
+        store=store,
+        authorizations=authorizations,
+        identity=identity,
+    )
     worker = ScanJobWorker(
         store=store,
         executor=executor,
         poll_seconds=config.worker_poll_seconds,
     )
-    return store, service, worker
+    authenticator = ApiTokenAuthenticator(identity)
+    limiter = FixedWindowRateLimiter(
+        requests=config.rate_limit_requests,
+        window_seconds=config.rate_limit_window_seconds,
+    )
+    return store, identity, service, worker, authenticator, limiter
 
 
 def _init_command(args: argparse.Namespace) -> int:
     config = _config(args)
-    ScanJobStore(config.database_path)
-    print(f"Initialized job database: {config.database_path}")
+    _stores(config)
+    print(f"Initialized service database: {config.database_path}")
     print(f"Authorization directory: {config.authorization_directory}")
     print(f"Artifact directory: {config.artifact_directory}")
     return EXIT_SUCCESS
 
 
+def _bootstrap_command(args: argparse.Namespace) -> int:
+    config = _config(args)
+    _, identity = _stores(config)
+    now = _utc_now()
+    organization = identity.create_organization(args.organization, now=now)
+    principal = identity.create_principal(
+        organization.organization_id,
+        args.principal,
+        principal_type=PrincipalType.USER,
+        role=OrganizationRole.OWNER,
+        now=now,
+    )
+    issued = identity.create_token(
+        principal.principal_id,
+        label=args.token_label,
+        validity_days=args.token_valid_days,
+        now=now,
+    )
+    print(f"Organization ID: {organization.organization_id}")
+    print(f"Owner principal ID: {principal.principal_id}")
+    print(f"API token ID: {issued.metadata.token_id}")
+    print(f"API token: {issued.token}")
+    print("Store this token securely. It will not be displayed again.")
+    return EXIT_SUCCESS
+
+
+def _organization_create_command(args: argparse.Namespace) -> int:
+    config = _config(args)
+    _, identity = _stores(config)
+    value = identity.create_organization(args.name, now=_utc_now())
+    print(f"Organization ID: {value.organization_id}")
+    print(f"Organization name: {value.name}")
+    return EXIT_SUCCESS
+
+
+def _principal_create_command(args: argparse.Namespace) -> int:
+    config = _config(args)
+    _, identity = _stores(config)
+    value = identity.create_principal(
+        args.organization_id,
+        args.name,
+        principal_type=PrincipalType(args.type),
+        role=OrganizationRole(args.role),
+        now=_utc_now(),
+    )
+    print(f"Principal ID: {value.principal_id}")
+    print(f"Role: {value.role.value}")
+    return EXIT_SUCCESS
+
+
+def _token_create_command(args: argparse.Namespace) -> int:
+    config = _config(args)
+    _, identity = _stores(config)
+    issued = identity.create_token(
+        args.principal_id,
+        label=args.label,
+        validity_days=args.valid_days,
+        now=_utc_now(),
+    )
+    print(f"API token ID: {issued.metadata.token_id}")
+    print(f"API token: {issued.token}")
+    print("Store this token securely. It will not be displayed again.")
+    return EXIT_SUCCESS
+
+
+def _token_revoke_command(args: argparse.Namespace) -> int:
+    config = _config(args)
+    _, identity = _stores(config)
+    metadata = identity.revoke_token(args.token_id, now=_utc_now())
+    print(f"Revoked API token: {metadata.token_id}")
+    return EXIT_SUCCESS
+
+
+def _authorization_assign_command(args: argparse.Namespace) -> int:
+    config = _config(args)
+    _, identity = _stores(config)
+    repository = AuthorizationRepository(config.authorization_directory)
+    repository.get(args.authorization_id)
+    identity.assign_authorization(
+        args.organization_id,
+        args.authorization_id,
+        assigned_by=args.principal_id,
+        now=_utc_now(),
+    )
+    print(f"Assigned authorization: {args.authorization_id}")
+    print(f"Organization ID: {args.organization_id}")
+    return EXIT_SUCCESS
+
+
 def _worker_command(args: argparse.Namespace) -> int:
     config = _config(args)
-    _, _, worker = _components(config)
+    _, _, _, worker, _, _ = _components(config)
     if args.once:
         processed = worker.run_once()
         print("Processed one job." if processed else "No queued job was available.")
@@ -89,7 +212,7 @@ def _worker_command(args: argparse.Namespace) -> int:
 
 def _serve_command(args: argparse.Namespace) -> int:
     config = _config(args)
-    _, service, worker = _components(config)
+    _, _, service, worker, authenticator, limiter = _components(config)
     stop_event = threading.Event()
     worker_thread = threading.Thread(
         target=worker.run_forever,
@@ -101,6 +224,8 @@ def _serve_command(args: argparse.Namespace) -> int:
         config.host,
         config.port,
         service,
+        authenticator=authenticator,
+        rate_limiter=limiter,
         maximum_request_bytes=config.maximum_request_bytes,
     )
 
@@ -113,6 +238,7 @@ def _serve_command(args: argparse.Namespace) -> int:
     worker_thread.start()
     bound_host, bound_port = server.server_address[:2]
     print(f"WebGuard API listening on http://{bound_host}:{bound_port}")
+    print("Bearer authentication and organization RBAC are enabled.")
     print("Binding is loopback-only. Press Ctrl+C to stop.")
     try:
         server.serve_forever(poll_interval=0.25)
@@ -127,55 +253,98 @@ def _serve_command(args: argparse.Namespace) -> int:
 def _add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", default=DEFAULT_API_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_API_PORT)
+    parser.add_argument("--database", type=Path, default=Path("var/webguard-api/jobs.sqlite3"))
+    parser.add_argument("--authorizations", type=Path, default=Path("authorizations"))
+    parser.add_argument("--artifacts", type=Path, default=Path("scan-results/service"))
     parser.add_argument(
-        "--database",
-        type=Path,
-        default=Path("var/webguard-api/jobs.sqlite3"),
+        "--maximum-request-bytes", type=int, default=DEFAULT_API_MAXIMUM_REQUEST_BYTES
     )
     parser.add_argument(
-        "--authorizations",
-        type=Path,
-        default=Path("authorizations"),
+        "--worker-poll-seconds", type=float, default=DEFAULT_WORKER_POLL_SECONDS
     )
     parser.add_argument(
-        "--artifacts",
-        type=Path,
-        default=Path("scan-results/service"),
+        "--rate-limit-requests", type=int, default=DEFAULT_RATE_LIMIT_REQUESTS
     )
     parser.add_argument(
-        "--maximum-request-bytes",
-        type=int,
-        default=DEFAULT_API_MAXIMUM_REQUEST_BYTES,
-    )
-    parser.add_argument(
-        "--worker-poll-seconds",
-        type=float,
-        default=DEFAULT_WORKER_POLL_SECONDS,
+        "--rate-limit-window-seconds", type=int, default=DEFAULT_RATE_LIMIT_WINDOW_SECONDS
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="webguard-api",
-        description="Local WebGuard control-plane API and scanner job queue.",
+        description="Authenticated local WebGuard control-plane API and scanner queue.",
     )
-    parser.add_argument("--version", action="version", version="webguard-api 0.1.0")
+    parser.add_argument("--version", action="version", version="webguard-api 0.2.0")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = subparsers.add_parser("init", help="Initialize the job database.")
+    init_parser = subparsers.add_parser("init", help="Initialize service and identity tables.")
     _add_common_options(init_parser)
     init_parser.set_defaults(handler=_init_command)
 
+    bootstrap = subparsers.add_parser(
+        "bootstrap", help="Create the first organization, owner, and one-time API token."
+    )
+    _add_common_options(bootstrap)
+    bootstrap.add_argument("--organization", required=True)
+    bootstrap.add_argument("--principal", required=True)
+    bootstrap.add_argument("--token-label", default="bootstrap-owner")
+    bootstrap.add_argument(
+        "--token-valid-days", type=int, default=DEFAULT_TOKEN_VALIDITY_DAYS
+    )
+    bootstrap.set_defaults(handler=_bootstrap_command)
+
+    organization = subparsers.add_parser("organization", help="Manage organizations.")
+    organization_commands = organization.add_subparsers(dest="organization_command", required=True)
+    organization_create = organization_commands.add_parser("create")
+    _add_common_options(organization_create)
+    organization_create.add_argument("--name", required=True)
+    organization_create.set_defaults(handler=_organization_create_command)
+
+    principal = subparsers.add_parser("principal", help="Manage users and service accounts.")
+    principal_commands = principal.add_subparsers(dest="principal_command", required=True)
+    principal_create = principal_commands.add_parser("create")
+    _add_common_options(principal_create)
+    principal_create.add_argument("--organization-id", required=True)
+    principal_create.add_argument("--name", required=True)
+    principal_create.add_argument(
+        "--type", choices=[item.value for item in PrincipalType], default=PrincipalType.USER.value
+    )
+    principal_create.add_argument(
+        "--role", choices=[item.value for item in OrganizationRole], required=True
+    )
+    principal_create.set_defaults(handler=_principal_create_command)
+
+    token = subparsers.add_parser("token", help="Manage API tokens.")
+    token_commands = token.add_subparsers(dest="token_command", required=True)
+    token_create = token_commands.add_parser("create")
+    _add_common_options(token_create)
+    token_create.add_argument("--principal-id", required=True)
+    token_create.add_argument("--label", required=True)
+    token_create.add_argument("--valid-days", type=int, default=DEFAULT_TOKEN_VALIDITY_DAYS)
+    token_create.set_defaults(handler=_token_create_command)
+    token_revoke = token_commands.add_parser("revoke")
+    _add_common_options(token_revoke)
+    token_revoke.add_argument("--token-id", required=True)
+    token_revoke.set_defaults(handler=_token_revoke_command)
+
+    assignment = subparsers.add_parser("authorization", help="Assign target authorizations.")
+    assignment_commands = assignment.add_subparsers(dest="authorization_command", required=True)
+    assignment_create = assignment_commands.add_parser("assign")
+    _add_common_options(assignment_create)
+    assignment_create.add_argument("--organization-id", required=True)
+    assignment_create.add_argument("--principal-id", required=True)
+    assignment_create.add_argument("--authorization-id", required=True)
+    assignment_create.set_defaults(handler=_authorization_assign_command)
+
     serve_parser = subparsers.add_parser(
-        "serve",
-        help="Run the loopback HTTP API with one background worker.",
+        "serve", help="Run the loopback HTTP API with one background worker."
     )
     _add_common_options(serve_parser)
     serve_parser.set_defaults(handler=_serve_command)
 
     worker_parser = subparsers.add_parser(
-        "worker",
-        help="Run a scanner worker without the HTTP API.",
+        "worker", help="Run a scanner worker without the HTTP API."
     )
     _add_common_options(worker_parser)
     worker_parser.add_argument("--once", action="store_true")
@@ -188,7 +357,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.handler(args))
-    except (ServiceConfigError, JobStoreError) as exc:
+    except (
+        AuthorizationRepositoryError,
+        IdentityStoreError,
+        ServiceConfigError,
+        JobStoreError,
+    ) as exc:
         print(f"ERROR [{exc.code}]: {exc.message}", file=sys.stderr)
         return EXIT_FAILURE
     except KeyboardInterrupt:

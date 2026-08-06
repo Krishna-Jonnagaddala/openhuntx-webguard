@@ -43,6 +43,17 @@ class ServiceConfigTests(unittest.TestCase):
                     authorization_directory=path,
                 )
 
+    def test_rate_limit_defaults_are_bounded(self) -> None:
+        config = ServiceConfig()
+        self.assertEqual(config.rate_limit_requests, 120)
+        self.assertEqual(config.rate_limit_window_seconds, 60)
+
+    def test_invalid_rate_limit_is_rejected(self) -> None:
+        with self.assertRaises(ServiceConfigError):
+            ServiceConfig(rate_limit_requests=0)
+        with self.assertRaises(ServiceConfigError):
+            ServiceConfig(rate_limit_window_seconds=0)
+
 
 if __name__ == "__main__":
     unittest.main()

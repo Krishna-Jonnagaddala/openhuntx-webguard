@@ -35,7 +35,7 @@ class ApiCliTests(unittest.TestCase):
                 )
             self.assertEqual(result, 0)
             self.assertTrue(database.is_file())
-            self.assertIn("Initialized job database", output.getvalue())
+            self.assertIn("Initialized service database", output.getvalue())
 
     def test_worker_once_reports_empty_queue(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -88,3 +88,48 @@ class ApiCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApiIdentityCliTests(unittest.TestCase):
+    def test_parser_has_identity_commands(self) -> None:
+        parser = build_parser()
+        self.assertEqual(parser.parse_args(["bootstrap", "--organization", "Org", "--principal", "Owner"]).command, "bootstrap")
+        self.assertEqual(parser.parse_args(["organization", "create", "--name", "Org"]).organization_command, "create")
+        self.assertEqual(parser.parse_args(["principal", "create", "--organization-id", "x", "--name", "N", "--role", "viewer"]).principal_command, "create")
+        self.assertEqual(parser.parse_args(["token", "revoke", "--token-id", "x"]).token_command, "revoke")
+        self.assertEqual(parser.parse_args(["authorization", "assign", "--organization-id", "x", "--principal-id", "y", "--authorization-id", "z"]).authorization_command, "assign")
+
+    def test_bootstrap_prints_token_once(self) -> None:
+        import re
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = main([
+                    "bootstrap",
+                    "--organization", "InternStack",
+                    "--principal", "Krishna Jonnagaddala",
+                    "--database", str(root / "jobs.sqlite3"),
+                    "--authorizations", str(root / "authorizations"),
+                    "--artifacts", str(root / "artifacts"),
+                ])
+            self.assertEqual(result, 0)
+            text = output.getvalue()
+            self.assertRegex(text, r"API token: wgt_[0-9a-f-]+_")
+            self.assertIn("will not be displayed again", text)
+
+    def test_bootstrap_duplicate_organization_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = [
+                "bootstrap", "--organization", "InternStack", "--principal", "Owner",
+                "--database", str(root / "jobs.sqlite3"),
+                "--authorizations", str(root / "authorizations"),
+                "--artifacts", str(root / "artifacts"),
+            ]
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main(args), 0)
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                self.assertEqual(main(args), 1)
+            self.assertIn("organization_conflict", errors.getvalue())

@@ -10,7 +10,9 @@ import unittest
 from pathlib import Path
 
 from webguard_api import (
+    ApiTokenAuthenticator,
     AuthorizationRepository,
+    FixedWindowRateLimiter,
     JobExecutionOutcome,
     ScanJobStore,
     ScanJobWorker,
@@ -18,8 +20,14 @@ from webguard_api import (
     create_server,
 )
 
-from tests.unit.service_test_support import AUTH_ID, NOW, TARGET, completed_report, write_authorization
-
+from tests.unit.service_test_support import (
+    AUTH_ID,
+    NOW,
+    TARGET,
+    completed_report,
+    create_identity_fixture,
+    write_authorization,
+)
 
 RUN_INTEGRATION = os.environ.get("WEBGUARD_RUN_INTEGRATION") == "1"
 
@@ -39,15 +47,17 @@ class FakeExecutor:
     "Set WEBGUARD_RUN_INTEGRATION=1 to run service integration tests.",
 )
 class ScanJobServiceIntegrationTests(unittest.TestCase):
-    def test_http_submission_flows_through_persistent_worker_queue(self) -> None:
+    def test_authenticated_http_submission_flows_through_tenant_queue(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             auth_dir = root / "authorizations"
             write_authorization(auth_dir)
             store = ScanJobStore(root / "jobs.sqlite3")
+            identity, context, token = create_identity_fixture(store.path)
             service = WebGuardJobService(
                 store=store,
                 authorizations=AuthorizationRepository(auth_dir),
+                identity=identity,
                 clock=lambda: NOW,
             )
             worker = ScanJobWorker(
@@ -57,16 +67,16 @@ class ScanJobServiceIntegrationTests(unittest.TestCase):
                 clock=lambda: NOW,
             )
             stop = threading.Event()
-            worker_thread = threading.Thread(
-                target=worker.run_forever,
-                args=(stop,),
-                daemon=True,
-            )
+            worker_thread = threading.Thread(target=worker.run_forever, args=(stop,), daemon=True)
             server = create_server(
                 "127.0.0.1",
                 0,
                 service,
+                authenticator=ApiTokenAuthenticator(identity),
+                rate_limiter=FixedWindowRateLimiter(requests=100, window_seconds=60),
                 maximum_request_bytes=4096,
+                clock=lambda: NOW,
+                epoch_clock=lambda: 1000.0,
             )
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             worker_thread.start()
@@ -87,6 +97,7 @@ class ScanJobServiceIntegrationTests(unittest.TestCase):
                     "/v1/jobs",
                     body=body,
                     headers={
+                        "Authorization": f"Bearer {token}",
                         "Content-Type": "application/json",
                         "Content-Length": str(len(body)),
                         "Idempotency-Key": "service-integration-1",
@@ -96,13 +107,18 @@ class ScanJobServiceIntegrationTests(unittest.TestCase):
                 created = json.loads(response.read())
                 connection.close()
                 self.assertEqual(response.status, 201)
+                self.assertEqual(created["organization_id"], context.organization_id)
                 job_id = created["job_id"]
 
                 deadline = time.monotonic() + 3
                 result = None
                 while time.monotonic() < deadline:
                     connection = http.client.HTTPConnection(host, port, timeout=3)
-                    connection.request("GET", f"/v1/jobs/{job_id}/result")
+                    connection.request(
+                        "GET",
+                        f"/v1/jobs/{job_id}/result",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
                     response = connection.getresponse()
                     payload = json.loads(response.read())
                     connection.close()
@@ -114,7 +130,7 @@ class ScanJobServiceIntegrationTests(unittest.TestCase):
                 self.assertIsNotNone(result)
                 assert result is not None
                 self.assertEqual(result["state"], "completed")
-                self.assertEqual(result["report_ref"], f"jobs/{job_id}/report.json")
+                self.assertEqual(result["organization_id"], context.organization_id)
                 self.assertNotIn("findings", result)
             finally:
                 stop.set()
