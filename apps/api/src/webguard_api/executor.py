@@ -1,0 +1,303 @@
+"""Safe owned-target scanner execution for queued service jobs."""
+
+from __future__ import annotations
+
+import os
+import stat
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+from uuid import uuid4
+
+from webguard_contracts import (
+    OwnedTargetContractError,
+    ScanJobMode,
+    ScanJobRecord,
+    WebGuardReport,
+    write_owned_target_audit_file,
+)
+from webguard_scanner import (
+    CrawlCancellationToken,
+    CrawlPolicy,
+    FetchPolicy,
+    OWNED_DEFAULT_CRAWL_DELAY_SECONDS,
+    OWNED_DEFAULT_CRAWL_DEPTH,
+    OWNED_DEFAULT_CRAWL_EXECUTION_SECONDS,
+    OWNED_DEFAULT_CRAWL_LINKS_PER_PAGE,
+    OWNED_DEFAULT_CRAWL_PAGES,
+    OWNED_DEFAULT_CRAWL_REQUEST_ATTEMPTS,
+    RetryPolicy,
+    ValidationMode,
+    ValidationPolicy,
+    validate_owned_target_preflight,
+    validate_target_url,
+    run_passive_crawl_scan,
+    run_passive_header_scan,
+)
+
+from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
+
+
+class JobExecutionError(ValueError):
+    """Controlled service-side execution failure."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass(frozen=True, slots=True)
+class JobExecutionOutcome:
+    """Result and safe relative artifact references from one worker run."""
+
+    report: WebGuardReport
+    report_ref: str
+    audit_ref: str
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _prepare_private_directory(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise JobExecutionError(
+            "artifact_directory_create_failed",
+            f"Unable to create private artifact directory {path}.",
+        ) from exc
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise JobExecutionError(
+            "artifact_directory_inspection_failed",
+            f"Unable to inspect artifact directory {path}.",
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise JobExecutionError(
+            "artifact_directory_invalid",
+            "Artifact directories must be real directories, not links.",
+        )
+    try:
+        os.chmod(path, 0o700)
+    except OSError as exc:
+        raise JobExecutionError(
+            "artifact_directory_permissions_failed",
+            "Unable to apply owner-only artifact directory permissions.",
+        ) from exc
+
+
+def _write_report(report: WebGuardReport, path: Path) -> None:
+    try:
+        exists = os.path.lexists(path)
+    except OSError as exc:
+        raise JobExecutionError(
+            "artifact_path_inspection_failed",
+            f"Unable to inspect report path {path}.",
+        ) from exc
+    if exists:
+        raise JobExecutionError(
+            "artifact_path_exists",
+            "A service job artifact path already exists.",
+        )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(
+            descriptor,
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as output:
+            descriptor = None
+            output.write(report.to_json())
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+    except OSError as exc:
+        raise JobExecutionError(
+            "artifact_write_failed",
+            f"Unable to write scan report {path}.",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+class ScanJobExecutor:
+    """Execute one validated, server-authorized passive scanner job."""
+
+    def __init__(
+        self,
+        *,
+        authorizations: AuthorizationRepository,
+        artifact_directory: Path,
+        clock: Callable[[], datetime] = _utc_now,
+        single_scanner: Callable[..., WebGuardReport] = run_passive_header_scan,
+        crawl_scanner: Callable[..., WebGuardReport] = run_passive_crawl_scan,
+    ) -> None:
+        self.authorizations = authorizations
+        self.artifact_directory = Path(artifact_directory).expanduser()
+        self.clock = clock
+        self.single_scanner = single_scanner
+        self.crawl_scanner = crawl_scanner
+
+    def _policies(self, authorization, mode: ScanJobMode):
+        limits = authorization.limits
+        fetch_policy = FetchPolicy(
+            timeout_seconds=min(10.0, limits.timeout_seconds),
+            maximum_body_bytes=min(1_048_576, limits.maximum_body_bytes),
+            maximum_header_bytes=min(65_536, limits.maximum_header_bytes),
+            maximum_header_count=min(100, limits.maximum_header_count),
+        )
+        retry_policy = RetryPolicy(maximum_attempts=1)
+        if mode is ScanJobMode.SINGLE_PAGE:
+            return fetch_policy, retry_policy, None
+        crawl_policy = CrawlPolicy(
+            maximum_pages=min(OWNED_DEFAULT_CRAWL_PAGES, limits.maximum_pages),
+            maximum_depth=min(OWNED_DEFAULT_CRAWL_DEPTH, limits.maximum_depth),
+            maximum_links_per_page=min(
+                OWNED_DEFAULT_CRAWL_LINKS_PER_PAGE,
+                limits.maximum_links_per_page,
+            ),
+            minimum_delay_seconds=max(
+                OWNED_DEFAULT_CRAWL_DELAY_SECONDS,
+                limits.minimum_delay_seconds,
+            ),
+            maximum_execution_seconds=min(
+                OWNED_DEFAULT_CRAWL_EXECUTION_SECONDS,
+                limits.maximum_execution_seconds,
+            ),
+            maximum_request_attempts=min(
+                OWNED_DEFAULT_CRAWL_REQUEST_ATTEMPTS,
+                limits.maximum_request_attempts,
+            ),
+        )
+        return fetch_policy, retry_policy, crawl_policy
+
+    def execute(
+        self,
+        record: ScanJobRecord,
+        *,
+        cancellation_token: CrawlCancellationToken | None = None,
+    ) -> JobExecutionOutcome:
+        if record.state.value != "running":
+            raise JobExecutionError(
+                "job_not_running",
+                "Only a running job can be executed.",
+            )
+        if cancellation_token is not None and cancellation_token.is_cancelled:
+            raise JobExecutionError(
+                "job_cancelled_before_execution",
+                "The job was cancelled before scanner execution.",
+            )
+        try:
+            authorization = self.authorizations.get(record.request.authorization_id)
+        except AuthorizationRepositoryError as exc:
+            raise JobExecutionError(exc.code, exc.message) from exc
+        if authorization.fingerprint != record.request.authorization_sha256:
+            raise JobExecutionError(
+                "authorization_changed_after_submission",
+                "The server-side authorization changed after the job was submitted.",
+            )
+        if authorization.target != record.request.target:
+            raise JobExecutionError(
+                "authorization_target_mismatch",
+                "The job target no longer matches the server-side authorization.",
+            )
+
+        try:
+            target = validate_target_url(
+                record.request.target,
+                ValidationPolicy(mode=ValidationMode.COMMERCIAL),
+            )
+        except ValueError as exc:
+            raise JobExecutionError(
+                getattr(exc, "code", "target_validation_failed"),
+                str(exc),
+            ) from exc
+
+        fetch_policy, retry_policy, crawl_policy = self._policies(
+            authorization,
+            record.request.mode,
+        )
+        scan_id = str(uuid4())
+        try:
+            preflight = validate_owned_target_preflight(
+                authorization,
+                target,
+                confirmation=authorization.authorization_id,
+                scan_id=scan_id,
+                fetch_policy=fetch_policy,
+                retry_policy=retry_policy,
+                crawl_policy=crawl_policy,
+                now=self.clock(),
+            )
+        except ValueError as exc:
+            raise JobExecutionError(
+                getattr(exc, "code", "owned_target_preflight_failed"),
+                str(exc),
+            ) from exc
+
+        if cancellation_token is not None and cancellation_token.is_cancelled:
+            raise JobExecutionError(
+                "job_cancelled_before_execution",
+                "The job was cancelled before scanner execution.",
+            )
+
+        relative_directory = Path("jobs") / record.job_id
+        report_ref = (relative_directory / "report.json").as_posix()
+        audit_ref = (relative_directory / "authorization-audit.json").as_posix()
+        _prepare_private_directory(self.artifact_directory)
+        job_directory = self.artifact_directory / relative_directory
+        _prepare_private_directory(job_directory)
+        report_path = self.artifact_directory / report_ref
+        audit_path = self.artifact_directory / audit_ref
+
+        try:
+            write_owned_target_audit_file(
+                preflight.audit_record,
+                audit_path,
+                overwrite=False,
+            )
+        except OwnedTargetContractError as exc:
+            raise JobExecutionError(exc.code, exc.message) from exc
+
+        if crawl_policy is None:
+            report = self.single_scanner(
+                target,
+                fetch_policy=fetch_policy,
+                retry_policy=retry_policy,
+                scan_id=scan_id,
+            )
+        else:
+            token = cancellation_token or CrawlCancellationToken()
+            report = self.crawl_scanner(
+                target,
+                crawl_policy=crawl_policy,
+                fetch_policy=fetch_policy,
+                retry_policy=retry_policy,
+                scan_id=scan_id,
+                cancellation_token=token,
+            )
+        _write_report(report, report_path)
+        return JobExecutionOutcome(
+            report=report,
+            report_ref=report_ref,
+            audit_ref=audit_ref,
+        )
+
+
+__all__ = [
+    "JobExecutionError",
+    "JobExecutionOutcome",
+    "ScanJobExecutor",
+]

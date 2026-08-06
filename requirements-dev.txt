@@ -1,2 +1,3 @@
 -e packages/contracts/python
 -e workers/scanner
+-e apps/api

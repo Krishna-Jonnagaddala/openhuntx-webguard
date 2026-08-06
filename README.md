@@ -27,7 +27,7 @@ A locally generated authorization document records operator approval and limits.
 
 ## Current scanner milestone
 
-Milestone 1.25 adds professional security reporting and remediation verification while preserving the strict machine-readable scan reports.
+Milestone 1.26 adds a local-only control-plane API, persistent SQLite scan-job queue, and background worker while preserving the CLI scanner and strict report contracts.
 
 Render a self-contained customer-facing HTML report:
 
@@ -59,3 +59,35 @@ webguard report render scan-results/current.json \
 The HTML is self-contained, JavaScript-free, escaped, and written with owner-only permissions. Comparison uses stable finding fingerprints and requires both reports to use the same canonical target.
 
 The Milestone 1.23 owned-target readiness gate remains mandatory for external scans. External execution remains passive: no form submission, JavaScript execution, active payload injection, redirect following, brute force, or directory enumeration.
+
+
+## Local scanner service foundation
+
+Initialize the private SQLite job store:
+
+```bash
+webguard-api init
+```
+
+Run the loopback-only API and one background scanner worker:
+
+```bash
+webguard-api serve \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --database var/webguard-api/jobs.sqlite3 \
+  --authorizations authorizations \
+  --artifacts scan-results/service
+```
+
+Submit an owned-target job with an idempotency key:
+
+```bash
+curl --fail-with-body \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: internstack-20260806-001' \
+  --data '{"target":"https://internstack.in/","authorization_id":"<AUTHORIZATION-UUID>","confirm_authorization":"<AUTHORIZATION-UUID>","mode":"crawl"}' \
+  http://127.0.0.1:8765/v1/jobs
+```
+
+The initial service binds only to a loopback IP literal. It returns job metadata and safe relative artifact references, not authorization documents or report bodies. The worker reloads and revalidates the server-side authorization immediately before execution, writes the authorization audit first, and uses the conservative owned-target scan policy.

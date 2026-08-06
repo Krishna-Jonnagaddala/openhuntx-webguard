@@ -53,3 +53,5 @@ tmp/
 temp/
 *.tmp
 *.log
+# Local control-plane service state
+var/webguard-api/
