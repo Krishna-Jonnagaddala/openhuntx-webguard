@@ -154,6 +154,38 @@ class DatabaseMigrationTests(unittest.TestCase):
         self.assertIsNotNone(record.completed_at)
         self.assertEqual(record.revision, 5)
 
+    def test_schedule_table_exists_after_migration(self) -> None:
+        create_v1_database(self.path)
+        ScanJobStore(self.path)
+        connection = sqlite3.connect(self.path)
+        try:
+            table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'scan_schedules'"
+            ).fetchone()
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(scan_schedules)"
+                )
+            }
+        finally:
+            connection.close()
+        self.assertEqual(table, ("scan_schedules",))
+        self.assertTrue(
+            {
+                "schedule_id",
+                "organization_id",
+                "next_run_at",
+                "last_job_id",
+                "last_error_code",
+            }.issubset(columns)
+        )
+
+    def test_reopening_version_three_database_is_idempotent(self) -> None:
+        first = ScanJobStore(self.path)
+        second = ScanJobStore(self.path)
+        self.assertEqual(first.path, second.path)
+
     def test_future_schema_version_is_rejected(self) -> None:
         create_v1_database(self.path)
         connection = sqlite3.connect(self.path)

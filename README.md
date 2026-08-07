@@ -19,29 +19,33 @@ The current platform combines:
 - professional HTML reporting and remediation comparison
 - a local scanner-service API with a persistent, lease-aware job queue
 - organisation isolation, API authentication, and role-based access control
-- request correlation, audit events, rate-limit foundations, and crash recovery
+- request correlation, audit events, rate-limit foundations, crash recovery, and recurring scan scheduling
 
 WebGuard does not claim to identify every vulnerability. Its current external scan mode is intentionally conservative and passive.
 
 ## Current milestone
 
-**Milestone 1.28 — Durable worker leases and crash recovery**
+**Milestone 1.29 — Recurring scan scheduling and safe catch-up**
 
-The current implementation adds a fenced execution lease to every service-run scan job:
+The current implementation adds organisation-scoped recurring assessments on top of the authenticated job API and lease-aware worker queue:
 
-- versioned SQLite job-store migration from schema `1` to schema `2`
-- atomic worker identity, lease token, expiry, heartbeat, and attempt metadata
-- renewable leases while scanner execution is active
-- stale-worker fencing on completion, failure, and cancellation transitions
-- automatic recovery of expired running jobs
-- requeue of recoverable jobs without preserving stale execution state
-- terminal cancellation recovery when a customer already requested cancellation
-- controlled failure after the configured maximum number of attempts
-- safe migration of legacy running jobs during database upgrade
-- configurable worker IDs, lease durations, heartbeat intervals, and attempt limits
-- API version `0.3.0`
+- versioned SQLite job-store migration from schema `2` to schema `3`
+- strict recurring schedule contracts with canonical UTC start times
+- fixed intervals from one hour to one year
+- authenticated create, list, read, pause, and resume API operations
+- owner and administrator access, analyst schedule management, and viewer read-only access
+- database-backed due-schedule selection
+- atomic schedule advancement and scan-job creation
+- deterministic schedule-run idempotency keys
+- optimistic revision fencing between concurrent scheduler processes
+- one-job catch-up policy that skips missed intervals instead of flooding the queue
+- revalidation of organisation assignment, target match, and authorisation validity before enqueue
+- automatic pause with controlled error metadata when an authorisation is invalid or unavailable
+- a standalone `webguard-api scheduler` command
+- scheduler and worker threads integrated into `webguard-api serve`
+- API version `0.4.0`
 
-Milestone 1.27 organisation isolation, authentication, RBAC, audit events, and rate-limit foundations remain in force. The API remains loopback-only and must not be exposed directly to the public internet.
+Milestone 1.28 durable worker leases and crash recovery remain in force. The API and scheduler remain local, single-host foundations and must not be exposed directly to the public internet.
 
 ## Safety and authorisation
 
@@ -133,6 +137,9 @@ External execution currently performs no:
 - audit events
 - request IDs
 - token rate-limit foundations
+- organisation-scoped recurring scan schedules
+- atomic due-run materialisation and safe catch-up
+- automatic schedule blocking when authorisation becomes invalid
 
 ## Architecture
 
@@ -145,9 +152,14 @@ Loopback control-plane API
         |
         +--> identity, organisation, RBAC, and audit controls
         |
-        +--> SQLite job and identity store
+        +--> SQLite job, identity, and schedule store
         |      +--> versioned migrations
+        |      +--> recurring schedules and due-run fencing
         |      +--> job leases, heartbeats, and attempt counters
+        |
+        +--> database-backed scheduler
+        |      +--> validates current authorisation
+        |      +--> atomically creates due jobs
         |
         v
 Lease-aware background scanner worker
@@ -200,10 +212,10 @@ Run the local verification gate:
 ./scripts/verify.sh
 ```
 
-At Milestone 1.28, the repository contains:
+At Milestone 1.29, the repository contains:
 
-- 768 unit tests
-- 11 opt-in authorised integration tests
+- 824 unit tests
+- 12 opt-in authorised integration tests
 - CI validation across three Python versions
 - an authorised Juice Shop integration job
 
@@ -381,6 +393,67 @@ Before execution, the worker:
 4. writes the authorisation audit record
 5. executes the conservative owned-target policy
 
+### 7. Create a recurring authorised schedule
+
+Schedule start times use canonical UTC microsecond notation. The minimum interval is one hour.
+
+```bash
+STARTS_AT="$(python - <<'PYTHON'
+from datetime import datetime, timedelta, timezone
+
+value = datetime.now(timezone.utc) + timedelta(hours=1)
+print(value.isoformat(timespec="microseconds").replace("+00:00", "Z"))
+PYTHON
+)"
+
+curl --fail-with-body \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data "{
+    \"name\": \"Daily passive crawl\",
+    \"target\": \"https://security.example/\",
+    \"authorization_id\": \"AUTHORIZATION_UUID\",
+    \"confirm_authorization\": \"AUTHORIZATION_UUID\",
+    \"mode\": \"crawl\",
+    \"interval_seconds\": 86400,
+    \"starts_at\": \"${STARTS_AT}\"
+  }" \
+  http://127.0.0.1:8765/v1/schedules
+```
+
+List schedules:
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  http://127.0.0.1:8765/v1/schedules
+```
+
+Pause or resume a schedule without a request body:
+
+```bash
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  -H "Content-Length: 0" \
+  http://127.0.0.1:8765/v1/schedules/SCHEDULE_UUID/pause
+
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  -H "Content-Length: 0" \
+  http://127.0.0.1:8765/v1/schedules/SCHEDULE_UUID/resume
+```
+
+A due schedule creates at most one job during a scheduler pass. When multiple intervals were missed, WebGuard advances to the next future interval rather than producing a backlog burst. A missing, expired, unassigned, or target-mismatched authorisation automatically pauses the schedule and records a controlled error code.
+
+The scheduler can also run independently:
+
+```bash
+webguard-api scheduler \
+  --database var/webguard-api/jobs.sqlite3 \
+  --authorizations authorizations \
+  --artifacts scan-results/service
+```
+
 ## Token lifecycle
 
 API tokens are stored as scrypt hashes rather than raw values and support expiry and revocation.
@@ -415,7 +488,8 @@ Known limitations include:
 - no customer dashboard
 - no production identity provider
 - no automated asset-ownership verification
-- no recurring scan scheduler
+- fixed-interval schedules only; cron expressions and customer time zones are not yet supported
+- scheduler coordination remains single-host SQLite coordination
 - no email or webhook notifications
 - no billing, subscriptions, or usage metering
 - local rather than distributed rate limiting
@@ -427,8 +501,8 @@ Known limitations include:
 Upcoming engineering priorities include:
 
 - PostgreSQL-backed shared persistence and production migrations
-- distributed worker coordination and database-backed scheduling
-- scan scheduling and recurring assessments
+- distributed worker and scheduler coordination
+- richer calendar schedules, customer time zones, and maintenance windows
 - customer dashboard and organisation administration
 - target and authorisation management workflows
 - findings search, filtering, comparison, and export
@@ -451,6 +525,8 @@ WebGuard development follows these principles:
 - never store raw API tokens
 - produce deterministic evidence
 - preserve auditable execution records
+- atomically advance schedules when due jobs are created
+- skip missed intervals instead of flooding the scanner queue
 - fence stale workers before terminal state changes
 - do not overstate security assurance
 

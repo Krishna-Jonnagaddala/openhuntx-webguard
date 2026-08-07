@@ -12,7 +12,7 @@ from webguard_api.cli import build_parser, main
 class ApiCliTests(unittest.TestCase):
     def test_parser_has_init_serve_and_worker(self) -> None:
         parser = build_parser()
-        for command in ("init", "serve", "worker"):
+        for command in ("init", "serve", "worker", "scheduler"):
             namespace = parser.parse_args([command])
             self.assertEqual(namespace.command, command)
 
@@ -34,6 +34,19 @@ class ApiCliTests(unittest.TestCase):
         self.assertEqual(namespace.worker_lease_seconds, 45.0)
         self.assertEqual(namespace.worker_heartbeat_seconds, 15.0)
         self.assertEqual(namespace.worker_maximum_attempts, 5)
+
+    def test_scheduler_options_are_available(self) -> None:
+        namespace = build_parser().parse_args(
+            [
+                "scheduler",
+                "--scheduler-poll-seconds",
+                "2.5",
+                "--scheduler-batch-size",
+                "25",
+            ]
+        )
+        self.assertEqual(namespace.scheduler_poll_seconds, 2.5)
+        self.assertEqual(namespace.scheduler_batch_size, 25)
 
     def test_init_creates_private_database(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -75,6 +88,26 @@ class ApiCliTests(unittest.TestCase):
                 )
             self.assertEqual(result, 0)
             self.assertIn("No queued job", output.getvalue())
+
+    def test_scheduler_once_reports_empty_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = main(
+                    [
+                        "scheduler",
+                        "--once",
+                        "--database",
+                        str(root / "jobs.sqlite3"),
+                        "--authorizations",
+                        str(root / "authorizations"),
+                        "--artifacts",
+                        str(root / "artifacts"),
+                    ]
+                )
+            self.assertEqual(result, 0)
+            self.assertIn("inspected=0", output.getvalue())
 
     def test_public_host_returns_controlled_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

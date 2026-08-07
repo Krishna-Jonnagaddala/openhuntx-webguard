@@ -21,6 +21,9 @@ from .service import ApiServiceError, WebGuardJobService
 _JOB_PATH = re.compile(r"^/v1/jobs/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _JOB_CANCEL_PATH = re.compile(r"^/v1/jobs/([0-9a-f-]{36})/cancel$")
 _JOB_RESULT_PATH = re.compile(r"^/v1/jobs/([0-9a-f-]{36})/result$")
+_SCHEDULE_PATH = re.compile(r"^/v1/schedules/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+_SCHEDULE_PAUSE_PATH = re.compile(r"^/v1/schedules/([0-9a-f-]{36})/pause$")
+_SCHEDULE_RESUME_PATH = re.compile(r"^/v1/schedules/([0-9a-f-]{36})/resume$")
 
 
 class ApiTransportError(ValueError):
@@ -207,18 +210,26 @@ def build_handler(
                     payload = service.me(context, request_id=request_id)
                 elif path == "/v1/audit-events":
                     payload = service.audit_events(context, request_id=request_id)
+                elif path == "/v1/schedules":
+                    payload = service.list_schedules(context, request_id=request_id)
                 else:
-                    match = _JOB_PATH.fullmatch(path)
-                    if match:
-                        payload = service.get(context, match.group(1), request_id=request_id)
+                    schedule_match = _SCHEDULE_PATH.fullmatch(path)
+                    if schedule_match:
+                        payload = service.get_schedule(
+                            context, schedule_match.group(1), request_id=request_id
+                        )
                     else:
-                        match = _JOB_RESULT_PATH.fullmatch(path)
+                        match = _JOB_PATH.fullmatch(path)
                         if match:
-                            payload = service.result(context, match.group(1), request_id=request_id)
+                            payload = service.get(context, match.group(1), request_id=request_id)
                         else:
-                            raise ApiTransportError(
-                                "route_not_found", "API route was not found.", status=404
-                            )
+                            match = _JOB_RESULT_PATH.fullmatch(path)
+                            if match:
+                                payload = service.result(context, match.group(1), request_id=request_id)
+                            else:
+                                raise ApiTransportError(
+                                    "route_not_found", "API route was not found.", status=404
+                                )
                 self._send_json(
                     200,
                     payload,
@@ -233,6 +244,19 @@ def build_handler(
             try:
                 path = self._path()
                 context, decision = self._authenticate()
+                if path == "/v1/schedules":
+                    payload = service.create_schedule(
+                        context,
+                        self._read_json_body(),
+                        request_id=request_id,
+                    )
+                    self._send_json(
+                        201,
+                        payload,
+                        request_id=request_id,
+                        extra_headers=self._rate_headers(decision),
+                    )
+                    return
                 if path == "/v1/jobs":
                     keys = self.headers.get_all("Idempotency-Key") or []
                     if len(keys) != 1:
@@ -251,6 +275,40 @@ def build_handler(
                         201 if created else 200,
                         payload,
                         request_id=request_id,
+                        extra_headers=self._rate_headers(decision),
+                    )
+                    return
+                schedule_match = _SCHEDULE_PAUSE_PATH.fullmatch(path)
+                if schedule_match:
+                    lengths = self.headers.get_all("Content-Length") or []
+                    if lengths and any(value != "0" for value in lengths):
+                        raise ApiTransportError(
+                            "schedule_body_not_allowed",
+                            "Schedule state requests cannot contain a body.",
+                            status=400,
+                        )
+                    payload = service.pause_schedule(
+                        context, schedule_match.group(1), request_id=request_id
+                    )
+                    self._send_json(
+                        200, payload, request_id=request_id,
+                        extra_headers=self._rate_headers(decision),
+                    )
+                    return
+                schedule_match = _SCHEDULE_RESUME_PATH.fullmatch(path)
+                if schedule_match:
+                    lengths = self.headers.get_all("Content-Length") or []
+                    if lengths and any(value != "0" for value in lengths):
+                        raise ApiTransportError(
+                            "schedule_body_not_allowed",
+                            "Schedule state requests cannot contain a body.",
+                            status=400,
+                        )
+                    payload = service.resume_schedule(
+                        context, schedule_match.group(1), request_id=request_id
+                    )
+                    self._send_json(
+                        200, payload, request_id=request_id,
                         extra_headers=self._rate_headers(decision),
                     )
                     return
@@ -311,7 +369,7 @@ def create_server(
     if not address.is_loopback:
         raise ApiTransportError(
             "service_non_loopback_binding_rejected",
-            "Milestone 1.27 permits loopback API binding only.",
+            "Milestone 1.29 permits loopback API binding only.",
             status=500,
         )
     handler = build_handler(

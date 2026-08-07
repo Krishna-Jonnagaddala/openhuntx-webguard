@@ -14,6 +14,7 @@ python -m compileall \
   -q \
   packages/contracts/python/src \
   workers/scanner/src \
+  apps/api/src \
   scripts \
   tests
 

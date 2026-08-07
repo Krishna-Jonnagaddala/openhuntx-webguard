@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openhuntx-webguard-api"
-version = "0.3.0"
-description = "Lease-aware local control-plane API and scanner job queue for OpenHuntX WebGuard"
+version = "0.4.0"
+description = "Scheduled, lease-aware local control-plane API and scanner job queue for OpenHuntX WebGuard"
 requires-python = ">=3.11"
 dependencies = [
     "openhuntx-webguard-contracts==0.1.0",
