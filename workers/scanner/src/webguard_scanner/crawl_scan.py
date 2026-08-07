@@ -51,6 +51,7 @@ from .passive_scan import (
     PASSIVE_TLS_CHECKS,
 )
 from .retry_policy import RetryPolicy
+from .runtime_hooks import AfterRequestHook, BeforeRequestHook
 from .safe_http import FetchPolicy
 from .scope_validator import ValidatedTarget
 
@@ -367,6 +368,8 @@ def run_passive_crawl_scan(
     cancellation_token: CrawlCancellationToken | None = None,
     resume_checkpoint: CrawlCheckpoint | None = None,
     checkpoint_callback: CheckpointCallback | None = None,
+    before_request: BeforeRequestHook | None = None,
+    after_request: AfterRequestHook | None = None,
 ) -> CrawlScanResult:
     """Crawl, analyse, checkpoint, or safely resume same-origin pages.
 
@@ -499,6 +502,8 @@ def run_passive_crawl_scan(
         cancellation_token=cancellation_token,
         resume_state=resume_state,
         on_checkpoint=checkpoint_state,
+        before_request=before_request,
+        after_request=after_request,
     )
 
     # Avoid reconstructing a pending queue from a count. The checkpoint callback

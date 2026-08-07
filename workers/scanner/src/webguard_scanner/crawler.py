@@ -29,6 +29,7 @@ from webguard_contracts import (
 
 from .error_taxonomy import is_retryable_error
 from .retry_policy import RetryPolicy
+from .runtime_hooks import AfterRequestHook, BeforeRequestHook
 from .safe_http import (
     FetchPolicy,
     SafeHttpResponse,
@@ -1343,6 +1344,8 @@ def _fetch_with_retry(
     fetch_policy: FetchPolicy,
     retry_policy: RetryPolicy,
     budget: _ExecutionBudget,
+    before_request: BeforeRequestHook | None = None,
+    after_request: AfterRequestHook | None = None,
 ) -> _FetchOutcome:
     attempts: list[RequestAttempt] = []
 
@@ -1376,6 +1379,9 @@ def _fetch_with_retry(
         attempt_number = len(attempts) + 1
         attempt_started_at = _utc_now()
 
+        if before_request is not None:
+            before_request(target, "GET")
+
         try:
             response = fetch_once(
                 target,
@@ -1384,6 +1390,8 @@ def _fetch_with_retry(
             )
         except SafeRequestError as exc:
             attempt_completed_at = _utc_now()
+            if after_request is not None:
+                after_request(target, "GET", None, exc.code)
             retryable = is_retryable_error(
                 stage="request",
                 code=exc.code,
@@ -1455,6 +1463,8 @@ def _fetch_with_retry(
             continue
 
         attempt_completed_at = _utc_now()
+        if after_request is not None:
+            after_request(target, "GET", response, None)
         attempts.append(
             RequestAttempt(
                 attempt_number=attempt_number,
@@ -1484,6 +1494,8 @@ def crawl_same_origin(
     cancellation_token: CrawlCancellationToken | None = None,
     resume_state: CrawlResumeState | None = None,
     on_checkpoint: CheckpointObserver | None = None,
+    before_request: BeforeRequestHook | None = None,
+    after_request: AfterRequestHook | None = None,
 ) -> CrawlExecution:
     """Fetch or resume a budgeted breadth-first same-origin HTML crawl.
 
@@ -1515,6 +1527,16 @@ def crawl_same_origin(
         raise CrawlPolicyError(
             "checkpoint_observer_invalid",
             "on_checkpoint must be callable or null.",
+        )
+    if before_request is not None and not callable(before_request):
+        raise CrawlPolicyError(
+            "before_request_hook_invalid",
+            "before_request must be callable or null.",
+        )
+    if after_request is not None and not callable(after_request):
+        raise CrawlPolicyError(
+            "after_request_hook_invalid",
+            "after_request must be callable or null.",
         )
     if (
         cancellation_token is not None
@@ -1684,6 +1706,8 @@ def crawl_same_origin(
             fetch_policy=fetch_policy,
             retry_policy=retry_policy,
             budget=budget,
+            before_request=before_request,
+            after_request=after_request,
         )
 
         if fetch_outcome.response is None:

@@ -707,6 +707,7 @@ class WebGuardJobService:
         )
         try:
             permit_binding = self.store.get_job_permit_binding(job_id)
+            safety_receipt = self.store.get_job_safety_receipt(job_id)
         except JobStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=500) from exc
         return {
@@ -717,6 +718,14 @@ class WebGuardJobService:
             "result_status": None if record.result_status is None else record.result_status.value,
             "report_ref": record.report_ref,
             "audit_ref": record.audit_ref,
+            "trustscan_safety_receipt": (
+                None
+                if safety_receipt is None
+                else {
+                    "receipt_ref": safety_receipt[0],
+                    "receipt_sha256": safety_receipt[1],
+                }
+            ),
             "trustscan_permit": (
                 None
                 if permit_binding is None

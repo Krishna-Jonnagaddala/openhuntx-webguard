@@ -169,6 +169,7 @@ from .retry_policy import (
     MAXIMUM_REQUEST_ATTEMPTS,
     RetryPolicy,
 )
+from .runtime_hooks import AfterRequestHook, BeforeRequestHook
 from .safe_http import (
     FetchPolicy,
     SafeHttpResponse,
@@ -189,6 +190,8 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AnalyzerOutputError",
+    "BeforeRequestHook",
+    "AfterRequestHook",
     "AnalyzerPipelineResult",
     "AnalyzerRegistryError",
     "COOKIE_CHECKS",

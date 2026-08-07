@@ -99,9 +99,19 @@ class ScanJobWorker:
             report_ref=outcome.report_ref,
             audit_ref=outcome.audit_ref,
             now=self.clock(),
+            safety_receipt_ref=outcome.safety_receipt_ref,
+            safety_receipt_sha256=outcome.safety_receipt_sha256,
         )
 
-    def _fail(self, lease: LeasedScanJob, *, code: str, message: str) -> None:
+    def _fail(
+        self,
+        lease: LeasedScanJob,
+        *,
+        code: str,
+        message: str,
+        safety_receipt_ref: str | None = None,
+        safety_receipt_sha256: str | None = None,
+    ) -> None:
         self.store.fail_leased(
             lease.record.job_id,
             worker_id=lease.worker_id,
@@ -109,6 +119,8 @@ class ScanJobWorker:
             error_code=code,
             error_message=message,
             now=self.clock(),
+            safety_receipt_ref=safety_receipt_ref,
+            safety_receipt_sha256=safety_receipt_sha256,
         )
 
     def _cancel(self, lease: LeasedScanJob) -> None:
@@ -198,7 +210,13 @@ class ScanJobWorker:
                 if token.is_cancelled or exc.code == "job_cancelled_before_execution":
                     self._cancel(lease)
                 else:
-                    self._fail(lease, code=exc.code, message=exc.message)
+                    self._fail(
+                        lease,
+                        code=exc.code,
+                        message=exc.message,
+                        safety_receipt_ref=exc.safety_receipt_ref,
+                        safety_receipt_sha256=exc.safety_receipt_sha256,
+                    )
             except JobStoreError as store_error:
                 if not self._is_stale_lease_error(store_error):
                     raise

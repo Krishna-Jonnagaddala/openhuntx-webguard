@@ -25,30 +25,28 @@ WebGuard does not claim to identify every vulnerability. Its current external sc
 
 ## Current milestone
 
-**Milestone 1.31 — TrustScan cryptographic scan permit v1**
+**Milestone 1.32 — TrustScan runtime safety engine and Safety Receipt v1**
 
-The current implementation adds a cryptographically signed execution permit above the existing owned-target authorisation model. A valid owned-target authorisation remains necessary, but scanner execution now also requires a narrower TrustScan permit bound to the exact organisation, authorisation fingerprint, target, scan mode, validity window, and safety envelope.
+The current implementation moves TrustScan enforcement from a pre-execution permit check to the outbound request boundary. Every scanner request is evaluated against the permit-authorised origin, HTTP method, request-attempt budget, request rate, maximum concurrency, current authorisation state, and current permit state immediately before network activity.
 
-Milestone 1.31 adds:
+Milestone 1.32 adds:
 
-- versioned SQLite job-store migration from schema `4` to schema `5`
-- an owner-only, database-generated Ed25519 private signing key
-- a public Ed25519 verification-key endpoint
-- strict TrustScan scan-permit schema `1.0`
-- owner/administrator permit issuance and revocation with analyst/viewer read access
-- immutable signed permit claims plus separate durable revocation metadata
-- exact organisation, target, authorisation fingerprint, and scan-mode binding
-- permit validity of at most 90 days and never beyond the underlying authorisation
-- passive v1 method policy restricted to `GET` and optional `HEAD`
-- per-permit request-attempt and request-rate ceilings
-- per-permit maximum execution concurrency of one
-- transactional job and recurring-schedule permit bindings
-- worker-side permit signature, revocation, scope, and expiry revalidation before network execution
-- scheduler-side permit revalidation before a due job is materialised
-- fail-closed handling for legacy jobs and schedules that have no TrustScan permit binding
-- API version `0.6.0`
+- versioned SQLite job-store migration from schema `5` to schema `6`
+- strict TrustScan Safety Receipt schema `1.0`
+- Ed25519-signed safety receipts using the existing TrustScan signing authority
+- strict canonical JSON loading and signature verification for exported receipts
+- request-boundary TrustScan permit and authorisation revalidation
+- fail-closed blocking for revoked, expired, changed, or otherwise invalid permission
+- permit-bound HTTP-method, same-origin, request-budget, request-rate, and concurrency enforcement
+- runtime request-rate throttling with permission revalidation after every enforced wait
+- conservative circuit breaking after repeated request failures, HTTP `429`, or HTTP `5xx` responses
+- observed counters for attempted, permitted, and blocked requests, target-health signals, throttles, circuit-breaker activations, scope violations, and permit revalidations
+- owner-only `trustscan-safety-receipt.json` artefacts associated transactionally with terminal jobs
+- safety-receipt references and SHA-256 fingerprints in job result metadata
+- runtime hooks wired through both single-page and same-origin crawl execution paths
+- API version `0.7.0`
 
-Milestones 1.28 through 1.30 durable worker recovery, recurring scheduling, and signed activity-feed pagination remain in force. The API remains a local, single-host engineering foundation and must not be exposed directly to the public internet.
+Milestone 1.31 cryptographic Scan Permit v1 remains the permission authority. A Safety Receipt proves what WebGuard enforced and observed during one execution; it does **not** claim that testing could not affect a target or that the target is secure. The API remains a local, single-host engineering foundation and must not be exposed directly to the public internet.
 
 ## Safety and authorisation
 
@@ -149,6 +147,9 @@ External execution currently performs no:
 - permit issuance, read, revocation, and public verification-key APIs
 - job and schedule permit binding with pre-execution revalidation
 - permit-level request budget, rate, method, validity-window, and concurrency constraints
+- request-boundary TrustScan runtime safety enforcement
+- conservative target-health circuit breaking and runtime throttling
+- Ed25519-signed TrustScan Safety Receipt v1 artefacts
 
 ## Architecture
 
@@ -178,12 +179,16 @@ Loopback control-plane API
 Lease-aware background scanner worker
         |
         +--> revalidates permit signature, scope, state, and limits
+        +--> TrustScan runtime safety engine
+        |      +--> checks every outbound request boundary
+        |      +--> throttles or blocks outside the approved safety envelope
+        |      +--> records observed target-health and policy events
         +--> target-scope and authorisation validation
         +--> safe HTTP client
         +--> bounded passive analyzers and crawler
         |
         v
-Private JSON, audit, comparison, and HTML artefacts
+Private JSON, audit, Safety Receipt, comparison, and HTML artefacts
 ```
 
 ## Repository structure
@@ -523,7 +528,7 @@ The following paths contain private runtime material and must remain outside sou
 - `scan-results/`
 - `var/`
 - SQLite databases
-- generated audit records
+- generated audit and TrustScan Safety Receipt records
 - raw API tokens
 - the database-held pagination cursor HMAC key
 - the database-held TrustScan Ed25519 private signing seed
@@ -546,6 +551,8 @@ Known limitations include:
 - TrustScan v1 uses one local Ed25519 signing key and does not yet provide key rotation, external KMS/HSM custody, or multi-region trust distribution
 - TrustScan v1 permits only the existing passive scan modes and `GET`/`HEAD` transport methods
 - permit maximum concurrency is fixed at one and enforced through the current single-host SQLite job queue
+- the runtime circuit breaker currently uses conservative local response/error signals and is not an external application-health monitor
+- Safety Receipt v1 records WebGuard-observed enforcement facts; it does not prove that testing caused no target impact
 - fixed-interval schedules only; cron expressions and customer time zones are not yet supported
 - scheduler coordination remains single-host SQLite coordination
 - pagination cursors are local-service cursors and become invalid if the private database secret is rotated or lost
@@ -564,8 +571,8 @@ Upcoming engineering priorities include:
 - richer calendar schedules, customer time zones, and maintenance windows
 - customer dashboard and organisation administration
 - target ownership/delegated-authority verification and production authorisation workflows
-- TrustScan key rotation, KMS/HSM-backed signing, runner attestation, and verifiable execution receipts
-- runtime safety receipts, coverage-truth maps, and signed remediation evidence
+- TrustScan key rotation, KMS/HSM-backed signing, and runner attestation
+- coverage-truth maps, signed remediation evidence, and independently verifiable assessment capsules
 - findings search, filtering, comparison, and export
 - notifications and customer remediation workflows
 - production secrets, observability, backups, and deployment controls
@@ -579,9 +586,11 @@ WebGuard development follows these principles:
 - authorised targets only
 - deny by default
 - validate before connecting
-- revalidate authorisation and cryptographic permit before execution
+- revalidate authorisation and cryptographic permit before execution and at every outbound request boundary
 - no valid TrustScan permit means no scanner network execution
 - cryptographically bind jobs and recurring schedules to their approved execution permit
+- fail closed when runtime permission or safety policy cannot be verified
+- record signed evidence of the safety controls WebGuard enforced and observed
 - minimise network capability
 - keep scans passive and bounded
 - isolate customer data by organisation

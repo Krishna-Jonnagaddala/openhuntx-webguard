@@ -57,6 +57,7 @@ from .permits import (
     validate_permit_scope,
     validate_permit_use,
 )
+from .safety import TrustScanRuntimeSafetyEngine, TrustScanRuntimeSafetyError
 from .scheduler import ScanScheduleCoordinator, ScheduleRunSummary
 from .service import ApiServiceError, WebGuardJobService
 from .store import (
@@ -68,7 +69,7 @@ from .store import (
 )
 from .worker import ScanJobWorker
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "ApiPermission",
@@ -124,6 +125,8 @@ __all__ = [
     "PersistedTrustScanPermit",
     "TrustScanPermitError",
     "TrustScanSigner",
+    "TrustScanRuntimeSafetyError",
+    "TrustScanRuntimeSafetyEngine",
     "validate_permit_scope",
     "validate_permit_use",
     "RateLimitDecision",

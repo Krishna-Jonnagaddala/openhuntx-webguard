@@ -15,8 +15,17 @@ from webguard_api import (
     ScanJobExecutor,
     ScanJobStore,
 )
-from webguard_contracts import ScanJobMode, ScanJobRequest, ScanJobState
-from webguard_scanner import CrawlCancellationToken, ValidatedTarget
+from webguard_contracts import (
+    ScanJobMode,
+    ScanJobRequest,
+    ScanJobState,
+    load_signed_trustscan_safety_receipt_json,
+)
+from webguard_scanner import (
+    CrawlCancellationToken,
+    SafeHttpResponse,
+    ValidatedTarget,
+)
 
 from tests.unit.service_test_support import (
     AUTH_ID,
@@ -103,15 +112,81 @@ class ScanJobExecutorTests(unittest.TestCase):
         outcome = executor.execute(record, cancellation_token=token)
         report = self.artifacts / outcome.report_ref
         audit = self.artifacts / outcome.audit_ref
+        safety_receipt = self.artifacts / outcome.safety_receipt_ref
         self.assertTrue(observed["audit_existed_before_scan"])
         self.assertIs(observed["token"], token)
         self.assertEqual(observed["policy"].maximum_pages, 10)
         self.assertTrue(report.is_file())
         self.assertTrue(audit.is_file())
+        self.assertTrue(safety_receipt.is_file())
+        loaded_receipt = load_signed_trustscan_safety_receipt_json(
+            safety_receipt.read_text(encoding="utf-8")
+        )
+        self.signer.verify_safety_receipt(loaded_receipt)
+        self.assertEqual(loaded_receipt.claims.job_id, record.job_id)
+        self.assertEqual(loaded_receipt.claims.termination_reason, "completed")
+        self.assertEqual(loaded_receipt.fingerprint, outcome.safety_receipt_sha256)
         self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(audit.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(safety_receipt.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(report.parent.stat().st_mode), 0o700)
         self.assertNotIn(str(self.artifacts), outcome.report_ref)
+
+    @patch("webguard_api.executor.validate_target_url")
+    def test_runtime_permit_revocation_blocks_next_request_and_writes_receipt(
+        self, validate_mock
+    ) -> None:
+        validate_mock.return_value = self.validated_target()
+        record = self.running_record()
+
+        def fake_crawl(target, **kwargs):
+            kwargs["before_request"](target, "GET")
+            kwargs["after_request"](
+                target,
+                "GET",
+                SafeHttpResponse(
+                    status=200,
+                    reason="OK",
+                    headers=(),
+                    body=b"",
+                    connected_address="204.69.207.1",
+                    elapsed_milliseconds=5,
+                ),
+                None,
+            )
+            self.store.revoke_scan_permit_scoped(
+                self.permit.permit.claims.permit_id,
+                ORG_ID,
+                revoked_by=OWNER_ID,
+                now=NOW,
+            )
+            kwargs["before_request"](target, "GET")
+            raise AssertionError("revoked permit must block before the second request")
+
+        executor = ScanJobExecutor(
+            authorizations=AuthorizationRepository(self.auth_dir),
+            store=self.store,
+            trustscan_signer=self.signer,
+            artifact_directory=self.artifacts,
+            clock=lambda: NOW,
+            crawl_scanner=fake_crawl,
+        )
+        with self.assertRaises(JobExecutionError) as caught:
+            executor.execute(record)
+        self.assertEqual(caught.exception.code, "trustscan_permit_revoked")
+        self.assertIsNotNone(caught.exception.safety_receipt_ref)
+        receipt_path = self.artifacts / caught.exception.safety_receipt_ref
+        loaded = load_signed_trustscan_safety_receipt_json(
+            receipt_path.read_text(encoding="utf-8")
+        )
+        self.signer.verify_safety_receipt(loaded)
+        self.assertEqual(loaded.claims.requests_permitted, 1)
+        self.assertEqual(loaded.claims.requests_blocked, 1)
+        self.assertEqual(loaded.claims.termination_reason, "safety_blocked")
+        self.assertEqual(
+            loaded.fingerprint,
+            caught.exception.safety_receipt_sha256,
+        )
 
     @patch("webguard_api.executor.validate_target_url")
     def test_single_page_uses_single_scanner(self, validate_mock) -> None:

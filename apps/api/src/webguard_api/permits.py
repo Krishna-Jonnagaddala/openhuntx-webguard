@@ -15,7 +15,9 @@ from webguard_contracts import (
     OwnedTargetAuthorization,
     ScanJobMode,
     SignedTrustScanPermit,
+    SignedTrustScanSafetyReceipt,
     TrustScanPermitClaims,
+    TrustScanSafetyReceiptClaims,
 )
 
 
@@ -140,6 +142,40 @@ class TrustScanSigner:
             raise TrustScanPermitError(
                 "trustscan_permit_signature_invalid",
                 "TrustScan permit signature verification failed.",
+            ) from exc
+
+    def sign_safety_receipt(
+        self, claims: TrustScanSafetyReceiptClaims
+    ) -> SignedTrustScanSafetyReceipt:
+        signature = self._private_key.sign(claims.signing_bytes)
+        return SignedTrustScanSafetyReceipt(
+            claims=claims,
+            signing_key_id=self.key_id,
+            signature=_b64url_encode(signature),
+        )
+
+    def verify_safety_receipt(
+        self, receipt: SignedTrustScanSafetyReceipt
+    ) -> None:
+        if receipt.signing_key_id != self.key_id:
+            raise TrustScanPermitError(
+                "trustscan_safety_receipt_signing_key_mismatch",
+                "TrustScan safety receipt was not signed by the active service key.",
+            )
+        signature = _b64url_decode_canonical(receipt.signature)
+        if len(signature) != 64:
+            raise TrustScanPermitError(
+                "trustscan_safety_receipt_signature_invalid",
+                "TrustScan safety receipt Ed25519 signature must contain exactly 64 bytes.",
+            )
+        try:
+            self._private_key.public_key().verify(
+                signature, receipt.claims.signing_bytes
+            )
+        except InvalidSignature as exc:
+            raise TrustScanPermitError(
+                "trustscan_safety_receipt_signature_invalid",
+                "TrustScan safety receipt signature verification failed.",
             ) from exc
 
     def verification_key_document(self) -> dict[str, str]:

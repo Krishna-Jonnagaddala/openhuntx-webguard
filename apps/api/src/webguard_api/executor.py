@@ -38,16 +38,26 @@ from webguard_scanner import (
 
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
+from .safety import TrustScanRuntimeSafetyEngine, TrustScanRuntimeSafetyError
 from .store import JobStoreError, ScanJobStore
 
 
 class JobExecutionError(ValueError):
     """Controlled service-side execution failure."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        safety_receipt_ref: str | None = None,
+        safety_receipt_sha256: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.safety_receipt_ref = safety_receipt_ref
+        self.safety_receipt_sha256 = safety_receipt_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +67,8 @@ class JobExecutionOutcome:
     report: WebGuardReport
     report_ref: str
     audit_ref: str
+    safety_receipt_ref: str | None = None
+    safety_receipt_sha256: str | None = None
 
 
 def _utc_now() -> datetime:
@@ -132,6 +144,44 @@ def _write_report(report: WebGuardReport, path: Path) -> None:
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _write_signed_safety_receipt(receipt, path: Path) -> str:
+    document = receipt.to_json() + "\n"
+    try:
+        exists = os.path.lexists(path)
+    except OSError as exc:
+        raise JobExecutionError(
+            "artifact_path_inspection_failed",
+            f"Unable to inspect safety receipt path {path}.",
+        ) from exc
+    if exists:
+        raise JobExecutionError(
+            "artifact_path_exists",
+            "A service job artifact path already exists.",
+        )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
+            descriptor = None
+            output.write(document)
+            output.flush()
+            os.fsync(output.fileno())
+    except OSError as exc:
+        raise JobExecutionError(
+            "artifact_write_failed",
+            f"Unable to write TrustScan safety receipt {path}.",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return receipt.fingerprint
 
 
 class ScanJobExecutor:
@@ -311,11 +361,13 @@ class ScanJobExecutor:
         )
         report_ref = (relative_directory / "report.json").as_posix()
         audit_ref = (relative_directory / "authorization-audit.json").as_posix()
+        safety_receipt_ref = (relative_directory / "trustscan-safety-receipt.json").as_posix()
         _prepare_private_directory(self.artifact_directory)
         job_directory = self.artifact_directory / relative_directory
         _prepare_private_directory(job_directory)
         report_path = self.artifact_directory / report_ref
         audit_path = self.artifact_directory / audit_ref
+        safety_receipt_path = self.artifact_directory / safety_receipt_ref
 
         try:
             write_owned_target_audit_file(
@@ -326,28 +378,97 @@ class ScanJobExecutor:
         except OwnedTargetContractError as exc:
             raise JobExecutionError(exc.code, exc.message) from exc
 
-        if crawl_policy is None:
-            report = self.single_scanner(
-                target,
-                fetch_policy=fetch_policy,
-                retry_policy=retry_policy,
-                scan_id=scan_id,
+        def revalidate_runtime_permission() -> None:
+            try:
+                current_authorization = self.authorizations.get(
+                    record.request.authorization_id
+                )
+            except AuthorizationRepositoryError as exc:
+                raise TrustScanPermitError(exc.code, exc.message) from exc
+            if current_authorization.fingerprint != authorization.fingerprint:
+                raise TrustScanPermitError(
+                    "authorization_changed_during_execution",
+                    "The server-side authorization changed during scanner execution.",
+                )
+            current_binding = self.store.get_job_permit_binding(record.job_id)
+            if current_binding is None or current_binding != binding:
+                raise TrustScanPermitError(
+                    "trustscan_permit_binding_changed",
+                    "The job TrustScan permit binding changed during execution.",
+                )
+            try:
+                current_permit = self.store.get_scan_permit_scoped(
+                    binding[0], scope[0]
+                )
+            except JobStoreError as exc:
+                raise TrustScanPermitError(exc.code, exc.message) from exc
+            if current_permit.permit.fingerprint != binding[1]:
+                raise TrustScanPermitError(
+                    "trustscan_permit_binding_changed",
+                    "The persisted TrustScan permit changed during execution.",
+                )
+            validate_permit_use(
+                current_permit,
+                signer=self.trustscan_signer,
+                organization_id=scope[0],
+                authorization=current_authorization,
+                target=record.request.target,
+                mode=record.request.mode,
+                now=self.clock(),
             )
-        else:
-            token = cancellation_token or CrawlCancellationToken()
-            report = self.crawl_scanner(
-                target,
-                crawl_policy=crawl_policy,
-                fetch_policy=fetch_policy,
-                retry_policy=retry_policy,
-                scan_id=scan_id,
-                cancellation_token=token,
-            )
+
+        safety = TrustScanRuntimeSafetyEngine(
+            permit=permit,
+            signer=self.trustscan_signer,
+            organization_id=scope[0],
+            job_id=record.job_id,
+            scan_id=scan_id,
+            target=record.request.target,
+            revalidate=revalidate_runtime_permission,
+            clock=self.clock,
+        )
+
+        try:
+            if crawl_policy is None:
+                report = self.single_scanner(
+                    target,
+                    fetch_policy=fetch_policy,
+                    retry_policy=retry_policy,
+                    scan_id=scan_id,
+                    before_request=safety.before_request,
+                    after_request=safety.after_request,
+                )
+            else:
+                token = cancellation_token or CrawlCancellationToken()
+                report = self.crawl_scanner(
+                    target,
+                    crawl_policy=crawl_policy,
+                    fetch_policy=fetch_policy,
+                    retry_policy=retry_policy,
+                    scan_id=scan_id,
+                    cancellation_token=token,
+                    before_request=safety.before_request,
+                    after_request=safety.after_request,
+                )
+        except TrustScanRuntimeSafetyError as exc:
+            receipt = safety.signed_receipt(termination_reason="safety_blocked")
+            digest = _write_signed_safety_receipt(receipt, safety_receipt_path)
+            raise JobExecutionError(
+                exc.code,
+                exc.message,
+                safety_receipt_ref=safety_receipt_ref,
+                safety_receipt_sha256=digest,
+            ) from exc
+
+        receipt = safety.signed_receipt(termination_reason=report.status.value)
         _write_report(report, report_path)
+        digest = _write_signed_safety_receipt(receipt, safety_receipt_path)
         return JobExecutionOutcome(
             report=report,
             report_ref=report_ref,
             audit_ref=audit_ref,
+            safety_receipt_ref=safety_receipt_ref,
+            safety_receipt_sha256=digest,
         )
 
 
