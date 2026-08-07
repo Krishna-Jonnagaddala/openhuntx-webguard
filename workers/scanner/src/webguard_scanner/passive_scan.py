@@ -54,6 +54,7 @@ from .tls_analyzer import (
     analyze_tls_security,
 )
 from .retry_policy import RetryPolicy
+from .runtime_hooks import AfterRequestHook, BeforeRequestHook
 from .safe_http import (
     FetchPolicy,
     SafeRequestError,
@@ -272,6 +273,8 @@ def run_passive_header_scan(
     analyzers: tuple[PassiveAnalyzer, ...] = DEFAULT_PASSIVE_ANALYZERS,
     scan_id: str | None = None,
     started_at: datetime | None = None,
+    before_request: BeforeRequestHook | None = None,
+    after_request: AfterRequestHook | None = None,
 ) -> ScanResult:
     """Run one bounded passive HTTP response scan.
 
@@ -287,6 +290,10 @@ def run_passive_header_scan(
 
     registry = validate_analyzer_registry(analyzers)
     planned_checks = registered_checks(registry)
+    if before_request is not None and not callable(before_request):
+        raise TypeError("before_request must be callable or null.")
+    if after_request is not None and not callable(after_request):
+        raise TypeError("after_request must be callable or null.")
 
     effective_scan_id = scan_id or str(uuid4())
     effective_started_at = started_at or _utc_now()
@@ -296,6 +303,9 @@ def run_passive_header_scan(
         attempt_number = len(request_attempts) + 1
         attempt_started_at = _utc_now()
 
+        if before_request is not None:
+            before_request(target, "GET")
+
         try:
             response = fetch_once(
                 target,
@@ -304,6 +314,8 @@ def run_passive_header_scan(
             )
         except SafeRequestError as exc:
             attempt_completed_at = _utc_now()
+            if after_request is not None:
+                after_request(target, "GET", None, exc.code)
             retryable = is_retryable_error(
                 stage="request",
                 code=exc.code,
@@ -359,6 +371,8 @@ def run_passive_header_scan(
             continue
 
         attempt_completed_at = _utc_now()
+        if after_request is not None:
+            after_request(target, "GET", response, None)
         request_attempts.append(
             RequestAttempt(
                 attempt_number=attempt_number,

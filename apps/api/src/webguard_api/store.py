@@ -27,7 +27,7 @@ from webguard_contracts import (
 from .permits import PersistedTrustScanPermit
 
 
-DATABASE_SCHEMA_VERSION = 5
+DATABASE_SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +195,9 @@ class ScanJobStore:
             if version == 4:
                 self._migrate_v4_to_v5(connection)
                 version = 5
+            if version == 5:
+                self._migrate_v5_to_v6(connection)
+                version = 6
             if version != DATABASE_SCHEMA_VERSION:
                 raise JobStoreError(
                     "job_store_schema_unsupported",
@@ -224,6 +227,31 @@ class ScanJobStore:
                 "job_store_permissions_failed",
                 "Unable to apply owner-only database permissions.",
             ) from exc
+
+    @staticmethod
+    def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
+        """Add immutable per-job TrustScan safety-receipt references."""
+        try:
+            connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE job_safety_receipts (
+                    job_id TEXT PRIMARY KEY,
+                    receipt_ref TEXT NOT NULL,
+                    receipt_sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (job_id) REFERENCES scan_jobs(job_id) ON DELETE CASCADE
+                );
+                UPDATE service_metadata SET value = '6' WHERE key = 'schema_version';
+                COMMIT;
+                """
+            )
+        except sqlite3.Error:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
 
     @staticmethod
     def _read_schema_version(connection: sqlite3.Connection) -> int:
@@ -683,6 +711,21 @@ class ScanJobStore:
         if row is None:
             return None
         return row["permit_id"], row["permit_sha256"]
+
+    def get_job_safety_receipt(self, job_id: str) -> tuple[str, str] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT receipt_ref, receipt_sha256 FROM job_safety_receipts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError("job_store_read_failed", "Unable to read TrustScan safety-receipt metadata.") from exc
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return row["receipt_ref"], row["receipt_sha256"]
 
     def get_schedule_permit_binding(self, schedule_id: str) -> tuple[str, str] | None:
         connection = self._connect()
@@ -1592,6 +1635,8 @@ class ScanJobStore:
         report_ref: str,
         audit_ref: str,
         now: datetime,
+        safety_receipt_ref: str | None = None,
+        safety_receipt_sha256: str | None = None,
     ) -> ScanJobRecord:
         state_by_status = {
             ScanStatus.COMPLETED: ScanJobState.COMPLETED,
@@ -1614,6 +1659,8 @@ class ScanJobStore:
             result_status=result_status,
             report_ref=report_ref,
             audit_ref=audit_ref,
+            safety_receipt_ref=safety_receipt_ref,
+            safety_receipt_sha256=safety_receipt_sha256,
         )
 
     def finish_result_leased(
@@ -1627,6 +1674,8 @@ class ScanJobStore:
         report_ref: str,
         audit_ref: str,
         now: datetime,
+        safety_receipt_ref: str | None = None,
+        safety_receipt_sha256: str | None = None,
     ) -> ScanJobRecord:
         state_by_status = {
             ScanStatus.COMPLETED: ScanJobState.COMPLETED,
@@ -1651,6 +1700,8 @@ class ScanJobStore:
             result_status=result_status,
             report_ref=report_ref,
             audit_ref=audit_ref,
+            safety_receipt_ref=safety_receipt_ref,
+            safety_receipt_sha256=safety_receipt_sha256,
         )
 
     def complete(
@@ -1697,6 +1748,8 @@ class ScanJobStore:
         error_code: str,
         error_message: str,
         now: datetime,
+        safety_receipt_ref: str | None = None,
+        safety_receipt_sha256: str | None = None,
     ) -> ScanJobRecord:
         return self._terminal_update(
             job_id,
@@ -1704,6 +1757,8 @@ class ScanJobStore:
             now=now,
             error_code=error_code,
             error_message=error_message,
+            safety_receipt_ref=safety_receipt_ref,
+            safety_receipt_sha256=safety_receipt_sha256,
         )
 
     def cancel_running(self, job_id: str, *, now: datetime) -> ScanJobRecord:
@@ -1722,6 +1777,8 @@ class ScanJobStore:
         error_code: str,
         error_message: str,
         now: datetime,
+        safety_receipt_ref: str | None = None,
+        safety_receipt_sha256: str | None = None,
     ) -> ScanJobRecord:
         return self._terminal_update(
             job_id,
@@ -1731,6 +1788,8 @@ class ScanJobStore:
             lease_token=lease_token,
             error_code=error_code,
             error_message=error_message,
+            safety_receipt_ref=safety_receipt_ref,
+            safety_receipt_sha256=safety_receipt_sha256,
         )
 
     def cancel_running_leased(
@@ -1763,7 +1822,14 @@ class ScanJobStore:
         audit_ref: str | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
+        safety_receipt_ref: str | None = None,
+        safety_receipt_sha256: str | None = None,
     ) -> ScanJobRecord:
+        if (safety_receipt_ref is None) != (safety_receipt_sha256 is None):
+            raise JobStoreError(
+                "trustscan_safety_receipt_metadata_invalid",
+                "Safety receipt reference and digest must be supplied together.",
+            )
         if (worker_id is None) != (lease_token is None):
             raise JobStoreError(
                 "job_lease_credentials_invalid",
@@ -1843,6 +1909,30 @@ class ScanJobStore:
                     "The worker lease is no longer current."
                     if effective_worker_id is not None
                     else "The scan-job state changed before the transition completed.",
+                )
+            if safety_receipt_ref is not None:
+                if (
+                    not isinstance(safety_receipt_ref, str)
+                    or not safety_receipt_ref
+                    or safety_receipt_ref.startswith("/")
+                    or ".." in safety_receipt_ref.split("/")
+                ):
+                    raise JobStoreError(
+                        "trustscan_safety_receipt_reference_invalid",
+                        "Safety receipt reference must be a safe relative path.",
+                    )
+                if (
+                    not isinstance(safety_receipt_sha256, str)
+                    or len(safety_receipt_sha256) != 64
+                    or any(c not in "0123456789abcdef" for c in safety_receipt_sha256)
+                ):
+                    raise JobStoreError(
+                        "trustscan_safety_receipt_digest_invalid",
+                        "Safety receipt digest must be a lower-case SHA-256 value.",
+                    )
+                connection.execute(
+                    "INSERT INTO job_safety_receipts(job_id, receipt_ref, receipt_sha256, created_at) VALUES (?, ?, ?, ?)",
+                    (job_id, safety_receipt_ref, safety_receipt_sha256, timestamp),
                 )
             updated = connection.execute(
                 "SELECT * FROM scan_jobs WHERE job_id = ?",

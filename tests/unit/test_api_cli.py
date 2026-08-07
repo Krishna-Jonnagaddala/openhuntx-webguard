@@ -6,10 +6,23 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+from webguard_api import __version__
 from webguard_api.cli import build_parser, main
 
 
 class ApiCliTests(unittest.TestCase):
+    def test_version_matches_package_version(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaises(SystemExit) as raised:
+                main(["--version"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(
+            output.getvalue(),
+            f"webguard-api {__version__}\n",
+        )
+
     def test_parser_has_init_serve_and_worker(self) -> None:
         parser = build_parser()
         for command in ("init", "serve", "worker", "scheduler"):

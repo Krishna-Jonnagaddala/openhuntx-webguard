@@ -21,6 +21,8 @@ Help organisations identify, prioritise, remediate and continuously monitor know
 9. Continuous vulnerability intelligence.
 10. Actionable remediation rather than vulnerability volume.
 11. Cryptographically permissioned execution: no valid TrustScan permit, no scanner network execution.
+12. Runtime enforcement at the request boundary: permission and safety limits are revalidated before outbound activity.
+13. Verifiable safety evidence: record what WebGuard enforced and observed without claiming zero target impact.
 
 ## Initial customer
 
@@ -45,7 +47,9 @@ The initial release will provide:
 * Retesting
 * Audit records
 * Cryptographically signed TrustScan execution permits
-* Permit revocation and execution-time revalidation
+* Permit revocation and request-boundary revalidation
+* Conservative runtime safety enforcement and circuit breaking
+* Signed TrustScan Safety Receipt artefacts
 
 ## Excluded from the initial release
 
@@ -92,5 +96,7 @@ The product will be considered commercially ready only when it can:
 * Record complete scan audit trails;
 * Protect customer credentials and scan data;
 * Cancel running scans safely;
+* Fail closed when runtime permission or safety policy cannot be verified;
+* Produce tamper-evident safety evidence for completed or safety-blocked assessments;
 * Pass an independent security assessment; and
 * Clearly communicate assessment limitations.

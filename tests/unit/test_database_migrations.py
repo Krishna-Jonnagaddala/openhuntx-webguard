@@ -225,7 +225,7 @@ class DatabaseMigrationTests(unittest.TestCase):
         second = ScanJobStore(self.path).cursor_signing_key()
         self.assertEqual(first, second)
 
-    def test_v4_database_migrates_transactionally_to_trustscan_schema_v5(self) -> None:
+    def test_v4_database_migrates_transactionally_through_trustscan_to_schema_v6(self) -> None:
         create_v4_database(self.path)
         before = sqlite3.connect(self.path)
         try:
@@ -251,7 +251,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                 after.execute(
                     "SELECT value FROM service_metadata WHERE key = 'schema_version'"
                 ).fetchone(),
-                ("5",),
+                ("6",),
             )
             integrity = after.execute("PRAGMA integrity_check").fetchone()
         finally:
@@ -288,7 +288,14 @@ class DatabaseMigrationTests(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(version, (str(DATABASE_SCHEMA_VERSION),))
-        self.assertTrue({"scan_permits", "job_permits", "schedule_permits"}.issubset(tables))
+        self.assertTrue(
+            {
+                "scan_permits",
+                "job_permits",
+                "schedule_permits",
+                "job_safety_receipts",
+            }.issubset(tables)
+        )
         self.assertTrue(
             {
                 "idx_scan_permits_organization",

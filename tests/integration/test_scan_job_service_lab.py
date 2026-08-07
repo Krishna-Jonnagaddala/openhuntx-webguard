@@ -40,6 +40,10 @@ class FakeExecutor:
             report=report,
             report_ref=f"jobs/{record.job_id}/report.json",
             audit_ref=f"jobs/{record.job_id}/authorization-audit.json",
+            safety_receipt_ref=(
+                f"jobs/{record.job_id}/trustscan-safety-receipt.json"
+            ),
+            safety_receipt_sha256="b" * 64,
         )
 
 
@@ -135,6 +139,15 @@ class ScanJobServiceIntegrationTests(unittest.TestCase):
                 assert result is not None
                 self.assertEqual(result["state"], "completed")
                 self.assertEqual(result["organization_id"], context.organization_id)
+                self.assertEqual(
+                    result["trustscan_safety_receipt"],
+                    {
+                        "receipt_ref": (
+                            f"jobs/{job_id}/trustscan-safety-receipt.json"
+                        ),
+                        "receipt_sha256": "b" * 64,
+                    },
+                )
                 self.assertNotIn("findings", result)
             finally:
                 stop.set()

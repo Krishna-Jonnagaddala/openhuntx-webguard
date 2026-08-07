@@ -12,6 +12,7 @@ from typing import Sequence
 
 from webguard_contracts import OrganizationRole, PrincipalType
 
+from . import __version__
 from .auth import ApiTokenAuthenticator
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .config import (
@@ -388,7 +389,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="webguard-api",
         description="Authenticated local WebGuard control-plane API and scanner queue.",
     )
-    parser.add_argument("--version", action="version", version="webguard-api 0.5.0")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="Initialize service and identity tables.")
