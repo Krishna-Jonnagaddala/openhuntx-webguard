@@ -1149,7 +1149,7 @@ class ScanJobStore:
                 WHERE {' AND '.join(clauses)}
                 ORDER BY jobs.submitted_at DESC, jobs.job_id DESC
                 LIMIT ?
-                """,
+                """,  # noqa: S608
                 tuple(parameters),
             ).fetchall()
         except sqlite3.Error as exc:
@@ -1900,7 +1900,7 @@ class ScanJobStore:
                     error_code = ?, error_message = ?, worker_id = NULL,
                     lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL
                 WHERE job_id = ? AND state = ? AND revision = ?{lease_predicate}
-                """,
+                """,  # noqa: S608
                 tuple(parameters),
             )
             if updated_count.rowcount != 1:
@@ -2141,7 +2141,7 @@ class ScanJobStore:
                 WHERE {' AND '.join(clauses)}
                 ORDER BY created_at DESC, schedule_id DESC
                 LIMIT ?
-                """,
+                """,  # noqa: S608
                 tuple(parameters),
             ).fetchall()
         except sqlite3.Error as exc:

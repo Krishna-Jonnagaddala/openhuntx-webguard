@@ -1,0 +1,5 @@
+# C1-003 hash-locked security-analysis tooling.
+# Only reviewed Linux x86_64 CI and macOS ARM64 developer wheels are allowed.
+ruff==0.16.2 \
+    --hash=sha256:ab3d62dde0b19facdd632008cc4827fc28ada7736c6bd35ab6f1050f0bfed53f \
+    --hash=sha256:a2c0d14fcbb26c91f0f867a6dc9bd71bbc30b1b6151829c884f23faeab2e5700

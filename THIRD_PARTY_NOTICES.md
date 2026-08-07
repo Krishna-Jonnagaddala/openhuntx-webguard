@@ -12,11 +12,12 @@ Release packaging must preserve all licence texts, notices, attribution, source-
 | --- | --- | --- | --- |
 | `pip` | `26.2.1` | Bootstrap installer used by the locked development/CI workflow | MIT |
 | `setuptools` | `83.0.0` | Build backend for WebGuard Python packages | MIT |
-| `cryptography` | `46.0.7` | Ed25519 signing and verification | Apache-2.0 OR BSD-3-Clause |
+| `cryptography` | `50.0.0` | Ed25519 signing and verification | Apache-2.0 OR BSD-3-Clause |
 | `cffi` | `2.1.0` | Transitive dependency used by `cryptography` on supported platforms | MIT-0 |
 | `pycparser` | `3.0` | Transitive dependency of `cffi` | BSD-3-Clause |
+| `ruff` | `0.16.2` | Static Python security analysis in the CI security gate | MIT |
 
-Versions and artifact hashes are controlled by `requirements-bootstrap.lock` and `requirements-ci.lock`.
+Runtime/build versions and artifact hashes are controlled by `requirements-bootstrap.lock` and `requirements-ci.lock`. Security-tool versions and reviewed platform hashes are controlled by `requirements-security.lock`.
 
 ## Authorised integration target
 

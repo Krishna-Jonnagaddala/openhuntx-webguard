@@ -52,10 +52,35 @@ jobs:
       - name: Run local verification gate
         run: ./scripts/verify.sh
 
+  security-gates:
+    name: Security gates
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13.14"
+          pip-version: "26.2.1"
+          cache: pip
+          cache-dependency-path: |
+            requirements-bootstrap.lock
+            requirements-security.lock
+
+      - name: Install hash-locked security tools
+        run: ./scripts/install-security-tools.sh
+
+      - name: Run security gates
+        run: ./scripts/run-security-gates.sh
+
   authorised-lab-integration:
     name: Authorised Juice Shop integration
     needs:
       - unit-tests
+      - security-gates
     runs-on: ubuntu-24.04
 
     steps:
