@@ -20,7 +20,7 @@ WebGuard adopts reviewed supply-chain pins for the current CI and development ba
 4. Every package build backend pins `setuptools` to the reviewed version rather than a lower-bound range.
 5. The API's direct `cryptography` dependency is exact-version pinned so package metadata does not silently widen the cryptographic runtime used by WebGuard.
 6. GitHub Actions are referenced by immutable 40-character commit SHAs, with human-readable release versions retained in comments.
-7. CI uses the explicit `ubuntu-24.04` runner family rather than the moving `ubuntu-latest` alias, and each tested Python interpreter is pinned to an exact patch release (`3.11.15`, `3.13.14`, `3.14.6`).
+7. CI uses the explicit `ubuntu-24.04` runner family rather than the moving `ubuntu-latest` alias, and each tested Python interpreter is pinned to an exact patch release (`3.11.15`, `3.12.13`, `3.13.14`, `3.14.6`).
 8. The OWASP Juice Shop lab image is referenced by its multi-platform OCI index digest as well as its release tag, preserving both AMD64 CI and ARM64 local development while preventing tag drift.
 9. `scripts/verify-supply-chain-pins.py` runs inside the normal verification gate and fails closed if these reviewed invariants drift.
 

@@ -3,7 +3,7 @@
 # separately with --no-deps and --no-build-isolation.
 #
 # The multiple hashes on platform-specific packages cover the current
-# GitHub-hosted Linux x86_64 Python 3.11/3.13/3.14 matrix and macOS ARM64
+# GitHub-hosted Linux x86_64 Python 3.11/3.12/3.13/3.14 matrix and macOS ARM64
 # Python 3.14 development environment.
 
 setuptools==83.0.0 \
@@ -17,6 +17,7 @@ cryptography==46.0.7 \
 
 cffi==2.1.0 \
     --hash=sha256:aa7a1b53a2a4452ada2d1b5dade9960b2522f1e61293a811a077439e39029565 \
+    --hash=sha256:1e9f50d192a3e525b15a75ab5114e442d83d657b7ec29182a991bc9a88fd3a66 \
     --hash=sha256:799416bae98336e400981ff6e532d67d5c709cfb30afb79865a1315f94b0e224 \
     --hash=sha256:d53d10f7da99ae46f7373b9150393e9c5eab9b224909982b43832668de4779f5 \
     --hash=sha256:c4165821e131d6d4ca444347c2b694e2311bcfa3fe5a861cc72968f28867beac

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
+from importlib.metadata import version as distribution_version
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -21,6 +22,12 @@ class ApiCliTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue(),
             f"webguard-api {__version__}\n",
+        )
+
+    def test_distribution_metadata_matches_package_version(self) -> None:
+        self.assertEqual(
+            distribution_version("openhuntx-webguard-api"),
+            __version__,
         )
 
     def test_parser_has_init_serve_and_worker(self) -> None:
