@@ -12,6 +12,9 @@ cd "$REPOSITORY_ROOT"
 echo "Verifying supply-chain pins..."
 python scripts/verify-supply-chain-pins.py
 
+echo "Verifying security-governance documents..."
+python scripts/verify-governance-docs.py
+
 echo "Compiling Python sources..."
 python -m compileall \
   -q \

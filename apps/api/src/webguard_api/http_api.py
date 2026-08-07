@@ -529,7 +529,7 @@ def create_server(
     if not address.is_loopback:
         raise ApiTransportError(
             "service_non_loopback_binding_rejected",
-            "Milestone 1.31 permits loopback API binding only.",
+            "WebGuard API binding is restricted to loopback addresses.",
             status=500,
         )
     handler = build_handler(
