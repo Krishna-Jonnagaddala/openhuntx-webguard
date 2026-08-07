@@ -1,0 +1,25 @@
+# C1-001 hash-locked external Python dependencies for WebGuard CI and the
+# supported macOS ARM64 developer path. Local WebGuard packages are installed
+# separately with --no-deps and --no-build-isolation.
+#
+# The multiple hashes on platform-specific packages cover the current
+# GitHub-hosted Linux x86_64 Python 3.11/3.13/3.14 matrix and macOS ARM64
+# Python 3.14 development environment.
+
+setuptools==83.0.0 \
+    --hash=sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3
+
+cryptography==46.0.7 \
+    --hash=sha256:42a1e5f98abb6391717978baf9f90dc28a743b7d9be7f0751a6f56a75d14065b \
+    --hash=sha256:420b1e4109cc95f0e5700eed79908cef9268265c773d3a66f7af1eef53d409ef \
+    --hash=sha256:5ad9ef796328c5e3c4ceed237a183f5d41d21150f972455a9d926593a1dcb308 \
+    --hash=sha256:462ad5cb1c148a22b2e3bcc5ad52504dff325d17daf5df8d88c17dda1f75f2a4
+
+cffi==2.1.0 \
+    --hash=sha256:aa7a1b53a2a4452ada2d1b5dade9960b2522f1e61293a811a077439e39029565 \
+    --hash=sha256:799416bae98336e400981ff6e532d67d5c709cfb30afb79865a1315f94b0e224 \
+    --hash=sha256:d53d10f7da99ae46f7373b9150393e9c5eab9b224909982b43832668de4779f5 \
+    --hash=sha256:c4165821e131d6d4ca444347c2b694e2311bcfa3fe5a861cc72968f28867beac
+
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992

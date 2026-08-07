@@ -18,8 +18,7 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install --requirement requirements-dev.txt
+./scripts/install-locked-dependencies.sh
 
 echo
 echo "OpenHuntX WebGuard development environment is ready."

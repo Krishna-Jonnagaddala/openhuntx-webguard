@@ -218,11 +218,8 @@ GitHub CI currently verifies unit tests on Python 3.11, 3.13, and 3.14, plus the
 git clone https://github.com/Krishna-Jonnagaddala/openhuntx-webguard.git
 cd openhuntx-webguard
 
-python3 -m venv .venv
+./scripts/bootstrap-dev.sh
 source .venv/bin/activate
-
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install --requirement requirements-dev.txt
 ```
 
 Run the local verification gate:
@@ -230,6 +227,8 @@ Run the local verification gate:
 ```bash
 ./scripts/verify.sh
 ```
+
+External Python dependencies are installed from repository-reviewed SHA-256 locks. CI also pins GitHub Actions by immutable commit SHA, Python to reviewed patch releases on the Ubuntu 24.04 runner family, and the authorised Juice Shop image by its multi-platform OCI index digest. Dependency updates are therefore deliberate review events rather than implicit upgrades.
 
 At Milestone 1.31, the repository contains:
 
