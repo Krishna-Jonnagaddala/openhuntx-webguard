@@ -194,15 +194,25 @@ Private JSON, audit, Safety Receipt, comparison, and HTML artefacts
 ## Repository structure
 
 - `apps/api` — local control-plane API
-- `apps/web` — future customer dashboard
 - `workers/scanner` — isolated scanner components
 - `packages/contracts` — shared API, scan, finding, and tenancy contracts
 - `infra/compose` — local infrastructure and authorised lab target
-- `infra/zap` — future controlled ZAP automation plans
-- `docs` — product, architecture, security, and ADR documentation
+- `docs` — product, architecture, security, roadmap, and ADR documentation
 - `scripts` — local verification and development utilities
 - `tests/unit` — deterministic unit tests
 - `tests/integration` — opt-in authorised integration tests
+
+Planned components that do not yet exist in the repository are tracked in `docs/ROADMAP.md` rather than listed as current repository structure.
+
+## Security and governance
+
+- `SECURITY.md` — vulnerability reporting, supported development baseline, and secret-handling expectations
+- `docs/ARCHITECTURE.md` — implemented architecture, persistence, cryptographic uses, and trust boundaries
+- `docs/AUTHORIZATION_MODEL.md` — layered owned-target and TrustScan permission model
+- `docs/DATA_CLASSIFICATION.md` — data sensitivity and handling requirements
+- `docs/THREAT_MODEL.md` — threats, controls, assumptions, and residual risks
+- `docs/ROADMAP.md` — implemented foundation versus planned production capabilities
+- `THIRD_PARTY_NOTICES.md` — directly referenced third-party component inventory
 
 ## Requirements
 
@@ -210,7 +220,7 @@ Private JSON, audit, Safety Receipt, comparison, and HTML artefacts
 - Git
 - Docker with Docker Compose for authorised integration tests
 
-GitHub CI currently verifies unit tests on Python 3.11, 3.13, and 3.14, plus the authorised OWASP Juice Shop integration suite.
+GitHub CI currently verifies unit tests on Python 3.11.15, 3.13.14, and 3.14.6, plus the authorised OWASP Juice Shop integration suite.
 
 ## Development setup
 
@@ -230,12 +240,13 @@ Run the local verification gate:
 
 External Python dependencies are installed from repository-reviewed SHA-256 locks. CI also pins GitHub Actions by immutable commit SHA, Python to reviewed patch releases on the Ubuntu 24.04 runner family, and the authorised Juice Shop image by its multi-platform OCI index digest. Dependency updates are therefore deliberate review events rather than implicit upgrades.
 
-At Milestone 1.31, the repository contains:
+At Milestone 1.32, repository verification includes:
 
-- 887 unit tests
-- 14 opt-in authorised integration tests
-- CI validation across three Python versions
-- an authorised Juice Shop integration job
+- the deterministic unit suite on Python 3.11.15, 3.13.14, and 3.14.6
+- the opt-in authorised integration suite
+- an authorised, digest-pinned Juice Shop integration job
+
+Current test totals are emitted by `./scripts/verify.sh` and CI. The README intentionally does not hardcode volatile test counts.
 
 ## Authorised lab integration
 
