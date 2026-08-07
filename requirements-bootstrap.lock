@@ -1,0 +1,4 @@
+# C1-001 bootstrap lock.
+# Update deliberately and verify hashes against the official PyPI release.
+pip==26.2.1 \
+    --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e

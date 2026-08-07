@@ -9,6 +9,9 @@ REPOSITORY_ROOT="$(
 
 cd "$REPOSITORY_ROOT"
 
+echo "Verifying supply-chain pins..."
+python scripts/verify-supply-chain-pins.py
+
 echo "Compiling Python sources..."
 python -m compileall \
   -q \

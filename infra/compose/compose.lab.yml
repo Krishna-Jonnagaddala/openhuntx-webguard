@@ -2,7 +2,7 @@ name: openhuntx-webguard-lab
 
 services:
   juice-shop:
-    image: bkimminich/juice-shop:v20.1.1
+    image: bkimminich/juice-shop:v20.1.1@sha256:cd58d79c5cb4d82f22fbaf616f9ff43bbd04ba630cd6b448a9ed99cf652fcebf
     hostname: juice-shop
     restart: "no"
 

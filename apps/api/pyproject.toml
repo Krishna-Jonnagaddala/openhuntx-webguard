@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "openhuntx-webguard-contracts==0.1.0",
     "openhuntx-webguard-scanner==0.1.0",
-    "cryptography>=45,<47",
+    "cryptography==46.0.7",
 ]
 
 [project.scripts]
