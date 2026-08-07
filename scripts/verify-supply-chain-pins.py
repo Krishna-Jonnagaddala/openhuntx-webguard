@@ -13,9 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPECTED = {
     "pip": "26.2.1",
     "setuptools": "83.0.0",
-    "cryptography": "46.0.7",
+    "cryptography": "50.0.0",
     "cffi": "2.1.0",
     "pycparser": "3.0",
+    "ruff": "0.16.2",
 }
 
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -27,6 +28,10 @@ EXPECTED_RUNNER = "ubuntu-24.04"
 JUICE_SHOP_INDEX_DIGEST = (
     "sha256:cd58d79c5cb4d82f22fbaf616f9ff43bbd04ba630cd6b448a9ed99cf652fcebf"
 )
+RUFF_WHEEL_HASHES = {
+    "ab3d62dde0b19facdd632008cc4827fc28ada7736c6bd35ab6f1050f0bfed53f",
+    "a2c0d14fcbb26c91f0f867a6dc9bd71bbc30b1b6151829c884f23faeab2e5700",
+}
 
 
 def fail(message: str) -> None:
@@ -82,6 +87,16 @@ for name in expected_runtime:
     if locked[name][0] != EXPECTED[name]:
         fail(f"{name} lock version is {locked[name][0]}, expected {EXPECTED[name]}")
 
+security_locked = parse_locked("requirements-security.lock")
+if set(security_locked) != {"ruff"}:
+    fail(f"security lock package set changed: {sorted(security_locked)}")
+if security_locked["ruff"][0] != EXPECTED["ruff"]:
+    fail(
+        f"ruff lock version is {security_locked['ruff'][0]}, expected {EXPECTED['ruff']}"
+    )
+if set(security_locked["ruff"][1]) != RUFF_WHEEL_HASHES:
+    fail("Ruff security-tool wheel hashes changed from the reviewed platform set")
+
 for path in (
     "packages/contracts/python/pyproject.toml",
     "workers/scanner/pyproject.toml",
@@ -130,8 +145,8 @@ if f"actions/setup-python@{SETUP_PYTHON_SHA}" not in workflow:
     fail("actions/setup-python is not pinned to the reviewed immutable SHA")
 if re.search(r"uses:\s+actions/(?:checkout|setup-python)@v", workflow):
     fail("a moving GitHub Action major-version tag remains in CI")
-if workflow.count(f"runs-on: {EXPECTED_RUNNER}") != 2:
-    fail("CI runner is not pinned to the reviewed Ubuntu major release")
+if workflow.count(f"runs-on: {EXPECTED_RUNNER}") != 3:
+    fail("CI runner count or reviewed Ubuntu runner pin changed")
 if "runs-on: ubuntu-latest" in workflow:
     fail("CI still uses the moving ubuntu-latest runner label")
 for version in EXPECTED_PYTHON_VERSIONS:
@@ -148,6 +163,51 @@ if "./scripts/install-locked-dependencies.sh" not in workflow:
     fail("CI bypasses the locked dependency installer")
 if "pip install --upgrade" in workflow:
     fail("CI still performs an unconstrained packaging-tool upgrade")
+
+uses_lines = [
+    line.strip().split("uses:", 1)[1].strip()
+    for line in workflow.splitlines()
+    if line.strip().startswith("uses:")
+]
+reviewed_actions = {
+    f"actions/checkout@{CHECKOUT_SHA}",
+    f"actions/setup-python@{SETUP_PYTHON_SHA}",
+}
+for action in uses_lines:
+    action_ref = action.split("#", 1)[0].strip()
+    if action_ref not in reviewed_actions:
+        fail(f"CI uses an unreviewed GitHub Action: {action_ref}")
+
+if "  security-gates:" not in workflow:
+    fail("CI security-gates job is missing")
+if "name: Security gates" not in workflow:
+    fail("CI security-gates job has no stable display name")
+if "requirements-security.lock" not in workflow:
+    fail("CI security tooling lock is not part of the cache/install inputs")
+if "./scripts/install-security-tools.sh" not in workflow:
+    fail("CI does not install reviewed security tooling")
+if "./scripts/run-security-gates.sh" not in workflow:
+    fail("CI does not execute the security gates")
+if "      - security-gates" not in workflow:
+    fail("authorised integration is not gated on the security job")
+
+security_installer = read("scripts/install-security-tools.sh")
+if "--require-hashes" not in security_installer:
+    fail("security-tool installer does not require reviewed hashes")
+if "--only-binary=:all:" not in security_installer:
+    fail("security-tool installer permits an unreviewed source build")
+if "ruff 0.16.2" not in security_installer:
+    fail("security-tool installer does not verify the reviewed Ruff version")
+
+security_runner = read("scripts/run-security-gates.sh")
+for required in (
+    "python scripts/scan-secrets.py",
+    "--select S",
+    "--ignore S101",
+    "python scripts/audit-dependencies.py",
+):
+    if required not in security_runner:
+        fail(f"security-gate runner is missing reviewed control: {required}")
 
 compose = read("infra/compose/compose.lab.yml")
 expected_image = f"bkimminich/juice-shop:v20.1.1@{JUICE_SHOP_INDEX_DIGEST}"

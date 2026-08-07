@@ -29,7 +29,7 @@ from webguard_contracts import (
 IDENTITY_SCHEMA_VERSION = 1
 DEFAULT_TOKEN_VALIDITY_DAYS = 90
 MAXIMUM_TOKEN_VALIDITY_DAYS = 366
-TOKEN_PREFIX = "wgt"
+TOKEN_PREFIX = "wgt"  # noqa: S105
 _SCRYPT_N = 2**14
 _SCRYPT_R = 8
 _SCRYPT_P = 1
@@ -648,7 +648,7 @@ class IdentityStore:
                 WHERE {' AND '.join(clauses)}
                 ORDER BY occurred_at DESC, event_id DESC
                 LIMIT ?
-                """,
+                """,  # noqa: S608
                 tuple(parameters),
             ).fetchall()
         except sqlite3.Error as exc:

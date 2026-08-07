@@ -13,7 +13,7 @@ from typing import Any
 CURRENT_TENANCY_SCHEMA_VERSION = "1.0"
 ORGANIZATION_TYPE = "organization"
 PRINCIPAL_TYPE = "principal"
-API_TOKEN_METADATA_TYPE = "api_token_metadata"
+API_TOKEN_METADATA_TYPE = "api_token_metadata"  # noqa: S105
 SECURITY_AUDIT_EVENT_TYPE = "security_audit_event"
 MAXIMUM_ORGANIZATION_NAME_LENGTH = 120
 MAXIMUM_PRINCIPAL_NAME_LENGTH = 120
