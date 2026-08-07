@@ -84,7 +84,7 @@ def verify_readme() -> None:
     required = (
         "Milestone 1.32",
         "Current test totals are emitted by `./scripts/verify.sh` and CI.",
-        "Python 3.11.15, 3.13.14, and 3.14.6",
+        "Python 3.11.15, 3.12.13, 3.13.14, and 3.14.6",
         "docs/ARCHITECTURE.md",
         "docs/THREAT_MODEL.md",
     )

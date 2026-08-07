@@ -21,7 +21,8 @@ EXPECTED = {
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 SETUP_PYTHON_SHA = "ece7cb06caefa5fff74198d8649806c4678c61a1"
 
-EXPECTED_PYTHON_VERSIONS = ("3.11.15", "3.13.14", "3.14.6")
+EXPECTED_PYTHON_VERSIONS = ("3.11.15", "3.12.13", "3.13.14", "3.14.6")
+EXPECTED_PYTHON_REQUIRES = ">=3.11,<3.15"
 EXPECTED_RUNNER = "ubuntu-24.04"
 JUICE_SHOP_INDEX_DIGEST = (
     "sha256:cd58d79c5cb4d82f22fbaf616f9ff43bbd04ba630cd6b448a9ed99cf652fcebf"
@@ -91,11 +92,32 @@ for path in (
     requires = document["build-system"]["requires"]
     if requires != [f"setuptools=={EXPECTED['setuptools']}"]:
         fail(f"{path} build backend is not exactly pinned")
+    if document["project"].get("requires-python") != EXPECTED_PYTHON_REQUIRES:
+        fail(f"{path} Python support range is not {EXPECTED_PYTHON_REQUIRES}")
 
 with (ROOT / "apps/api/pyproject.toml").open("rb") as handle:
     api = tomllib.load(handle)
 if f"cryptography=={EXPECTED['cryptography']}" not in api["project"]["dependencies"]:
     fail("API cryptography dependency is not exactly pinned")
+if "version" in api["project"]:
+    fail("API pyproject must not define a second static version authority")
+if api["project"].get("dynamic") != ["version"]:
+    fail("API pyproject must declare version as dynamic")
+try:
+    version_attr = api["tool"]["setuptools"]["dynamic"]["version"]["attr"]
+except (KeyError, TypeError):
+    fail("API setuptools dynamic version configuration is missing")
+if version_attr != "webguard_api._version.__version__":
+    fail("API package metadata does not use the canonical version module")
+version_source = read("apps/api/src/webguard_api/_version.py")
+version_matches = re.findall(r'^__version__\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$', version_source, re.MULTILINE)
+if len(version_matches) != 1:
+    fail("canonical API version module must contain exactly one semantic version literal")
+api_init = read("apps/api/src/webguard_api/__init__.py")
+if "from ._version import __version__" not in api_init:
+    fail("API package does not re-export the canonical version")
+if re.search(r'^__version__\s*=\s*', api_init, re.MULTILINE):
+    fail("API package __init__ contains a duplicate version authority")
 
 dev_records = logical_requirements("requirements-dev.txt")
 if not dev_records or any(not record.startswith("-e ") for record in dev_records):
@@ -115,7 +137,7 @@ if "runs-on: ubuntu-latest" in workflow:
 for version in EXPECTED_PYTHON_VERSIONS:
     if f'python-version: "{version}"' not in workflow and f'- "{version}"' not in workflow:
         fail(f"CI does not pin reviewed Python {version}")
-for floating in ("3.11", "3.13", "3.14"):
+for floating in ("3.11", "3.12", "3.13", "3.14"):
     if re.search(rf'python-version:\s+"{re.escape(floating)}"', workflow):
         fail(f"CI still uses floating Python {floating}")
     if re.search(rf'^\s*-\s+"{re.escape(floating)}"\s*$', workflow, re.MULTILINE):

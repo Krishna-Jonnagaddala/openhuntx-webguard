@@ -216,11 +216,11 @@ Planned components that do not yet exist in the repository are tracked in `docs/
 
 ## Requirements
 
-- Python 3.11 or later
+- Python 3.11 through 3.14 (`>=3.11,<3.15`)
 - Git
 - Docker with Docker Compose for authorised integration tests
 
-GitHub CI currently verifies unit tests on Python 3.11.15, 3.13.14, and 3.14.6, plus the authorised OWASP Juice Shop integration suite.
+GitHub CI currently verifies unit tests on Python 3.11.15, 3.12.13, 3.13.14, and 3.14.6, plus the authorised OWASP Juice Shop integration suite.
 
 ## Development setup
 
@@ -242,7 +242,7 @@ External Python dependencies are installed from repository-reviewed SHA-256 lock
 
 At Milestone 1.32, repository verification includes:
 
-- the deterministic unit suite on Python 3.11.15, 3.13.14, and 3.14.6
+- the deterministic unit suite on Python 3.11.15, 3.12.13, 3.13.14, and 3.14.6
 - the opt-in authorised integration suite
 - an authorised, digest-pinned Juice Shop integration job
 

@@ -68,8 +68,7 @@ from .store import (
     ScanJobStore,
 )
 from .worker import ScanJobWorker
-
-__version__ = "0.7.0"
+from ._version import __version__
 
 __all__ = [
     "ApiPermission",
