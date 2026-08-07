@@ -333,9 +333,13 @@ class HttpApiTests(unittest.TestCase):
             )
         _, _, first = self.request("GET", "/v1/jobs?limit=1")
         cursor = first["page"]["next_cursor"]
-        replacement = "A" if cursor[-1] != "A" else "B"
+        payload_segment, signature_segment = cursor.split(".", 1)
+        replacement = "A" if signature_segment[0] != "A" else "B"
+        tampered = (
+            f"{payload_segment}.{replacement}{signature_segment[1:]}"
+        )
         status, _, payload = self.request(
-            "GET", f"/v1/jobs?limit=1&cursor={cursor[:-1]}{replacement}"
+            "GET", f"/v1/jobs?limit=1&cursor={tampered}"
         )
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"]["code"], "page_cursor_signature_invalid")
