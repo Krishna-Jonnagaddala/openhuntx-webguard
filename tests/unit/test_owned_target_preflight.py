@@ -30,8 +30,8 @@ def authorization(**overrides) -> OwnedTargetAuthorization:
         "authorization_id": AUTHORIZATION_ID,
         "organization": "InternStack Private Limited",
         "authorized_by": "Krishna Jonnagaddala",
-        "target": "https://internstack.in/",
-        "allowed_hosts": ("internstack.in",),
+        "target": "https://example.com/",
+        "allowed_hosts": ("example.com",),
         "issued_at": NOW - timedelta(days=1),
         "expires_at": NOW + timedelta(days=30),
         "purpose": "Controlled passive assessment of the owned website.",
@@ -43,10 +43,10 @@ def authorization(**overrides) -> OwnedTargetAuthorization:
 
 def target(**overrides) -> ValidatedTarget:
     values = {
-        "original_url": "https://internstack.in/",
-        "normalised_url": "https://internstack.in/",
+        "original_url": "https://example.com/",
+        "normalised_url": "https://example.com/",
         "scheme": "https",
-        "hostname": "internstack.in",
+        "hostname": "example.com",
         "port": 443,
         "resolved_addresses": ("93.184.216.34",),
     }
@@ -157,8 +157,8 @@ class OwnedTargetPreflightTests(unittest.TestCase):
         with self.assertRaises(OwnedTargetPreflightError) as raised:
             preflight(
                 target=target(
-                    original_url="https://internstack.in/app",
-                    normalised_url="https://internstack.in/app",
+                    original_url="https://example.com/app",
+                    normalised_url="https://example.com/app",
                 )
             )
         self.assertEqual(
@@ -170,8 +170,8 @@ class OwnedTargetPreflightTests(unittest.TestCase):
         with self.assertRaises(OwnedTargetPreflightError) as raised:
             preflight(
                 target=target(
-                    original_url="http://internstack.in/",
-                    normalised_url="http://internstack.in/",
+                    original_url="http://example.com/",
+                    normalised_url="http://example.com/",
                     scheme="http",
                     port=80,
                 )

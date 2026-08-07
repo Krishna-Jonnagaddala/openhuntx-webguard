@@ -25,7 +25,7 @@ SCHEDULE_ID = "66666666-6666-4666-8666-666666666666"
 def body(**changes) -> bytes:
     value = {
         "name": "Daily passive crawl",
-        "target": "https://internstack.in/",
+        "target": "https://example.com/",
         "authorization_id": AUTH_ID,
         "confirm_authorization": AUTH_ID,
         "mode": "crawl",
@@ -108,7 +108,7 @@ class ScanScheduleContractTests(unittest.TestCase):
         with self.assertRaises(ScanScheduleValidationError):
             ScanScheduleSubmission(
                 name="Daily",
-                target="https://internstack.in/",
+                target="https://example.com/",
                 authorization_id=AUTH_ID,
                 confirmation=AUTH_ID,
                 mode=ScanJobMode.CRAWL,
@@ -122,7 +122,7 @@ class ScanScheduleContractTests(unittest.TestCase):
             organization_id=ORG_ID,
             created_by=OWNER_ID,
             name="Daily",
-            target="https://internstack.in/",
+            target="https://example.com/",
             authorization_id=AUTH_ID,
             authorization_sha256="a" * 64,
             mode=ScanJobMode.CRAWL,
@@ -143,7 +143,7 @@ class ScanScheduleContractTests(unittest.TestCase):
                 organization_id=ORG_ID,
                 created_by=OWNER_ID,
                 name="Daily",
-                target="https://internstack.in/",
+                target="https://example.com/",
                 authorization_id=AUTH_ID,
                 authorization_sha256="a" * 64,
                 mode=ScanJobMode.CRAWL,

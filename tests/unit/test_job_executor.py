@@ -82,7 +82,7 @@ class ScanJobExecutorTests(unittest.TestCase):
             original_url=TARGET,
             normalised_url=TARGET,
             scheme="https",
-            hostname="internstack.in",
+            hostname="example.com",
             port=443,
             resolved_addresses=("204.69.207.1",),
         )

@@ -32,7 +32,7 @@ DIGEST = "a" * 64
 def request(**changes) -> ScanJobRequest:
     values = dict(
         idempotency_key="internstack-20260806",
-        target="https://internstack.in/",
+        target="https://example.com/",
         authorization_id=AUTH_ID,
         authorization_sha256=DIGEST,
         mode=ScanJobMode.CRAWL,
@@ -57,7 +57,7 @@ class ScanJobSubmissionTests(unittest.TestCase):
     def valid_document(self) -> str:
         return json.dumps(
             {
-                "target": "https://internstack.in/",
+                "target": "https://example.com/",
                 "authorization_id": AUTH_ID,
                 "confirm_authorization": AUTH_ID,
                 "mode": "crawl",
@@ -66,7 +66,7 @@ class ScanJobSubmissionTests(unittest.TestCase):
 
     def test_loads_valid_submission(self) -> None:
         result = load_scan_job_submission_json(self.valid_document())
-        self.assertEqual(result.target, "https://internstack.in/")
+        self.assertEqual(result.target, "https://example.com/")
         self.assertIs(result.mode, ScanJobMode.CRAWL)
 
     def test_single_page_mode_is_supported(self) -> None:
@@ -83,7 +83,7 @@ class ScanJobSubmissionTests(unittest.TestCase):
 
     def test_rejects_http_target(self) -> None:
         document = json.loads(self.valid_document())
-        document["target"] = "http://internstack.in/"
+        document["target"] = "http://example.com/"
         with self.assertRaises(ScanJobLoadError):
             load_scan_job_submission_json(json.dumps(document))
 
@@ -101,7 +101,7 @@ class ScanJobSubmissionTests(unittest.TestCase):
 
     def test_rejects_duplicate_json_key(self) -> None:
         document = (
-            '{"target":"https://internstack.in/",'
+            '{"target":"https://example.com/",'
             f'"authorization_id":"{AUTH_ID}",'
             f'"confirm_authorization":"{AUTH_ID}",'
             '"mode":"crawl","mode":"single_page"}'
@@ -156,7 +156,7 @@ class ScanJobRequestTests(unittest.TestCase):
 
     def test_rejects_noncanonical_target(self) -> None:
         # Request construction canonicalizes the root path.
-        self.assertEqual(request(target="https://internstack.in").target, "https://internstack.in/")
+        self.assertEqual(request(target="https://example.com").target, "https://example.com/")
 
     def test_rejects_invalid_digest(self) -> None:
         with self.assertRaisesRegex(ScanJobValidationError, "SHA-256"):

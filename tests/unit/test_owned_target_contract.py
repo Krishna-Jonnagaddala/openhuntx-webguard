@@ -39,8 +39,8 @@ def authorization(**overrides) -> OwnedTargetAuthorization:
         "authorization_id": AUTHORIZATION_ID,
         "organization": "InternStack Private Limited",
         "authorized_by": "Krishna Jonnagaddala",
-        "target": "https://internstack.in/",
-        "allowed_hosts": ("internstack.in", "www.internstack.in"),
+        "target": "https://example.com/",
+        "allowed_hosts": ("example.com", "www.example.com"),
         "issued_at": NOW,
         "expires_at": NOW + timedelta(days=30),
         "purpose": "Passive security assessment of the owned production website.",
@@ -84,7 +84,7 @@ def audit(**overrides) -> OwnedTargetAuditRecord:
         "authorization_sha256": authorization().fingerprint,
         "organization": "InternStack Private Limited",
         "authorized_by": "Krishna Jonnagaddala",
-        "target": "https://internstack.in/",
+        "target": "https://example.com/",
         "resolved_addresses": ("93.184.216.34",),
         "created_at": NOW,
         "execution_policy": execution_policy(),
@@ -115,8 +115,8 @@ class OwnedTargetContractTests(unittest.TestCase):
 
     def test_url_canonicalizer_adds_root_path(self) -> None:
         self.assertEqual(
-            canonicalize_owned_target_url("https://InternStack.in"),
-            "https://internstack.in/",
+            canonicalize_owned_target_url("https://Example.COM"),
+            "https://example.com/",
         )
 
     def test_hostname_canonicalizer_supports_idna(self) -> None:
@@ -130,7 +130,7 @@ class OwnedTargetContractTests(unittest.TestCase):
             OwnedTargetValidationError,
             "HTTPS",
         ):
-            authorization(target="http://internstack.in/")
+            authorization(target="http://example.com/")
 
     def test_ip_literal_authorization_is_rejected(self) -> None:
         with self.assertRaises(OwnedTargetValidationError) as raised:
@@ -145,7 +145,7 @@ class OwnedTargetContractTests(unittest.TestCase):
 
     def test_target_must_be_canonical(self) -> None:
         with self.assertRaises(OwnedTargetValidationError) as raised:
-            authorization(target="https://InternStack.in")
+            authorization(target="https://Example.COM")
         self.assertEqual(
             raised.exception.code,
             "owned_target_url_non_canonical",
@@ -153,8 +153,8 @@ class OwnedTargetContractTests(unittest.TestCase):
 
     def test_target_cannot_include_query_or_fragment(self) -> None:
         for value in (
-            "https://internstack.in/?a=1",
-            "https://internstack.in/#section",
+            "https://example.com/?a=1",
+            "https://example.com/#section",
         ):
             with self.subTest(value=value):
                 with self.assertRaises(OwnedTargetValidationError):
@@ -164,9 +164,9 @@ class OwnedTargetContractTests(unittest.TestCase):
         with self.assertRaises(OwnedTargetValidationError) as raised:
             authorization(
                 allowed_hosts=(
-                    "www.internstack.in",
-                    "internstack.in",
-                    "internstack.in",
+                    "www.example.com",
+                    "example.com",
+                    "example.com",
                 )
             )
         self.assertEqual(
@@ -176,7 +176,7 @@ class OwnedTargetContractTests(unittest.TestCase):
 
     def test_canonical_host_must_be_allowed(self) -> None:
         with self.assertRaises(OwnedTargetValidationError) as raised:
-            authorization(allowed_hosts=("www.internstack.in",))
+            authorization(allowed_hosts=("www.example.com",))
         self.assertEqual(
             raised.exception.code,
             "owned_target_canonical_host_not_allowed",
