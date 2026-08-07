@@ -90,7 +90,7 @@ class WebGuardJobServiceTests(unittest.TestCase):
 
     def test_target_mismatch_is_rejected(self) -> None:
         with self.assertRaisesRegex(ApiServiceError, "does not match"):
-            self.submit(body(target="https://www.internstack.in/"))
+            self.submit(body(target="https://www.example.com/"))
 
     def test_invalid_idempotency_key_is_http_400(self) -> None:
         with self.assertRaises(ApiServiceError) as caught:

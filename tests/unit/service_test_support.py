@@ -19,7 +19,7 @@ from webguard_contracts import (
 
 NOW = datetime(2026, 8, 6, 18, 0, tzinfo=timezone.utc)
 AUTH_ID = "8ae6403f-7832-498c-b37e-c0c87be19ea1"
-TARGET = "https://internstack.in/"
+TARGET = "https://example.com/"
 
 
 def authorization(**changes) -> OwnedTargetAuthorization:
@@ -28,7 +28,7 @@ def authorization(**changes) -> OwnedTargetAuthorization:
         organization="InternStack",
         authorized_by="Krishna Jonnagaddala",
         target=TARGET,
-        allowed_hosts=("internstack.in",),
+        allowed_hosts=("example.com",),
         issued_at=NOW - timedelta(days=1),
         expires_at=NOW + timedelta(days=30),
         purpose="Controlled passive production assessment",
@@ -41,7 +41,7 @@ def authorization(**changes) -> OwnedTargetAuthorization:
 def write_authorization(directory: Path, value: OwnedTargetAuthorization | None = None) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
-    path = directory / "internstack.in.json"
+    path = directory / "example.com.json"
     write_owned_target_authorization_file(
         authorization() if value is None else value,
         path,

@@ -132,7 +132,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(schedule.last_error_code, "authorization_target_mismatch")
 
     def test_expired_authorization_blocks_schedule(self) -> None:
-        (self.auth_dir / "internstack.in.json").unlink()
+        (self.auth_dir / "example.com.json").unlink()
         write_authorization(
             self.auth_dir,
             authorization(
@@ -147,7 +147,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(schedule.last_error_code, "authorization_not_current")
 
     def test_future_authorization_blocks_schedule(self) -> None:
-        (self.auth_dir / "internstack.in.json").unlink()
+        (self.auth_dir / "example.com.json").unlink()
         write_authorization(
             self.auth_dir,
             authorization(

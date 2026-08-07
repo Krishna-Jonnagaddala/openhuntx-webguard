@@ -39,13 +39,13 @@ class AuthorizationRepositoryTests(unittest.TestCase):
             self.repository.get(AUTH_ID)
 
     def test_insecure_permissions_are_rejected(self) -> None:
-        path = self.directory / "internstack.in.json"
+        path = self.directory / "example.com.json"
         os.chmod(path, 0o644)
         with self.assertRaisesRegex(AuthorizationRepositoryError, "owner-only"):
             self.repository.get(AUTH_ID)
 
     def test_symlink_file_is_rejected(self) -> None:
-        target = self.directory / "internstack.in.json"
+        target = self.directory / "example.com.json"
         link = self.directory / "linked.json"
         link.symlink_to(target)
         with self.assertRaisesRegex(AuthorizationRepositoryError, "symbolic link"):
