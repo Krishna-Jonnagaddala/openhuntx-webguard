@@ -18,14 +18,25 @@ from webguard_contracts import (
     ScanScheduleState,
     ScanScheduleValidationError,
     SecurityAuditEvent,
+    TrustScanPermitClaims,
+    TrustScanPermitLoadError,
+    TrustScanPermitValidationError,
     load_scan_job_submission_json,
     load_scan_schedule_submission_json,
+    load_trustscan_permit_submission_json,
 )
 
 from .auth import ApiPermission, AuthContext, AuthenticationError
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .identity import IdentityStore, IdentityStoreError
 from .pagination import PageRequest, PaginationError, SignedCursorCodec
+from .permits import (
+    PersistedTrustScanPermit,
+    TrustScanPermitError,
+    TrustScanSigner,
+    validate_permit_scope,
+    validate_permit_use,
+)
 from .store import JobStoreError, ScanJobStore
 
 
@@ -54,6 +65,7 @@ class WebGuardJobService:
         identity: IdentityStore,
         clock: Callable[[], datetime] = _utc_now,
         cursor_codec: SignedCursorCodec | None = None,
+        trustscan_signer: TrustScanSigner | None = None,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
@@ -66,6 +78,19 @@ class WebGuardJobService:
         self.cursor_codec = (
             SignedCursorCodec(key) if cursor_codec is None else cursor_codec
         )
+        try:
+            permit_key = (
+                store.trustscan_signing_private_key()
+                if trustscan_signer is None
+                else None
+            )
+            self.trustscan_signer = (
+                TrustScanSigner(permit_key)
+                if trustscan_signer is None
+                else trustscan_signer
+            )
+        except (JobStoreError, TrustScanPermitError) as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
 
     def _audit(
         self,
@@ -132,10 +157,31 @@ class WebGuardJobService:
         ).hexdigest()
         return f"tenant-{digest}"
 
-    @staticmethod
-    def _public(record, context: AuthContext) -> dict:
+    def _public(self, record, context: AuthContext) -> dict:
         payload = record.to_public_dict()
         payload["organization_id"] = context.organization_id
+        try:
+            binding = self.store.get_job_permit_binding(record.job_id)
+        except JobStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        payload["trustscan_permit"] = (
+            None
+            if binding is None
+            else {"permit_id": binding[0], "permit_sha256": binding[1]}
+        )
+        return payload
+
+    def _schedule_public(self, record) -> dict:
+        payload = record.to_public_dict()
+        try:
+            binding = self.store.get_schedule_permit_binding(record.schedule_id)
+        except JobStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        payload["trustscan_permit"] = (
+            None
+            if binding is None
+            else {"permit_id": binding[0], "permit_sha256": binding[1]}
+        )
         return payload
 
     @staticmethod
@@ -189,6 +235,230 @@ class WebGuardJobService:
     @staticmethod
     def _page_payload(limit: int, next_cursor: str | None) -> dict[str, object]:
         return {"limit": limit, "next_cursor": next_cursor}
+
+    def trustscan_verification_key(self) -> dict[str, str]:
+        """Return the public Ed25519 verification key; never expose the private seed."""
+
+        return self.trustscan_signer.verification_key_document()
+
+    def _permit_record(
+        self, context: AuthContext, permit_id: str
+    ) -> PersistedTrustScanPermit:
+        try:
+            return self.store.get_scan_permit_scoped(
+                permit_id, context.organization_id
+            )
+        except JobStoreError as exc:
+            status = 404 if exc.code == "trustscan_permit_not_found" else 500
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+
+    @staticmethod
+    def _permit_error_status(error: TrustScanPermitError) -> int:
+        if error.code == "trustscan_permit_organization_mismatch":
+            return 404
+        if error.code in {
+            "trustscan_permit_revoked",
+            "trustscan_permit_pending",
+            "trustscan_permit_expired",
+            "trustscan_permit_mode_not_allowed",
+        }:
+            return 403
+        return 400
+
+    def _validate_permit_now(
+        self,
+        context: AuthContext,
+        permit_id: str,
+        *,
+        authorization,
+        target: str,
+        mode: ScanJobMode,
+    ) -> PersistedTrustScanPermit:
+        record = self._permit_record(context, permit_id)
+        try:
+            validate_permit_use(
+                record,
+                signer=self.trustscan_signer,
+                organization_id=context.organization_id,
+                authorization=authorization,
+                target=target,
+                mode=mode,
+                now=self.clock(),
+            )
+        except TrustScanPermitError as exc:
+            raise ApiServiceError(
+                exc.code, exc.message, status=self._permit_error_status(exc)
+            ) from exc
+        return record
+
+    def issue_permit(
+        self, context: AuthContext, body: bytes, *, request_id: str
+    ) -> dict:
+        self._require(
+            context,
+            ApiPermission.PERMIT_ISSUE,
+            request_id=request_id,
+            action="permits.issue",
+            resource_type="trustscan_permit",
+            resource_id="pending",
+        )
+        try:
+            submission = load_trustscan_permit_submission_json(body)
+        except TrustScanPermitLoadError as exc:
+            self._audit(
+                context,
+                request_id=request_id,
+                action="permits.issue",
+                resource_type="trustscan_permit",
+                resource_id="pending",
+                outcome=AuditOutcome.FAILED,
+                detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        if not self.identity.authorization_is_assigned(
+            context.organization_id, submission.authorization_id
+        ):
+            raise ApiServiceError(
+                "authorization_not_found",
+                "Authorization was not found for this organization.",
+                status=404,
+            )
+        try:
+            authorization = self.authorizations.get(submission.authorization_id)
+        except AuthorizationRepositoryError as exc:
+            status = 404 if exc.code == "authorization_not_found" else 500
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        now = self.clock()
+        if authorization.target != submission.target:
+            raise ApiServiceError(
+                "authorization_target_mismatch",
+                "The requested target does not match the server-side authorization.",
+                status=400,
+            )
+        if not authorization.issued_at <= now < authorization.expires_at:
+            raise ApiServiceError(
+                "authorization_not_current",
+                "The underlying authorization is not currently valid.",
+                status=400,
+            )
+        if submission.not_before < now:
+            raise ApiServiceError(
+                "trustscan_permit_start_in_past",
+                "not_before cannot be earlier than the current service time.",
+                status=400,
+            )
+        if submission.expires_at > authorization.expires_at:
+            raise ApiServiceError(
+                "trustscan_permit_exceeds_authorization",
+                "TrustScan permit cannot outlive the underlying authorization.",
+                status=400,
+            )
+        if (
+            submission.maximum_request_attempts
+            > authorization.limits.maximum_request_attempts
+        ):
+            raise ApiServiceError(
+                "trustscan_permit_request_budget_too_high",
+                "TrustScan request budget cannot exceed the underlying authorization.",
+                status=400,
+            )
+        authorization_rate = 1.0 / authorization.limits.minimum_delay_seconds
+        if submission.maximum_requests_per_second > authorization_rate + 1e-12:
+            raise ApiServiceError(
+                "trustscan_permit_rate_too_high",
+                "TrustScan request rate cannot exceed the underlying authorization.",
+                status=400,
+            )
+        try:
+            claims = TrustScanPermitClaims(
+                permit_id=str(uuid4()),
+                organization_id=context.organization_id,
+                authorization_id=authorization.authorization_id,
+                authorization_sha256=authorization.fingerprint,
+                target=submission.target,
+                issued_by=context.principal_id,
+                issued_at=now,
+                not_before=submission.not_before,
+                expires_at=submission.expires_at,
+                permitted_modes=submission.permitted_modes,
+                allowed_http_methods=submission.allowed_http_methods,
+                maximum_request_attempts=submission.maximum_request_attempts,
+                maximum_requests_per_second=submission.maximum_requests_per_second,
+                maximum_concurrency=submission.maximum_concurrency,
+            )
+            signed = self.trustscan_signer.sign(claims)
+            record = self.store.create_scan_permit(signed)
+        except (TrustScanPermitValidationError, TrustScanPermitError) as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        except JobStoreError as exc:
+            status = 409 if exc.code == "trustscan_permit_conflict" else 500
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        self._audit(
+            context,
+            request_id=request_id,
+            action="permits.issue",
+            resource_type="trustscan_permit",
+            resource_id=claims.permit_id,
+            outcome=AuditOutcome.SUCCEEDED,
+        )
+        return record.to_public_dict(now=now)
+
+    def get_permit(
+        self, context: AuthContext, permit_id: str, *, request_id: str
+    ) -> dict:
+        self._require(
+            context,
+            ApiPermission.PERMIT_READ,
+            request_id=request_id,
+            action="permits.read",
+            resource_type="trustscan_permit",
+            resource_id=permit_id,
+        )
+        record = self._permit_record(context, permit_id)
+        try:
+            self.trustscan_signer.verify(record.permit)
+        except TrustScanPermitError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        self._audit(
+            context,
+            request_id=request_id,
+            action="permits.read",
+            resource_type="trustscan_permit",
+            resource_id=permit_id,
+            outcome=AuditOutcome.SUCCEEDED,
+        )
+        return record.to_public_dict(now=self.clock())
+
+    def revoke_permit(
+        self, context: AuthContext, permit_id: str, *, request_id: str
+    ) -> dict:
+        self._require(
+            context,
+            ApiPermission.PERMIT_REVOKE,
+            request_id=request_id,
+            action="permits.revoke",
+            resource_type="trustscan_permit",
+            resource_id=permit_id,
+        )
+        try:
+            record = self.store.revoke_scan_permit_scoped(
+                permit_id,
+                context.organization_id,
+                revoked_by=context.principal_id,
+                now=self.clock(),
+            )
+        except JobStoreError as exc:
+            status = 404 if exc.code == "trustscan_permit_not_found" else 500
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        self._audit(
+            context,
+            request_id=request_id,
+            action="permits.revoke",
+            resource_type="trustscan_permit",
+            resource_id=permit_id,
+            outcome=AuditOutcome.SUCCEEDED,
+        )
+        return record.to_public_dict(now=self.clock())
 
     def list_jobs(
         self,
@@ -247,6 +517,7 @@ class WebGuardJobService:
         body: bytes,
         *,
         idempotency_key: str,
+        permit_id: str,
         request_id: str,
     ) -> tuple[dict, bool]:
         self._require(
@@ -298,6 +569,13 @@ class WebGuardJobService:
                 "The requested target does not match the server-side authorization.",
                 status=400,
             )
+        permit_record = self._validate_permit_now(
+            context,
+            permit_id,
+            authorization=authorization,
+            target=submission.target,
+            mode=submission.mode,
+        )
         try:
             submitted_at = self.clock()
             # Validate the client key before replacing it with a tenant-scoped digest.
@@ -324,6 +602,8 @@ class WebGuardJobService:
                 request,
                 organization_id=context.organization_id,
                 submitted_by=context.principal_id,
+                permit_id=permit_record.permit.claims.permit_id,
+                permit_sha256=permit_record.permit.fingerprint,
             )
         except JobStoreError as exc:
             status = 409 if exc.code == "job_idempotency_conflict" else 500
@@ -425,6 +705,10 @@ class WebGuardJobService:
             resource_id=job_id,
             outcome=AuditOutcome.SUCCEEDED,
         )
+        try:
+            permit_binding = self.store.get_job_permit_binding(job_id)
+        except JobStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
         return {
             "job_id": record.job_id,
             "organization_id": context.organization_id,
@@ -433,6 +717,14 @@ class WebGuardJobService:
             "result_status": None if record.result_status is None else record.result_status.value,
             "report_ref": record.report_ref,
             "audit_ref": record.audit_ref,
+            "trustscan_permit": (
+                None
+                if permit_binding is None
+                else {
+                    "permit_id": permit_binding[0],
+                    "permit_sha256": permit_binding[1],
+                }
+            ),
             "error": None
             if record.error_code is None
             else {"code": record.error_code, "message": record.error_message},
@@ -443,6 +735,7 @@ class WebGuardJobService:
         context: AuthContext,
         body: bytes,
         *,
+        permit_id: str,
         request_id: str,
     ) -> dict:
         self._require(
@@ -486,6 +779,20 @@ class WebGuardJobService:
                 "The requested target does not match the server-side authorization.",
                 status=400,
             )
+        permit_record = self._permit_record(context, permit_id)
+        try:
+            validate_permit_scope(
+                permit_record,
+                signer=self.trustscan_signer,
+                organization_id=context.organization_id,
+                authorization=authorization,
+                target=submission.target,
+                mode=submission.mode,
+            )
+        except TrustScanPermitError as exc:
+            raise ApiServiceError(
+                exc.code, exc.message, status=self._permit_error_status(exc)
+            ) from exc
         now = self.clock()
         if submission.starts_at < now:
             raise ApiServiceError(
@@ -497,6 +804,13 @@ class WebGuardJobService:
             raise ApiServiceError(
                 "schedule_start_too_distant",
                 "starts_at cannot be more than 365 days in the future.",
+                status=400,
+            )
+        permit_claims = permit_record.permit.claims
+        if not permit_claims.not_before <= submission.starts_at < permit_claims.expires_at:
+            raise ApiServiceError(
+                "trustscan_schedule_outside_permit_window",
+                "Schedule start must fall inside the TrustScan permit validity window.",
                 status=400,
             )
         try:
@@ -511,6 +825,8 @@ class WebGuardJobService:
                 interval_seconds=submission.interval_seconds,
                 starts_at=submission.starts_at,
                 now=now,
+                permit_id=permit_record.permit.claims.permit_id,
+                permit_sha256=permit_record.permit.fingerprint,
             )
         except (JobStoreError, ScanScheduleValidationError) as exc:
             status = 409 if getattr(exc, "code", "") == "schedule_conflict" else 500
@@ -523,7 +839,7 @@ class WebGuardJobService:
             resource_id=record.schedule_id,
             outcome=AuditOutcome.SUCCEEDED,
         )
-        return record.to_public_dict()
+        return self._schedule_public(record)
 
     def list_schedules(
         self,
@@ -575,7 +891,7 @@ class WebGuardJobService:
             outcome=AuditOutcome.SUCCEEDED,
         )
         return {
-            "schedules": [schedule.to_public_dict() for schedule in schedules],
+            "schedules": [self._schedule_public(schedule) for schedule in schedules],
             "page": self._page_payload(page.limit, next_cursor),
         }
 
@@ -610,7 +926,7 @@ class WebGuardJobService:
             resource_id=schedule_id,
             outcome=AuditOutcome.SUCCEEDED,
         )
-        return record.to_public_dict()
+        return self._schedule_public(record)
 
     def pause_schedule(
         self,
@@ -683,7 +999,7 @@ class WebGuardJobService:
             resource_id=schedule_id,
             outcome=AuditOutcome.SUCCEEDED,
         )
-        return record.to_public_dict()
+        return self._schedule_public(record)
 
     def me(self, context: AuthContext, *, request_id: str) -> dict:
         self._audit(

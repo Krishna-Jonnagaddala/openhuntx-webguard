@@ -17,6 +17,7 @@ from tests.unit.service_test_support import (
     VIEWER_ID,
     VIEWER_TOKEN_ID,
     create_identity_fixture,
+    create_trustscan_permit,
     write_authorization,
 )
 
@@ -49,6 +50,8 @@ class ScheduleServiceTests(unittest.TestCase):
         write_authorization(auth_dir)
         self.store = ScanJobStore(root / "jobs.sqlite3")
         self.identity, self.context, _ = create_identity_fixture(self.store.path)
+        self.permit = create_trustscan_permit(self.store)
+        self.permit_id = self.permit.permit.claims.permit_id
         self.service = WebGuardJobService(
             store=self.store,
             authorizations=AuthorizationRepository(auth_dir),
@@ -63,6 +66,7 @@ class ScheduleServiceTests(unittest.TestCase):
         return self.service.create_schedule(
             self.context if context is None else context,
             body() if payload is None else payload,
+            permit_id=self.permit_id,
             request_id=REQUEST_ID,
         )
 

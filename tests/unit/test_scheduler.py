@@ -20,6 +20,8 @@ from tests.unit.service_test_support import (
     OWNER_ID,
     TARGET,
     authorization,
+    create_trustscan_permit,
+    trustscan_signer,
     write_authorization,
 )
 
@@ -51,6 +53,8 @@ class SchedulerTests(unittest.TestCase):
             assigned_by=OWNER_ID,
             now=NOW,
         )
+        self.signer = trustscan_signer(self.store)
+        self.permit = create_trustscan_permit(self.store)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -70,6 +74,8 @@ class SchedulerTests(unittest.TestCase):
             schedule_id=SCHEDULE_ID,
         )
         values.update(changes)
+        values.setdefault("permit_id", self.permit.permit.claims.permit_id)
+        values.setdefault("permit_sha256", self.permit.permit.fingerprint)
         return self.store.create_schedule(**values)
 
     def coordinator(self, **changes):
@@ -77,6 +83,7 @@ class SchedulerTests(unittest.TestCase):
             store=self.store,
             authorizations=AuthorizationRepository(self.auth_dir),
             identity=self.identity,
+            trustscan_signer=self.signer,
             clock=lambda: NOW,
         )
         values.update(changes)
@@ -151,6 +158,34 @@ class SchedulerTests(unittest.TestCase):
         self.create_schedule()
         summary = self.coordinator().run_once()
         self.assertEqual(summary.blocked, 1)
+
+    def test_missing_trustscan_permit_blocks_legacy_schedule(self) -> None:
+        self.create_schedule(permit_id=None, permit_sha256=None)
+        summary = self.coordinator().run_once()
+        self.assertEqual(summary.blocked, 1)
+        schedule = self.store.get_schedule_scoped(SCHEDULE_ID, ORG_ID)
+        self.assertIs(schedule.state, ScanScheduleState.PAUSED)
+        self.assertEqual(schedule.last_error_code, "trustscan_permit_missing")
+
+    def test_revoked_trustscan_permit_blocks_schedule(self) -> None:
+        self.create_schedule()
+        self.store.revoke_scan_permit_scoped(
+            self.permit.permit.claims.permit_id,
+            ORG_ID,
+            revoked_by=OWNER_ID,
+            now=NOW,
+        )
+        summary = self.coordinator().run_once()
+        self.assertEqual(summary.blocked, 1)
+        schedule = self.store.get_schedule_scoped(SCHEDULE_ID, ORG_ID)
+        self.assertEqual(schedule.last_error_code, "trustscan_permit_revoked")
+
+    def test_expired_trustscan_permit_blocks_schedule(self) -> None:
+        self.create_schedule()
+        summary = self.coordinator(clock=lambda: NOW + timedelta(days=8)).run_once()
+        self.assertEqual(summary.blocked, 1)
+        schedule = self.store.get_schedule_scoped(SCHEDULE_ID, ORG_ID)
+        self.assertEqual(schedule.last_error_code, "trustscan_permit_expired")
 
     def test_scheduler_configuration_is_bounded(self) -> None:
         with self.assertRaises(ValueError):

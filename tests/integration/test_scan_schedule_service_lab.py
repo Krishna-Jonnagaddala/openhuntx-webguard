@@ -26,6 +26,8 @@ from tests.unit.service_test_support import (
     TARGET,
     completed_report,
     create_identity_fixture,
+    create_trustscan_permit,
+    trustscan_signer,
     write_authorization,
 )
 
@@ -54,17 +56,21 @@ class ScanScheduleServiceIntegrationTests(unittest.TestCase):
             write_authorization(auth_dir)
             store = ScanJobStore(root / "jobs.sqlite3")
             identity, context, token = create_identity_fixture(store.path)
+            permit = create_trustscan_permit(store)
+            permit_id = permit.permit.claims.permit_id
             repository = AuthorizationRepository(auth_dir)
             service = WebGuardJobService(
                 store=store,
                 authorizations=repository,
                 identity=identity,
+                trustscan_signer=trustscan_signer(store),
                 clock=lambda: NOW,
             )
             scheduler = ScanScheduleCoordinator(
                 store=store,
                 authorizations=repository,
                 identity=identity,
+                trustscan_signer=trustscan_signer(store),
                 clock=lambda: NOW,
             )
             worker = ScanJobWorker(
@@ -108,6 +114,7 @@ class ScanScheduleServiceIntegrationTests(unittest.TestCase):
                     body=body,
                     headers={
                         "Authorization": f"Bearer {token}",
+                        "TrustScan-Permit": permit_id,
                         "Content-Type": "application/json",
                         "Content-Length": str(len(body)),
                     },

@@ -20,6 +20,7 @@ Help organisations identify, prioritise, remediate and continuously monitor know
 8. Complete auditability of customer and scanner actions.
 9. Continuous vulnerability intelligence.
 10. Actionable remediation rather than vulnerability volume.
+11. Cryptographically permissioned execution: no valid TrustScan permit, no scanner network execution.
 
 ## Initial customer
 
@@ -43,6 +44,8 @@ The initial release will provide:
 * Web and PDF reporting
 * Retesting
 * Audit records
+* Cryptographically signed TrustScan execution permits
+* Permit revocation and execution-time revalidation
 
 ## Excluded from the initial release
 
@@ -73,7 +76,8 @@ No scan may begin until the customer has:
 * Verified control of the target;
 * Accepted the applicable testing terms;
 * Selected the permitted assessment level; and
-* Confirmed that any necessary third-party permission has been obtained.
+* Confirmed that any necessary third-party permission has been obtained; and
+* Received a valid TrustScan permit that narrows the approved execution policy.
 
 ## Success criteria
 

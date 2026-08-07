@@ -22,6 +22,7 @@ from tests.unit.service_test_support import (
     NOW,
     TARGET,
     create_identity_fixture,
+    create_trustscan_permit,
     write_authorization,
 )
 
@@ -40,6 +41,8 @@ class ActivityPaginationServiceIntegrationTests(unittest.TestCase):
             write_authorization(auth_dir)
             store = ScanJobStore(root / "jobs.sqlite3")
             identity, context, token = create_identity_fixture(store.path)
+            permit = create_trustscan_permit(store)
+            permit_id = permit.permit.claims.permit_id
             service = WebGuardJobService(
                 store=store,
                 authorizations=AuthorizationRepository(auth_dir),
@@ -62,6 +65,8 @@ class ActivityPaginationServiceIntegrationTests(unittest.TestCase):
 
             def request(method: str, path: str, *, body: bytes | None = None, headers=None):
                 effective = {"Authorization": f"Bearer {token}", **(headers or {})}
+                if method == "POST" and path == "/v1/jobs":
+                    effective.setdefault("TrustScan-Permit", permit_id)
                 connection = http.client.HTTPConnection(host, port, timeout=3)
                 connection.request(method, path, body=body, headers=effective)
                 response = connection.getresponse()

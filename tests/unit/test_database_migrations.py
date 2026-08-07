@@ -110,6 +110,18 @@ def create_v1_database(
         connection.close()
 
 
+def create_v4_database(path: Path) -> None:
+    create_v1_database(path)
+    connection = sqlite3.connect(path, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        ScanJobStore._migrate_v1_to_v2(connection)
+        ScanJobStore._migrate_v2_to_v3(connection)
+        ScanJobStore._migrate_v3_to_v4(connection)
+    finally:
+        connection.close()
+
+
 class DatabaseMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -181,7 +193,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             }.issubset(columns)
         )
 
-    def test_reopening_version_four_database_is_idempotent(self) -> None:
+    def test_reopening_current_database_is_idempotent(self) -> None:
         first = ScanJobStore(self.path)
         second = ScanJobStore(self.path)
         self.assertEqual(first.path, second.path)
@@ -212,6 +224,80 @@ class DatabaseMigrationTests(unittest.TestCase):
         first = ScanJobStore(self.path).cursor_signing_key()
         second = ScanJobStore(self.path).cursor_signing_key()
         self.assertEqual(first, second)
+
+    def test_v4_database_migrates_transactionally_to_trustscan_schema_v5(self) -> None:
+        create_v4_database(self.path)
+        before = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(
+                before.execute(
+                    "SELECT value FROM service_metadata WHERE key = 'schema_version'"
+                ).fetchone(),
+                ("4",),
+            )
+            self.assertIsNone(
+                before.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'scan_permits'"
+                ).fetchone()
+            )
+        finally:
+            before.close()
+        store = ScanJobStore(self.path)
+        self.assertEqual(len(store.trustscan_signing_private_key()), 32)
+        self.assertIsNone(store.get_job_permit_binding(JOB_ID))
+        after = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(
+                after.execute(
+                    "SELECT value FROM service_metadata WHERE key = 'schema_version'"
+                ).fetchone(),
+                ("5",),
+            )
+            integrity = after.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            after.close()
+        self.assertEqual(integrity, ("ok",))
+
+    def test_trustscan_schema_and_private_signing_key_exist_after_migration(self) -> None:
+        create_v1_database(self.path)
+        store = ScanJobStore(self.path)
+        first_key = store.trustscan_signing_private_key()
+        second_key = ScanJobStore(self.path).trustscan_signing_private_key()
+        self.assertEqual(first_key, second_key)
+        self.assertEqual(len(first_key), 32)
+        connection = sqlite3.connect(self.path)
+        try:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            indexes = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                )
+            }
+            secret = connection.execute(
+                "SELECT value FROM service_secrets WHERE key = 'trustscan_ed25519_private_key_v1'"
+            ).fetchone()
+            version = connection.execute(
+                "SELECT value FROM service_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(version, (str(DATABASE_SCHEMA_VERSION),))
+        self.assertTrue({"scan_permits", "job_permits", "schedule_permits"}.issubset(tables))
+        self.assertTrue(
+            {
+                "idx_scan_permits_organization",
+                "idx_scan_permits_authorization",
+                "idx_job_permits_permit",
+                "idx_schedule_permits_permit",
+            }.issubset(indexes)
+        )
+        self.assertIsNotNone(secret)
 
     def test_future_schema_version_is_rejected(self) -> None:
         create_v1_database(self.path)

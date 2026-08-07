@@ -13,6 +13,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from webguard_contracts import (
+    SignedTrustScanPermit,
     ScanJobMode,
     ScanJobRecord,
     ScanJobRequest,
@@ -20,10 +21,13 @@ from webguard_contracts import (
     ScanScheduleRecord,
     ScanScheduleState,
     ScanStatus,
+    load_signed_trustscan_permit_json,
 )
 
+from .permits import PersistedTrustScanPermit
 
-DATABASE_SCHEMA_VERSION = 4
+
+DATABASE_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +192,9 @@ class ScanJobStore:
             if version == 3:
                 self._migrate_v3_to_v4(connection)
                 version = 4
+            if version == 4:
+                self._migrate_v4_to_v5(connection)
+                version = 5
             if version != DATABASE_SCHEMA_VERSION:
                 raise JobStoreError(
                     "job_store_schema_unsupported",
@@ -372,6 +379,329 @@ class ScanJobStore:
                 pass
             raise
 
+    @staticmethod
+    def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+        """Add cryptographic TrustScan permits and scan bindings."""
+
+        private_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+        now = _timestamp(datetime.now(timezone.utc))
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO service_secrets(key, value, created_at)
+                VALUES ('trustscan_ed25519_private_key_v1', ?, ?)
+                """,
+                (private_key, now),
+            )
+            connection.execute(
+                """
+                CREATE TABLE scan_permits (
+                    permit_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    authorization_id TEXT NOT NULL,
+                    authorization_sha256 TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    issued_by TEXT NOT NULL,
+                    issued_at TEXT NOT NULL,
+                    not_before TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    permit_sha256 TEXT NOT NULL UNIQUE,
+                    signing_key_id TEXT NOT NULL,
+                    document_json TEXT NOT NULL,
+                    revoked_at TEXT,
+                    revoked_by TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX idx_scan_permits_organization
+                ON scan_permits(organization_id, issued_at DESC, permit_id DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX idx_scan_permits_authorization
+                ON scan_permits(organization_id, authorization_id, expires_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE job_permits (
+                    job_id TEXT PRIMARY KEY,
+                    permit_id TEXT NOT NULL,
+                    permit_sha256 TEXT NOT NULL,
+                    FOREIGN KEY (job_id) REFERENCES scan_jobs(job_id) ON DELETE CASCADE,
+                    FOREIGN KEY (permit_id) REFERENCES scan_permits(permit_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX idx_job_permits_permit
+                ON job_permits(permit_id, job_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE schedule_permits (
+                    schedule_id TEXT PRIMARY KEY,
+                    permit_id TEXT NOT NULL,
+                    permit_sha256 TEXT NOT NULL,
+                    FOREIGN KEY (schedule_id) REFERENCES scan_schedules(schedule_id) ON DELETE CASCADE,
+                    FOREIGN KEY (permit_id) REFERENCES scan_permits(permit_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX idx_schedule_permits_permit
+                ON schedule_permits(permit_id, schedule_id)
+                """
+            )
+            connection.execute(
+                "UPDATE service_metadata SET value = '5' WHERE key = 'schema_version'"
+            )
+            connection.execute("COMMIT")
+        except sqlite3.Error:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    def trustscan_signing_private_key(self) -> bytes:
+        """Return the private Ed25519 seed used to sign TrustScan permits."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT value FROM service_secrets WHERE key = ?",
+                ("trustscan_ed25519_private_key_v1",),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "trustscan_signing_key_read_failed",
+                "Unable to read the TrustScan signing key.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            raise JobStoreError(
+                "trustscan_signing_key_missing",
+                "TrustScan signing key is missing.",
+            )
+        try:
+            key = base64.urlsafe_b64decode(row["value"].encode("ascii"))
+        except (ValueError, UnicodeEncodeError) as exc:
+            raise JobStoreError(
+                "trustscan_signing_key_invalid",
+                "TrustScan signing key is invalid.",
+            ) from exc
+        if len(key) != 32:
+            raise JobStoreError(
+                "trustscan_signing_key_invalid",
+                "TrustScan signing key is invalid.",
+            )
+        return key
+
+    @staticmethod
+    def _permit_from_row(row: sqlite3.Row) -> PersistedTrustScanPermit:
+        try:
+            permit = load_signed_trustscan_permit_json(row["document_json"])
+        except ValueError as exc:
+            raise JobStoreError(
+                "trustscan_permit_document_invalid",
+                "Persisted TrustScan permit document is invalid.",
+            ) from exc
+        revoked_at = _parse_timestamp(row["revoked_at"])
+        return PersistedTrustScanPermit(
+            permit=permit,
+            revoked_at=revoked_at,
+            revoked_by=row["revoked_by"],
+        )
+
+    def create_scan_permit(self, permit: SignedTrustScanPermit) -> PersistedTrustScanPermit:
+        """Persist one signed immutable TrustScan permit."""
+
+        claims = permit.claims
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO scan_permits(
+                    permit_id, organization_id, authorization_id, authorization_sha256,
+                    target, issued_by, issued_at, not_before, expires_at, permit_sha256,
+                    signing_key_id, document_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    claims.permit_id,
+                    claims.organization_id,
+                    claims.authorization_id,
+                    claims.authorization_sha256,
+                    claims.target,
+                    claims.issued_by,
+                    _timestamp(claims.issued_at),
+                    _timestamp(claims.not_before),
+                    _timestamp(claims.expires_at),
+                    permit.fingerprint,
+                    permit.signing_key_id,
+                    permit.to_json(),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM scan_permits WHERE permit_id = ?",
+                (claims.permit_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+            assert row is not None
+            return self._permit_from_row(row)
+        except sqlite3.IntegrityError as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "trustscan_permit_conflict",
+                "TrustScan permit conflicts with an existing permit.",
+            ) from exc
+        except sqlite3.Error as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "trustscan_permit_create_failed",
+                "Unable to persist the TrustScan permit.",
+            ) from exc
+        finally:
+            connection.close()
+
+    def get_scan_permit(self, permit_id: str) -> PersistedTrustScanPermit:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM scan_permits WHERE permit_id = ?",
+                (permit_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "trustscan_permit_read_failed",
+                "Unable to read the TrustScan permit.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            raise JobStoreError(
+                "trustscan_permit_not_found",
+                "TrustScan permit was not found.",
+            )
+        return self._permit_from_row(row)
+
+    def get_scan_permit_scoped(
+        self, permit_id: str, organization_id: str
+    ) -> PersistedTrustScanPermit:
+        record = self.get_scan_permit(permit_id)
+        if record.permit.claims.organization_id != organization_id:
+            raise JobStoreError(
+                "trustscan_permit_not_found",
+                "TrustScan permit was not found.",
+            )
+        return record
+
+    def revoke_scan_permit_scoped(
+        self,
+        permit_id: str,
+        organization_id: str,
+        *,
+        revoked_by: str,
+        now: datetime,
+    ) -> PersistedTrustScanPermit:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM scan_permits WHERE permit_id = ? AND organization_id = ?",
+                (permit_id, organization_id),
+            ).fetchone()
+            if row is None:
+                raise JobStoreError(
+                    "trustscan_permit_not_found",
+                    "TrustScan permit was not found.",
+                )
+            if row["revoked_at"] is None:
+                connection.execute(
+                    """
+                    UPDATE scan_permits
+                    SET revoked_at = ?, revoked_by = ?
+                    WHERE permit_id = ? AND organization_id = ? AND revoked_at IS NULL
+                    """,
+                    (_timestamp(now), revoked_by, permit_id, organization_id),
+                )
+            updated = connection.execute(
+                "SELECT * FROM scan_permits WHERE permit_id = ?",
+                (permit_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+            assert updated is not None
+            return self._permit_from_row(updated)
+        except JobStoreError:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        except sqlite3.Error as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "trustscan_permit_revoke_failed",
+                "Unable to revoke the TrustScan permit.",
+            ) from exc
+        finally:
+            connection.close()
+
+    def get_job_permit_binding(self, job_id: str) -> tuple[str, str] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT permit_id, permit_sha256 FROM job_permits WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "trustscan_job_binding_read_failed",
+                "Unable to read TrustScan job permit binding.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return row["permit_id"], row["permit_sha256"]
+
+    def get_schedule_permit_binding(self, schedule_id: str) -> tuple[str, str] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT permit_id, permit_sha256 FROM schedule_permits WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "trustscan_schedule_binding_read_failed",
+                "Unable to read TrustScan schedule permit binding.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return row["permit_id"], row["permit_sha256"]
+
     def cursor_signing_key(self) -> bytes:
         """Return the private HMAC key used for opaque API cursors."""
 
@@ -537,6 +867,8 @@ class ScanJobStore:
         job_id: str | None = None,
         organization_id: str | None = None,
         submitted_by: str | None = None,
+        permit_id: str | None = None,
+        permit_sha256: str | None = None,
     ) -> tuple[ScanJobRecord, bool]:
         """Insert a queued job or return the idempotent existing job."""
 
@@ -549,6 +881,16 @@ class ScanJobStore:
             raise JobStoreError(
                 "job_scope_invalid",
                 "organization_id and submitted_by must be supplied together.",
+            )
+        if (permit_id is None) != (permit_sha256 is None):
+            raise JobStoreError(
+                "trustscan_job_binding_invalid",
+                "permit_id and permit_sha256 must be supplied together.",
+            )
+        if permit_id is not None and organization_id is None:
+            raise JobStoreError(
+                "trustscan_job_binding_invalid",
+                "TrustScan job binding requires organization scope.",
             )
         effective_job_id = str(uuid4()) if job_id is None else job_id
         record = ScanJobRecord(
@@ -581,6 +923,20 @@ class ScanJobStore:
                             "job_idempotency_conflict",
                             "The idempotency key was already used outside this organization.",
                         )
+                if permit_id is not None:
+                    binding = connection.execute(
+                        "SELECT permit_id, permit_sha256 FROM job_permits WHERE job_id = ?",
+                        (existing_record.job_id,),
+                    ).fetchone()
+                    if (
+                        binding is None
+                        or binding["permit_id"] != permit_id
+                        or binding["permit_sha256"] != permit_sha256
+                    ):
+                        raise JobStoreError(
+                            "job_idempotency_conflict",
+                            "The idempotency key was already used with a different TrustScan permit.",
+                        )
                 connection.execute("COMMIT")
                 return existing_record, False
             connection.execute(
@@ -611,6 +967,24 @@ class ScanJobStore:
                 connection.execute(
                     "INSERT INTO job_scopes(job_id, organization_id, submitted_by) VALUES (?, ?, ?)",
                     (record.job_id, organization_id, submitted_by),
+                )
+            if permit_id is not None:
+                permit_row = connection.execute(
+                    "SELECT organization_id, permit_sha256 FROM scan_permits WHERE permit_id = ?",
+                    (permit_id,),
+                ).fetchone()
+                if (
+                    permit_row is None
+                    or permit_row["organization_id"] != organization_id
+                    or permit_row["permit_sha256"] != permit_sha256
+                ):
+                    raise JobStoreError(
+                        "trustscan_permit_not_found",
+                        "TrustScan permit was not found for this organization.",
+                    )
+                connection.execute(
+                    "INSERT INTO job_permits(job_id, permit_id, permit_sha256) VALUES (?, ?, ?)",
+                    (record.job_id, permit_id, permit_sha256),
                 )
             connection.execute("COMMIT")
             return record, True
@@ -767,9 +1141,22 @@ class ScanJobStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT * FROM scan_jobs
-                WHERE state = ?
-                ORDER BY submitted_at, job_id
+                SELECT jobs.*
+                FROM scan_jobs AS jobs
+                LEFT JOIN job_permits AS binding ON binding.job_id = jobs.job_id
+                WHERE jobs.state = ? AND jobs.cancellation_requested = 0
+                  AND (
+                    binding.permit_id IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM scan_jobs AS running
+                        JOIN job_permits AS running_binding
+                          ON running_binding.job_id = running.job_id
+                        WHERE running.state = 'running'
+                          AND running_binding.permit_id = binding.permit_id
+                    )
+                  )
+                ORDER BY jobs.submitted_at, jobs.job_id
                 LIMIT 1
                 """,
                 (ScanJobState.QUEUED.value,),
@@ -836,9 +1223,22 @@ class ScanJobStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT * FROM scan_jobs
-                WHERE state = ? AND cancellation_requested = 0
-                ORDER BY submitted_at, job_id
+                SELECT jobs.*
+                FROM scan_jobs AS jobs
+                LEFT JOIN job_permits AS binding ON binding.job_id = jobs.job_id
+                WHERE jobs.state = ? AND jobs.cancellation_requested = 0
+                  AND (
+                    binding.permit_id IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM scan_jobs AS running
+                        JOIN job_permits AS running_binding
+                          ON running_binding.job_id = running.job_id
+                        WHERE running.state = 'running'
+                          AND running_binding.permit_id = binding.permit_id
+                    )
+                  )
+                ORDER BY jobs.submitted_at, jobs.job_id
                 LIMIT 1
                 """,
                 (ScanJobState.QUEUED.value,),
@@ -1484,7 +1884,14 @@ class ScanJobStore:
         starts_at: datetime,
         now: datetime,
         schedule_id: str | None = None,
+        permit_id: str | None = None,
+        permit_sha256: str | None = None,
     ) -> ScanScheduleRecord:
+        if (permit_id is None) != (permit_sha256 is None):
+            raise JobStoreError(
+                "trustscan_schedule_binding_invalid",
+                "permit_id and permit_sha256 must be supplied together.",
+            )
         record = ScanScheduleRecord(
             schedule_id=str(uuid4()) if schedule_id is None else schedule_id,
             organization_id=organization_id,
@@ -1530,6 +1937,24 @@ class ScanJobStore:
                     record.revision,
                 ),
             )
+            if permit_id is not None:
+                permit_row = connection.execute(
+                    "SELECT organization_id, permit_sha256 FROM scan_permits WHERE permit_id = ?",
+                    (permit_id,),
+                ).fetchone()
+                if (
+                    permit_row is None
+                    or permit_row["organization_id"] != organization_id
+                    or permit_row["permit_sha256"] != permit_sha256
+                ):
+                    raise JobStoreError(
+                        "trustscan_permit_not_found",
+                        "TrustScan permit was not found for this organization.",
+                    )
+                connection.execute(
+                    "INSERT INTO schedule_permits(schedule_id, permit_id, permit_sha256) VALUES (?, ?, ?)",
+                    (record.schedule_id, permit_id, permit_sha256),
+                )
             connection.execute("COMMIT")
             return record
         except sqlite3.IntegrityError as exc:
@@ -1819,6 +2244,8 @@ class ScanJobStore:
         *,
         expected_revision: int,
         authorization_sha256: str,
+        permit_id: str,
+        permit_sha256: str,
         now: datetime,
     ) -> tuple[ScanScheduleRecord, ScanJobRecord] | None:
         connection = self._connect()
@@ -1839,6 +2266,19 @@ class ScanJobStore:
             ):
                 connection.execute("COMMIT")
                 return None
+            binding = connection.execute(
+                "SELECT permit_id, permit_sha256 FROM schedule_permits WHERE schedule_id = ?",
+                (schedule.schedule_id,),
+            ).fetchone()
+            if (
+                binding is None
+                or binding["permit_id"] != permit_id
+                or binding["permit_sha256"] != permit_sha256
+            ):
+                raise JobStoreError(
+                    "trustscan_schedule_binding_changed",
+                    "TrustScan schedule permit binding changed before enqueue.",
+                )
             scheduled_for = schedule.next_run_at
             idempotency_key = (
                 f"schedule:{schedule.schedule_id}:{_timestamp(scheduled_for)}"
@@ -1887,6 +2327,10 @@ class ScanJobStore:
                 VALUES (?, ?, ?)
                 """,
                 (record.job_id, schedule.organization_id, schedule.created_by),
+            )
+            connection.execute(
+                "INSERT INTO job_permits(job_id, permit_id, permit_sha256) VALUES (?, ?, ?)",
+                (record.job_id, permit_id, permit_sha256),
             )
             next_run_at = self._next_schedule_time(
                 scheduled_for,

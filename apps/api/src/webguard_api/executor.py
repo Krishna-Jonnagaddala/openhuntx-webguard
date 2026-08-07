@@ -37,6 +37,8 @@ from webguard_scanner import (
 )
 
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
+from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
+from .store import JobStoreError, ScanJobStore
 
 
 class JobExecutionError(ValueError):
@@ -139,6 +141,8 @@ class ScanJobExecutor:
         self,
         *,
         authorizations: AuthorizationRepository,
+        store: ScanJobStore,
+        trustscan_signer: TrustScanSigner,
         artifact_directory: Path,
         clock: Callable[[], datetime] = _utc_now,
         single_scanner: Callable[..., WebGuardReport] = run_passive_header_scan,
@@ -146,19 +150,23 @@ class ScanJobExecutor:
         organization_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self.authorizations = authorizations
+        self.store = store
+        self.trustscan_signer = trustscan_signer
         self.artifact_directory = Path(artifact_directory).expanduser()
         self.clock = clock
         self.single_scanner = single_scanner
         self.crawl_scanner = crawl_scanner
         self.organization_resolver = organization_resolver
 
-    def _policies(self, authorization, mode: ScanJobMode):
+    def _policies(self, authorization, permit, mode: ScanJobMode):
         limits = authorization.limits
+        claims = permit.permit.claims
         fetch_policy = FetchPolicy(
             timeout_seconds=min(10.0, limits.timeout_seconds),
             maximum_body_bytes=min(1_048_576, limits.maximum_body_bytes),
             maximum_header_bytes=min(65_536, limits.maximum_header_bytes),
             maximum_header_count=min(100, limits.maximum_header_count),
+            allowed_methods=frozenset(claims.allowed_http_methods),
         )
         retry_policy = RetryPolicy(maximum_attempts=1)
         if mode is ScanJobMode.SINGLE_PAGE:
@@ -173,6 +181,7 @@ class ScanJobExecutor:
             minimum_delay_seconds=max(
                 OWNED_DEFAULT_CRAWL_DELAY_SECONDS,
                 limits.minimum_delay_seconds,
+                1.0 / claims.maximum_requests_per_second,
             ),
             maximum_execution_seconds=min(
                 OWNED_DEFAULT_CRAWL_EXECUTION_SECONDS,
@@ -181,6 +190,7 @@ class ScanJobExecutor:
             maximum_request_attempts=min(
                 OWNED_DEFAULT_CRAWL_REQUEST_ATTEMPTS,
                 limits.maximum_request_attempts,
+                claims.maximum_request_attempts,
             ),
         )
         return fetch_policy, retry_policy, crawl_policy
@@ -215,6 +225,39 @@ class ScanJobExecutor:
                 "authorization_target_mismatch",
                 "The job target no longer matches the server-side authorization.",
             )
+        scope = self.store.get_scope(record.job_id)
+        if scope is None:
+            raise JobExecutionError(
+                "trustscan_job_scope_missing",
+                "The service job does not contain organization scope metadata.",
+            )
+        binding = self.store.get_job_permit_binding(record.job_id)
+        if binding is None:
+            raise JobExecutionError(
+                "trustscan_permit_missing",
+                "The service job is not bound to a TrustScan permit.",
+            )
+        try:
+            permit = self.store.get_scan_permit_scoped(binding[0], scope[0])
+        except JobStoreError as exc:
+            raise JobExecutionError(exc.code, exc.message) from exc
+        if permit.permit.fingerprint != binding[1]:
+            raise JobExecutionError(
+                "trustscan_permit_binding_changed",
+                "The job TrustScan permit fingerprint does not match the persisted permit.",
+            )
+        try:
+            validate_permit_use(
+                permit,
+                signer=self.trustscan_signer,
+                organization_id=scope[0],
+                authorization=authorization,
+                target=record.request.target,
+                mode=record.request.mode,
+                now=self.clock(),
+            )
+        except TrustScanPermitError as exc:
+            raise JobExecutionError(exc.code, exc.message) from exc
 
         try:
             target = validate_target_url(
@@ -229,6 +272,7 @@ class ScanJobExecutor:
 
         fetch_policy, retry_policy, crawl_policy = self._policies(
             authorization,
+            permit,
             record.request.mode,
         )
         scan_id = str(uuid4())

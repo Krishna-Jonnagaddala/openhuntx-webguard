@@ -50,6 +50,13 @@ from .pagination import (
     parse_page_request,
 )
 from .rate_limit import FixedWindowRateLimiter, RateLimitDecision, RateLimitError
+from .permits import (
+    PersistedTrustScanPermit,
+    TrustScanPermitError,
+    TrustScanSigner,
+    validate_permit_scope,
+    validate_permit_use,
+)
 from .scheduler import ScanScheduleCoordinator, ScheduleRunSummary
 from .service import ApiServiceError, WebGuardJobService
 from .store import (
@@ -61,7 +68,7 @@ from .store import (
 )
 from .worker import ScanJobWorker
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "ApiPermission",
@@ -114,6 +121,11 @@ __all__ = [
     "PaginationError",
     "SignedCursorCodec",
     "parse_page_request",
+    "PersistedTrustScanPermit",
+    "TrustScanPermitError",
+    "TrustScanSigner",
+    "validate_permit_scope",
+    "validate_permit_use",
     "RateLimitDecision",
     "RateLimitError",
     "ScanJobExecutor",

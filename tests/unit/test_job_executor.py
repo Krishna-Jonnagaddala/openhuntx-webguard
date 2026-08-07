@@ -24,6 +24,10 @@ from tests.unit.service_test_support import (
     TARGET,
     authorization,
     completed_report,
+    create_trustscan_permit,
+    ORG_ID,
+    OWNER_ID,
+    trustscan_signer,
     write_authorization,
 )
 
@@ -36,6 +40,8 @@ class ScanJobExecutorTests(unittest.TestCase):
         self.auth_path = write_authorization(self.auth_dir)
         self.artifacts = self.root / "artifacts"
         self.store = ScanJobStore(self.root / "jobs.sqlite3")
+        self.signer = trustscan_signer(self.store)
+        self.permit = create_trustscan_permit(self.store)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -50,7 +56,13 @@ class ScanJobExecutorTests(unittest.TestCase):
             mode=mode,
             submitted_at=NOW,
         )
-        queued, _ = self.store.submit(request)
+        queued, _ = self.store.submit(
+            request,
+            organization_id=ORG_ID,
+            submitted_by=OWNER_ID,
+            permit_id=self.permit.permit.claims.permit_id,
+            permit_sha256=self.permit.permit.fingerprint,
+        )
         claimed = self.store.claim_next(now=NOW)
         assert claimed is not None
         return claimed
@@ -81,6 +93,8 @@ class ScanJobExecutorTests(unittest.TestCase):
 
         executor = ScanJobExecutor(
             authorizations=AuthorizationRepository(self.auth_dir),
+            store=self.store,
+            trustscan_signer=self.signer,
             artifact_directory=self.artifacts,
             clock=lambda: NOW,
             crawl_scanner=fake_crawl,
@@ -114,6 +128,8 @@ class ScanJobExecutorTests(unittest.TestCase):
 
         executor = ScanJobExecutor(
             authorizations=AuthorizationRepository(self.auth_dir),
+            store=self.store,
+            trustscan_signer=self.signer,
             artifact_directory=self.artifacts,
             clock=lambda: NOW,
             single_scanner=fake_single,
@@ -133,6 +149,8 @@ class ScanJobExecutorTests(unittest.TestCase):
         write_authorization(self.auth_dir, changed)
         executor = ScanJobExecutor(
             authorizations=AuthorizationRepository(self.auth_dir),
+            store=self.store,
+            trustscan_signer=self.signer,
             artifact_directory=self.artifacts,
             clock=lambda: NOW,
         )
@@ -148,6 +166,8 @@ class ScanJobExecutorTests(unittest.TestCase):
         token.cancel()
         executor = ScanJobExecutor(
             authorizations=AuthorizationRepository(self.auth_dir),
+            store=self.store,
+            trustscan_signer=self.signer,
             artifact_directory=self.artifacts,
             clock=lambda: NOW,
         )
@@ -166,6 +186,8 @@ class ScanJobExecutorTests(unittest.TestCase):
         os.chmod(job_dir / "authorization-audit.json", 0o600)
         executor = ScanJobExecutor(
             authorizations=AuthorizationRepository(self.auth_dir),
+            store=self.store,
+            trustscan_signer=self.signer,
             artifact_directory=self.artifacts,
             clock=lambda: NOW,
         )
@@ -182,14 +204,71 @@ class ScanJobExecutorTests(unittest.TestCase):
             mode=ScanJobMode.CRAWL,
             submitted_at=NOW,
         )
-        queued, _ = self.store.submit(request)
+        queued, _ = self.store.submit(
+            request,
+            organization_id=ORG_ID,
+            submitted_by=OWNER_ID,
+            permit_id=self.permit.permit.claims.permit_id,
+            permit_sha256=self.permit.permit.fingerprint,
+        )
         executor = ScanJobExecutor(
             authorizations=AuthorizationRepository(self.auth_dir),
+            store=self.store,
+            trustscan_signer=self.signer,
             artifact_directory=self.artifacts,
             clock=lambda: NOW,
         )
         with self.assertRaisesRegex(JobExecutionError, "running"):
             executor.execute(queued)
+
+    def test_unbound_legacy_job_fails_closed_before_network(self) -> None:
+        auth = authorization()
+        request = ScanJobRequest(
+            idempotency_key="legacy-unbound-job",
+            target=TARGET,
+            authorization_id=AUTH_ID,
+            authorization_sha256=auth.fingerprint,
+            mode=ScanJobMode.CRAWL,
+            submitted_at=NOW,
+        )
+        self.store.submit(
+            request,
+            organization_id=ORG_ID,
+            submitted_by=OWNER_ID,
+        )
+        record = self.store.claim_next(now=NOW)
+        assert record is not None
+        executor = ScanJobExecutor(
+            authorizations=AuthorizationRepository(self.auth_dir),
+            store=self.store,
+            trustscan_signer=self.signer,
+            artifact_directory=self.artifacts,
+            clock=lambda: NOW,
+        )
+        with self.assertRaises(JobExecutionError) as caught:
+            executor.execute(record)
+        self.assertEqual(caught.exception.code, "trustscan_permit_missing")
+        self.assertFalse(self.artifacts.exists())
+
+    def test_revoked_permit_fails_closed_before_network(self) -> None:
+        record = self.running_record()
+        self.store.revoke_scan_permit_scoped(
+            self.permit.permit.claims.permit_id,
+            ORG_ID,
+            revoked_by=OWNER_ID,
+            now=NOW,
+        )
+        executor = ScanJobExecutor(
+            authorizations=AuthorizationRepository(self.auth_dir),
+            store=self.store,
+            trustscan_signer=self.signer,
+            artifact_directory=self.artifacts,
+            clock=lambda: NOW,
+        )
+        with self.assertRaises(JobExecutionError) as caught:
+            executor.execute(record)
+        self.assertEqual(caught.exception.code, "trustscan_permit_revoked")
+        self.assertFalse(self.artifacts.exists())
 
     @patch("webguard_api.executor.validate_target_url")
     def test_authorization_expiry_is_revalidated_at_execution(self, validate_mock) -> None:
@@ -197,6 +276,8 @@ class ScanJobExecutorTests(unittest.TestCase):
         record = self.running_record()
         executor = ScanJobExecutor(
             authorizations=AuthorizationRepository(self.auth_dir),
+            store=self.store,
+            trustscan_signer=self.signer,
             artifact_directory=self.artifacts,
             clock=lambda: NOW + timedelta(days=60),
         )

@@ -21,6 +21,9 @@ class ApiPermission(str, Enum):
     AUDIT_READ = "audit.read"
     IDENTITY_MANAGE = "identity.manage"
     AUTHORIZATION_ASSIGN = "authorization.assign"
+    PERMIT_ISSUE = "permits.issue"
+    PERMIT_READ = "permits.read"
+    PERMIT_REVOKE = "permits.revoke"
 
 
 _ROLE_PERMISSIONS = {
@@ -34,10 +37,11 @@ _ROLE_PERMISSIONS = {
             ApiPermission.SCHEDULE_CREATE,
             ApiPermission.SCHEDULE_READ,
             ApiPermission.SCHEDULE_UPDATE,
+            ApiPermission.PERMIT_READ,
         }
     ),
     OrganizationRole.VIEWER: frozenset(
-        {ApiPermission.JOB_READ, ApiPermission.SCHEDULE_READ}
+        {ApiPermission.JOB_READ, ApiPermission.SCHEDULE_READ, ApiPermission.PERMIT_READ}
     ),
 }
 
