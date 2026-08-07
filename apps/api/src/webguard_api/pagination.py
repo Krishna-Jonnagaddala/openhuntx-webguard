@@ -124,15 +124,29 @@ class SignedCursorCodec:
     def _b64_encode(value: bytes) -> str:
         return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
-    @staticmethod
-    def _b64_decode(value: str) -> bytes:
+    @classmethod
+    def _b64_decode(cls, value: str) -> bytes:
+        if not isinstance(value, str) or not value:
+            raise PaginationError(
+                "page_cursor_invalid", "cursor is not valid base64url data."
+            )
         padding = "=" * (-len(value) % 4)
         try:
-            return base64.urlsafe_b64decode(value + padding)
+            decoded = base64.b64decode(
+                (value + padding).encode("ascii"),
+                altchars=b"-_",
+                validate=True,
+            )
         except (ValueError, UnicodeEncodeError, binascii.Error) as exc:
             raise PaginationError(
                 "page_cursor_invalid", "cursor is not valid base64url data."
             ) from exc
+        if cls._b64_encode(decoded) != value:
+            raise PaginationError(
+                "page_cursor_non_canonical",
+                "cursor base64url data is not canonical.",
+            )
+        return decoded
 
     @staticmethod
     def _canonical_json(value: object) -> bytes:

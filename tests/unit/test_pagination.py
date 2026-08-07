@@ -121,6 +121,34 @@ class SignedCursorCodecTests(unittest.TestCase):
                     {"page_cursor_signature_invalid", "page_cursor_invalid"},
                 )
 
+    def test_noncanonical_base64url_signature_is_rejected(self) -> None:
+        cursor = self.encode()
+        payload, signature = cursor.split(".", 1)
+        final_index = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".index(
+            signature[-1]
+        )
+        replacement_index = final_index ^ 1
+        replacement = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"[
+            replacement_index
+        ]
+        noncanonical = f"{payload}.{signature[:-1]}{replacement}"
+
+        self.assertEqual(
+            base64.urlsafe_b64decode(
+                signature + "=" * (-len(signature) % 4)
+            ),
+            base64.urlsafe_b64decode(
+                noncanonical.split(".", 1)[1]
+                + "=" * (-len(signature) % 4)
+            ),
+        )
+        with self.assertRaises(PaginationError) as context:
+            self.decode(noncanonical)
+        self.assertEqual(
+            context.exception.code,
+            "page_cursor_non_canonical",
+        )
+
     def test_scope_resource_and_filter_replay_are_rejected(self) -> None:
         cursor = self.encode()
         cases = (
