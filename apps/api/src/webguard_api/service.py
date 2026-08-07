@@ -10,9 +10,12 @@ from uuid import uuid4
 from webguard_contracts import (
     AuditOutcome,
     ScanJobLoadError,
+    ScanJobMode,
     ScanJobRequest,
+    ScanJobState,
     ScanJobValidationError,
     ScanScheduleLoadError,
+    ScanScheduleState,
     ScanScheduleValidationError,
     SecurityAuditEvent,
     load_scan_job_submission_json,
@@ -22,6 +25,7 @@ from webguard_contracts import (
 from .auth import ApiPermission, AuthContext, AuthenticationError
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .identity import IdentityStore, IdentityStoreError
+from .pagination import PageRequest, PaginationError, SignedCursorCodec
 from .store import JobStoreError, ScanJobStore
 
 
@@ -49,11 +53,19 @@ class WebGuardJobService:
         authorizations: AuthorizationRepository,
         identity: IdentityStore,
         clock: Callable[[], datetime] = _utc_now,
+        cursor_codec: SignedCursorCodec | None = None,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
         self.identity = identity
         self.clock = clock
+        try:
+            key = store.cursor_signing_key() if cursor_codec is None else None
+        except JobStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        self.cursor_codec = (
+            SignedCursorCodec(key) if cursor_codec is None else cursor_codec
+        )
 
     def _audit(
         self,
@@ -125,6 +137,109 @@ class WebGuardJobService:
         payload = record.to_public_dict()
         payload["organization_id"] = context.organization_id
         return payload
+
+    @staticmethod
+    def _timestamp(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+
+    def _decode_page(
+        self,
+        context: AuthContext,
+        page: PageRequest,
+        *,
+        resource: str,
+    ) -> tuple[str, str] | None:
+        if page.cursor is None:
+            return None
+        try:
+            position = self.cursor_codec.decode(
+                page.cursor,
+                organization_id=context.organization_id,
+                resource=resource,
+                filters=page.filter_map,
+                now=self.clock(),
+            )
+        except PaginationError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        return position.ordered_at, position.resource_id
+
+    def _next_cursor(
+        self,
+        context: AuthContext,
+        page: PageRequest,
+        *,
+        resource: str,
+        ordered_at: datetime,
+        resource_id: str,
+    ) -> str:
+        try:
+            return self.cursor_codec.encode(
+                organization_id=context.organization_id,
+                resource=resource,
+                filters=page.filter_map,
+                ordered_at=self._timestamp(ordered_at),
+                resource_id=resource_id,
+                now=self.clock(),
+            )
+        except PaginationError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+
+    @staticmethod
+    def _page_payload(limit: int, next_cursor: str | None) -> dict[str, object]:
+        return {"limit": limit, "next_cursor": next_cursor}
+
+    def list_jobs(
+        self,
+        context: AuthContext,
+        page: PageRequest,
+        *,
+        request_id: str,
+    ) -> dict:
+        self._require(
+            context,
+            ApiPermission.JOB_READ,
+            request_id=request_id,
+            action="jobs.list",
+            resource_type="organization",
+            resource_id=context.organization_id,
+        )
+        filters = page.filter_map
+        state = ScanJobState(filters["state"]) if "state" in filters else None
+        mode = ScanJobMode(filters["mode"]) if "mode" in filters else None
+        try:
+            records, has_more = self.store.list_jobs_scoped_page(
+                context.organization_id,
+                limit=page.limit,
+                after=self._decode_page(context, page, resource="jobs"),
+                state=state,
+                mode=mode,
+            )
+        except JobStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        next_cursor = None
+        if has_more and records:
+            last = records[-1]
+            next_cursor = self._next_cursor(
+                context,
+                page,
+                resource="jobs",
+                ordered_at=last.request.submitted_at,
+                resource_id=last.job_id,
+            )
+        self._audit(
+            context,
+            request_id=request_id,
+            action="jobs.list",
+            resource_type="organization",
+            resource_id=context.organization_id,
+            outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {
+            "jobs": [self._public(record, context) for record in records],
+            "page": self._page_payload(page.limit, next_cursor),
+        }
 
     def submit(
         self,
@@ -410,7 +525,14 @@ class WebGuardJobService:
         )
         return record.to_public_dict()
 
-    def list_schedules(self, context: AuthContext, *, request_id: str) -> dict:
+    def list_schedules(
+        self,
+        context: AuthContext,
+        page: PageRequest | None = None,
+        *,
+        request_id: str,
+    ) -> dict:
+        page = PageRequest() if page is None else page
         self._require(
             context,
             ApiPermission.SCHEDULE_READ,
@@ -419,10 +541,31 @@ class WebGuardJobService:
             resource_type="organization",
             resource_id=context.organization_id,
         )
+        filters = page.filter_map
+        state = (
+            ScanScheduleState(filters["state"])
+            if "state" in filters
+            else None
+        )
         try:
-            schedules = self.store.list_schedules_scoped(context.organization_id)
+            schedules, has_more = self.store.list_schedules_scoped_page(
+                context.organization_id,
+                limit=page.limit,
+                after=self._decode_page(context, page, resource="schedules"),
+                state=state,
+            )
         except JobStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        next_cursor = None
+        if has_more and schedules:
+            last = schedules[-1]
+            next_cursor = self._next_cursor(
+                context,
+                page,
+                resource="schedules",
+                ordered_at=last.created_at,
+                resource_id=last.schedule_id,
+            )
         self._audit(
             context,
             request_id=request_id,
@@ -431,7 +574,10 @@ class WebGuardJobService:
             resource_id=context.organization_id,
             outcome=AuditOutcome.SUCCEEDED,
         )
-        return {"schedules": [schedule.to_public_dict() for schedule in schedules]}
+        return {
+            "schedules": [schedule.to_public_dict() for schedule in schedules],
+            "page": self._page_payload(page.limit, next_cursor),
+        }
 
     def get_schedule(
         self,
@@ -550,7 +696,14 @@ class WebGuardJobService:
         )
         return context.to_public_dict()
 
-    def audit_events(self, context: AuthContext, *, request_id: str) -> dict:
+    def audit_events(
+        self,
+        context: AuthContext,
+        page: PageRequest | None = None,
+        *,
+        request_id: str,
+    ) -> dict:
+        page = PageRequest() if page is None else page
         self._require(
             context,
             ApiPermission.AUDIT_READ,
@@ -559,7 +712,27 @@ class WebGuardJobService:
             resource_type="organization",
             resource_id=context.organization_id,
         )
-        events = self.identity.list_audit_events(context.organization_id)
+        filters = page.filter_map
+        outcome = AuditOutcome(filters["outcome"]) if "outcome" in filters else None
+        try:
+            events, has_more = self.identity.list_audit_events_page(
+                context.organization_id,
+                limit=page.limit,
+                after=self._decode_page(context, page, resource="audit-events"),
+                outcome=outcome,
+            )
+        except IdentityStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        next_cursor = None
+        if has_more and events:
+            last = events[-1]
+            next_cursor = self._next_cursor(
+                context,
+                page,
+                resource="audit-events",
+                ordered_at=last.occurred_at,
+                resource_id=last.event_id,
+            )
         self._audit(
             context,
             request_id=request_id,
@@ -568,7 +741,10 @@ class WebGuardJobService:
             resource_id=context.organization_id,
             outcome=AuditOutcome.SUCCEEDED,
         )
-        return {"events": [event.to_dict() for event in events]}
+        return {
+            "events": [event.to_dict() for event in events],
+            "page": self._page_payload(page.limit, next_cursor),
+        }
 
 
 __all__ = ["ApiServiceError", "WebGuardJobService"]

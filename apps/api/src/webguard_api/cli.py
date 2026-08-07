@@ -382,7 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="webguard-api",
         description="Authenticated local WebGuard control-plane API and scanner queue.",
     )
-    parser.add_argument("--version", action="version", version="webguard-api 0.4.0")
+    parser.add_argument("--version", action="version", version="webguard-api 0.5.0")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="Initialize service and identity tables.")

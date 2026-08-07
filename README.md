@@ -19,33 +19,31 @@ The current platform combines:
 - professional HTML reporting and remediation comparison
 - a local scanner-service API with a persistent, lease-aware job queue
 - organisation isolation, API authentication, and role-based access control
-- request correlation, audit events, rate-limit foundations, crash recovery, and recurring scan scheduling
+- request correlation, audit events, rate-limit foundations, crash recovery, recurring scan scheduling, and signed cursor pagination
 
 WebGuard does not claim to identify every vulnerability. Its current external scan mode is intentionally conservative and passive.
 
 ## Current milestone
 
-**Milestone 1.29 — Recurring scan scheduling and safe catch-up**
+**Milestone 1.30 — Signed cursor pagination and organisation activity feeds**
 
-The current implementation adds organisation-scoped recurring assessments on top of the authenticated job API and lease-aware worker queue:
+The current implementation adds stable, bounded list APIs suitable for the future customer dashboard without weakening tenant isolation:
 
-- versioned SQLite job-store migration from schema `2` to schema `3`
-- strict recurring schedule contracts with canonical UTC start times
-- fixed intervals from one hour to one year
-- authenticated create, list, read, pause, and resume API operations
-- owner and administrator access, analyst schedule management, and viewer read-only access
-- database-backed due-schedule selection
-- atomic schedule advancement and scan-job creation
-- deterministic schedule-run idempotency keys
-- optimistic revision fencing between concurrent scheduler processes
-- one-job catch-up policy that skips missed intervals instead of flooding the queue
-- revalidation of organisation assignment, target match, and authorisation validity before enqueue
-- automatic pause with controlled error metadata when an authorisation is invalid or unavailable
-- a standalone `webguard-api scheduler` command
-- scheduler and worker threads integrated into `webguard-api serve`
-- API version `0.4.0`
+- versioned SQLite job-store migration from schema `3` to schema `4`
+- an owner-only, database-generated HMAC key for opaque API cursors
+- cursor signatures using HMAC-SHA-256
+- 24-hour cursor expiry
+- organisation, resource, and filter binding to prevent cursor replay across scopes
+- stable descending pagination with deterministic timestamp and UUID tie-breakers
+- page sizes from 1 to 100, with a default of 50
+- `GET /v1/jobs` with optional `state` and `mode` filters
+- paginated `GET /v1/schedules` with an optional `state` filter
+- paginated `GET /v1/audit-events` with an optional `outcome` filter
+- strict rejection of duplicate, unknown, empty, or unsupported query parameters
+- no total-count query and no raw secret, authorisation, report, or evidence exposure
+- API version `0.5.0`
 
-Milestone 1.28 durable worker leases and crash recovery remain in force. The API and scheduler remain local, single-host foundations and must not be exposed directly to the public internet.
+Milestones 1.28 and 1.29 durable worker recovery and recurring scheduling remain in force. The API remains a local, single-host foundation and must not be exposed directly to the public internet.
 
 ## Safety and authorisation
 
@@ -140,6 +138,8 @@ External execution currently performs no:
 - organisation-scoped recurring scan schedules
 - atomic due-run materialisation and safe catch-up
 - automatic schedule blocking when authorisation becomes invalid
+- signed, expiring, organisation-bound cursor pagination
+- paginated jobs, schedules, and audit activity feeds
 
 ## Architecture
 
@@ -152,8 +152,8 @@ Loopback control-plane API
         |
         +--> identity, organisation, RBAC, and audit controls
         |
-        +--> SQLite job, identity, and schedule store
-        |      +--> versioned migrations
+        +--> SQLite job, identity, schedule, and service-secret store
+        |      +--> versioned migrations and private cursor key
         |      +--> recurring schedules and due-run fencing
         |      +--> job leases, heartbeats, and attempt counters
         |
@@ -212,10 +212,10 @@ Run the local verification gate:
 ./scripts/verify.sh
 ```
 
-At Milestone 1.29, the repository contains:
+At Milestone 1.30, the repository contains:
 
-- 824 unit tests
-- 12 opt-in authorised integration tests
+- 846 unit tests
+- 13 opt-in authorised integration tests
 - CI validation across three Python versions
 - an authorised Juice Shop integration job
 
@@ -367,7 +367,39 @@ curl --fail-with-body \
 
 Responses include correlation and rate-limit headers such as `X-Request-ID` and `RateLimit-*`.
 
-### 6. Submit an authorised scan job
+### 6. List organisation jobs with signed pagination
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  "http://127.0.0.1:8765/v1/jobs?limit=25&state=queued&mode=crawl"
+```
+
+The response contains a `page.next_cursor` value when another page exists. Treat the cursor as opaque and send it back unchanged with the same filters:
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  "http://127.0.0.1:8765/v1/jobs?limit=25&state=queued&mode=crawl&cursor=${NEXT_CURSOR}"
+```
+
+A cursor expires after 24 hours and is bound to the organisation, list resource, and filter set that created it. Modified, expired, cross-organisation, cross-resource, and filter-mismatched cursors fail closed.
+
+Paginated schedules and audit events use the same response shape:
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  "http://127.0.0.1:8765/v1/schedules?limit=25&state=active"
+
+curl --fail-with-body \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  "http://127.0.0.1:8765/v1/audit-events?limit=25&outcome=succeeded"
+```
+
+The API deliberately does not return a total count. This keeps list requests bounded and avoids expensive count scans as the activity history grows.
+
+### 7. Submit an authorised scan job
 
 ```bash
 curl --fail-with-body \
@@ -393,7 +425,7 @@ Before execution, the worker:
 4. writes the authorisation audit record
 5. executes the conservative owned-target policy
 
-### 7. Create a recurring authorised schedule
+### 8. Create a recurring authorised schedule
 
 Schedule start times use canonical UTC microsecond notation. The minimum interval is one hour.
 
@@ -472,6 +504,7 @@ The following paths contain private runtime material and must remain outside sou
 - SQLite databases
 - generated audit records
 - raw API tokens
+- the database-held pagination cursor HMAC key
 
 Scan reports may contain sensitive target metadata and security findings. Treat them as confidential customer records.
 
@@ -490,6 +523,7 @@ Known limitations include:
 - no automated asset-ownership verification
 - fixed-interval schedules only; cron expressions and customer time zones are not yet supported
 - scheduler coordination remains single-host SQLite coordination
+- pagination cursors are local-service cursors and become invalid if the private database secret is rotated or lost
 - no email or webhook notifications
 - no billing, subscriptions, or usage metering
 - local rather than distributed rate limiting
@@ -525,6 +559,7 @@ WebGuard development follows these principles:
 - never store raw API tokens
 - produce deterministic evidence
 - preserve auditable execution records
+- sign and scope opaque pagination cursors before returning them
 - atomically advance schedules when due jobs are created
 - skip missed intervals instead of flooding the scanner queue
 - fence stale workers before terminal state changes

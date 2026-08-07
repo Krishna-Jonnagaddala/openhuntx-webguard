@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Type
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from .auth import ApiTokenAuthenticator, AuthContext, AuthenticationError
+from .pagination import PaginationError, parse_page_request
 from .rate_limit import FixedWindowRateLimiter, RateLimitDecision, RateLimitError
 from .service import ApiServiceError, WebGuardJobService
 
@@ -114,15 +115,48 @@ def build_handler(
                 extra_headers=headers,
             )
 
-        def _path(self) -> str:
+        def _request_target(self) -> tuple[str, dict[str, tuple[str, ...]]]:
             parsed = urlsplit(self.path)
-            if parsed.query or parsed.fragment:
+            if parsed.fragment:
                 raise ApiTransportError(
                     "request_target_invalid",
-                    "API request targets cannot contain query strings or fragments.",
+                    "API request targets cannot contain fragments.",
                     status=400,
                 )
-            return parsed.path
+            try:
+                parsed_query = parse_qs(
+                    parsed.query,
+                    keep_blank_values=True,
+                    strict_parsing=True,
+                )
+            except ValueError as exc:
+                raise ApiTransportError(
+                    "request_query_invalid",
+                    "API query string is malformed.",
+                    status=400,
+                ) from exc
+            query = {key: tuple(values) for key, values in parsed_query.items()}
+            return parsed.path, query
+
+        @staticmethod
+        def _require_empty_query(query: dict[str, tuple[str, ...]]) -> None:
+            if query:
+                raise ApiTransportError(
+                    "request_query_not_allowed",
+                    "This API route does not accept query parameters.",
+                    status=400,
+                )
+
+        @staticmethod
+        def _page_request(
+            query: dict[str, tuple[str, ...]],
+            *,
+            filters: dict[str, frozenset[str]],
+        ):
+            try:
+                return parse_page_request(query, allowed_filters=filters)
+            except PaginationError as exc:
+                raise ApiTransportError(exc.code, exc.message, status=400) from exc
 
         def _read_json_body(self) -> bytes:
             transfer_values = self.headers.get_all("Transfer-Encoding") or []
@@ -201,18 +235,57 @@ def build_handler(
         def do_GET(self) -> None:  # noqa: N802
             request_id = str(uuid4())
             try:
-                path = self._path()
+                path, query = self._request_target()
                 if path == "/healthz":
+                    self._require_empty_query(query)
                     self._send_json(200, {"status": "ok"}, request_id=request_id)
                     return
                 context, decision = self._authenticate()
                 if path == "/v1/me":
+                    self._require_empty_query(query)
                     payload = service.me(context, request_id=request_id)
+                elif path == "/v1/jobs":
+                    page = self._page_request(
+                        query,
+                        filters={
+                            "state": frozenset(
+                                {
+                                    "queued",
+                                    "running",
+                                    "completed",
+                                    "completed_with_errors",
+                                    "failed",
+                                    "cancelled",
+                                }
+                            ),
+                            "mode": frozenset({"single_page", "crawl"}),
+                        },
+                    )
+                    payload = service.list_jobs(
+                        context, page, request_id=request_id
+                    )
                 elif path == "/v1/audit-events":
-                    payload = service.audit_events(context, request_id=request_id)
+                    page = self._page_request(
+                        query,
+                        filters={
+                            "outcome": frozenset(
+                                {"succeeded", "failed", "denied"}
+                            )
+                        },
+                    )
+                    payload = service.audit_events(
+                        context, page, request_id=request_id
+                    )
                 elif path == "/v1/schedules":
-                    payload = service.list_schedules(context, request_id=request_id)
+                    page = self._page_request(
+                        query,
+                        filters={"state": frozenset({"active", "paused"})},
+                    )
+                    payload = service.list_schedules(
+                        context, page, request_id=request_id
+                    )
                 else:
+                    self._require_empty_query(query)
                     schedule_match = _SCHEDULE_PATH.fullmatch(path)
                     if schedule_match:
                         payload = service.get_schedule(
@@ -221,14 +294,20 @@ def build_handler(
                     else:
                         match = _JOB_PATH.fullmatch(path)
                         if match:
-                            payload = service.get(context, match.group(1), request_id=request_id)
+                            payload = service.get(
+                                context, match.group(1), request_id=request_id
+                            )
                         else:
                             match = _JOB_RESULT_PATH.fullmatch(path)
                             if match:
-                                payload = service.result(context, match.group(1), request_id=request_id)
+                                payload = service.result(
+                                    context, match.group(1), request_id=request_id
+                                )
                             else:
                                 raise ApiTransportError(
-                                    "route_not_found", "API route was not found.", status=404
+                                    "route_not_found",
+                                    "API route was not found.",
+                                    status=404,
                                 )
                 self._send_json(
                     200,
@@ -236,13 +315,19 @@ def build_handler(
                     request_id=request_id,
                     extra_headers=self._rate_headers(decision),
                 )
-            except (ApiTransportError, ApiServiceError, AuthenticationError, RateLimitError) as exc:
+            except (
+                ApiTransportError,
+                ApiServiceError,
+                AuthenticationError,
+                RateLimitError,
+            ) as exc:
                 self._error(exc, request_id=request_id)
 
         def do_POST(self) -> None:  # noqa: N802
             request_id = str(uuid4())
             try:
-                path = self._path()
+                path, query = self._request_target()
+                self._require_empty_query(query)
                 context, decision = self._authenticate()
                 if path == "/v1/schedules":
                     payload = service.create_schedule(
@@ -369,7 +454,7 @@ def create_server(
     if not address.is_loopback:
         raise ApiTransportError(
             "service_non_loopback_binding_rejected",
-            "Milestone 1.29 permits loopback API binding only.",
+            "Milestone 1.30 permits loopback API binding only.",
             status=500,
         )
     handler = build_handler(

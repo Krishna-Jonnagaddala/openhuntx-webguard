@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import os
+import secrets
 import sqlite3
 import stat
 from dataclasses import dataclass
@@ -21,7 +23,7 @@ from webguard_contracts import (
 )
 
 
-DATABASE_SCHEMA_VERSION = 3
+DATABASE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +185,9 @@ class ScanJobStore:
             if version == 2:
                 self._migrate_v2_to_v3(connection)
                 version = 3
+            if version == 3:
+                self._migrate_v3_to_v4(connection)
+                version = 4
             if version != DATABASE_SCHEMA_VERSION:
                 raise JobStoreError(
                     "job_store_schema_unsupported",
@@ -320,6 +325,87 @@ class ScanJobStore:
             except sqlite3.Error:
                 pass
             raise
+
+    @staticmethod
+    def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+        """Add a private service secret for signed pagination cursors."""
+
+        key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                CREATE TABLE service_secrets (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO service_secrets(key, value, created_at)
+                VALUES ('pagination_cursor_hmac', ?, ?)
+                """,
+                (key, _timestamp(datetime.now(timezone.utc))),
+            )
+            connection.execute(
+                """
+                CREATE INDEX idx_scan_jobs_organization_feed
+                ON scan_jobs(submitted_at DESC, job_id DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX idx_scan_schedules_organization_feed
+                ON scan_schedules(organization_id, created_at DESC, schedule_id DESC)
+                """
+            )
+            connection.execute(
+                "UPDATE service_metadata SET value = '4' WHERE key = 'schema_version'"
+            )
+            connection.execute("COMMIT")
+        except sqlite3.Error:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    def cursor_signing_key(self) -> bytes:
+        """Return the private HMAC key used for opaque API cursors."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT value FROM service_secrets WHERE key = ?",
+                ("pagination_cursor_hmac",),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "cursor_key_read_failed",
+                "Unable to read the pagination cursor key.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            raise JobStoreError(
+                "cursor_key_missing",
+                "Pagination cursor key is missing.",
+            )
+        try:
+            key = base64.urlsafe_b64decode(row["value"].encode("ascii"))
+        except (ValueError, UnicodeEncodeError) as exc:
+            raise JobStoreError(
+                "cursor_key_invalid",
+                "Pagination cursor key is invalid.",
+            ) from exc
+        if len(key) < 32:
+            raise JobStoreError(
+                "cursor_key_invalid",
+                "Pagination cursor key is invalid.",
+            )
+        return key
 
     @staticmethod
     def _schedule_from_row(row: sqlite3.Row) -> ScanScheduleRecord:
@@ -588,6 +674,77 @@ class ScanJobStore:
         if scope is None or scope[0] != organization_id:
             raise JobStoreError("job_not_found", "Scan job was not found.")
         return record
+
+    def list_jobs_scoped_page(
+        self,
+        organization_id: str,
+        *,
+        limit: int,
+        after: tuple[str, str] | None = None,
+        state: ScanJobState | None = None,
+        mode: ScanJobMode | None = None,
+    ) -> tuple[tuple[ScanJobRecord, ...], bool]:
+        """List one stable descending organization job page."""
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise JobStoreError(
+                "job_list_limit_invalid",
+                "Job list limit must be from 1 to 100.",
+            )
+        clauses = ["scope.organization_id = ?"]
+        parameters: list[object] = [organization_id]
+        if state is not None:
+            if not isinstance(state, ScanJobState):
+                raise JobStoreError(
+                    "job_list_state_invalid", "Job state filter is invalid."
+                )
+            clauses.append("jobs.state = ?")
+            parameters.append(state.value)
+        if mode is not None:
+            if not isinstance(mode, ScanJobMode):
+                raise JobStoreError(
+                    "job_list_mode_invalid", "Job mode filter is invalid."
+                )
+            clauses.append("jobs.mode = ?")
+            parameters.append(mode.value)
+        if after is not None:
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 2
+                or not all(isinstance(value, str) and value for value in after)
+            ):
+                raise JobStoreError(
+                    "job_list_cursor_invalid", "Job cursor position is invalid."
+                )
+            clauses.append(
+                "(jobs.submitted_at < ? OR "
+                "(jobs.submitted_at = ? AND jobs.job_id < ?))"
+            )
+            parameters.extend((after[0], after[0], after[1]))
+        parameters.append(limit + 1)
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"""
+                SELECT jobs.*
+                FROM scan_jobs AS jobs
+                JOIN job_scopes AS scope ON scope.job_id = jobs.job_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY jobs.submitted_at DESC, jobs.job_id DESC
+                LIMIT ?
+                """,
+                tuple(parameters),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "job_store_read_failed",
+                "Unable to read organization scan jobs.",
+            ) from exc
+        finally:
+            connection.close()
+        has_more = len(rows) > limit
+        selected = rows[:limit]
+        return tuple(self._record_from_row(row) for row in selected), has_more
 
     def request_cancellation_scoped(
         self,
@@ -1420,6 +1577,68 @@ class ScanJobStore:
         if row is None:
             raise JobStoreError("schedule_not_found", "Scan schedule was not found.")
         return self._schedule_from_row(row)
+
+    def list_schedules_scoped_page(
+        self,
+        organization_id: str,
+        *,
+        limit: int,
+        after: tuple[str, str] | None = None,
+        state: ScanScheduleState | None = None,
+    ) -> tuple[tuple[ScanScheduleRecord, ...], bool]:
+        """List one stable descending organization schedule page."""
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise JobStoreError(
+                "schedule_list_limit_invalid",
+                "Schedule list limit must be from 1 to 100.",
+            )
+        clauses = ["organization_id = ?"]
+        parameters: list[object] = [organization_id]
+        if state is not None:
+            if not isinstance(state, ScanScheduleState):
+                raise JobStoreError(
+                    "schedule_list_state_invalid",
+                    "Schedule state filter is invalid.",
+                )
+            clauses.append("state = ?")
+            parameters.append(state.value)
+        if after is not None:
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 2
+                or not all(isinstance(value, str) and value for value in after)
+            ):
+                raise JobStoreError(
+                    "schedule_list_cursor_invalid",
+                    "Schedule cursor position is invalid.",
+                )
+            clauses.append(
+                "(created_at < ? OR (created_at = ? AND schedule_id < ?))"
+            )
+            parameters.extend((after[0], after[0], after[1]))
+        parameters.append(limit + 1)
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM scan_schedules
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at DESC, schedule_id DESC
+                LIMIT ?
+                """,
+                tuple(parameters),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "schedule_read_failed",
+                "Unable to read scan-schedule metadata.",
+            ) from exc
+        finally:
+            connection.close()
+        has_more = len(rows) > limit
+        selected = rows[:limit]
+        return tuple(self._schedule_from_row(row) for row in selected), has_more
 
     def list_schedules_scoped(
         self,

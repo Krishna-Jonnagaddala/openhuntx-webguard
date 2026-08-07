@@ -93,7 +93,7 @@ class ServiceConfig:
         if not address.is_loopback:
             raise ServiceConfigError(
                 "service_non_loopback_binding_rejected",
-                "Milestone 1.29 permits loopback API binding only.",
+                "Milestone 1.30 permits loopback API binding only.",
             )
         object.__setattr__(self, "host", address.compressed)
 
