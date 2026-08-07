@@ -19,31 +19,36 @@ The current platform combines:
 - professional HTML reporting and remediation comparison
 - a local scanner-service API with a persistent, lease-aware job queue
 - organisation isolation, API authentication, and role-based access control
-- request correlation, audit events, rate-limit foundations, crash recovery, recurring scan scheduling, and signed cursor pagination
+- request correlation, audit events, rate-limit foundations, crash recovery, recurring scan scheduling, signed cursor pagination, and cryptographic TrustScan permits
 
 WebGuard does not claim to identify every vulnerability. Its current external scan mode is intentionally conservative and passive.
 
 ## Current milestone
 
-**Milestone 1.30 — Signed cursor pagination and organisation activity feeds**
+**Milestone 1.31 — TrustScan cryptographic scan permit v1**
 
-The current implementation adds stable, bounded list APIs suitable for the future customer dashboard without weakening tenant isolation:
+The current implementation adds a cryptographically signed execution permit above the existing owned-target authorisation model. A valid owned-target authorisation remains necessary, but scanner execution now also requires a narrower TrustScan permit bound to the exact organisation, authorisation fingerprint, target, scan mode, validity window, and safety envelope.
 
-- versioned SQLite job-store migration from schema `3` to schema `4`
-- an owner-only, database-generated HMAC key for opaque API cursors
-- cursor signatures using HMAC-SHA-256
-- 24-hour cursor expiry
-- organisation, resource, and filter binding to prevent cursor replay across scopes
-- stable descending pagination with deterministic timestamp and UUID tie-breakers
-- page sizes from 1 to 100, with a default of 50
-- `GET /v1/jobs` with optional `state` and `mode` filters
-- paginated `GET /v1/schedules` with an optional `state` filter
-- paginated `GET /v1/audit-events` with an optional `outcome` filter
-- strict rejection of duplicate, unknown, empty, or unsupported query parameters
-- no total-count query and no raw secret, authorisation, report, or evidence exposure
-- API version `0.5.0`
+Milestone 1.31 adds:
 
-Milestones 1.28 and 1.29 durable worker recovery and recurring scheduling remain in force. The API remains a local, single-host foundation and must not be exposed directly to the public internet.
+- versioned SQLite job-store migration from schema `4` to schema `5`
+- an owner-only, database-generated Ed25519 private signing key
+- a public Ed25519 verification-key endpoint
+- strict TrustScan scan-permit schema `1.0`
+- owner/administrator permit issuance and revocation with analyst/viewer read access
+- immutable signed permit claims plus separate durable revocation metadata
+- exact organisation, target, authorisation fingerprint, and scan-mode binding
+- permit validity of at most 90 days and never beyond the underlying authorisation
+- passive v1 method policy restricted to `GET` and optional `HEAD`
+- per-permit request-attempt and request-rate ceilings
+- per-permit maximum execution concurrency of one
+- transactional job and recurring-schedule permit bindings
+- worker-side permit signature, revocation, scope, and expiry revalidation before network execution
+- scheduler-side permit revalidation before a due job is materialised
+- fail-closed handling for legacy jobs and schedules that have no TrustScan permit binding
+- API version `0.6.0`
+
+Milestones 1.28 through 1.30 durable worker recovery, recurring scheduling, and signed activity-feed pagination remain in force. The API remains a local, single-host engineering foundation and must not be exposed directly to the public internet.
 
 ## Safety and authorisation
 
@@ -64,7 +69,7 @@ External scans require:
 - bounded passive execution
 - an authorisation audit record
 
-A locally generated authorisation document records operator approval and scan limits. It does not independently prove legal ownership. A future production release must add centrally controlled customer identity, asset ownership verification, and production-grade authorisation workflows.
+A locally generated authorisation document records operator approval and scan limits. It does not independently prove legal ownership. TrustScan v1 cryptographically narrows and proves the service-issued execution policy for an existing authorisation; it does not itself prove that the customer legally owns the target. A future production release must add centrally controlled customer identity, asset-ownership or delegated-authority verification, and production-grade authorisation workflows.
 
 External execution currently performs no:
 
@@ -140,30 +145,39 @@ External execution currently performs no:
 - automatic schedule blocking when authorisation becomes invalid
 - signed, expiring, organisation-bound cursor pagination
 - paginated jobs, schedules, and audit activity feeds
+- Ed25519-signed TrustScan execution permits
+- permit issuance, read, revocation, and public verification-key APIs
+- job and schedule permit binding with pre-execution revalidation
+- permit-level request budget, rate, method, validity-window, and concurrency constraints
 
 ## Architecture
 
 ```text
 Operator / local client
         |
-        | Bearer token
+        | Bearer token + TrustScan permit ID for scan creation
         v
 Loopback control-plane API
         |
         +--> identity, organisation, RBAC, and audit controls
         |
-        +--> SQLite job, identity, schedule, and service-secret store
-        |      +--> versioned migrations and private cursor key
+        +--> TrustScan permit authority
+        |      +--> Ed25519 signing and public verification key
+        |      +--> immutable signed claims + revocation state
+        |
+        +--> SQLite job, identity, schedule, permit, and service-secret store
+        |      +--> versioned migrations and private signing keys
         |      +--> recurring schedules and due-run fencing
         |      +--> job leases, heartbeats, and attempt counters
         |
         +--> database-backed scheduler
-        |      +--> validates current authorisation
-        |      +--> atomically creates due jobs
+        |      +--> revalidates authorisation and TrustScan permit
+        |      +--> atomically creates permit-bound due jobs
         |
         v
 Lease-aware background scanner worker
         |
+        +--> revalidates permit signature, scope, state, and limits
         +--> target-scope and authorisation validation
         +--> safe HTTP client
         +--> bounded passive analyzers and crawler
@@ -212,10 +226,10 @@ Run the local verification gate:
 ./scripts/verify.sh
 ```
 
-At Milestone 1.30, the repository contains:
+At Milestone 1.31, the repository contains:
 
-- 846 unit tests
-- 13 opt-in authorised integration tests
+- 887 unit tests
+- 14 opt-in authorised integration tests
 - CI validation across three Python versions
 - an authorised Juice Shop integration job
 
@@ -367,43 +381,77 @@ curl --fail-with-body \
 
 Responses include correlation and rate-limit headers such as `X-Request-ID` and `RateLimit-*`.
 
-### 6. List organisation jobs with signed pagination
+### 6. Read the TrustScan verification key
+
+The public verification key may be retrieved without authentication. The private Ed25519 seed never leaves the owner-only service database.
 
 ```bash
 curl --fail-with-body \
-  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
-  "http://127.0.0.1:8765/v1/jobs?limit=25&state=queued&mode=crawl"
+  http://127.0.0.1:8765/v1/trustscan/verification-key
 ```
 
-The response contains a `page.next_cursor` value when another page exists. Treat the cursor as opaque and send it back unchanged with the same filters:
+### 7. Issue a TrustScan scan permit
+
+Only an organisation owner or administrator may issue or revoke a permit. The underlying owned-target authorisation must already be assigned to that organisation and must be current.
 
 ```bash
+NOT_BEFORE="$(python - <<'PYTHON'
+from datetime import datetime, timezone
+print(datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"))
+PYTHON
+)"
+
+EXPIRES_AT="$(python - <<'PYTHON'
+from datetime import datetime, timedelta, timezone
+print((datetime.now(timezone.utc) + timedelta(days=7)).isoformat(timespec="microseconds").replace("+00:00", "Z"))
+PYTHON
+)"
+
 curl --fail-with-body \
   -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
-  "http://127.0.0.1:8765/v1/jobs?limit=25&state=queued&mode=crawl&cursor=${NEXT_CURSOR}"
+  -H "Content-Type: application/json" \
+  --data "{
+    \"target\": \"https://security.example/\",
+    \"authorization_id\": \"AUTHORIZATION_UUID\",
+    \"confirm_authorization\": \"AUTHORIZATION_UUID\",
+    \"permitted_modes\": [\"crawl\", \"single_page\"],
+    \"allowed_http_methods\": [\"GET\", \"HEAD\"],
+    \"not_before\": \"${NOT_BEFORE}\",
+    \"expires_at\": \"${EXPIRES_AT}\",
+    \"maximum_request_attempts\": 15,
+    \"maximum_requests_per_second\": 1.0,
+    \"maximum_concurrency\": 1
+  }" \
+  http://127.0.0.1:8765/v1/permits
 ```
 
-A cursor expires after 24 hours and is bound to the organisation, list resource, and filter set that created it. Modified, expired, cross-organisation, cross-resource, and filter-mismatched cursors fail closed.
-
-Paginated schedules and audit events use the same response shape:
+Store the returned permit UUID in a shell variable without treating it as a bearer credential. The permit does not replace API authentication.
 
 ```bash
-curl --fail-with-body \
-  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
-  "http://127.0.0.1:8765/v1/schedules?limit=25&state=active"
-
-curl --fail-with-body \
-  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
-  "http://127.0.0.1:8765/v1/audit-events?limit=25&outcome=succeeded"
+export TRUSTSCAN_PERMIT_ID="PERMIT_UUID"
 ```
 
-The API deliberately does not return a total count. This keeps list requests bounded and avoids expensive count scans as the activity history grows.
+Permit v1 is deliberately conservative: `GET` is required, `HEAD` is optional, concurrency is fixed at one, the permit may be valid for at most 90 days, and it cannot exceed the request budget, request rate, expiry, or target authorised by the underlying owned-target document.
 
-### 7. Submit an authorised scan job
+Read or revoke a permit:
 
 ```bash
 curl --fail-with-body \
   -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  http://127.0.0.1:8765/v1/permits/${TRUSTSCAN_PERMIT_ID}
+
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  -H "Content-Length: 0" \
+  http://127.0.0.1:8765/v1/permits/${TRUSTSCAN_PERMIT_ID}/revoke
+```
+
+### 8. Submit a permit-bound authorised scan job
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  -H "TrustScan-Permit: ${TRUSTSCAN_PERMIT_ID}" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: owned-target-001" \
   --data '{
@@ -415,24 +463,15 @@ curl --fail-with-body \
   http://127.0.0.1:8765/v1/jobs
 ```
 
-The service returns job metadata and safe relative artefact references. It does not return authorisation documents or report bodies through the API.
+The job is transactionally bound to the exact permit ID and permit fingerprint (the SHA-256 digest of the canonical signed claims). The worker reloads the server-side authorisation and signed permit immediately before network execution. Missing, revoked, expired, altered, cross-organisation, target-mismatched, authorisation-mismatched, or mode-mismatched permits fail closed.
 
-Before execution, the worker:
+### 9. Create a permit-bound recurring schedule
 
-1. reloads the server-side authorisation
-2. validates organisation and principal scope
-3. revalidates the target and authorisation limits
-4. writes the authorisation audit record
-5. executes the conservative owned-target policy
-
-### 8. Create a recurring authorised schedule
-
-Schedule start times use canonical UTC microsecond notation. The minimum interval is one hour.
+Schedule start times use canonical UTC microsecond notation. The minimum interval is one hour, and the first run must fall inside the TrustScan permit validity window.
 
 ```bash
 STARTS_AT="$(python - <<'PYTHON'
 from datetime import datetime, timedelta, timezone
-
 value = datetime.now(timezone.utc) + timedelta(hours=1)
 print(value.isoformat(timespec="microseconds").replace("+00:00", "Z"))
 PYTHON
@@ -440,6 +479,7 @@ PYTHON
 
 curl --fail-with-body \
   -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
+  -H "TrustScan-Permit: ${TRUSTSCAN_PERMIT_ID}" \
   -H "Content-Type: application/json" \
   --data "{
     \"name\": \"Daily passive crawl\",
@@ -453,38 +493,19 @@ curl --fail-with-body \
   http://127.0.0.1:8765/v1/schedules
 ```
 
-List schedules:
+The scheduler revalidates both the underlying authorisation and the permit before every due run. A revoked or expired permit pauses the schedule rather than creating an unauthorised job. Missed intervals still use the existing safe catch-up policy rather than producing a backlog burst.
+
+### 10. List organisation activity with signed pagination
 
 ```bash
 curl --fail-with-body \
   -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
-  http://127.0.0.1:8765/v1/schedules
+  "http://127.0.0.1:8765/v1/jobs?limit=25&state=queued&mode=crawl"
 ```
 
-Pause or resume a schedule without a request body:
+The response contains a `page.next_cursor` value when another page exists. Treat it as opaque and send it back unchanged with the same filters. The same bounded signed-pagination model applies to `/v1/schedules` and `/v1/audit-events`.
 
-```bash
-curl --fail-with-body -X POST \
-  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
-  -H "Content-Length: 0" \
-  http://127.0.0.1:8765/v1/schedules/SCHEDULE_UUID/pause
-
-curl --fail-with-body -X POST \
-  -H "Authorization: Bearer ${WEBGUARD_API_TOKEN}" \
-  -H "Content-Length: 0" \
-  http://127.0.0.1:8765/v1/schedules/SCHEDULE_UUID/resume
-```
-
-A due schedule creates at most one job during a scheduler pass. When multiple intervals were missed, WebGuard advances to the next future interval rather than producing a backlog burst. A missing, expired, unassigned, or target-mismatched authorisation automatically pauses the schedule and records a controlled error code.
-
-The scheduler can also run independently:
-
-```bash
-webguard-api scheduler \
-  --database var/webguard-api/jobs.sqlite3 \
-  --authorizations authorizations \
-  --artifacts scan-results/service
-```
+The API deliberately omits total counts and never exposes raw API tokens, the private TrustScan signing seed, owned-target authorisation documents, or report bodies through list responses.
 
 ## Token lifecycle
 
@@ -505,6 +526,7 @@ The following paths contain private runtime material and must remain outside sou
 - generated audit records
 - raw API tokens
 - the database-held pagination cursor HMAC key
+- the database-held TrustScan Ed25519 private signing seed
 
 Scan reports may contain sensitive target metadata and security findings. Treat them as confidential customer records.
 
@@ -520,7 +542,10 @@ Known limitations include:
 - no cross-host distributed worker coordination
 - no customer dashboard
 - no production identity provider
-- no automated asset-ownership verification
+- no automated asset-ownership or delegated-authority verification
+- TrustScan v1 uses one local Ed25519 signing key and does not yet provide key rotation, external KMS/HSM custody, or multi-region trust distribution
+- TrustScan v1 permits only the existing passive scan modes and `GET`/`HEAD` transport methods
+- permit maximum concurrency is fixed at one and enforced through the current single-host SQLite job queue
 - fixed-interval schedules only; cron expressions and customer time zones are not yet supported
 - scheduler coordination remains single-host SQLite coordination
 - pagination cursors are local-service cursors and become invalid if the private database secret is rotated or lost
@@ -538,7 +563,9 @@ Upcoming engineering priorities include:
 - distributed worker and scheduler coordination
 - richer calendar schedules, customer time zones, and maintenance windows
 - customer dashboard and organisation administration
-- target and authorisation management workflows
+- target ownership/delegated-authority verification and production authorisation workflows
+- TrustScan key rotation, KMS/HSM-backed signing, runner attestation, and verifiable execution receipts
+- runtime safety receipts, coverage-truth maps, and signed remediation evidence
 - findings search, filtering, comparison, and export
 - notifications and customer remediation workflows
 - production secrets, observability, backups, and deployment controls
@@ -552,7 +579,9 @@ WebGuard development follows these principles:
 - authorised targets only
 - deny by default
 - validate before connecting
-- revalidate before execution
+- revalidate authorisation and cryptographic permit before execution
+- no valid TrustScan permit means no scanner network execution
+- cryptographically bind jobs and recurring schedules to their approved execution permit
 - minimise network capability
 - keep scans passive and bounded
 - isolate customer data by organisation

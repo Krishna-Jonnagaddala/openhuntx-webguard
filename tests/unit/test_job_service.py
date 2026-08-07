@@ -17,6 +17,7 @@ from tests.unit.service_test_support import (
     VIEWER_ID,
     VIEWER_TOKEN_ID,
     create_identity_fixture,
+    create_trustscan_permit,
     write_authorization,
 )
 
@@ -40,6 +41,8 @@ class WebGuardJobServiceTests(unittest.TestCase):
         write_authorization(auth_dir)
         self.store = ScanJobStore(root / "jobs.sqlite3")
         self.identity, self.context, _ = create_identity_fixture(self.store.path)
+        self.permit = create_trustscan_permit(self.store)
+        self.permit_id = self.permit.permit.claims.permit_id
         self.service = WebGuardJobService(
             store=self.store,
             authorizations=AuthorizationRepository(auth_dir),
@@ -55,6 +58,7 @@ class WebGuardJobServiceTests(unittest.TestCase):
             self.context,
             body() if payload is None else payload,
             idempotency_key=key,
+            permit_id=self.permit_id,
             request_id="66666666-6666-4666-8666-666666666666",
         )
 
@@ -154,6 +158,7 @@ class WebGuardJobServiceTests(unittest.TestCase):
                 viewer,
                 body(),
                 idempotency_key="viewer-submit-1",
+                permit_id=self.permit_id,
                 request_id="77777777-7777-4777-8777-777777777777",
             )
         self.assertEqual(caught.exception.status, 403)

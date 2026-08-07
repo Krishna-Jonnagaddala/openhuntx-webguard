@@ -37,6 +37,7 @@ from .identity import (
     IdentityStoreError,
 )
 from .rate_limit import FixedWindowRateLimiter
+from .permits import TrustScanSigner
 from .scheduler import ScanScheduleCoordinator
 from .service import WebGuardJobService
 from .store import JobStoreError, ScanJobStore
@@ -81,8 +82,11 @@ def _stores(config: ServiceConfig) -> tuple[ScanJobStore, IdentityStore]:
 def _components(config: ServiceConfig):
     store, identity = _stores(config)
     authorizations = AuthorizationRepository(config.authorization_directory)
+    trustscan_signer = TrustScanSigner(store.trustscan_signing_private_key())
     executor = ScanJobExecutor(
         authorizations=authorizations,
+        store=store,
+        trustscan_signer=trustscan_signer,
         artifact_directory=config.artifact_directory,
         organization_resolver=store.organization_id_for_job,
     )
@@ -90,6 +94,7 @@ def _components(config: ServiceConfig):
         store=store,
         authorizations=authorizations,
         identity=identity,
+        trustscan_signer=trustscan_signer,
     )
     worker = ScanJobWorker(
         store=store,
@@ -104,6 +109,7 @@ def _components(config: ServiceConfig):
         store=store,
         authorizations=authorizations,
         identity=identity,
+        trustscan_signer=trustscan_signer,
         poll_seconds=config.scheduler_poll_seconds,
         batch_size=config.scheduler_batch_size,
     )

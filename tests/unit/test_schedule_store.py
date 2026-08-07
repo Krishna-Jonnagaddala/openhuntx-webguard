@@ -8,7 +8,9 @@ from pathlib import Path
 from webguard_api import JobStoreError, ScanJobStore
 from webguard_contracts import ScanJobMode, ScanJobState, ScanScheduleState
 
-from tests.unit.service_test_support import AUTH_ID, NOW, ORG_ID, OWNER_ID, TARGET
+from tests.unit.service_test_support import (
+    AUTH_ID, NOW, ORG_ID, OWNER_ID, TARGET, create_trustscan_permit
+)
 
 OTHER_ORG = "77777777-7777-4777-8777-777777777777"
 SCHEDULE_ID = "66666666-6666-4666-8666-666666666666"
@@ -18,6 +20,7 @@ class ScheduleStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.store = ScanJobStore(Path(self.temporary.name) / "jobs.sqlite3")
+        self.permit = create_trustscan_permit(self.store)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -37,7 +40,15 @@ class ScheduleStoreTests(unittest.TestCase):
             schedule_id=SCHEDULE_ID,
         )
         values.update(changes)
+        if values["organization_id"] == ORG_ID:
+            values.setdefault("permit_id", self.permit.permit.claims.permit_id)
+            values.setdefault("permit_sha256", self.permit.permit.fingerprint)
         return self.store.create_schedule(**values)
+
+    def enqueue_due_schedule(self, schedule_id, **kwargs):
+        kwargs.setdefault("permit_id", self.permit.permit.claims.permit_id)
+        kwargs.setdefault("permit_sha256", self.permit.permit.fingerprint)
+        return self.store.enqueue_due_schedule(schedule_id, **kwargs)
 
     def test_create_and_read_schedule(self) -> None:
         created = self.create()
@@ -94,7 +105,7 @@ class ScheduleStoreTests(unittest.TestCase):
 
     def test_enqueue_due_schedule_creates_scoped_job(self) -> None:
         schedule = self.create(starts_at=NOW)
-        result = self.store.enqueue_due_schedule(
+        result = self.enqueue_due_schedule(
             schedule.schedule_id,
             expected_revision=schedule.revision,
             authorization_sha256="b" * 64,
@@ -114,7 +125,7 @@ class ScheduleStoreTests(unittest.TestCase):
             starts_at=NOW,
             interval_seconds=3600,
         )
-        result = self.store.enqueue_due_schedule(
+        result = self.enqueue_due_schedule(
             schedule.schedule_id,
             expected_revision=schedule.revision,
             authorization_sha256="a" * 64,
@@ -126,13 +137,13 @@ class ScheduleStoreTests(unittest.TestCase):
 
     def test_stale_revision_cannot_enqueue_duplicate(self) -> None:
         schedule = self.create(starts_at=NOW)
-        first = self.store.enqueue_due_schedule(
+        first = self.enqueue_due_schedule(
             schedule.schedule_id,
             expected_revision=0,
             authorization_sha256="a" * 64,
             now=NOW,
         )
-        second = self.store.enqueue_due_schedule(
+        second = self.enqueue_due_schedule(
             schedule.schedule_id,
             expected_revision=0,
             authorization_sha256="a" * 64,
@@ -144,7 +155,7 @@ class ScheduleStoreTests(unittest.TestCase):
     def test_not_due_schedule_is_not_enqueued(self) -> None:
         schedule = self.create(starts_at=NOW + timedelta(hours=1))
         self.assertIsNone(
-            self.store.enqueue_due_schedule(
+            self.enqueue_due_schedule(
                 schedule.schedule_id,
                 expected_revision=schedule.revision,
                 authorization_sha256="a" * 64,

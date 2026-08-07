@@ -26,6 +26,7 @@ from tests.unit.service_test_support import (
     VIEWER_ID,
     VIEWER_TOKEN_ID,
     create_identity_fixture,
+    create_trustscan_permit,
     write_authorization,
 )
 
@@ -37,6 +38,23 @@ def submission() -> bytes:
             "authorization_id": AUTH_ID,
             "confirm_authorization": AUTH_ID,
             "mode": "crawl",
+        }
+    ).encode("utf-8")
+
+
+def permit_submission() -> bytes:
+    return json.dumps(
+        {
+            "target": TARGET,
+            "authorization_id": AUTH_ID,
+            "confirm_authorization": AUTH_ID,
+            "permitted_modes": ["crawl", "single_page"],
+            "allowed_http_methods": ["GET", "HEAD"],
+            "not_before": NOW.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            "expires_at": (NOW + timedelta(days=7)).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            "maximum_request_attempts": 15,
+            "maximum_requests_per_second": 1.0,
+            "maximum_concurrency": 1,
         }
     ).encode("utf-8")
 
@@ -66,6 +84,8 @@ class HttpApiTests(unittest.TestCase):
         write_authorization(auth_dir)
         store = ScanJobStore(root / "jobs.sqlite3")
         identity, self.context, self.token = create_identity_fixture(store.path)
+        self.permit = create_trustscan_permit(store)
+        self.permit_id = self.permit.permit.claims.permit_id
         _, self.viewer_context, self.viewer_token = create_identity_fixture(
             store.path,
             role=OrganizationRole.VIEWER,
@@ -98,8 +118,10 @@ class HttpApiTests(unittest.TestCase):
         self.thread.join(timeout=2)
         self.temporary.cleanup()
 
-    def request(self, method, path, body=None, headers=None, *, token="owner"):
+    def request(self, method, path, body=None, headers=None, *, token="owner", permit="default"):
         effective = dict(headers or {})
+        if permit == "default" and method == "POST" and path in {"/v1/jobs", "/v1/schedules"}:
+            effective.setdefault("TrustScan-Permit", self.permit_id)
         if token == "owner":
             effective.setdefault("Authorization", f"Bearer {self.token}")
         elif token == "viewer":
@@ -130,6 +152,72 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(payload, {"status": "ok"})
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertIn("X-Request-ID", headers)
+
+    def test_trustscan_verification_key_is_public(self) -> None:
+        status, _, payload = self.request(
+            "GET", "/v1/trustscan/verification-key", token=None
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["algorithm"], "Ed25519")
+        self.assertTrue(payload["key_id"].startswith("sha256:"))
+        self.assertNotIn("private", json.dumps(payload).lower())
+
+    def test_owner_can_issue_read_and_revoke_trustscan_permit(self) -> None:
+        body = permit_submission()
+        status, _, issued = self.request(
+            "POST",
+            "/v1/permits",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        self.assertEqual(status, 201)
+        permit_id = issued["permit"]["claims"]["permit_id"]
+        status, _, fetched = self.request("GET", f"/v1/permits/{permit_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["permit"]["claims"]["permit_id"], permit_id)
+        status, _, revoked = self.request(
+            "POST",
+            f"/v1/permits/{permit_id}/revoke",
+            body=b"",
+            headers={"Content-Length": "0"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(revoked["state"], "revoked")
+
+    def test_invalid_trustscan_permit_header_is_400(self) -> None:
+        body = submission()
+        status, _, payload = self.request(
+            "POST",
+            "/v1/jobs",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+                "Idempotency-Key": "invalid-permit-http-1",
+                "TrustScan-Permit": "NOT-A-PERMIT",
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "trustscan_permit_invalid")
+
+    def test_missing_trustscan_permit_header_is_400(self) -> None:
+        body = submission()
+        status, _, payload = self.request(
+            "POST",
+            "/v1/jobs",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+                "Idempotency-Key": "missing-permit-http-1",
+            },
+            permit=None,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "trustscan_permit_required")
 
     def test_missing_bearer_token_is_401(self) -> None:
         status, headers, payload = self.request("GET", "/v1/me", token=None)

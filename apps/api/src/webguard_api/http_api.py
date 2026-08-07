@@ -11,7 +11,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Type
 from urllib.parse import parse_qs, urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from .auth import ApiTokenAuthenticator, AuthContext, AuthenticationError
 from .pagination import PaginationError, parse_page_request
@@ -25,6 +25,8 @@ _JOB_RESULT_PATH = re.compile(r"^/v1/jobs/([0-9a-f-]{36})/result$")
 _SCHEDULE_PATH = re.compile(r"^/v1/schedules/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _SCHEDULE_PAUSE_PATH = re.compile(r"^/v1/schedules/([0-9a-f-]{36})/pause$")
 _SCHEDULE_RESUME_PATH = re.compile(r"^/v1/schedules/([0-9a-f-]{36})/resume$")
+_PERMIT_PATH = re.compile(r"^/v1/permits/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+_PERMIT_REVOKE_PATH = re.compile(r"^/v1/permits/([0-9a-f-]{36})/revoke$")
 
 
 class ApiTransportError(ValueError):
@@ -216,6 +218,31 @@ def build_handler(
                 )
             return body
 
+        def _trustscan_permit_header(self) -> str:
+            values = self.headers.get_all("TrustScan-Permit") or []
+            if len(values) != 1 or not values[0] or values[0].strip() != values[0]:
+                raise ApiTransportError(
+                    "trustscan_permit_required",
+                    "Exactly one canonical TrustScan-Permit header is required.",
+                    status=400,
+                )
+            value = values[0]
+            try:
+                canonical = str(UUID(value))
+            except (ValueError, AttributeError) as exc:
+                raise ApiTransportError(
+                    "trustscan_permit_invalid",
+                    "TrustScan-Permit must be a canonical lower-case UUID.",
+                    status=400,
+                ) from exc
+            if canonical != value:
+                raise ApiTransportError(
+                    "trustscan_permit_invalid",
+                    "TrustScan-Permit must be a canonical lower-case UUID.",
+                    status=400,
+                )
+            return canonical
+
         def _authenticate(self) -> tuple[AuthContext, RateLimitDecision]:
             context = authenticator.authenticate(
                 self.headers.get_all("Authorization") or [],
@@ -239,6 +266,14 @@ def build_handler(
                 if path == "/healthz":
                     self._require_empty_query(query)
                     self._send_json(200, {"status": "ok"}, request_id=request_id)
+                    return
+                if path == "/v1/trustscan/verification-key":
+                    self._require_empty_query(query)
+                    self._send_json(
+                        200,
+                        service.trustscan_verification_key(),
+                        request_id=request_id,
+                    )
                     return
                 context, decision = self._authenticate()
                 if path == "/v1/me":
@@ -286,29 +321,35 @@ def build_handler(
                     )
                 else:
                     self._require_empty_query(query)
-                    schedule_match = _SCHEDULE_PATH.fullmatch(path)
-                    if schedule_match:
-                        payload = service.get_schedule(
-                            context, schedule_match.group(1), request_id=request_id
+                    permit_match = _PERMIT_PATH.fullmatch(path)
+                    if permit_match:
+                        payload = service.get_permit(
+                            context, permit_match.group(1), request_id=request_id
                         )
                     else:
-                        match = _JOB_PATH.fullmatch(path)
-                        if match:
-                            payload = service.get(
-                                context, match.group(1), request_id=request_id
+                        schedule_match = _SCHEDULE_PATH.fullmatch(path)
+                        if schedule_match:
+                            payload = service.get_schedule(
+                                context, schedule_match.group(1), request_id=request_id
                             )
                         else:
-                            match = _JOB_RESULT_PATH.fullmatch(path)
+                            match = _JOB_PATH.fullmatch(path)
                             if match:
-                                payload = service.result(
+                                payload = service.get(
                                     context, match.group(1), request_id=request_id
                                 )
                             else:
-                                raise ApiTransportError(
-                                    "route_not_found",
-                                    "API route was not found.",
-                                    status=404,
-                                )
+                                match = _JOB_RESULT_PATH.fullmatch(path)
+                                if match:
+                                    payload = service.result(
+                                        context, match.group(1), request_id=request_id
+                                    )
+                                else:
+                                    raise ApiTransportError(
+                                        "route_not_found",
+                                        "API route was not found.",
+                                        status=404,
+                                    )
                 self._send_json(
                     200,
                     payload,
@@ -329,10 +370,24 @@ def build_handler(
                 path, query = self._request_target()
                 self._require_empty_query(query)
                 context, decision = self._authenticate()
+                if path == "/v1/permits":
+                    payload = service.issue_permit(
+                        context,
+                        self._read_json_body(),
+                        request_id=request_id,
+                    )
+                    self._send_json(
+                        201,
+                        payload,
+                        request_id=request_id,
+                        extra_headers=self._rate_headers(decision),
+                    )
+                    return
                 if path == "/v1/schedules":
                     payload = service.create_schedule(
                         context,
                         self._read_json_body(),
+                        permit_id=self._trustscan_permit_header(),
                         request_id=request_id,
                     )
                     self._send_json(
@@ -354,10 +409,30 @@ def build_handler(
                         context,
                         self._read_json_body(),
                         idempotency_key=keys[0],
+                        permit_id=self._trustscan_permit_header(),
                         request_id=request_id,
                     )
                     self._send_json(
                         201 if created else 200,
+                        payload,
+                        request_id=request_id,
+                        extra_headers=self._rate_headers(decision),
+                    )
+                    return
+                permit_match = _PERMIT_REVOKE_PATH.fullmatch(path)
+                if permit_match:
+                    lengths = self.headers.get_all("Content-Length") or []
+                    if lengths and any(value != "0" for value in lengths):
+                        raise ApiTransportError(
+                            "permit_body_not_allowed",
+                            "TrustScan permit revocation requests cannot contain a body.",
+                            status=400,
+                        )
+                    payload = service.revoke_permit(
+                        context, permit_match.group(1), request_id=request_id
+                    )
+                    self._send_json(
+                        200,
                         payload,
                         request_id=request_id,
                         extra_headers=self._rate_headers(decision),
@@ -454,7 +529,7 @@ def create_server(
     if not address.is_loopback:
         raise ApiTransportError(
             "service_non_loopback_binding_rejected",
-            "Milestone 1.30 permits loopback API binding only.",
+            "Milestone 1.31 permits loopback API binding only.",
             status=500,
         )
     handler = build_handler(

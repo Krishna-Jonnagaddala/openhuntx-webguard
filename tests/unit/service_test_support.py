@@ -3,11 +3,14 @@ from __future__ import annotations
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from webguard_contracts import (
     OwnedTargetAuthorization,
     OwnedTargetLimits,
     ScanCoverage,
+    ScanJobMode,
+    TrustScanPermitClaims,
     ScanResult,
     ScanStatus,
     write_owned_target_authorization_file,
@@ -128,3 +131,61 @@ def create_identity_fixture(database: Path, *, role=None, principal_id=None, tok
         token_id=issued.metadata.token_id,
     )
     return identity, context, issued.token
+
+
+def trustscan_signer(store):
+    from webguard_api import TrustScanSigner
+
+    return TrustScanSigner(store.trustscan_signing_private_key())
+
+
+def create_trustscan_permit(
+    store,
+    *,
+    value: OwnedTargetAuthorization | None = None,
+    organization_id: str = ORG_ID,
+    issued_by: str = OWNER_ID,
+    permitted_modes: tuple[ScanJobMode, ...] = (ScanJobMode.CRAWL, ScanJobMode.SINGLE_PAGE),
+    allowed_http_methods: tuple[str, ...] = ("GET", "HEAD"),
+    not_before: datetime = NOW,
+    expires_at: datetime | None = None,
+    maximum_request_attempts: int | None = None,
+    maximum_requests_per_second: float | None = None,
+    permit_id: str | None = None,
+):
+    """Create one valid persisted TrustScan v1 permit for unit tests."""
+
+    auth = authorization() if value is None else value
+    effective_expiry = (
+        min(auth.expires_at, NOW + timedelta(days=7))
+        if expires_at is None
+        else expires_at
+    )
+    effective_attempts = (
+        auth.limits.maximum_request_attempts
+        if maximum_request_attempts is None
+        else maximum_request_attempts
+    )
+    effective_rate = (
+        min(1.0, 1.0 / auth.limits.minimum_delay_seconds)
+        if maximum_requests_per_second is None
+        else maximum_requests_per_second
+    )
+    claims = TrustScanPermitClaims(
+        permit_id=str(uuid4()) if permit_id is None else permit_id,
+        organization_id=organization_id,
+        authorization_id=auth.authorization_id,
+        authorization_sha256=auth.fingerprint,
+        target=auth.target,
+        issued_by=issued_by,
+        issued_at=NOW,
+        not_before=not_before,
+        expires_at=effective_expiry,
+        permitted_modes=permitted_modes,
+        allowed_http_methods=allowed_http_methods,
+        maximum_request_attempts=effective_attempts,
+        maximum_requests_per_second=effective_rate,
+        maximum_concurrency=1,
+    )
+    signed = trustscan_signer(store).sign(claims)
+    return store.create_scan_permit(signed)

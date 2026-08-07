@@ -26,6 +26,7 @@ from tests.unit.service_test_support import (
     TARGET,
     completed_report,
     create_identity_fixture,
+    create_trustscan_permit,
     write_authorization,
 )
 
@@ -54,6 +55,8 @@ class ScanJobServiceIntegrationTests(unittest.TestCase):
             write_authorization(auth_dir)
             store = ScanJobStore(root / "jobs.sqlite3")
             identity, context, token = create_identity_fixture(store.path)
+            permit = create_trustscan_permit(store)
+            permit_id = permit.permit.claims.permit_id
             service = WebGuardJobService(
                 store=store,
                 authorizations=AuthorizationRepository(auth_dir),
@@ -98,6 +101,7 @@ class ScanJobServiceIntegrationTests(unittest.TestCase):
                     body=body,
                     headers={
                         "Authorization": f"Bearer {token}",
+                        "TrustScan-Permit": permit_id,
                         "Content-Type": "application/json",
                         "Content-Length": str(len(body)),
                         "Idempotency-Key": "service-integration-1",
