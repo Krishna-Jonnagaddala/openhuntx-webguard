@@ -181,10 +181,37 @@ class DatabaseMigrationTests(unittest.TestCase):
             }.issubset(columns)
         )
 
-    def test_reopening_version_three_database_is_idempotent(self) -> None:
+    def test_reopening_version_four_database_is_idempotent(self) -> None:
         first = ScanJobStore(self.path)
         second = ScanJobStore(self.path)
         self.assertEqual(first.path, second.path)
+
+    def test_pagination_secret_and_feed_indexes_exist_after_migration(self) -> None:
+        create_v1_database(self.path)
+        store = ScanJobStore(self.path)
+        key = store.cursor_signing_key()
+        self.assertGreaterEqual(len(key), 32)
+        connection = sqlite3.connect(self.path)
+        try:
+            secret = connection.execute(
+                "SELECT value FROM service_secrets WHERE key = 'pagination_cursor_hmac'"
+            ).fetchone()
+            indexes = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                )
+            }
+        finally:
+            connection.close()
+        self.assertIsNotNone(secret)
+        self.assertIn("idx_scan_jobs_organization_feed", indexes)
+        self.assertIn("idx_scan_schedules_organization_feed", indexes)
+
+    def test_reopening_database_preserves_cursor_key(self) -> None:
+        first = ScanJobStore(self.path).cursor_signing_key()
+        second = ScanJobStore(self.path).cursor_signing_key()
+        self.assertEqual(first, second)
 
     def test_future_schema_version_is_rejected(self) -> None:
         create_v1_database(self.path)

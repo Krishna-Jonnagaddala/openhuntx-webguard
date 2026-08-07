@@ -589,38 +589,83 @@ class IdentityStore:
         finally:
             connection.close()
 
-    def list_audit_events(self, organization_id: str, *, limit: int = 100) -> tuple[SecurityAuditEvent, ...]:
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
-            raise IdentityStoreError("audit_limit_invalid", "Audit limit must be from 1 to 500.")
+    @staticmethod
+    def _audit_event(row: sqlite3.Row) -> SecurityAuditEvent:
+        return SecurityAuditEvent(
+            event_id=row["event_id"],
+            request_id=row["request_id"],
+            organization_id=row["organization_id"],
+            principal_id=row["principal_id"],
+            token_id=row["token_id"],
+            action=row["action"],
+            resource_type=row["resource_type"],
+            resource_id=row["resource_id"],
+            outcome=AuditOutcome(row["outcome"]),
+            occurred_at=_parse_timestamp(row["occurred_at"]),
+            detail_code=row["detail_code"],
+        )
+
+    def list_audit_events_page(
+        self,
+        organization_id: str,
+        *,
+        limit: int,
+        after: tuple[str, str] | None = None,
+        outcome: AuditOutcome | None = None,
+    ) -> tuple[tuple[SecurityAuditEvent, ...], bool]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise IdentityStoreError(
+                "audit_limit_invalid", "Audit limit must be from 1 to 100."
+            )
+        clauses = ["organization_id = ?"]
+        parameters: list[object] = [organization_id]
+        if outcome is not None:
+            if not isinstance(outcome, AuditOutcome):
+                raise IdentityStoreError(
+                    "audit_outcome_invalid", "Audit outcome filter is invalid."
+                )
+            clauses.append("outcome = ?")
+            parameters.append(outcome.value)
+        if after is not None:
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 2
+                or not all(isinstance(value, str) and value for value in after)
+            ):
+                raise IdentityStoreError(
+                    "audit_cursor_invalid", "Audit cursor position is invalid."
+                )
+            clauses.append(
+                "(occurred_at < ? OR (occurred_at = ? AND event_id < ?))"
+            )
+            parameters.extend((after[0], after[0], after[1]))
+        parameters.append(limit + 1)
         connection = self._connect()
         try:
             rows = connection.execute(
-                """
+                f"""
                 SELECT * FROM security_audit_events
-                WHERE organization_id = ?
+                WHERE {' AND '.join(clauses)}
                 ORDER BY occurred_at DESC, event_id DESC
                 LIMIT ?
                 """,
-                (organization_id, limit),
+                tuple(parameters),
             ).fetchall()
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "audit_read_failed", "Unable to read security audit events."
+            ) from exc
         finally:
             connection.close()
-        return tuple(
-            SecurityAuditEvent(
-                event_id=row["event_id"],
-                request_id=row["request_id"],
-                organization_id=row["organization_id"],
-                principal_id=row["principal_id"],
-                token_id=row["token_id"],
-                action=row["action"],
-                resource_type=row["resource_type"],
-                resource_id=row["resource_id"],
-                outcome=AuditOutcome(row["outcome"]),
-                occurred_at=_parse_timestamp(row["occurred_at"]),
-                detail_code=row["detail_code"],
-            )
-            for row in rows
+        has_more = len(rows) > limit
+        return tuple(self._audit_event(row) for row in rows[:limit]), has_more
+
+    def list_audit_events(self, organization_id: str, *, limit: int = 100) -> tuple[SecurityAuditEvent, ...]:
+        events, _ = self.list_audit_events_page(
+            organization_id,
+            limit=min(limit, 100),
         )
+        return events
 
 
 __all__ = [

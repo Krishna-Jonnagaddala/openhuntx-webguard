@@ -38,6 +38,17 @@ from .identity import (
     IdentityStoreError,
     IssuedApiToken,
 )
+from .pagination import (
+    CursorPosition,
+    DEFAULT_CURSOR_VALIDITY_SECONDS,
+    DEFAULT_PAGE_LIMIT,
+    MAXIMUM_CURSOR_LENGTH,
+    MAXIMUM_PAGE_LIMIT,
+    PageRequest,
+    PaginationError,
+    SignedCursorCodec,
+    parse_page_request,
+)
 from .rate_limit import FixedWindowRateLimiter, RateLimitDecision, RateLimitError
 from .scheduler import ScanScheduleCoordinator, ScheduleRunSummary
 from .service import ApiServiceError, WebGuardJobService
@@ -50,7 +61,7 @@ from .store import (
 )
 from .worker import ScanJobWorker
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "ApiPermission",
@@ -94,6 +105,15 @@ __all__ = [
     "MAXIMUM_RATE_LIMIT_WINDOW_SECONDS",
     "MAXIMUM_TOKEN_VALIDITY_DAYS",
     "MAXIMUM_WORKER_POLL_SECONDS",
+    "CursorPosition",
+    "DEFAULT_CURSOR_VALIDITY_SECONDS",
+    "DEFAULT_PAGE_LIMIT",
+    "MAXIMUM_CURSOR_LENGTH",
+    "MAXIMUM_PAGE_LIMIT",
+    "PageRequest",
+    "PaginationError",
+    "SignedCursorCodec",
+    "parse_page_request",
     "RateLimitDecision",
     "RateLimitError",
     "ScanJobExecutor",

@@ -260,7 +260,98 @@ class HttpApiTests(unittest.TestCase):
     def test_query_string_is_rejected(self) -> None:
         status, _, payload = self.request("GET", "/healthz?verbose=1", token=None)
         self.assertEqual(status, 400)
-        self.assertEqual(payload["error"]["code"], "request_target_invalid")
+        self.assertEqual(payload["error"]["code"], "request_query_not_allowed")
+
+    def test_job_list_is_paginated_with_opaque_cursor(self) -> None:
+        created_ids = []
+        for index in range(3):
+            body = submission()
+            status, _, created = self.request(
+                "POST",
+                "/v1/jobs",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                    "Idempotency-Key": f"pagination-http-{index}",
+                },
+            )
+            self.assertEqual(status, 201)
+            created_ids.append(created["job_id"])
+        status, _, first = self.request("GET", "/v1/jobs?limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(first["jobs"]), 2)
+        cursor = first["page"]["next_cursor"]
+        self.assertIsInstance(cursor, str)
+        self.assertNotIn(self.context.organization_id, cursor)
+        status, _, second = self.request(
+            "GET", f"/v1/jobs?limit=2&cursor={cursor}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(second["jobs"]), 1)
+        self.assertIsNone(second["page"]["next_cursor"])
+        returned = [item["job_id"] for item in first["jobs"] + second["jobs"]]
+        self.assertEqual(set(returned), set(created_ids))
+        self.assertEqual(len(returned), len(set(returned)))
+
+    def test_job_list_filters_are_bound_to_cursor(self) -> None:
+        body = submission()
+        for index in range(2):
+            self.request(
+                "POST",
+                "/v1/jobs",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                    "Idempotency-Key": f"filter-http-{index}",
+                },
+            )
+        status, _, first = self.request(
+            "GET", "/v1/jobs?limit=1&state=queued&mode=crawl"
+        )
+        self.assertEqual(status, 200)
+        cursor = first["page"]["next_cursor"]
+        status, _, payload = self.request(
+            "GET", f"/v1/jobs?limit=1&state=running&mode=crawl&cursor={cursor}"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "page_cursor_filter_mismatch")
+
+    def test_tampered_cursor_is_rejected(self) -> None:
+        body = submission()
+        for index in range(2):
+            self.request(
+                "POST",
+                "/v1/jobs",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(body)),
+                    "Idempotency-Key": f"tamper-http-{index}",
+                },
+            )
+        _, _, first = self.request("GET", "/v1/jobs?limit=1")
+        cursor = first["page"]["next_cursor"]
+        replacement = "A" if cursor[-1] != "A" else "B"
+        status, _, payload = self.request(
+            "GET", f"/v1/jobs?limit=1&cursor={cursor[:-1]}{replacement}"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "page_cursor_signature_invalid")
+
+    def test_list_query_validation_rejects_duplicate_unknown_and_invalid_values(self) -> None:
+        cases = (
+            ("/v1/jobs?limit=1&limit=2", "page_query_parameter_duplicate"),
+            ("/v1/jobs?unknown=1", "page_query_parameter_unknown"),
+            ("/v1/jobs?limit=101", "page_limit_invalid"),
+            ("/v1/jobs?state=other", "page_filter_invalid"),
+        )
+        for path, code in cases:
+            with self.subTest(path=path):
+                status, _, payload = self.request("GET", path)
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["code"], code)
 
     def test_unknown_route_is_404(self) -> None:
         status, _, payload = self.request("GET", "/v1/unknown")
@@ -347,7 +438,9 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "permission_denied")
         status, _, listing = self.request("GET", "/v1/schedules", token="viewer")
         self.assertEqual(status, 200)
-        self.assertEqual(listing, {"schedules": []})
+        self.assertEqual(listing["schedules"], [])
+        self.assertEqual(listing["page"]["limit"], 50)
+        self.assertIsNone(listing["page"]["next_cursor"])
 
     def test_schedule_state_body_is_rejected(self) -> None:
         body = schedule_submission()
