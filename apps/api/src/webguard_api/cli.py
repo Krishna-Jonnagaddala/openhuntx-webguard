@@ -20,6 +20,8 @@ from .config import (
     DEFAULT_API_PORT,
     DEFAULT_RATE_LIMIT_REQUESTS,
     DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+    DEFAULT_SCHEDULER_BATCH_SIZE,
+    DEFAULT_SCHEDULER_POLL_SECONDS,
     DEFAULT_WORKER_HEARTBEAT_SECONDS,
     DEFAULT_WORKER_LEASE_SECONDS,
     DEFAULT_WORKER_MAXIMUM_ATTEMPTS,
@@ -35,6 +37,7 @@ from .identity import (
     IdentityStoreError,
 )
 from .rate_limit import FixedWindowRateLimiter
+from .scheduler import ScanScheduleCoordinator
 from .service import WebGuardJobService
 from .store import JobStoreError, ScanJobStore
 from .worker import ScanJobWorker
@@ -62,6 +65,8 @@ def _config(args: argparse.Namespace) -> ServiceConfig:
         worker_lease_seconds=args.worker_lease_seconds,
         worker_heartbeat_seconds=args.worker_heartbeat_seconds,
         worker_maximum_attempts=args.worker_maximum_attempts,
+        scheduler_poll_seconds=args.scheduler_poll_seconds,
+        scheduler_batch_size=args.scheduler_batch_size,
         rate_limit_requests=args.rate_limit_requests,
         rate_limit_window_seconds=args.rate_limit_window_seconds,
     )
@@ -95,12 +100,19 @@ def _components(config: ServiceConfig):
         heartbeat_seconds=config.worker_heartbeat_seconds,
         maximum_attempts=config.worker_maximum_attempts,
     )
+    scheduler = ScanScheduleCoordinator(
+        store=store,
+        authorizations=authorizations,
+        identity=identity,
+        poll_seconds=config.scheduler_poll_seconds,
+        batch_size=config.scheduler_batch_size,
+    )
     authenticator = ApiTokenAuthenticator(identity)
     limiter = FixedWindowRateLimiter(
         requests=config.rate_limit_requests,
         window_seconds=config.rate_limit_window_seconds,
     )
-    return store, identity, service, worker, authenticator, limiter
+    return store, identity, service, worker, scheduler, authenticator, limiter
 
 
 def _init_command(args: argparse.Namespace) -> int:
@@ -203,7 +215,7 @@ def _authorization_assign_command(args: argparse.Namespace) -> int:
 
 def _worker_command(args: argparse.Namespace) -> int:
     config = _config(args)
-    _, _, _, worker, _, _ = _components(config)
+    _, _, _, worker, _, _, _ = _components(config)
     if args.once:
         processed = worker.run_once()
         recovery = worker.last_recovery_summary
@@ -235,14 +247,48 @@ def _worker_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _scheduler_command(args: argparse.Namespace) -> int:
+    config = _config(args)
+    _, _, _, _, scheduler, _, _ = _components(config)
+    if args.once:
+        summary = scheduler.run_once()
+        print(
+            "Schedule pass: "
+            f"inspected={summary.inspected}, enqueued={summary.enqueued}, "
+            f"blocked={summary.blocked}, raced={summary.raced}."
+        )
+        return EXIT_SUCCESS
+    stop_event = threading.Event()
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    print(
+        "WebGuard scheduler started: "
+        f"poll={scheduler.poll_seconds:g}s; batch={scheduler.batch_size}."
+    )
+    print("Press Ctrl+C to stop.")
+    scheduler.run_forever(stop_event)
+    print("WebGuard scheduler stopped.")
+    return EXIT_SUCCESS
+
+
 def _serve_command(args: argparse.Namespace) -> int:
     config = _config(args)
-    _, _, service, worker, authenticator, limiter = _components(config)
+    _, _, service, worker, scheduler, authenticator, limiter = _components(config)
     stop_event = threading.Event()
     worker_thread = threading.Thread(
         target=worker.run_forever,
         args=(stop_event,),
         name="webguard-job-worker",
+        daemon=True,
+    )
+    scheduler_thread = threading.Thread(
+        target=scheduler.run_forever,
+        args=(stop_event,),
+        name="webguard-scan-scheduler",
         daemon=True,
     )
     server = create_server(
@@ -261,12 +307,17 @@ def _serve_command(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     worker_thread.start()
+    scheduler_thread.start()
     bound_host, bound_port = server.server_address[:2]
     print(f"WebGuard API listening on http://{bound_host}:{bound_port}")
     print("Bearer authentication and organization RBAC are enabled.")
     print(
         f"Worker {worker.worker_id} uses renewable database leases "
         f"({worker.lease_seconds:g}s)."
+    )
+    print(
+        "Recurring scan scheduler is enabled "
+        f"({scheduler.poll_seconds:g}s poll interval)."
     )
     print("Binding is loopback-only. Press Ctrl+C to stop.")
     try:
@@ -275,6 +326,7 @@ def _serve_command(args: argparse.Namespace) -> int:
         stop_event.set()
         server.server_close()
         worker_thread.join(timeout=2.0)
+        scheduler_thread.join(timeout=2.0)
     print("WebGuard API stopped.")
     return EXIT_SUCCESS
 
@@ -308,6 +360,16 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_WORKER_MAXIMUM_ATTEMPTS,
     )
     parser.add_argument(
+        "--scheduler-poll-seconds",
+        type=float,
+        default=DEFAULT_SCHEDULER_POLL_SECONDS,
+    )
+    parser.add_argument(
+        "--scheduler-batch-size",
+        type=int,
+        default=DEFAULT_SCHEDULER_BATCH_SIZE,
+    )
+    parser.add_argument(
         "--rate-limit-requests", type=int, default=DEFAULT_RATE_LIMIT_REQUESTS
     )
     parser.add_argument(
@@ -320,7 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="webguard-api",
         description="Authenticated local WebGuard control-plane API and scanner queue.",
     )
-    parser.add_argument("--version", action="version", version="webguard-api 0.3.0")
+    parser.add_argument("--version", action="version", version="webguard-api 0.4.0")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="Initialize service and identity tables.")
@@ -394,6 +456,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_options(worker_parser)
     worker_parser.add_argument("--once", action="store_true")
     worker_parser.set_defaults(handler=_worker_command)
+
+    scheduler_parser = subparsers.add_parser(
+        "scheduler", help="Materialize recurring schedules without the HTTP API."
+    )
+    _add_common_options(scheduler_parser)
+    scheduler_parser.add_argument("--once", action="store_true")
+    scheduler_parser.set_defaults(handler=_scheduler_command)
     return parser
 
 

@@ -15,11 +15,13 @@ from webguard_contracts import (
     ScanJobRecord,
     ScanJobRequest,
     ScanJobState,
+    ScanScheduleRecord,
+    ScanScheduleState,
     ScanStatus,
 )
 
 
-DATABASE_SCHEMA_VERSION = 2
+DATABASE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +180,9 @@ class ScanJobStore:
             if version == 1:
                 self._migrate_v1_to_v2(connection)
                 version = 2
+            if version == 2:
+                self._migrate_v2_to_v3(connection)
+                version = 3
             if version != DATABASE_SCHEMA_VERSION:
                 raise JobStoreError(
                     "job_store_schema_unsupported",
@@ -271,6 +276,79 @@ class ScanJobStore:
             except sqlite3.Error:
                 pass
             raise
+
+    @staticmethod
+    def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+        """Add organization-scoped recurring scan schedules."""
+
+        try:
+            connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE scan_schedules (
+                    schedule_id TEXT PRIMARY KEY,
+                    organization_id TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    authorization_id TEXT NOT NULL,
+                    authorization_sha256 TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    interval_seconds INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    next_run_at TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    last_enqueued_at TEXT,
+                    last_job_id TEXT,
+                    last_error_code TEXT,
+                    last_error_at TEXT,
+                    FOREIGN KEY (last_job_id) REFERENCES scan_jobs(job_id) ON DELETE SET NULL
+                );
+                CREATE INDEX idx_scan_schedules_organization
+                    ON scan_schedules(organization_id, created_at, schedule_id);
+                CREATE INDEX idx_scan_schedules_due
+                    ON scan_schedules(state, next_run_at, schedule_id);
+                UPDATE service_metadata SET value = '3' WHERE key = 'schema_version';
+                COMMIT;
+                """
+            )
+        except sqlite3.Error:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    @staticmethod
+    def _schedule_from_row(row: sqlite3.Row) -> ScanScheduleRecord:
+        next_run_at = _parse_timestamp(row["next_run_at"])
+        created_at = _parse_timestamp(row["created_at"])
+        updated_at = _parse_timestamp(row["updated_at"])
+        assert next_run_at is not None
+        assert created_at is not None
+        assert updated_at is not None
+        return ScanScheduleRecord(
+            schedule_id=row["schedule_id"],
+            organization_id=row["organization_id"],
+            created_by=row["created_by"],
+            name=row["name"],
+            target=row["target"],
+            authorization_id=row["authorization_id"],
+            authorization_sha256=row["authorization_sha256"],
+            mode=ScanJobMode(row["mode"]),
+            interval_seconds=int(row["interval_seconds"]),
+            state=ScanScheduleState(row["state"]),
+            created_at=created_at,
+            updated_at=updated_at,
+            next_run_at=next_run_at,
+            revision=int(row["revision"]),
+            last_enqueued_at=_parse_timestamp(row["last_enqueued_at"]),
+            last_job_id=row["last_job_id"],
+            last_error_code=row["last_error_code"],
+            last_error_at=_parse_timestamp(row["last_error_at"]),
+        )
 
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> ScanJobRecord:
@@ -1230,6 +1308,468 @@ class ScanJobStore:
             raise JobStoreError(
                 "job_store_transition_failed",
                 "Unable to persist the scan-job state transition.",
+            ) from exc
+        finally:
+            connection.close()
+
+
+    def create_schedule(
+        self,
+        *,
+        organization_id: str,
+        created_by: str,
+        name: str,
+        target: str,
+        authorization_id: str,
+        authorization_sha256: str,
+        mode: ScanJobMode,
+        interval_seconds: int,
+        starts_at: datetime,
+        now: datetime,
+        schedule_id: str | None = None,
+    ) -> ScanScheduleRecord:
+        record = ScanScheduleRecord(
+            schedule_id=str(uuid4()) if schedule_id is None else schedule_id,
+            organization_id=organization_id,
+            created_by=created_by,
+            name=name,
+            target=target,
+            authorization_id=authorization_id,
+            authorization_sha256=authorization_sha256,
+            mode=mode,
+            interval_seconds=interval_seconds,
+            state=ScanScheduleState.ACTIVE,
+            created_at=now,
+            updated_at=now,
+            next_run_at=starts_at,
+        )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO scan_schedules(
+                    schedule_id, organization_id, created_by, name, target,
+                    authorization_id, authorization_sha256, mode,
+                    interval_seconds, state, created_at, updated_at,
+                    next_run_at, revision, last_enqueued_at, last_job_id,
+                    last_error_code, last_error_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
+                """,
+                (
+                    record.schedule_id,
+                    record.organization_id,
+                    record.created_by,
+                    record.name,
+                    record.target,
+                    record.authorization_id,
+                    record.authorization_sha256,
+                    record.mode.value,
+                    record.interval_seconds,
+                    record.state.value,
+                    _timestamp(record.created_at),
+                    _timestamp(record.updated_at),
+                    _timestamp(record.next_run_at),
+                    record.revision,
+                ),
+            )
+            connection.execute("COMMIT")
+            return record
+        except sqlite3.IntegrityError as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "schedule_conflict",
+                "The scan schedule conflicts with an existing record.",
+            ) from exc
+        except sqlite3.Error as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "schedule_create_failed",
+                "Unable to persist the scan schedule.",
+            ) from exc
+        finally:
+            connection.close()
+
+    def get_schedule_scoped(
+        self,
+        schedule_id: str,
+        organization_id: str,
+    ) -> ScanScheduleRecord:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT * FROM scan_schedules
+                WHERE schedule_id = ? AND organization_id = ?
+                """,
+                (schedule_id, organization_id),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "schedule_read_failed",
+                "Unable to read scan-schedule metadata.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            raise JobStoreError("schedule_not_found", "Scan schedule was not found.")
+        return self._schedule_from_row(row)
+
+    def list_schedules_scoped(
+        self,
+        organization_id: str,
+        *,
+        limit: int = 100,
+    ) -> tuple[ScanScheduleRecord, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise JobStoreError(
+                "schedule_list_limit_invalid",
+                "Schedule list limit must be from 1 to 1000.",
+            )
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM scan_schedules
+                WHERE organization_id = ?
+                ORDER BY created_at, schedule_id
+                LIMIT ?
+                """,
+                (organization_id, limit),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "schedule_read_failed",
+                "Unable to read scan-schedule metadata.",
+            ) from exc
+        finally:
+            connection.close()
+        return tuple(self._schedule_from_row(row) for row in rows)
+
+    def pause_schedule_scoped(
+        self,
+        schedule_id: str,
+        organization_id: str,
+        *,
+        now: datetime,
+    ) -> ScanScheduleRecord:
+        return self._set_schedule_state(
+            schedule_id,
+            organization_id,
+            state=ScanScheduleState.PAUSED,
+            now=now,
+            next_run_at=None,
+        )
+
+    def resume_schedule_scoped(
+        self,
+        schedule_id: str,
+        organization_id: str,
+        *,
+        now: datetime,
+    ) -> ScanScheduleRecord:
+        current = self.get_schedule_scoped(schedule_id, organization_id)
+        return self._set_schedule_state(
+            schedule_id,
+            organization_id,
+            state=ScanScheduleState.ACTIVE,
+            now=now,
+            next_run_at=now + timedelta(seconds=current.interval_seconds),
+        )
+
+    def _set_schedule_state(
+        self,
+        schedule_id: str,
+        organization_id: str,
+        *,
+        state: ScanScheduleState,
+        now: datetime,
+        next_run_at: datetime | None,
+    ) -> ScanScheduleRecord:
+        timestamp = _timestamp(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM scan_schedules
+                WHERE schedule_id = ? AND organization_id = ?
+                """,
+                (schedule_id, organization_id),
+            ).fetchone()
+            if row is None:
+                raise JobStoreError("schedule_not_found", "Scan schedule was not found.")
+            revision = int(row["revision"]) + 1
+            effective_next = row["next_run_at"] if next_run_at is None else _timestamp(next_run_at)
+            connection.execute(
+                """
+                UPDATE scan_schedules
+                SET state = ?, updated_at = ?, next_run_at = ?, revision = ?,
+                    last_error_code = NULL, last_error_at = NULL
+                WHERE schedule_id = ? AND organization_id = ? AND revision = ?
+                """,
+                (
+                    state.value,
+                    timestamp,
+                    effective_next,
+                    revision,
+                    schedule_id,
+                    organization_id,
+                    row["revision"],
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM scan_schedules WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+            assert updated is not None
+            return self._schedule_from_row(updated)
+        except JobStoreError:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        except sqlite3.Error as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "schedule_update_failed",
+                "Unable to update the scan schedule.",
+            ) from exc
+        finally:
+            connection.close()
+
+    def list_due_schedules(
+        self,
+        *,
+        now: datetime,
+        limit: int = 100,
+    ) -> tuple[ScanScheduleRecord, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise JobStoreError(
+                "schedule_batch_limit_invalid",
+                "Schedule batch limit must be from 1 to 1000.",
+            )
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM scan_schedules
+                WHERE state = ? AND next_run_at <= ?
+                ORDER BY next_run_at, schedule_id
+                LIMIT ?
+                """,
+                (ScanScheduleState.ACTIVE.value, _timestamp(now), limit),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "schedule_due_read_failed",
+                "Unable to read due scan schedules.",
+            ) from exc
+        finally:
+            connection.close()
+        return tuple(self._schedule_from_row(row) for row in rows)
+
+    @staticmethod
+    def _next_schedule_time(
+        scheduled_for: datetime,
+        *,
+        interval_seconds: int,
+        now: datetime,
+    ) -> datetime:
+        interval = timedelta(seconds=interval_seconds)
+        next_run = scheduled_for + interval
+        if next_run > now:
+            return next_run
+        intervals = ((now - scheduled_for) // interval) + 1
+        return scheduled_for + (interval * intervals)
+
+    def enqueue_due_schedule(
+        self,
+        schedule_id: str,
+        *,
+        expected_revision: int,
+        authorization_sha256: str,
+        now: datetime,
+    ) -> tuple[ScanScheduleRecord, ScanJobRecord] | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM scan_schedules WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+            if row is None:
+                connection.execute("COMMIT")
+                return None
+            schedule = self._schedule_from_row(row)
+            if (
+                schedule.state is not ScanScheduleState.ACTIVE
+                or schedule.revision != expected_revision
+                or schedule.next_run_at > now
+            ):
+                connection.execute("COMMIT")
+                return None
+            scheduled_for = schedule.next_run_at
+            idempotency_key = (
+                f"schedule:{schedule.schedule_id}:{_timestamp(scheduled_for)}"
+            )
+            request = ScanJobRequest(
+                idempotency_key=idempotency_key,
+                target=schedule.target,
+                authorization_id=schedule.authorization_id,
+                authorization_sha256=authorization_sha256,
+                mode=schedule.mode,
+                submitted_at=now,
+            )
+            record = ScanJobRecord(
+                job_id=str(uuid4()),
+                request=request,
+                state=ScanJobState.QUEUED,
+                updated_at=now,
+            )
+            connection.execute(
+                """
+                INSERT INTO scan_jobs(
+                    job_id, idempotency_key, request_fingerprint,
+                    target, authorization_id, authorization_sha256, mode,
+                    submitted_at, state, updated_at, revision,
+                    cancellation_requested
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.job_id,
+                    request.idempotency_key,
+                    request.fingerprint,
+                    request.target,
+                    request.authorization_id,
+                    request.authorization_sha256,
+                    request.mode.value,
+                    _timestamp(request.submitted_at),
+                    record.state.value,
+                    _timestamp(record.updated_at),
+                    record.revision,
+                    0,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO job_scopes(job_id, organization_id, submitted_by)
+                VALUES (?, ?, ?)
+                """,
+                (record.job_id, schedule.organization_id, schedule.created_by),
+            )
+            next_run_at = self._next_schedule_time(
+                scheduled_for,
+                interval_seconds=schedule.interval_seconds,
+                now=now,
+            )
+            updated_count = connection.execute(
+                """
+                UPDATE scan_schedules
+                SET authorization_sha256 = ?, updated_at = ?, next_run_at = ?,
+                    revision = revision + 1, last_enqueued_at = ?, last_job_id = ?,
+                    last_error_code = NULL, last_error_at = NULL
+                WHERE schedule_id = ? AND revision = ? AND state = ?
+                """,
+                (
+                    authorization_sha256,
+                    _timestamp(now),
+                    _timestamp(next_run_at),
+                    _timestamp(now),
+                    record.job_id,
+                    schedule.schedule_id,
+                    expected_revision,
+                    ScanScheduleState.ACTIVE.value,
+                ),
+            )
+            if updated_count.rowcount != 1:
+                connection.execute("ROLLBACK")
+                return None
+            updated = connection.execute(
+                "SELECT * FROM scan_schedules WHERE schedule_id = ?",
+                (schedule.schedule_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+            assert updated is not None
+            return self._schedule_from_row(updated), record
+        except sqlite3.IntegrityError as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "schedule_enqueue_conflict",
+                "The scheduled run conflicts with an existing job.",
+            ) from exc
+        except sqlite3.Error as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "schedule_enqueue_failed",
+                "Unable to enqueue the scheduled scan.",
+            ) from exc
+        finally:
+            connection.close()
+
+    def block_due_schedule(
+        self,
+        schedule_id: str,
+        *,
+        expected_revision: int,
+        error_code: str,
+        now: datetime,
+    ) -> ScanScheduleRecord | None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            updated_count = connection.execute(
+                """
+                UPDATE scan_schedules
+                SET state = ?, updated_at = ?, revision = revision + 1,
+                    last_error_code = ?, last_error_at = ?
+                WHERE schedule_id = ? AND revision = ? AND state = ?
+                """,
+                (
+                    ScanScheduleState.PAUSED.value,
+                    _timestamp(now),
+                    error_code,
+                    _timestamp(now),
+                    schedule_id,
+                    expected_revision,
+                    ScanScheduleState.ACTIVE.value,
+                ),
+            )
+            if updated_count.rowcount != 1:
+                connection.execute("COMMIT")
+                return None
+            row = connection.execute(
+                "SELECT * FROM scan_schedules WHERE schedule_id = ?",
+                (schedule_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+            assert row is not None
+            return self._schedule_from_row(row)
+        except sqlite3.Error as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise JobStoreError(
+                "schedule_block_failed",
+                "Unable to pause the invalid scan schedule.",
             ) from exc
         finally:
             connection.close()

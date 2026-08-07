@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client
 import json
 import tempfile
+from datetime import timedelta
 import threading
 import unittest
 from pathlib import Path
@@ -36,6 +37,23 @@ def submission() -> bytes:
             "authorization_id": AUTH_ID,
             "confirm_authorization": AUTH_ID,
             "mode": "crawl",
+        }
+    ).encode("utf-8")
+
+
+def schedule_submission() -> bytes:
+    starts_at = (NOW + timedelta(hours=1)).isoformat(
+        timespec="microseconds"
+    ).replace("+00:00", "Z")
+    return json.dumps(
+        {
+            "name": "Daily passive crawl",
+            "target": TARGET,
+            "authorization_id": AUTH_ID,
+            "confirm_authorization": AUTH_ID,
+            "mode": "crawl",
+            "interval_seconds": 86400,
+            "starts_at": starts_at,
         }
     ).encode("utf-8")
 
@@ -276,6 +294,81 @@ class HttpApiTests(unittest.TestCase):
         status, _, payload = self.request("GET", "/v1/audit-events")
         self.assertEqual(status, 200)
         self.assertTrue(payload["events"])
+
+    def test_schedule_create_list_pause_and_resume(self) -> None:
+        body = schedule_submission()
+        status, _, created = self.request(
+            "POST",
+            "/v1/schedules",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        self.assertEqual(status, 201)
+        schedule_id = created["schedule_id"]
+        status, _, listing = self.request("GET", "/v1/schedules")
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["schedules"][0]["schedule_id"], schedule_id)
+        status, _, fetched = self.request("GET", f"/v1/schedules/{schedule_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["schedule_id"], schedule_id)
+        status, _, paused = self.request(
+            "POST",
+            f"/v1/schedules/{schedule_id}/pause",
+            body=b"",
+            headers={"Content-Length": "0"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(paused["state"], "paused")
+        status, _, resumed = self.request(
+            "POST",
+            f"/v1/schedules/{schedule_id}/resume",
+            body=b"",
+            headers={"Content-Length": "0"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(resumed["state"], "active")
+
+    def test_viewer_can_list_schedules_but_cannot_create(self) -> None:
+        body = schedule_submission()
+        status, _, payload = self.request(
+            "POST",
+            "/v1/schedules",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+            token="viewer",
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"]["code"], "permission_denied")
+        status, _, listing = self.request("GET", "/v1/schedules", token="viewer")
+        self.assertEqual(status, 200)
+        self.assertEqual(listing, {"schedules": []})
+
+    def test_schedule_state_body_is_rejected(self) -> None:
+        body = schedule_submission()
+        status, _, created = self.request(
+            "POST",
+            "/v1/schedules",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        self.assertEqual(status, 201)
+        status, _, payload = self.request(
+            "POST",
+            f"/v1/schedules/{created['schedule_id']}/pause",
+            body=b"x",
+            headers={"Content-Length": "1"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "schedule_body_not_allowed")
 
     def test_viewer_cannot_read_audit_events(self) -> None:
         status, _, payload = self.request("GET", "/v1/audit-events", token="viewer")

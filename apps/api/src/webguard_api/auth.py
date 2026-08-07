@@ -15,6 +15,9 @@ class ApiPermission(str, Enum):
     JOB_SUBMIT = "jobs.submit"
     JOB_READ = "jobs.read"
     JOB_CANCEL = "jobs.cancel"
+    SCHEDULE_CREATE = "schedules.create"
+    SCHEDULE_READ = "schedules.read"
+    SCHEDULE_UPDATE = "schedules.update"
     AUDIT_READ = "audit.read"
     IDENTITY_MANAGE = "identity.manage"
     AUTHORIZATION_ASSIGN = "authorization.assign"
@@ -24,9 +27,18 @@ _ROLE_PERMISSIONS = {
     OrganizationRole.OWNER: frozenset(ApiPermission),
     OrganizationRole.ADMINISTRATOR: frozenset(ApiPermission),
     OrganizationRole.ANALYST: frozenset(
-        {ApiPermission.JOB_SUBMIT, ApiPermission.JOB_READ, ApiPermission.JOB_CANCEL}
+        {
+            ApiPermission.JOB_SUBMIT,
+            ApiPermission.JOB_READ,
+            ApiPermission.JOB_CANCEL,
+            ApiPermission.SCHEDULE_CREATE,
+            ApiPermission.SCHEDULE_READ,
+            ApiPermission.SCHEDULE_UPDATE,
+        }
     ),
-    OrganizationRole.VIEWER: frozenset({ApiPermission.JOB_READ}),
+    OrganizationRole.VIEWER: frozenset(
+        {ApiPermission.JOB_READ, ApiPermission.SCHEDULE_READ}
+    ),
 }
 
 

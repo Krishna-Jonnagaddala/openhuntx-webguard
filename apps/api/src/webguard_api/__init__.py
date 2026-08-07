@@ -12,6 +12,8 @@ from .config import (
     DEFAULT_API_PORT,
     DEFAULT_RATE_LIMIT_REQUESTS,
     DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+    DEFAULT_SCHEDULER_BATCH_SIZE,
+    DEFAULT_SCHEDULER_POLL_SECONDS,
     DEFAULT_WORKER_HEARTBEAT_SECONDS,
     DEFAULT_WORKER_LEASE_SECONDS,
     DEFAULT_WORKER_MAXIMUM_ATTEMPTS,
@@ -19,6 +21,8 @@ from .config import (
     MAXIMUM_API_REQUEST_BYTES,
     MAXIMUM_RATE_LIMIT_REQUESTS,
     MAXIMUM_RATE_LIMIT_WINDOW_SECONDS,
+    MAXIMUM_SCHEDULER_BATCH_SIZE,
+    MAXIMUM_SCHEDULER_POLL_SECONDS,
     MAXIMUM_WORKER_POLL_SECONDS,
     ServiceConfig,
     ServiceConfigError,
@@ -35,6 +39,7 @@ from .identity import (
     IssuedApiToken,
 )
 from .rate_limit import FixedWindowRateLimiter, RateLimitDecision, RateLimitError
+from .scheduler import ScanScheduleCoordinator, ScheduleRunSummary
 from .service import ApiServiceError, WebGuardJobService
 from .store import (
     DATABASE_SCHEMA_VERSION,
@@ -45,7 +50,7 @@ from .store import (
 )
 from .worker import ScanJobWorker
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "ApiPermission",
@@ -63,6 +68,12 @@ __all__ = [
     "DEFAULT_RATE_LIMIT_REQUESTS",
     "DEFAULT_RATE_LIMIT_WINDOW_SECONDS",
     "DEFAULT_TOKEN_VALIDITY_DAYS",
+    "DEFAULT_SCHEDULER_BATCH_SIZE",
+    "DEFAULT_SCHEDULER_POLL_SECONDS",
+    "MAXIMUM_SCHEDULER_BATCH_SIZE",
+    "MAXIMUM_SCHEDULER_POLL_SECONDS",
+    "ScanScheduleCoordinator",
+    "ScheduleRunSummary",
     "DEFAULT_WORKER_HEARTBEAT_SECONDS",
     "DEFAULT_WORKER_LEASE_SECONDS",
     "DEFAULT_WORKER_MAXIMUM_ATTEMPTS",

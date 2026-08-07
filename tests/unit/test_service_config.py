@@ -80,6 +80,19 @@ class ServiceConfigTests(unittest.TestCase):
                     authorization_directory=path,
                 )
 
+    def test_scheduler_defaults_are_bounded(self) -> None:
+        config = ServiceConfig()
+        self.assertEqual(config.scheduler_poll_seconds, 1.0)
+        self.assertEqual(config.scheduler_batch_size, 100)
+
+    def test_scheduler_configuration_is_validated(self) -> None:
+        with self.assertRaises(ServiceConfigError) as context:
+            ServiceConfig(scheduler_poll_seconds=0.01)
+        self.assertEqual(context.exception.code, "service_scheduler_poll_invalid")
+        with self.assertRaises(ServiceConfigError) as context:
+            ServiceConfig(scheduler_batch_size=0)
+        self.assertEqual(context.exception.code, "service_scheduler_batch_invalid")
+
     def test_rate_limit_defaults_are_bounded(self) -> None:
         config = ServiceConfig()
         self.assertEqual(config.rate_limit_requests, 120)

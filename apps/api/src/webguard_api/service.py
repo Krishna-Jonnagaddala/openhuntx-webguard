@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 from uuid import uuid4
 
@@ -12,8 +12,11 @@ from webguard_contracts import (
     ScanJobLoadError,
     ScanJobRequest,
     ScanJobValidationError,
+    ScanScheduleLoadError,
+    ScanScheduleValidationError,
     SecurityAuditEvent,
     load_scan_job_submission_json,
+    load_scan_schedule_submission_json,
 )
 
 from .auth import ApiPermission, AuthContext, AuthenticationError
@@ -319,6 +322,222 @@ class WebGuardJobService:
             if record.error_code is None
             else {"code": record.error_code, "message": record.error_message},
         }
+
+    def create_schedule(
+        self,
+        context: AuthContext,
+        body: bytes,
+        *,
+        request_id: str,
+    ) -> dict:
+        self._require(
+            context,
+            ApiPermission.SCHEDULE_CREATE,
+            request_id=request_id,
+            action="schedules.create",
+            resource_type="scan_schedule",
+            resource_id="pending",
+        )
+        try:
+            submission = load_scan_schedule_submission_json(body)
+        except ScanScheduleLoadError as exc:
+            self._audit(
+                context,
+                request_id=request_id,
+                action="schedules.create",
+                resource_type="scan_schedule",
+                resource_id="pending",
+                outcome=AuditOutcome.FAILED,
+                detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        if not self.identity.authorization_is_assigned(
+            context.organization_id,
+            submission.authorization_id,
+        ):
+            raise ApiServiceError(
+                "authorization_not_found",
+                "Authorization was not found for this organization.",
+                status=404,
+            )
+        try:
+            authorization = self.authorizations.get(submission.authorization_id)
+        except AuthorizationRepositoryError as exc:
+            status = 404 if exc.code == "authorization_not_found" else 500
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        if authorization.target != submission.target:
+            raise ApiServiceError(
+                "authorization_target_mismatch",
+                "The requested target does not match the server-side authorization.",
+                status=400,
+            )
+        now = self.clock()
+        if submission.starts_at < now:
+            raise ApiServiceError(
+                "schedule_start_in_past",
+                "starts_at cannot be earlier than the current service time.",
+                status=400,
+            )
+        if submission.starts_at > now + timedelta(days=365):
+            raise ApiServiceError(
+                "schedule_start_too_distant",
+                "starts_at cannot be more than 365 days in the future.",
+                status=400,
+            )
+        try:
+            record = self.store.create_schedule(
+                organization_id=context.organization_id,
+                created_by=context.principal_id,
+                name=submission.name,
+                target=submission.target,
+                authorization_id=submission.authorization_id,
+                authorization_sha256=authorization.fingerprint,
+                mode=submission.mode,
+                interval_seconds=submission.interval_seconds,
+                starts_at=submission.starts_at,
+                now=now,
+            )
+        except (JobStoreError, ScanScheduleValidationError) as exc:
+            status = 409 if getattr(exc, "code", "") == "schedule_conflict" else 500
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        self._audit(
+            context,
+            request_id=request_id,
+            action="schedules.create",
+            resource_type="scan_schedule",
+            resource_id=record.schedule_id,
+            outcome=AuditOutcome.SUCCEEDED,
+        )
+        return record.to_public_dict()
+
+    def list_schedules(self, context: AuthContext, *, request_id: str) -> dict:
+        self._require(
+            context,
+            ApiPermission.SCHEDULE_READ,
+            request_id=request_id,
+            action="schedules.list",
+            resource_type="organization",
+            resource_id=context.organization_id,
+        )
+        try:
+            schedules = self.store.list_schedules_scoped(context.organization_id)
+        except JobStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        self._audit(
+            context,
+            request_id=request_id,
+            action="schedules.list",
+            resource_type="organization",
+            resource_id=context.organization_id,
+            outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {"schedules": [schedule.to_public_dict() for schedule in schedules]}
+
+    def get_schedule(
+        self,
+        context: AuthContext,
+        schedule_id: str,
+        *,
+        request_id: str,
+    ) -> dict:
+        self._require(
+            context,
+            ApiPermission.SCHEDULE_READ,
+            request_id=request_id,
+            action="schedules.read",
+            resource_type="scan_schedule",
+            resource_id=schedule_id,
+        )
+        try:
+            record = self.store.get_schedule_scoped(
+                schedule_id,
+                context.organization_id,
+            )
+        except JobStoreError as exc:
+            status = 404 if exc.code == "schedule_not_found" else 500
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        self._audit(
+            context,
+            request_id=request_id,
+            action="schedules.read",
+            resource_type="scan_schedule",
+            resource_id=schedule_id,
+            outcome=AuditOutcome.SUCCEEDED,
+        )
+        return record.to_public_dict()
+
+    def pause_schedule(
+        self,
+        context: AuthContext,
+        schedule_id: str,
+        *,
+        request_id: str,
+    ) -> dict:
+        return self._update_schedule_state(
+            context,
+            schedule_id,
+            request_id=request_id,
+            action="schedules.pause",
+            resume=False,
+        )
+
+    def resume_schedule(
+        self,
+        context: AuthContext,
+        schedule_id: str,
+        *,
+        request_id: str,
+    ) -> dict:
+        return self._update_schedule_state(
+            context,
+            schedule_id,
+            request_id=request_id,
+            action="schedules.resume",
+            resume=True,
+        )
+
+    def _update_schedule_state(
+        self,
+        context: AuthContext,
+        schedule_id: str,
+        *,
+        request_id: str,
+        action: str,
+        resume: bool,
+    ) -> dict:
+        self._require(
+            context,
+            ApiPermission.SCHEDULE_UPDATE,
+            request_id=request_id,
+            action=action,
+            resource_type="scan_schedule",
+            resource_id=schedule_id,
+        )
+        try:
+            if resume:
+                record = self.store.resume_schedule_scoped(
+                    schedule_id,
+                    context.organization_id,
+                    now=self.clock(),
+                )
+            else:
+                record = self.store.pause_schedule_scoped(
+                    schedule_id,
+                    context.organization_id,
+                    now=self.clock(),
+                )
+        except JobStoreError as exc:
+            status = 404 if exc.code == "schedule_not_found" else 500
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        self._audit(
+            context,
+            request_id=request_id,
+            action=action,
+            resource_type="scan_schedule",
+            resource_id=schedule_id,
+            outcome=AuditOutcome.SUCCEEDED,
+        )
+        return record.to_public_dict()
 
     def me(self, context: AuthContext, *, request_id: str) -> dict:
         self._audit(
