@@ -103,6 +103,42 @@ class RateLimiterTests(unittest.TestCase):
         limiter.check("a", now_epoch=1)
         limiter.check("b", now_epoch=1)
 
+    def test_release_refunds_only_one_reservation(self):
+        limiter = FixedWindowRateLimiter(
+            requests=2,
+            window_seconds=60,
+        )
+
+        limiter.check(
+            "token",
+            now_epoch=1,
+        )
+        limiter.check(
+            "token",
+            now_epoch=2,
+        )
+
+        limiter.release(
+            "token",
+            now_epoch=2,
+        )
+
+        decision = limiter.check(
+            "token",
+            now_epoch=3,
+        )
+
+        self.assertEqual(
+            decision.remaining,
+            0,
+        )
+
+        with self.assertRaises(RateLimitError):
+            limiter.check(
+                "token",
+                now_epoch=4,
+            )
+
     def test_invalid_configuration_is_rejected(self):
         with self.assertRaises(ValueError):
             FixedWindowRateLimiter(requests=0, window_seconds=60)

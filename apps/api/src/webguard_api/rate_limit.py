@@ -35,6 +35,36 @@ class FixedWindowRateLimiter:
         self._lock = threading.Lock()
         self._windows: dict[str, tuple[int, int]] = {}
 
+    def release(
+        self,
+        key: str,
+        *,
+        now_epoch: float,
+    ) -> None:
+        """Release exactly one reservation from the matching window."""
+        window = int(now_epoch // self.window_seconds)
+
+        with self._lock:
+            current = self._windows.get(key)
+
+            if current is None:
+                return
+
+            current_window, count = current
+
+            # Never modify a newer window using a reservation
+            # that belonged to an older one.
+            if current_window != window:
+                return
+
+            if count <= 1:
+                self._windows.pop(key, None)
+            else:
+                self._windows[key] = (
+                    current_window,
+                    count - 1,
+                )
+
     def check(self, key: str, *, now_epoch: float) -> RateLimitDecision:
         window = int(now_epoch // self.window_seconds)
         with self._lock:

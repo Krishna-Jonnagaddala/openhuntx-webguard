@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
 from .auth import ApiTokenAuthenticator, AuthContext, AuthenticationError
+from .identity import TOKEN_PREFIX
 from .pagination import PaginationError, parse_page_request
 from .rate_limit import FixedWindowRateLimiter, RateLimitDecision, RateLimitError
 from .service import ApiServiceError, WebGuardJobService
@@ -243,12 +244,84 @@ def build_handler(
                 )
             return canonical
 
-        def _authenticate(self) -> tuple[AuthContext, RateLimitDecision]:
-            context = authenticator.authenticate(
-                self.headers.get_all("Authorization") or [],
-                now=clock(),
+        def _authentication_failure_key(
+            self,
+            authorization_headers: list[str],
+        ) -> str:
+            """Derive a secret-free bucket for failed authentication."""
+            if len(authorization_headers) == 1:
+                value = authorization_headers[0]
+                scheme, separator, token = value.partition(" ")
+
+                if (
+                    separator == " "
+                    and scheme.lower() == "bearer"
+                    and token
+                    and token.strip() == token
+                ):
+                    parts = token.split("_", 2)
+
+                    if (
+                        len(parts) == 3
+                        and parts[0] == TOKEN_PREFIX
+                        and parts[2]
+                    ):
+                        try:
+                            canonical = str(UUID(parts[1]))
+                        except (ValueError, AttributeError):
+                            pass
+                        else:
+                            if canonical == parts[1]:
+                                return (
+                                    "auth-failure-token:"
+                                    f"{canonical}"
+                                )
+
+            return (
+                "auth-failure-peer:"
+                f"{self.client_address[0]}"
             )
-            decision = rate_limiter.check(context.token_id, now_epoch=epoch_clock())
+
+        def _authenticate(self) -> tuple[AuthContext, RateLimitDecision]:
+            authorization_headers = (
+                self.headers.get_all("Authorization") or []
+            )
+            now_epoch = epoch_clock()
+
+            failure_key = self._authentication_failure_key(
+                authorization_headers
+            )
+
+            # Atomically reserve pre-authentication capacity before any
+            # token-secret verification. Failed authentication leaves this
+            # reservation consumed.
+            rate_limiter.check(
+                failure_key,
+                now_epoch=now_epoch,
+            )
+
+            try:
+                context = authenticator.authenticate(
+                    authorization_headers,
+                    now=clock(),
+                )
+            except AuthenticationError:
+                # The reservation remains consumed and therefore records
+                # this failed authentication attempt.
+                raise
+
+            # Refund only this successful request's reservation.
+            # Concurrent authentication failures remain counted.
+            rate_limiter.release(
+                failure_key,
+                now_epoch=now_epoch,
+            )
+
+            # Preserve the existing authenticated per-token quota.
+            decision = rate_limiter.check(
+                context.token_id,
+                now_epoch=now_epoch,
+            )
             return context, decision
 
         @staticmethod
