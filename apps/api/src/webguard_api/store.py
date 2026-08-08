@@ -1190,19 +1190,34 @@ class ScanJobStore:
                 WHERE jobs.state = ? AND jobs.cancellation_requested = 0
                   AND (
                     binding.permit_id IS NULL
-                    OR NOT EXISTS (
-                        SELECT 1
-                        FROM scan_jobs AS running
-                        JOIN job_permits AS running_binding
-                          ON running_binding.job_id = running.job_id
-                        WHERE running.state = 'running'
-                          AND running_binding.permit_id = binding.permit_id
+                    OR (
+                        EXISTS (
+                            SELECT 1
+                            FROM scan_permits AS permit
+                            WHERE permit.permit_id = binding.permit_id
+                              AND permit.permit_sha256 = binding.permit_sha256
+                              AND permit.revoked_at IS NULL
+                              AND permit.not_before <= ?
+                              AND ? < permit.expires_at
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM scan_jobs AS running
+                            JOIN job_permits AS running_binding
+                              ON running_binding.job_id = running.job_id
+                            WHERE running.state = 'running'
+                              AND running_binding.permit_id = binding.permit_id
+                        )
                     )
                   )
                 ORDER BY jobs.submitted_at, jobs.job_id
                 LIMIT 1
                 """,
-                (ScanJobState.QUEUED.value,),
+                (
+                    ScanJobState.QUEUED.value,
+                    timestamp,
+                    timestamp,
+                ),
             ).fetchone()
             if row is None:
                 connection.execute("COMMIT")
@@ -1272,19 +1287,34 @@ class ScanJobStore:
                 WHERE jobs.state = ? AND jobs.cancellation_requested = 0
                   AND (
                     binding.permit_id IS NULL
-                    OR NOT EXISTS (
-                        SELECT 1
-                        FROM scan_jobs AS running
-                        JOIN job_permits AS running_binding
-                          ON running_binding.job_id = running.job_id
-                        WHERE running.state = 'running'
-                          AND running_binding.permit_id = binding.permit_id
+                    OR (
+                        EXISTS (
+                            SELECT 1
+                            FROM scan_permits AS permit
+                            WHERE permit.permit_id = binding.permit_id
+                              AND permit.permit_sha256 = binding.permit_sha256
+                              AND permit.revoked_at IS NULL
+                              AND permit.not_before <= ?
+                              AND ? < permit.expires_at
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM scan_jobs AS running
+                            JOIN job_permits AS running_binding
+                              ON running_binding.job_id = running.job_id
+                            WHERE running.state = 'running'
+                              AND running_binding.permit_id = binding.permit_id
+                        )
                     )
                   )
                 ORDER BY jobs.submitted_at, jobs.job_id
                 LIMIT 1
                 """,
-                (ScanJobState.QUEUED.value,),
+                (
+                    ScanJobState.QUEUED.value,
+                    timestamp,
+                    timestamp,
+                ),
             ).fetchone()
             if row is None:
                 connection.execute("COMMIT")
@@ -2369,6 +2399,31 @@ class ScanJobStore:
                     "trustscan_schedule_binding_changed",
                     "TrustScan schedule permit binding changed before enqueue.",
                 )
+
+            permit_row = connection.execute(
+                """
+                SELECT permit_id
+                FROM scan_permits
+                WHERE permit_id = ?
+                  AND organization_id = ?
+                  AND permit_sha256 = ?
+                  AND revoked_at IS NULL
+                  AND not_before <= ?
+                  AND ? < expires_at
+                """,
+                (
+                    permit_id,
+                    schedule.organization_id,
+                    permit_sha256,
+                    _timestamp(now),
+                    _timestamp(now),
+                ),
+            ).fetchone()
+
+            if permit_row is None:
+                connection.execute("COMMIT")
+                return None
+
             scheduled_for = schedule.next_run_at
             idempotency_key = (
                 f"schedule:{schedule.schedule_id}:{_timestamp(scheduled_for)}"
