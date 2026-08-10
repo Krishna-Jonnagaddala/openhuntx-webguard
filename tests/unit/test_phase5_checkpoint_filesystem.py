@@ -47,7 +47,6 @@ class Phase5CheckpointFilesystemTests(unittest.TestCase):
                 overwrite=False,
             )
 
-            replacement_bytes = replacement_path.read_bytes()
             real_open = os.open
             replaced = False
 
@@ -63,11 +62,14 @@ class Phase5CheckpointFilesystemTests(unittest.TestCase):
                     not replaced
                     and Path(target) == checkpoint_path
                 ):
-                    checkpoint_path.unlink()
-                    checkpoint_path.write_bytes(
-                        replacement_bytes
+                    # Keep the replacement alive before the race so
+                    # it has a distinct filesystem identity. unlink()
+                    # followed by create can immediately reuse an inode
+                    # on Linux and makes the race injection nondeterministic.
+                    os.replace(
+                        replacement_path,
+                        checkpoint_path,
                     )
-                    os.chmod(checkpoint_path, 0o600)
                     replaced = True
 
                 return real_open(
@@ -105,6 +107,10 @@ class Phase5CheckpointFilesystemTests(unittest.TestCase):
             key_path.write_bytes(KEY)
             key_path.chmod(0o600)
 
+            replacement_path = root / "checkpoint-replacement.key"
+            replacement_path.write_bytes(OTHER_KEY)
+            replacement_path.chmod(0o600)
+
             real_open = os.open
             replaced = False
 
@@ -120,9 +126,10 @@ class Phase5CheckpointFilesystemTests(unittest.TestCase):
                     not replaced
                     and Path(target) == key_path
                 ):
-                    key_path.unlink()
-                    key_path.write_bytes(OTHER_KEY)
-                    key_path.chmod(0o600)
+                    os.replace(
+                        replacement_path,
+                        key_path,
+                    )
                     replaced = True
 
                 return real_open(
