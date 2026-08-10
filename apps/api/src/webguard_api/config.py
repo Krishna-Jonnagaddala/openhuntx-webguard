@@ -7,6 +7,8 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+from .service_secrets import default_service_secret_path
+
 
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8765
@@ -63,6 +65,7 @@ class ServiceConfig:
     host: str = DEFAULT_API_HOST
     port: int = DEFAULT_API_PORT
     database_path: Path = Path("var/webguard-api/jobs.sqlite3")
+    service_secret_path: Path | None = None
     authorization_directory: Path = Path("authorizations")
     artifact_directory: Path = Path("scan-results/service")
     maximum_request_bytes: int = DEFAULT_API_MAXIMUM_REQUEST_BYTES
@@ -112,6 +115,22 @@ class ServiceConfig:
             "database_path",
             _path(self.database_path, "database_path"),
         )
+        if self.service_secret_path is None:
+            service_secret_path = default_service_secret_path(
+                self.database_path
+            )
+        else:
+            service_secret_path = _path(
+                self.service_secret_path,
+                "service_secret_path",
+            )
+
+        object.__setattr__(
+            self,
+            "service_secret_path",
+            service_secret_path,
+        )
+
         object.__setattr__(
             self,
             "authorization_directory",
@@ -272,13 +291,17 @@ class ServiceConfig:
 
         resolved = [
             self.database_path.resolve(strict=False),
+            self.service_secret_path.resolve(strict=False),
             self.authorization_directory.resolve(strict=False),
             self.artifact_directory.resolve(strict=False),
         ]
         if len(set(resolved)) != len(resolved):
             raise ServiceConfigError(
                 "service_path_conflict",
-                "Database, authorization, and artifact paths must be distinct.",
+                (
+                    "Database, service-secret, authorization, and "
+                    "artifact paths must be distinct."
+                ),
             )
 
 

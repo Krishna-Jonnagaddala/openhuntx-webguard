@@ -198,15 +198,20 @@ class DatabaseMigrationTests(unittest.TestCase):
         second = ScanJobStore(self.path)
         self.assertEqual(first.path, second.path)
 
-    def test_pagination_secret_and_feed_indexes_exist_after_migration(self) -> None:
+    def test_pagination_secret_is_external_and_feed_indexes_exist_after_migration(self) -> None:
         create_v1_database(self.path)
         store = ScanJobStore(self.path)
         key = store.cursor_signing_key()
         self.assertGreaterEqual(len(key), 32)
         connection = sqlite3.connect(self.path)
         try:
-            secret = connection.execute(
-                "SELECT value FROM service_secrets WHERE key = 'pagination_cursor_hmac'"
+            legacy_secret_table = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'service_secrets'
+                """
             ).fetchone()
             indexes = {
                 row[0]
@@ -216,7 +221,8 @@ class DatabaseMigrationTests(unittest.TestCase):
             }
         finally:
             connection.close()
-        self.assertIsNotNone(secret)
+        self.assertIsNone(legacy_secret_table)
+        self.assertTrue(store.service_secret_path.is_file())
         self.assertIn("idx_scan_jobs_organization_feed", indexes)
         self.assertIn("idx_scan_schedules_organization_feed", indexes)
 
@@ -225,7 +231,7 @@ class DatabaseMigrationTests(unittest.TestCase):
         second = ScanJobStore(self.path).cursor_signing_key()
         self.assertEqual(first, second)
 
-    def test_v4_database_migrates_transactionally_through_trustscan_to_schema_v6(self) -> None:
+    def test_v4_database_migrates_transactionally_through_trustscan_to_current_schema(self) -> None:
         create_v4_database(self.path)
         before = sqlite3.connect(self.path)
         try:
@@ -251,7 +257,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                 after.execute(
                     "SELECT value FROM service_metadata WHERE key = 'schema_version'"
                 ).fetchone(),
-                ("6",),
+                (str(DATABASE_SCHEMA_VERSION),),
             )
             integrity = after.execute("PRAGMA integrity_check").fetchone()
         finally:
@@ -279,8 +285,13 @@ class DatabaseMigrationTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'index'"
                 )
             }
-            secret = connection.execute(
-                "SELECT value FROM service_secrets WHERE key = 'trustscan_ed25519_private_key_v1'"
+            legacy_secret_table = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'service_secrets'
+                """
             ).fetchone()
             version = connection.execute(
                 "SELECT value FROM service_metadata WHERE key = 'schema_version'"
@@ -304,7 +315,8 @@ class DatabaseMigrationTests(unittest.TestCase):
                 "idx_schedule_permits_permit",
             }.issubset(indexes)
         )
-        self.assertIsNotNone(secret)
+        self.assertIsNone(legacy_secret_table)
+        self.assertTrue(store.service_secret_path.is_file())
 
     def test_future_schema_version_is_rejected(self) -> None:
         create_v1_database(self.path)

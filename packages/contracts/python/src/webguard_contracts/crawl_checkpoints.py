@@ -1125,25 +1125,85 @@ def load_crawl_checkpoint_file(
             "checkpoint_symlink_not_allowed",
             "Checkpoint files cannot be symbolic links.",
         )
+
     if not stat.S_ISREG(metadata.st_mode):
         raise CrawlCheckpointLoadError(
             "checkpoint_not_regular_file",
             "Checkpoint path must be a regular file.",
         )
+
     if metadata.st_size > MAXIMUM_CRAWL_CHECKPOINT_BYTES:
         raise CrawlCheckpointLoadError(
             "checkpoint_too_large",
             "Checkpoint file exceeds the size limit.",
         )
+
+    descriptor: int | None = None
+
     try:
-        data = checkpoint_path.read_bytes()
+        flags = os.O_RDONLY
+
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+
+        descriptor = os.open(checkpoint_path, flags)
+        opened = os.fstat(descriptor)
+
+        if (
+            opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+        ):
+            raise CrawlCheckpointLoadError(
+                "checkpoint_file_changed_during_read",
+                (
+                    "Checkpoint file changed between inspection "
+                    "and opening."
+                ),
+            )
+
+        if not stat.S_ISREG(opened.st_mode):
+            raise CrawlCheckpointLoadError(
+                "checkpoint_not_regular_file",
+                "Checkpoint path must be a regular file.",
+            )
+
+        if opened.st_size > MAXIMUM_CRAWL_CHECKPOINT_BYTES:
+            raise CrawlCheckpointLoadError(
+                "checkpoint_too_large",
+                "Checkpoint file exceeds the size limit.",
+            )
+
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = None
+
+        with handle:
+            data = handle.read(
+                MAXIMUM_CRAWL_CHECKPOINT_BYTES + 1
+            )
+
+    except CrawlCheckpointError:
+        raise
+
     except OSError as exc:
         raise CrawlCheckpointLoadError(
             "checkpoint_file_read_failed",
             "Unable to read the checkpoint file.",
         ) from exc
-    return load_crawl_checkpoint_json(data, key)
 
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    if len(data) > MAXIMUM_CRAWL_CHECKPOINT_BYTES:
+        raise CrawlCheckpointLoadError(
+            "checkpoint_too_large",
+            "Checkpoint file exceeds the size limit.",
+        )
+
+    return load_crawl_checkpoint_json(data, key)
 
 def load_crawl_checkpoint_key_file(path: str | Path) -> bytes:
     """Read a private regular key file used for HMAC checkpoint signing."""
@@ -1157,38 +1217,157 @@ def load_crawl_checkpoint_key_file(path: str | Path) -> bytes:
             "Unable to inspect the checkpoint key file.",
         ) from exc
 
+    try:
+        directory_metadata = key_path.parent.lstat()
+    except OSError as exc:
+        raise CrawlCheckpointLoadError(
+            "checkpoint_key_directory_inspection_failed",
+            "Unable to inspect the checkpoint key directory.",
+        ) from exc
+
+    if not stat.S_ISDIR(directory_metadata.st_mode):
+        raise CrawlCheckpointLoadError(
+            "checkpoint_key_directory_invalid",
+            "Checkpoint key parent path must be a directory.",
+        )
+
+    if (
+        os.name == "posix"
+        and stat.S_IMODE(directory_metadata.st_mode) & 0o022
+    ):
+        raise CrawlCheckpointLoadError(
+            "checkpoint_key_directory_permissions_insecure",
+            (
+                "Checkpoint key directory cannot be writable "
+                "by group or other users."
+            ),
+        )
+
+    if os.name == "posix" and hasattr(os, "geteuid"):
+        trusted_directory_owners = {
+            0,
+            os.geteuid(),
+        }
+
+        if directory_metadata.st_uid not in trusted_directory_owners:
+            raise CrawlCheckpointLoadError(
+                "checkpoint_key_directory_owner_untrusted",
+                (
+                    "Checkpoint key directory must be owned "
+                    "by the service account or root."
+                ),
+            )
+
     if stat.S_ISLNK(metadata.st_mode):
         raise CrawlCheckpointLoadError(
             "checkpoint_key_symlink_not_allowed",
             "Checkpoint key files cannot be symbolic links.",
         )
+
     if not stat.S_ISREG(metadata.st_mode):
         raise CrawlCheckpointLoadError(
             "checkpoint_key_not_regular_file",
             "Checkpoint key path must be a regular file.",
         )
+
     if os.name == "posix" and metadata.st_mode & 0o077:
         raise CrawlCheckpointLoadError(
             "checkpoint_key_permissions_insecure",
-            "Checkpoint key file permissions must not grant group or other access.",
+            (
+                "Checkpoint key file permissions must not grant "
+                "group or other access."
+            ),
         )
-    if metadata.st_size > MAXIMUM_CRAWL_CHECKPOINT_KEY_BYTES + 16:
+
+    maximum_file_bytes = (
+        MAXIMUM_CRAWL_CHECKPOINT_KEY_BYTES + 16
+    )
+
+    if metadata.st_size > maximum_file_bytes:
         raise CrawlCheckpointLoadError(
             "checkpoint_key_too_large",
             "Checkpoint key file exceeds the size limit.",
         )
+
+    descriptor: int | None = None
+
     try:
-        key = key_path.read_bytes().strip()
+        flags = os.O_RDONLY
+
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+
+        descriptor = os.open(key_path, flags)
+        opened = os.fstat(descriptor)
+
+        if (
+            opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+        ):
+            raise CrawlCheckpointLoadError(
+                "checkpoint_key_file_changed_during_read",
+                (
+                    "Checkpoint key file changed between "
+                    "inspection and opening."
+                ),
+            )
+
+        if not stat.S_ISREG(opened.st_mode):
+            raise CrawlCheckpointLoadError(
+                "checkpoint_key_not_regular_file",
+                "Checkpoint key path must be a regular file.",
+            )
+
+        if os.name == "posix" and opened.st_mode & 0o077:
+            raise CrawlCheckpointLoadError(
+                "checkpoint_key_permissions_insecure",
+                (
+                    "Checkpoint key file permissions must not "
+                    "grant group or other access."
+                ),
+            )
+
+        if opened.st_size > maximum_file_bytes:
+            raise CrawlCheckpointLoadError(
+                "checkpoint_key_too_large",
+                "Checkpoint key file exceeds the size limit.",
+            )
+
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = None
+
+        with handle:
+            raw_key = handle.read(maximum_file_bytes + 1)
+
+    except CrawlCheckpointError:
+        raise
+
     except OSError as exc:
         raise CrawlCheckpointLoadError(
             "checkpoint_key_file_read_failed",
             "Unable to read the checkpoint key file.",
         ) from exc
-    try:
-        return _checkpoint_key(key)
-    except CrawlCheckpointValidationError as exc:
-        raise CrawlCheckpointLoadError(exc.code, exc.message) from exc
 
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    if len(raw_key) > maximum_file_bytes:
+        raise CrawlCheckpointLoadError(
+            "checkpoint_key_too_large",
+            "Checkpoint key file exceeds the size limit.",
+        )
+
+    try:
+        return _checkpoint_key(raw_key.strip())
+    except CrawlCheckpointValidationError as exc:
+        raise CrawlCheckpointLoadError(
+            exc.code,
+            exc.message,
+        ) from exc
 
 def write_crawl_checkpoint_file(
     checkpoint: CrawlCheckpoint,
@@ -1277,14 +1456,23 @@ def write_crawl_checkpoint_file(
             output.flush()
             os.fsync(output.fileno())
 
-        if not overwrite and os.path.lexists(checkpoint_path):
-            raise CrawlCheckpointLoadError(
-                "checkpoint_exists",
-                "Checkpoint destination already exists.",
-            )
+        if overwrite:
+            os.replace(temporary_path, checkpoint_path)
+            temporary_path = None
+        else:
+            try:
+                os.link(
+                    temporary_path,
+                    checkpoint_path,
+                )
+            except FileExistsError as exc:
+                raise CrawlCheckpointLoadError(
+                    "checkpoint_exists",
+                    "Checkpoint destination already exists.",
+                ) from exc
 
-        os.replace(temporary_path, checkpoint_path)
-        temporary_path = None
+            temporary_path.unlink()
+            temporary_path = None
 
         try:
             directory_descriptor = os.open(

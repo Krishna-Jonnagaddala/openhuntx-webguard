@@ -59,6 +59,7 @@ def _config(args: argparse.Namespace) -> ServiceConfig:
         host=args.host,
         port=args.port,
         database_path=args.database,
+        service_secret_path=args.service_secrets,
         authorization_directory=args.authorizations,
         artifact_directory=args.artifacts,
         maximum_request_bytes=args.maximum_request_bytes,
@@ -75,7 +76,10 @@ def _config(args: argparse.Namespace) -> ServiceConfig:
 
 
 def _stores(config: ServiceConfig) -> tuple[ScanJobStore, IdentityStore]:
-    jobs = ScanJobStore(config.database_path)
+    jobs = ScanJobStore(
+        config.database_path,
+        service_secret_path=config.service_secret_path,
+    )
     identity = IdentityStore(config.database_path)
     return jobs, identity
 
@@ -345,6 +349,15 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", default=DEFAULT_API_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_API_PORT)
     parser.add_argument("--database", type=Path, default=Path("var/webguard-api/jobs.sqlite3"))
+    parser.add_argument(
+        "--service-secrets",
+        type=Path,
+        default=None,
+        help=(
+            "Owner-only service signing secret file. "
+            "Defaults beside the service database."
+        ),
+    )
     parser.add_argument("--authorizations", type=Path, default=Path("authorizations"))
     parser.add_argument("--artifacts", type=Path, default=Path("scan-results/service"))
     parser.add_argument(

@@ -219,6 +219,47 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["error"]["code"], "trustscan_permit_required")
 
+    def test_invalid_bearer_token_does_not_echo_secret(
+        self,
+    ) -> None:
+        secret = "Phase5HttpSecret0123456789"
+
+        invalid_token = (
+            "wgt_"
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa_"
+            f"{secret}"
+        )
+
+        status, headers, payload = self.request(
+            "GET",
+            "/v1/me",
+            headers={
+                "Authorization": (
+                    f"Bearer {invalid_token}"
+                )
+            },
+            token=None,
+        )
+
+        self.assertEqual(status, 401)
+
+        serialized = json.dumps(
+            {
+                "headers": headers,
+                "payload": payload,
+            },
+            sort_keys=True,
+        )
+
+        self.assertNotIn(
+            invalid_token,
+            serialized,
+        )
+        self.assertNotIn(
+            secret,
+            serialized,
+        )
+
     def test_missing_bearer_token_is_401(self) -> None:
         status, headers, payload = self.request("GET", "/v1/me", token=None)
         self.assertEqual(status, 401)

@@ -89,6 +89,34 @@ class ApiCliTests(unittest.TestCase):
             self.assertTrue(database.is_file())
             self.assertIn("Initialized service database", output.getvalue())
 
+    def test_init_honors_explicit_service_secret_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "state" / "jobs.sqlite3"
+            secret_file = root / "private" / "webguard-secrets.json"
+
+            with redirect_stdout(io.StringIO()):
+                result = main(
+                    [
+                        "init",
+                        "--database",
+                        str(database),
+                        "--service-secrets",
+                        str(secret_file),
+                        "--authorizations",
+                        str(root / "authorizations"),
+                        "--artifacts",
+                        str(root / "artifacts"),
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertTrue(database.is_file())
+            self.assertTrue(secret_file.is_file())
+            self.assertFalse(
+                (database.parent / "service-secrets.json").exists()
+            )
+
     def test_worker_once_reports_empty_queue(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

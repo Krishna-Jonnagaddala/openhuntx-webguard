@@ -27,7 +27,16 @@ from webguard_contracts import (
 from .permits import PersistedTrustScanPermit
 
 
-DATABASE_SCHEMA_VERSION = 6
+from .service_secrets import (
+    CURSOR_SECRET_NAME,
+    default_service_secret_path,
+    TRUSTSCAN_SECRET_NAME,
+    ServiceSecretError,
+    ServiceSecretFile,
+    service_secrets_from_encoded,
+)
+
+DATABASE_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,10 +123,32 @@ def _persisted_integer(value: object) -> int:
 class ScanJobStore:
     """A small transactional queue using one SQLite database file."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        service_secret_path: Path | None = None,
+    ) -> None:
         self.path = Path(path).expanduser()
+        self.service_secret_path = (
+            default_service_secret_path(self.path)
+            if service_secret_path is None
+            else Path(service_secret_path).expanduser()
+        )
+        self._service_secret_file = ServiceSecretFile(
+            self.service_secret_path
+        )
+
         database_existed = self._prepare_path()
-        self._initialize(database_existed=database_existed)
+
+        try:
+            self._initialize(database_existed=database_existed)
+            self._service_secrets = self._service_secret_file.load()
+        except ServiceSecretError as exc:
+            raise JobStoreError(
+                exc.code,
+                exc.message,
+            ) from exc
 
     def _prepare_path(self) -> bool:
         try:
@@ -260,6 +291,10 @@ class ScanJobStore:
                 self._migrate_v5_to_v6(connection)
                 version = 6
 
+            if version == 6:
+                self._migrate_v6_to_v7(connection)
+                version = 7
+
             if version != DATABASE_SCHEMA_VERSION:
                 raise JobStoreError(
                     "job_store_schema_unsupported",
@@ -358,11 +393,6 @@ class ScanJobStore:
                 "last_job_id",
                 "last_error_code",
                 "last_error_at",
-            },
-            "service_secrets": {
-                "key",
-                "value",
-                "created_at",
             },
             "scan_permits": {
                 "permit_id",
@@ -464,6 +494,119 @@ class ScanJobStore:
             except sqlite3.Error:
                 pass
             raise
+
+    def _migrate_v6_to_v7(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Move long-lived service signing secrets outside SQLite."""
+
+        try:
+            rows = connection.execute(
+                """
+                SELECT key, value
+                FROM service_secrets
+                """
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "service_secret_legacy_state_invalid",
+                "Unable to read legacy service-secret state.",
+            ) from exc
+
+        legacy_values = {
+            row["key"]: row["value"]
+            for row in rows
+        }
+
+        expected_names = {
+            CURSOR_SECRET_NAME,
+            TRUSTSCAN_SECRET_NAME,
+        }
+
+        if set(legacy_values) != expected_names:
+            raise JobStoreError(
+                "service_secret_legacy_state_invalid",
+                "Legacy service-secret state is incomplete or invalid.",
+            )
+
+        legacy_material = service_secrets_from_encoded(
+            legacy_values[CURSOR_SECRET_NAME],
+            legacy_values[TRUSTSCAN_SECRET_NAME],
+        )
+
+        existing_material = self._service_secret_file.load_if_exists()
+
+        if existing_material is None:
+            installed_material = self._service_secret_file.create(
+                legacy_material
+            )
+        else:
+            installed_material = existing_material
+
+        if installed_material != legacy_material:
+            raise JobStoreError(
+                "service_secret_mismatch",
+                (
+                    "External service-secret material does not match "
+                    "the legacy database."
+                ),
+            )
+
+        try:
+            # Ensure content removed from the legacy secret table is
+            # overwritten rather than retained in SQLite free pages.
+            connection.execute("PRAGMA secure_delete = ON")
+            connection.execute("BEGIN IMMEDIATE")
+
+            locked_rows = connection.execute(
+                """
+                SELECT key, value
+                FROM service_secrets
+                """
+            ).fetchall()
+
+            locked_values = {
+                row["key"]: row["value"]
+                for row in locked_rows
+            }
+
+            if locked_values != legacy_values:
+                raise JobStoreError(
+                    "service_secret_mismatch",
+                    (
+                        "Legacy service-secret state changed during "
+                        "migration."
+                    ),
+                )
+
+            connection.execute("DROP TABLE service_secrets")
+            connection.execute(
+                """
+                UPDATE service_metadata
+                SET value = '7'
+                WHERE key = 'schema_version'
+                """
+            )
+            connection.execute("COMMIT")
+
+        except JobStoreError:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+        except sqlite3.Error as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+
+            raise JobStoreError(
+                "service_secret_migration_failed",
+                "Unable to migrate service secrets outside SQLite.",
+            ) from exc
 
     @staticmethod
     def _read_schema_version(connection: sqlite3.Connection) -> int:
@@ -712,39 +855,9 @@ class ScanJobStore:
             raise
 
     def trustscan_signing_private_key(self) -> bytes:
-        """Return the private Ed25519 seed used to sign TrustScan permits."""
+        """Return the externally stored private Ed25519 signing seed."""
 
-        connection = self._connect()
-        try:
-            row = connection.execute(
-                "SELECT value FROM service_secrets WHERE key = ?",
-                ("trustscan_ed25519_private_key_v1",),
-            ).fetchone()
-        except sqlite3.Error as exc:
-            raise JobStoreError(
-                "trustscan_signing_key_read_failed",
-                "Unable to read the TrustScan signing key.",
-            ) from exc
-        finally:
-            connection.close()
-        if row is None:
-            raise JobStoreError(
-                "trustscan_signing_key_missing",
-                "TrustScan signing key is missing.",
-            )
-        try:
-            key = base64.urlsafe_b64decode(row["value"].encode("ascii"))
-        except (ValueError, UnicodeEncodeError) as exc:
-            raise JobStoreError(
-                "trustscan_signing_key_invalid",
-                "TrustScan signing key is invalid.",
-            ) from exc
-        if len(key) != 32:
-            raise JobStoreError(
-                "trustscan_signing_key_invalid",
-                "TrustScan signing key is invalid.",
-            )
-        return key
+        return self._service_secrets.trustscan_signing_private_key
 
     @staticmethod
     def _permit_from_row(row: sqlite3.Row) -> PersistedTrustScanPermit:
@@ -958,39 +1071,9 @@ class ScanJobStore:
         return row["permit_id"], row["permit_sha256"]
 
     def cursor_signing_key(self) -> bytes:
-        """Return the private HMAC key used for opaque API cursors."""
+        """Return the externally stored HMAC key for opaque API cursors."""
 
-        connection = self._connect()
-        try:
-            row = connection.execute(
-                "SELECT value FROM service_secrets WHERE key = ?",
-                ("pagination_cursor_hmac",),
-            ).fetchone()
-        except sqlite3.Error as exc:
-            raise JobStoreError(
-                "cursor_key_read_failed",
-                "Unable to read the pagination cursor key.",
-            ) from exc
-        finally:
-            connection.close()
-        if row is None:
-            raise JobStoreError(
-                "cursor_key_missing",
-                "Pagination cursor key is missing.",
-            )
-        try:
-            key = base64.urlsafe_b64decode(row["value"].encode("ascii"))
-        except (ValueError, UnicodeEncodeError) as exc:
-            raise JobStoreError(
-                "cursor_key_invalid",
-                "Pagination cursor key is invalid.",
-            ) from exc
-        if len(key) < 32:
-            raise JobStoreError(
-                "cursor_key_invalid",
-                "Pagination cursor key is invalid.",
-            )
-        return key
+        return self._service_secrets.cursor_signing_key
 
     @staticmethod
     def _schedule_from_row(row: sqlite3.Row) -> ScanScheduleRecord:

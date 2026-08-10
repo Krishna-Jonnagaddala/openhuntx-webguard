@@ -8,7 +8,7 @@ import hmac
 import os
 import secrets
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -50,7 +50,7 @@ class IssuedApiToken:
     """One-time API token result; the raw token is never persisted."""
 
     metadata: ApiTokenMetadata
-    token: str
+    token: str = field(repr=False)
 
 
 def _timestamp(value: datetime) -> str:
