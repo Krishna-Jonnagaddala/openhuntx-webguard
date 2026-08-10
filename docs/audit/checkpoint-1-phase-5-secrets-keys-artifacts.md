@@ -534,8 +534,8 @@ Post-remediation local verification confirmed:
 - unrelated service-secret directory owners are rejected;
 - legitimate protected service-secret directories remain accepted.
 
-The follow-up remains subject to the pull-request Linux Python-version matrix
-before merge.
+The follow-up was verified successfully by the pull-request Linux
+Python-version matrix across Python 3.11, 3.12, 3.13 and 3.14.
 
 ---
 
@@ -611,8 +611,13 @@ P5-006 — Low — REMEDIATED / VERIFIED
 P5-007 — Low — REMEDIATED / VERIFIED
 P5-008 — Medium — REMEDIATED / VERIFIED
 P5-009 — Low — REMEDIATED / VERIFIED
-P5-010 — Medium — REMEDIATED / VERIFIED LOCALLY; PR CI PENDING
+P5-010 — Medium — REMEDIATED / VERIFIED
 
-Phase 5 remediation is complete locally. Formal closure remains contingent
-on successful pull-request Linux Python 3.11–3.14 CI verification, security
-gates, authorised integration verification, and merge.
+Phase 5 remediation and cross-version CI verification are complete.
+
+The pull-request verification passed on Python 3.11, 3.12, 3.13 and 3.14,
+together with the security gates and authorised Juice Shop integration.
+
+No unresolved confirmed Phase 5 vulnerability remains.
+
+Phase 5 is ready for merge and formal closure.
