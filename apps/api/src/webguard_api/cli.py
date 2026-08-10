@@ -90,6 +90,9 @@ def _components(config: ServiceConfig):
         trustscan_signer=trustscan_signer,
         artifact_directory=config.artifact_directory,
         organization_resolver=store.organization_id_for_job,
+        authorization_assignment_checker=(
+            identity.authorization_is_assigned
+        ),
     )
     service = WebGuardJobService(
         store=store,

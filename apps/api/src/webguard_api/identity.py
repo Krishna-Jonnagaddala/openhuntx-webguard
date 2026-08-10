@@ -126,6 +126,15 @@ def _token_parts(token: object) -> tuple[str, str]:
     return metadata.token_id, parts[2]
 
 
+def _persisted_boolean(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
+        raise IdentityStoreError(
+            'identity_persisted_state_invalid',
+            'Persisted boolean values must be encoded as integer 0 or 1.',
+        )
+    return value == 1
+
+
 class IdentityStore:
     """Persistent tenant identity and access-control metadata."""
 
@@ -144,144 +153,528 @@ class IdentityStore:
         if not self.path.is_file():
             raise IdentityStoreError(
                 "identity_database_missing",
-                "Initialize the scan-job database before the identity store.",
+                (
+                    "Initialize the scan-job database before "
+                    "the identity store."
+                ),
             )
+
         connection = self._connect()
+
         try:
-            connection.executescript(
+            connection.execute("BEGIN IMMEDIATE")
+
+            required_tables = {
+                "identity_metadata",
+                "organizations",
+                "principals",
+                "api_tokens",
+                "organization_authorizations",
+                "security_audit_events",
+            }
+
+            rows = connection.execute(
                 """
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS identity_metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS organizations (
-                    organization_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    name_key TEXT NOT NULL UNIQUE,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS principals (
-                    principal_id TEXT PRIMARY KEY,
-                    organization_id TEXT NOT NULL,
-                    display_name TEXT NOT NULL,
-                    principal_type TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    active INTEGER NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (organization_id) REFERENCES organizations(organization_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_principals_organization
-                    ON principals(organization_id, active, role);
-                CREATE TABLE IF NOT EXISTS api_tokens (
-                    token_id TEXT PRIMARY KEY,
-                    organization_id TEXT NOT NULL,
-                    principal_id TEXT NOT NULL,
-                    label TEXT NOT NULL,
-                    secret_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    revoked_at TEXT,
-                    last_used_at TEXT,
-                    FOREIGN KEY (organization_id) REFERENCES organizations(organization_id),
-                    FOREIGN KEY (principal_id) REFERENCES principals(principal_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_api_tokens_principal
-                    ON api_tokens(principal_id, revoked_at, expires_at);
-                CREATE TABLE IF NOT EXISTS organization_authorizations (
-                    organization_id TEXT NOT NULL,
-                    authorization_id TEXT NOT NULL,
-                    assigned_by TEXT NOT NULL,
-                    assigned_at TEXT NOT NULL,
-                    PRIMARY KEY (organization_id, authorization_id),
-                    FOREIGN KEY (organization_id) REFERENCES organizations(organization_id),
-                    FOREIGN KEY (assigned_by) REFERENCES principals(principal_id)
-                );
-                CREATE TABLE IF NOT EXISTS security_audit_events (
-                    event_id TEXT PRIMARY KEY,
-                    request_id TEXT NOT NULL,
-                    organization_id TEXT NOT NULL,
-                    principal_id TEXT NOT NULL,
-                    token_id TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    resource_type TEXT NOT NULL,
-                    resource_id TEXT NOT NULL,
-                    outcome TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL,
-                    detail_code TEXT,
-                    FOREIGN KEY (organization_id) REFERENCES organizations(organization_id),
-                    FOREIGN KEY (principal_id) REFERENCES principals(principal_id),
-                    FOREIGN KEY (token_id) REFERENCES api_tokens(token_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_security_audit_org_time
-                    ON security_audit_events(organization_id, occurred_at DESC, event_id DESC);
-                INSERT OR IGNORE INTO identity_metadata(key, value)
-                    VALUES ('schema_version', '1');
-                COMMIT;
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
                 """
-            )
+            ).fetchall()
+
+            existing_tables = {
+                row["name"]
+                for row in rows
+                if row["name"] in required_tables
+            }
+
+            if not existing_tables:
+                self._create_identity_schema(
+                    connection
+                )
+
+            elif existing_tables != required_tables:
+                raise IdentityStoreError(
+                    "identity_schema_invalid",
+                    (
+                        "The identity-store schema does not "
+                        "match its declared version."
+                    ),
+                )
+
             row = connection.execute(
-                "SELECT value FROM identity_metadata WHERE key = 'schema_version'"
+                """
+                SELECT value
+                FROM identity_metadata
+                WHERE key = 'schema_version'
+                """
             ).fetchone()
-            if row is None or int(row["value"]) != IDENTITY_SCHEMA_VERSION:
+
+            if row is None:
                 raise IdentityStoreError(
                     "identity_schema_unsupported",
-                    "The identity-store schema version is unsupported.",
+                    (
+                        "The identity-store schema version "
+                        "is missing."
+                    ),
                 )
+
+            try:
+                version = int(row["value"])
+            except (TypeError, ValueError) as exc:
+                raise IdentityStoreError(
+                    "identity_schema_unsupported",
+                    (
+                        "The identity-store schema version "
+                        "is unsupported."
+                    ),
+                ) from exc
+
+            if version != IDENTITY_SCHEMA_VERSION:
+                raise IdentityStoreError(
+                    "identity_schema_unsupported",
+                    (
+                        "The identity-store schema version "
+                        "is unsupported."
+                    ),
+                )
+
+            self._validate_current_schema(
+                connection
+            )
+
+            connection.execute("COMMIT")
+
+        except IdentityStoreError:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
         except sqlite3.Error as exc:
             try:
                 connection.execute("ROLLBACK")
             except sqlite3.Error:
                 pass
+
             raise IdentityStoreError(
                 "identity_initialize_failed",
-                "Unable to initialize identity and RBAC tables.",
+                (
+                    "Unable to initialize identity and "
+                    "RBAC tables."
+                ),
             ) from exc
+
         finally:
             connection.close()
+
         os.chmod(self.path, 0o600)
 
     @staticmethod
-    def _organization(row: sqlite3.Row) -> Organization:
-        created_at = _parse_timestamp(row["created_at"])
-        assert created_at is not None
-        return Organization(
-            organization_id=row["organization_id"],
-            name=row["name"],
-            status=OrganizationStatus(row["status"]),
-            created_at=created_at,
+    def _create_identity_schema(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute(
+            """
+            CREATE TABLE identity_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
         )
+
+        connection.execute(
+            """
+            CREATE TABLE organizations (
+                organization_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                name_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE principals (
+                principal_id TEXT PRIMARY KEY,
+                organization_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                principal_type TEXT NOT NULL,
+                role TEXT NOT NULL,
+                active INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (organization_id)
+                    REFERENCES organizations(
+                        organization_id
+                    )
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX idx_principals_organization
+            ON principals(
+                organization_id,
+                active,
+                role
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE api_tokens (
+                token_id TEXT PRIMARY KEY,
+                organization_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                secret_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT,
+                last_used_at TEXT,
+                FOREIGN KEY (organization_id)
+                    REFERENCES organizations(
+                        organization_id
+                    ),
+                FOREIGN KEY (principal_id)
+                    REFERENCES principals(
+                        principal_id
+                    )
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX idx_api_tokens_principal
+            ON api_tokens(
+                principal_id,
+                revoked_at,
+                expires_at
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE organization_authorizations (
+                organization_id TEXT NOT NULL,
+                authorization_id TEXT NOT NULL,
+                assigned_by TEXT NOT NULL,
+                assigned_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    organization_id,
+                    authorization_id
+                ),
+                FOREIGN KEY (organization_id)
+                    REFERENCES organizations(
+                        organization_id
+                    ),
+                FOREIGN KEY (assigned_by)
+                    REFERENCES principals(
+                        principal_id
+                    )
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE security_audit_events (
+                event_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                organization_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                detail_code TEXT,
+                FOREIGN KEY (organization_id)
+                    REFERENCES organizations(
+                        organization_id
+                    ),
+                FOREIGN KEY (principal_id)
+                    REFERENCES principals(
+                        principal_id
+                    ),
+                FOREIGN KEY (token_id)
+                    REFERENCES api_tokens(
+                        token_id
+                    )
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX idx_security_audit_org_time
+            ON security_audit_events(
+                organization_id,
+                occurred_at DESC,
+                event_id DESC
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            INSERT INTO identity_metadata(
+                key,
+                value
+            )
+            VALUES ('schema_version', ?)
+            """,
+            (str(IDENTITY_SCHEMA_VERSION),),
+        )
+
+    @staticmethod
+    def _validate_current_schema(
+        connection: sqlite3.Connection,
+    ) -> None:
+        required_columns = {
+            "identity_metadata": {
+                "key",
+                "value",
+            },
+            "organizations": {
+                "organization_id",
+                "name",
+                "name_key",
+                "status",
+                "created_at",
+            },
+            "principals": {
+                "principal_id",
+                "organization_id",
+                "display_name",
+                "principal_type",
+                "role",
+                "active",
+                "created_at",
+            },
+            "api_tokens": {
+                "token_id",
+                "organization_id",
+                "principal_id",
+                "label",
+                "secret_hash",
+                "created_at",
+                "expires_at",
+                "revoked_at",
+                "last_used_at",
+            },
+            "organization_authorizations": {
+                "organization_id",
+                "authorization_id",
+                "assigned_by",
+                "assigned_at",
+            },
+            "security_audit_events": {
+                "event_id",
+                "request_id",
+                "organization_id",
+                "principal_id",
+                "token_id",
+                "action",
+                "resource_type",
+                "resource_id",
+                "outcome",
+                "occurred_at",
+                "detail_code",
+            },
+        }
+
+        for table_name, expected in required_columns.items():
+            rows = connection.execute(
+                """
+                SELECT name
+                FROM pragma_table_info(?)
+                """,
+                (table_name,),
+            ).fetchall()
+
+            actual = {
+                row["name"]
+                for row in rows
+            }
+
+            if not expected.issubset(actual):
+                raise IdentityStoreError(
+                    "identity_schema_invalid",
+                    (
+                        "The identity-store schema does not "
+                        "match its declared version."
+                    ),
+                )
+
+        required_indexes = {
+            "idx_principals_organization",
+            "idx_api_tokens_principal",
+            "idx_security_audit_org_time",
+        }
+
+        rows = connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'index'
+            """
+        ).fetchall()
+
+        indexes = {
+            row["name"]
+            for row in rows
+        }
+
+        if not required_indexes.issubset(indexes):
+            raise IdentityStoreError(
+                "identity_schema_invalid",
+                (
+                    "The identity-store schema does not "
+                    "match its declared version."
+                ),
+            )
+
+    @staticmethod
+    def _persisted_timestamp(
+        value: object,
+        *,
+        required: bool,
+    ):
+        try:
+            parsed = _parse_timestamp(value)
+        except (TypeError, ValueError) as exc:
+            raise IdentityStoreError(
+                "identity_persisted_state_invalid",
+                "Persisted identity-store state is invalid.",
+            ) from exc
+
+        if required and parsed is None:
+            raise IdentityStoreError(
+                "identity_persisted_state_invalid",
+                "Persisted identity-store state is invalid.",
+            )
+
+        return parsed
+
+    @staticmethod
+    def _organization(row: sqlite3.Row) -> Organization:
+        try:
+            created_at = IdentityStore._persisted_timestamp(
+                row["created_at"],
+                required=True,
+            )
+
+            return Organization(
+                organization_id=row["organization_id"],
+                name=row["name"],
+                status=OrganizationStatus(
+                    row["status"]
+                ),
+                created_at=created_at,
+            )
+
+        except IdentityStoreError:
+            raise
+
+        except (
+            IndexError,
+            TypeError,
+            ValueError,
+            TenancyContractError,
+        ) as exc:
+            raise IdentityStoreError(
+                "identity_persisted_state_invalid",
+                "Persisted identity-store state is invalid.",
+            ) from exc
 
     @staticmethod
     def _principal(row: sqlite3.Row) -> Principal:
-        created_at = _parse_timestamp(row["created_at"])
-        assert created_at is not None
-        return Principal(
-            principal_id=row["principal_id"],
-            organization_id=row["organization_id"],
-            display_name=row["display_name"],
-            principal_type=PrincipalType(row["principal_type"]),
-            role=OrganizationRole(row["role"]),
-            active=bool(row["active"]),
-            created_at=created_at,
-        )
+        try:
+            created_at = IdentityStore._persisted_timestamp(
+                row["created_at"],
+                required=True,
+            )
+
+            return Principal(
+                principal_id=row["principal_id"],
+                organization_id=row["organization_id"],
+                display_name=row["display_name"],
+                principal_type=PrincipalType(
+                    row["principal_type"]
+                ),
+                role=OrganizationRole(
+                    row["role"]
+                ),
+                active=_persisted_boolean(row["active"]),
+                created_at=created_at,
+            )
+
+        except IdentityStoreError:
+            raise
+
+        except (
+            IndexError,
+            TypeError,
+            ValueError,
+            TenancyContractError,
+        ) as exc:
+            raise IdentityStoreError(
+                "identity_persisted_state_invalid",
+                "Persisted identity-store state is invalid.",
+            ) from exc
 
     @staticmethod
-    def _token_metadata(row: sqlite3.Row) -> ApiTokenMetadata:
-        created_at = _parse_timestamp(row["created_at"])
-        expires_at = _parse_timestamp(row["expires_at"])
-        assert created_at is not None and expires_at is not None
-        return ApiTokenMetadata(
-            token_id=row["token_id"],
-            organization_id=row["organization_id"],
-            principal_id=row["principal_id"],
-            label=row["label"],
-            created_at=created_at,
-            expires_at=expires_at,
-            revoked_at=_parse_timestamp(row["revoked_at"]),
-            last_used_at=_parse_timestamp(row["last_used_at"]),
-        )
+    def _token_metadata(
+        row: sqlite3.Row,
+    ) -> ApiTokenMetadata:
+        try:
+            created_at = IdentityStore._persisted_timestamp(
+                row["created_at"],
+                required=True,
+            )
+            expires_at = IdentityStore._persisted_timestamp(
+                row["expires_at"],
+                required=True,
+            )
+
+            return ApiTokenMetadata(
+                token_id=row["token_id"],
+                organization_id=row["organization_id"],
+                principal_id=row["principal_id"],
+                label=row["label"],
+                created_at=created_at,
+                expires_at=expires_at,
+                revoked_at=IdentityStore._persisted_timestamp(
+                    row["revoked_at"],
+                    required=False,
+                ),
+                last_used_at=IdentityStore._persisted_timestamp(
+                    row["last_used_at"],
+                    required=False,
+                ),
+            )
+
+        except IdentityStoreError:
+            raise
+
+        except (
+            IndexError,
+            TypeError,
+            ValueError,
+            TenancyContractError,
+        ) as exc:
+            raise IdentityStoreError(
+                "identity_persisted_state_invalid",
+                "Persisted identity-store state is invalid.",
+            ) from exc
 
     def create_organization(
         self,
@@ -312,6 +705,11 @@ class IdentityStore:
             raise IdentityStoreError(
                 "organization_conflict",
                 "An organization with that identifier or name already exists.",
+            ) from exc
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "organization_create_failed",
+                "Unable to persist the organization.",
             ) from exc
         finally:
             connection.close()
@@ -367,7 +765,15 @@ class IdentityStore:
                 ),
             )
         except sqlite3.IntegrityError as exc:
-            raise IdentityStoreError("principal_conflict", "Principal already exists.") from exc
+            raise IdentityStoreError(
+                "principal_conflict",
+                "Principal already exists.",
+            ) from exc
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "principal_create_failed",
+                "Unable to persist the principal.",
+            ) from exc
         finally:
             connection.close()
         return value
@@ -435,7 +841,15 @@ class IdentityStore:
                 ),
             )
         except sqlite3.IntegrityError as exc:
-            raise IdentityStoreError("api_token_conflict", "API token already exists.") from exc
+            raise IdentityStoreError(
+                "api_token_conflict",
+                "API token already exists.",
+            ) from exc
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "api_token_create_failed",
+                "Unable to persist the API token.",
+            ) from exc
         finally:
             connection.close()
         return IssuedApiToken(metadata=metadata, token=raw)
@@ -473,6 +887,13 @@ class IdentityStore:
                 "UPDATE api_tokens SET last_used_at = ? WHERE token_id = ?",
                 (_timestamp(now), token_id),
             )
+        except IdentityStoreError:
+            raise
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "api_token_authentication_failed",
+                "Unable to authenticate the API token.",
+            ) from exc
         finally:
             connection.close()
         updated = ApiTokenMetadata(
@@ -512,6 +933,13 @@ class IdentityStore:
                     last_used_at=metadata.last_used_at,
                 )
             return metadata
+        except IdentityStoreError:
+            raise
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "api_token_revoke_failed",
+                "Unable to revoke the API token.",
+            ) from exc
         finally:
             connection.close()
 
@@ -543,6 +971,11 @@ class IdentityStore:
             raise IdentityStoreError(
                 "authorization_assignment_invalid",
                 "Unable to assign the authorization to the organization.",
+            ) from exc
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "authorization_assignment_failed",
+                "Unable to persist the authorization assignment.",
             ) from exc
         finally:
             connection.close()
@@ -585,25 +1018,57 @@ class IdentityStore:
                 ),
             )
         except sqlite3.IntegrityError as exc:
-            raise IdentityStoreError("audit_event_conflict", "Audit event already exists.") from exc
+            raise IdentityStoreError(
+                "audit_event_conflict",
+                "Audit event already exists.",
+            ) from exc
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "audit_event_write_failed",
+                "Unable to persist the security audit event.",
+            ) from exc
         finally:
             connection.close()
 
     @staticmethod
-    def _audit_event(row: sqlite3.Row) -> SecurityAuditEvent:
-        return SecurityAuditEvent(
-            event_id=row["event_id"],
-            request_id=row["request_id"],
-            organization_id=row["organization_id"],
-            principal_id=row["principal_id"],
-            token_id=row["token_id"],
-            action=row["action"],
-            resource_type=row["resource_type"],
-            resource_id=row["resource_id"],
-            outcome=AuditOutcome(row["outcome"]),
-            occurred_at=_parse_timestamp(row["occurred_at"]),
-            detail_code=row["detail_code"],
-        )
+    def _audit_event(
+        row: sqlite3.Row,
+    ) -> SecurityAuditEvent:
+        try:
+            occurred_at = IdentityStore._persisted_timestamp(
+                row["occurred_at"],
+                required=True,
+            )
+
+            return SecurityAuditEvent(
+                event_id=row["event_id"],
+                request_id=row["request_id"],
+                organization_id=row["organization_id"],
+                principal_id=row["principal_id"],
+                token_id=row["token_id"],
+                action=row["action"],
+                resource_type=row["resource_type"],
+                resource_id=row["resource_id"],
+                outcome=AuditOutcome(
+                    row["outcome"]
+                ),
+                occurred_at=occurred_at,
+                detail_code=row["detail_code"],
+            )
+
+        except IdentityStoreError:
+            raise
+
+        except (
+            IndexError,
+            TypeError,
+            ValueError,
+            TenancyContractError,
+        ) as exc:
+            raise IdentityStoreError(
+                "identity_persisted_state_invalid",
+                "Persisted identity-store state is invalid.",
+            ) from exc
 
     def list_audit_events_page(
         self,

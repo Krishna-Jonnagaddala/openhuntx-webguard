@@ -72,7 +72,43 @@ def _timestamp(value: datetime) -> str:
 def _parse_timestamp(value: str | None) -> datetime | None:
     if value is None:
         return None
-    return datetime.fromisoformat(value[:-1] + "+00:00").astimezone(timezone.utc)
+
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise JobStoreError(
+            "job_store_persisted_state_invalid",
+            "Persisted job-store state is invalid.",
+        )
+
+    try:
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00"
+        )
+    except ValueError as exc:
+        raise JobStoreError(
+            "job_store_persisted_state_invalid",
+            "Persisted job-store state is invalid.",
+        ) from exc
+
+    return parsed.astimezone(timezone.utc)
+
+
+def _persisted_boolean(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
+        raise JobStoreError(
+            'job_store_persisted_state_invalid',
+            'Persisted boolean values must be encoded as integer 0 or 1.',
+        )
+    return value == 1
+
+
+def _persisted_integer(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise JobStoreError(
+            "job_store_persisted_state_invalid",
+            "Persisted job-store state is invalid.",
+        )
+
+    return value
 
 
 class ScanJobStore:
@@ -80,10 +116,10 @@ class ScanJobStore:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path).expanduser()
-        self._prepare_path()
-        self._initialize()
+        database_existed = self._prepare_path()
+        self._initialize(database_existed=database_existed)
 
-    def _prepare_path(self) -> None:
+    def _prepare_path(self) -> bool:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.path.parent, 0o700)
@@ -118,6 +154,8 @@ class ScanJobStore:
                     "Job-store path must be a regular file.",
                 )
 
+        return exists
+
     def _connect(self) -> sqlite3.Connection:
         try:
             connection = sqlite3.connect(
@@ -135,80 +173,108 @@ class ScanJobStore:
         connection.execute("PRAGMA busy_timeout = 5000")
         return connection
 
-    def _initialize(self) -> None:
+    def _initialize(
+        self,
+        *,
+        database_existed: bool,
+    ) -> None:
         connection = self._connect()
         try:
-            connection.executescript(
-                """
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS service_metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS scan_jobs (
-                    job_id TEXT PRIMARY KEY,
-                    idempotency_key TEXT NOT NULL UNIQUE,
-                    request_fingerprint TEXT NOT NULL,
-                    target TEXT NOT NULL,
-                    authorization_id TEXT NOT NULL,
-                    authorization_sha256 TEXT NOT NULL,
-                    mode TEXT NOT NULL,
-                    submitted_at TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    revision INTEGER NOT NULL,
-                    cancellation_requested INTEGER NOT NULL,
-                    started_at TEXT,
-                    completed_at TEXT,
-                    scan_id TEXT,
-                    result_status TEXT,
-                    report_ref TEXT,
-                    audit_ref TEXT,
-                    error_code TEXT,
-                    error_message TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_scan_jobs_queue
-                    ON scan_jobs(state, submitted_at, job_id);
-                CREATE TABLE IF NOT EXISTS job_scopes (
-                    job_id TEXT PRIMARY KEY,
-                    organization_id TEXT NOT NULL,
-                    submitted_by TEXT NOT NULL,
-                    FOREIGN KEY (job_id) REFERENCES scan_jobs(job_id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_job_scopes_organization
-                    ON job_scopes(organization_id, job_id);
-                INSERT OR IGNORE INTO service_metadata(key, value)
+            if not database_existed:
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE service_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
+                    CREATE TABLE scan_jobs (
+                        job_id TEXT PRIMARY KEY,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        request_fingerprint TEXT NOT NULL,
+                        target TEXT NOT NULL,
+                        authorization_id TEXT NOT NULL,
+                        authorization_sha256 TEXT NOT NULL,
+                        mode TEXT NOT NULL,
+                        submitted_at TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        revision INTEGER NOT NULL,
+                        cancellation_requested INTEGER NOT NULL,
+                        started_at TEXT,
+                        completed_at TEXT,
+                        scan_id TEXT,
+                        result_status TEXT,
+                        report_ref TEXT,
+                        audit_ref TEXT,
+                        error_code TEXT,
+                        error_message TEXT
+                    );
+                    CREATE INDEX idx_scan_jobs_queue
+                        ON scan_jobs(
+                            state,
+                            submitted_at,
+                            job_id
+                        );
+                    CREATE TABLE job_scopes (
+                        job_id TEXT PRIMARY KEY,
+                        organization_id TEXT NOT NULL,
+                        submitted_by TEXT NOT NULL,
+                        FOREIGN KEY (job_id)
+                            REFERENCES scan_jobs(job_id)
+                            ON DELETE CASCADE
+                    );
+                    CREATE INDEX idx_job_scopes_organization
+                        ON job_scopes(
+                            organization_id,
+                            job_id
+                        );
+                    INSERT INTO service_metadata(
+                        key,
+                        value
+                    )
                     VALUES ('schema_version', '1');
-                COMMIT;
-                """
-            )
+                    COMMIT;
+                    """
+                )
+
             version = self._read_schema_version(connection)
+
             if version == 1:
                 self._migrate_v1_to_v2(connection)
                 version = 2
+
             if version == 2:
                 self._migrate_v2_to_v3(connection)
                 version = 3
+
             if version == 3:
                 self._migrate_v3_to_v4(connection)
                 version = 4
+
             if version == 4:
                 self._migrate_v4_to_v5(connection)
                 version = 5
+
             if version == 5:
                 self._migrate_v5_to_v6(connection)
                 version = 6
+
             if version != DATABASE_SCHEMA_VERSION:
                 raise JobStoreError(
                     "job_store_schema_unsupported",
                     "The job-store schema version is unsupported.",
                 )
+
+            self._validate_current_schema(connection)
+
         except JobStoreError:
             try:
                 connection.execute("ROLLBACK")
             except sqlite3.Error:
                 pass
             raise
+
         except sqlite3.Error as exc:
             try:
                 connection.execute("ROLLBACK")
@@ -218,8 +284,10 @@ class ScanJobStore:
                 "job_store_initialize_failed",
                 "Unable to initialize the scan-job database.",
             ) from exc
+
         finally:
             connection.close()
+
         try:
             os.chmod(self.path, 0o600)
         except OSError as exc:
@@ -227,6 +295,150 @@ class ScanJobStore:
                 "job_store_permissions_failed",
                 "Unable to apply owner-only database permissions.",
             ) from exc
+
+    @staticmethod
+    def _validate_current_schema(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Fail closed when declared schema and storage disagree."""
+
+        required_columns = {
+            "service_metadata": {
+                "key",
+                "value",
+            },
+            "scan_jobs": {
+                "job_id",
+                "idempotency_key",
+                "request_fingerprint",
+                "target",
+                "authorization_id",
+                "authorization_sha256",
+                "mode",
+                "submitted_at",
+                "state",
+                "updated_at",
+                "revision",
+                "cancellation_requested",
+                "started_at",
+                "completed_at",
+                "scan_id",
+                "result_status",
+                "report_ref",
+                "audit_ref",
+                "error_code",
+                "error_message",
+                "worker_id",
+                "lease_token",
+                "lease_expires_at",
+                "heartbeat_at",
+                "attempt_count",
+            },
+            "job_scopes": {
+                "job_id",
+                "organization_id",
+                "submitted_by",
+            },
+            "scan_schedules": {
+                "schedule_id",
+                "organization_id",
+                "created_by",
+                "name",
+                "target",
+                "authorization_id",
+                "authorization_sha256",
+                "mode",
+                "interval_seconds",
+                "state",
+                "created_at",
+                "updated_at",
+                "next_run_at",
+                "revision",
+                "last_enqueued_at",
+                "last_job_id",
+                "last_error_code",
+                "last_error_at",
+            },
+            "service_secrets": {
+                "key",
+                "value",
+                "created_at",
+            },
+            "scan_permits": {
+                "permit_id",
+                "organization_id",
+                "authorization_id",
+                "authorization_sha256",
+                "target",
+                "issued_by",
+                "issued_at",
+                "not_before",
+                "expires_at",
+                "permit_sha256",
+                "signing_key_id",
+                "document_json",
+                "revoked_at",
+                "revoked_by",
+            },
+            "job_permits": {
+                "job_id",
+                "permit_id",
+                "permit_sha256",
+            },
+            "schedule_permits": {
+                "schedule_id",
+                "permit_id",
+                "permit_sha256",
+            },
+            "job_safety_receipts": {
+                "job_id",
+                "receipt_ref",
+                "receipt_sha256",
+                "created_at",
+            },
+        }
+
+        for table_name, expected in required_columns.items():
+            table = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = ?
+                """,
+                (table_name,),
+            ).fetchone()
+
+            if table is None:
+                raise JobStoreError(
+                    "job_store_schema_invalid",
+                    (
+                        "The job-store schema does not match "
+                        "its declared version."
+                    ),
+                )
+
+            rows = connection.execute(
+                """
+                SELECT name
+                FROM pragma_table_info(?)
+                """,
+                (table_name,),
+            ).fetchall()
+
+            actual = {
+                row["name"]
+                for row in rows
+            }
+
+            if not expected.issubset(actual):
+                raise JobStoreError(
+                    "job_store_schema_invalid",
+                    (
+                        "The job-store schema does not match "
+                        "its declared version."
+                    ),
+                )
 
     @staticmethod
     def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
@@ -782,12 +994,29 @@ class ScanJobStore:
 
     @staticmethod
     def _schedule_from_row(row: sqlite3.Row) -> ScanScheduleRecord:
+        try:
+            mode = ScanJobMode(row["mode"])
+            state = ScanScheduleState(row["state"])
+        except (TypeError, ValueError) as exc:
+            raise JobStoreError(
+                "job_store_persisted_state_invalid",
+                "Persisted job-store state is invalid.",
+            ) from exc
+
         next_run_at = _parse_timestamp(row["next_run_at"])
         created_at = _parse_timestamp(row["created_at"])
         updated_at = _parse_timestamp(row["updated_at"])
-        assert next_run_at is not None
-        assert created_at is not None
-        assert updated_at is not None
+
+        if (
+            next_run_at is None
+            or created_at is None
+            or updated_at is None
+        ):
+            raise JobStoreError(
+                "job_store_persisted_state_invalid",
+                "Persisted job-store state is invalid.",
+            )
+
         return ScanScheduleRecord(
             schedule_id=row["schedule_id"],
             organization_id=row["organization_id"],
@@ -796,46 +1025,90 @@ class ScanJobStore:
             target=row["target"],
             authorization_id=row["authorization_id"],
             authorization_sha256=row["authorization_sha256"],
-            mode=ScanJobMode(row["mode"]),
-            interval_seconds=int(row["interval_seconds"]),
-            state=ScanScheduleState(row["state"]),
+            mode=mode,
+            interval_seconds=_persisted_integer(
+                row["interval_seconds"]
+            ),
+            state=state,
             created_at=created_at,
             updated_at=updated_at,
             next_run_at=next_run_at,
-            revision=int(row["revision"]),
-            last_enqueued_at=_parse_timestamp(row["last_enqueued_at"]),
+            revision=_persisted_integer(
+                row["revision"]
+            ),
+            last_enqueued_at=_parse_timestamp(
+                row["last_enqueued_at"]
+            ),
             last_job_id=row["last_job_id"],
             last_error_code=row["last_error_code"],
-            last_error_at=_parse_timestamp(row["last_error_at"]),
+            last_error_at=_parse_timestamp(
+                row["last_error_at"]
+            ),
         )
 
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> ScanJobRecord:
-        request = ScanJobRequest(
-            idempotency_key=row["idempotency_key"],
-            target=row["target"],
-            authorization_id=row["authorization_id"],
-            authorization_sha256=row["authorization_sha256"],
-            mode=ScanJobMode(row["mode"]),
-            submitted_at=_parse_timestamp(row["submitted_at"]),
+        try:
+            mode = ScanJobMode(row["mode"])
+            state = ScanJobState(row["state"])
+            result_status = (
+                None
+                if row["result_status"] is None
+                else ScanStatus(row["result_status"])
+            )
+        except (TypeError, ValueError) as exc:
+            raise JobStoreError(
+                "job_store_persisted_state_invalid",
+                "Persisted job-store state is invalid.",
+            ) from exc
+
+        submitted_at = _parse_timestamp(
+            row["submitted_at"]
         )
-        assert request.submitted_at is not None
-        result_status = (
-            None
-            if row["result_status"] is None
-            else ScanStatus(row["result_status"])
+        updated_at = _parse_timestamp(
+            row["updated_at"]
         )
-        updated_at = _parse_timestamp(row["updated_at"])
-        assert updated_at is not None
+
+        if submitted_at is None or updated_at is None:
+            raise JobStoreError(
+                "job_store_persisted_state_invalid",
+                "Persisted job-store state is invalid.",
+            )
+
+        try:
+            request = ScanJobRequest(
+                idempotency_key=row["idempotency_key"],
+                target=row["target"],
+                authorization_id=row["authorization_id"],
+                authorization_sha256=row[
+                    "authorization_sha256"
+                ],
+                mode=mode,
+                submitted_at=submitted_at,
+            )
+        except (TypeError, ValueError) as exc:
+            raise JobStoreError(
+                "job_store_persisted_state_invalid",
+                "Persisted job-store state is invalid.",
+            ) from exc
+
         return ScanJobRecord(
             job_id=row["job_id"],
             request=request,
-            state=ScanJobState(row["state"]),
+            state=state,
             updated_at=updated_at,
-            revision=row["revision"],
-            cancellation_requested=bool(row["cancellation_requested"]),
-            started_at=_parse_timestamp(row["started_at"]),
-            completed_at=_parse_timestamp(row["completed_at"]),
+            revision=_persisted_integer(
+                row["revision"]
+            ),
+            cancellation_requested=bool(
+                row["cancellation_requested"]
+            ),
+            started_at=_parse_timestamp(
+                row["started_at"]
+            ),
+            completed_at=_parse_timestamp(
+                row["completed_at"]
+            ),
             scan_id=row["scan_id"],
             result_status=result_status,
             report_ref=row["report_ref"],
@@ -861,7 +1134,9 @@ class ScanJobStore:
             worker_id=row["worker_id"],
             lease_token=row["lease_token"],
             lease_expires_at=expires_at,
-            attempt_count=int(row["attempt_count"]),
+            attempt_count=_persisted_integer(
+                row["attempt_count"]
+            ),
         )
 
     @staticmethod
@@ -1177,17 +1452,44 @@ class ScanJobStore:
         scope = self.get_scope(job_id)
         return None if scope is None else scope[0]
 
-    def claim_next(self, *, now: datetime) -> ScanJobRecord | None:
-        timestamp = _timestamp(now)
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
+    @staticmethod
+    def _select_claimable_row(
+        connection: sqlite3.Connection,
+        *,
+        timestamp: str,
+    ) -> sqlite3.Row | None:
+        identity_ready = (
+            connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'organization_authorizations'
+                """
+            ).fetchone()
+            is not None
+        )
+
+        if identity_ready:
+            return connection.execute(
                 """
                 SELECT jobs.*
                 FROM scan_jobs AS jobs
-                LEFT JOIN job_permits AS binding ON binding.job_id = jobs.job_id
-                WHERE jobs.state = ? AND jobs.cancellation_requested = 0
+                LEFT JOIN job_scopes AS scope
+                  ON scope.job_id = jobs.job_id
+                LEFT JOIN job_permits AS binding
+                  ON binding.job_id = jobs.job_id
+                WHERE jobs.state = ?
+                  AND jobs.cancellation_requested = 0
+                  AND (
+                    scope.job_id IS NULL
+                    OR EXISTS (
+                        SELECT 1
+                        FROM organization_authorizations AS assignment
+                        WHERE assignment.organization_id = scope.organization_id
+                          AND assignment.authorization_id = jobs.authorization_id
+                    )
+                  )
                   AND (
                     binding.permit_id IS NULL
                     OR (
@@ -1213,16 +1515,60 @@ class ScanJobStore:
                 ORDER BY jobs.submitted_at, jobs.job_id
                 LIMIT 1
                 """,
-                (
-                    ScanJobState.QUEUED.value,
-                    timestamp,
-                    timestamp,
-                ),
+                (ScanJobState.QUEUED.value, timestamp, timestamp),
             ).fetchone()
+
+        return connection.execute(
+            """
+            SELECT jobs.*
+            FROM scan_jobs AS jobs
+            LEFT JOIN job_permits AS binding
+              ON binding.job_id = jobs.job_id
+            WHERE jobs.state = ?
+              AND jobs.cancellation_requested = 0
+              AND (
+                binding.permit_id IS NULL
+                OR (
+                    EXISTS (
+                        SELECT 1
+                        FROM scan_permits AS permit
+                        WHERE permit.permit_id = binding.permit_id
+                          AND permit.permit_sha256 = binding.permit_sha256
+                          AND permit.revoked_at IS NULL
+                          AND permit.not_before <= ?
+                          AND ? < permit.expires_at
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM scan_jobs AS running
+                        JOIN job_permits AS running_binding
+                          ON running_binding.job_id = running.job_id
+                        WHERE running.state = 'running'
+                          AND running_binding.permit_id = binding.permit_id
+                    )
+                )
+              )
+            ORDER BY jobs.submitted_at, jobs.job_id
+            LIMIT 1
+            """,
+            (ScanJobState.QUEUED.value, timestamp, timestamp),
+        ).fetchone()
+
+    def claim_next(self, *, now: datetime) -> ScanJobRecord | None:
+        timestamp = _timestamp(now)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._select_claimable_row(
+                connection,
+                timestamp=timestamp,
+            )
             if row is None:
                 connection.execute("COMMIT")
                 return None
-            revision = int(row["revision"]) + 1
+            revision = _persisted_integer(
+                row["revision"]
+            ) + 1
             updated = connection.execute(
                 """
                 UPDATE scan_jobs
@@ -1249,6 +1595,13 @@ class ScanJobStore:
             connection.execute("COMMIT")
             assert claimed is not None
             return self._record_from_row(claimed)
+        except JobStoreError:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
         except sqlite3.Error as exc:
             try:
                 connection.execute("ROLLBACK")
@@ -1279,47 +1632,16 @@ class ScanJobStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                """
-                SELECT jobs.*
-                FROM scan_jobs AS jobs
-                LEFT JOIN job_permits AS binding ON binding.job_id = jobs.job_id
-                WHERE jobs.state = ? AND jobs.cancellation_requested = 0
-                  AND (
-                    binding.permit_id IS NULL
-                    OR (
-                        EXISTS (
-                            SELECT 1
-                            FROM scan_permits AS permit
-                            WHERE permit.permit_id = binding.permit_id
-                              AND permit.permit_sha256 = binding.permit_sha256
-                              AND permit.revoked_at IS NULL
-                              AND permit.not_before <= ?
-                              AND ? < permit.expires_at
-                        )
-                        AND NOT EXISTS (
-                            SELECT 1
-                            FROM scan_jobs AS running
-                            JOIN job_permits AS running_binding
-                              ON running_binding.job_id = running.job_id
-                            WHERE running.state = 'running'
-                              AND running_binding.permit_id = binding.permit_id
-                        )
-                    )
-                  )
-                ORDER BY jobs.submitted_at, jobs.job_id
-                LIMIT 1
-                """,
-                (
-                    ScanJobState.QUEUED.value,
-                    timestamp,
-                    timestamp,
-                ),
-            ).fetchone()
+            row = self._select_claimable_row(
+                connection,
+                timestamp=timestamp,
+            )
             if row is None:
                 connection.execute("COMMIT")
                 return None
-            revision = int(row["revision"]) + 1
+            revision = _persisted_integer(
+                row["revision"]
+            ) + 1
             updated = connection.execute(
                 """
                 UPDATE scan_jobs
@@ -1352,6 +1674,13 @@ class ScanJobStore:
             connection.execute("COMMIT")
             assert claimed is not None
             return self._lease_from_row(claimed)
+        except JobStoreError:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
         except sqlite3.Error as exc:
             try:
                 connection.execute("ROLLBACK")
@@ -1394,7 +1723,7 @@ class ScanJobStore:
                 lease_token=lease_token,
                 now=now,
             )
-            revision = int(row["revision"]) + 1
+            revision = _persisted_integer(row["revision"]) + 1
             updated = connection.execute(
                 """
                 UPDATE scan_jobs
@@ -1470,7 +1799,7 @@ class ScanJobStore:
                 (ScanJobState.RUNNING.value, timestamp),
             ).fetchall()
             for row in rows:
-                revision = int(row["revision"]) + 1
+                revision = _persisted_integer(row["revision"]) + 1
                 common = (
                     timestamp,
                     revision,
@@ -1479,7 +1808,7 @@ class ScanJobStore:
                     row["revision"],
                     row["lease_token"],
                 )
-                if bool(row["cancellation_requested"]):
+                if _persisted_boolean(row["cancellation_requested"]):
                     result = connection.execute(
                         """
                         UPDATE scan_jobs
@@ -1492,7 +1821,7 @@ class ScanJobStore:
                         (ScanJobState.CANCELLED.value, timestamp, *common),
                     )
                     cancelled += result.rowcount
-                elif int(row["attempt_count"]) >= limit:
+                elif _persisted_integer(row["attempt_count"]) >= limit:
                     result = connection.execute(
                         """
                         UPDATE scan_jobs
@@ -2269,7 +2598,7 @@ class ScanJobStore:
             ).fetchone()
             if row is None:
                 raise JobStoreError("schedule_not_found", "Scan schedule was not found.")
-            revision = int(row["revision"]) + 1
+            revision = _persisted_integer(row["revision"]) + 1
             effective_next = row["next_run_at"] if next_run_at is None else _timestamp(next_run_at)
             connection.execute(
                 """
@@ -2386,6 +2715,36 @@ class ScanJobStore:
             ):
                 connection.execute("COMMIT")
                 return None
+            identity_ready = (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name = 'organization_authorizations'
+                    """
+                ).fetchone()
+                is not None
+            )
+
+            if identity_ready:
+                assignment = connection.execute(
+                    """
+                    SELECT 1
+                    FROM organization_authorizations
+                    WHERE organization_id = ?
+                      AND authorization_id = ?
+                    """,
+                    (
+                        schedule.organization_id,
+                        schedule.authorization_id,
+                    ),
+                ).fetchone()
+
+                if assignment is None:
+                    connection.execute("COMMIT")
+                    return None
+
             binding = connection.execute(
                 "SELECT permit_id, permit_sha256 FROM schedule_permits WHERE schedule_id = ?",
                 (schedule.schedule_id,),
