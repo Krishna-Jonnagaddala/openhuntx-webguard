@@ -246,6 +246,21 @@ class ServiceSecretFile:
                 ),
             )
 
+        if os.name == "posix":
+            trusted_owners = {
+                0,
+                os.geteuid(),
+            }
+
+            if metadata.st_uid not in trusted_owners:
+                raise ServiceSecretError(
+                    "service_secret_directory_owner_untrusted",
+                    (
+                        "Service-secret directory must be owned by "
+                        "the service account or root."
+                    ),
+                )
+
     def _read_bytes(self) -> bytes:
         self._validate_parent_directory()
         try:

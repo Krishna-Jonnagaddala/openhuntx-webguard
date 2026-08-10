@@ -9,6 +9,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from webguard_api.service_secrets import (
@@ -16,6 +17,8 @@ from webguard_api.service_secrets import (
     SERVICE_SECRET_DOCUMENT_TYPE,
     SERVICE_SECRET_DOCUMENT_VERSION,
     TRUSTSCAN_SECRET_NAME,
+    ServiceSecretError,
+    ServiceSecretFile,
 )
 from webguard_api.store import JobStoreError, ScanJobStore
 
@@ -196,6 +199,57 @@ class Phase5ServiceSecretHardeningTests(unittest.TestCase):
             "service_secret_not_regular_file",
         )
 
+    def test_secret_directory_owned_by_unrelated_uid_is_rejected(
+        self,
+    ) -> None:
+        if os.name != "posix":
+            self.skipTest(
+                "POSIX ownership validation only applies on POSIX."
+            )
+
+        secret_path = (
+            self.database.parent
+            / "phase5-untrusted-owner.service-secrets.json"
+        )
+        secret_file = ServiceSecretFile(secret_path)
+
+        real_lstat = Path.lstat
+        unrelated_uid = os.geteuid() + 10000
+
+        def unrelated_owner_lstat(path: Path):
+            metadata = real_lstat(path)
+
+            if path == secret_path.parent:
+                values = {
+                    name: getattr(metadata, name)
+                    for name in dir(metadata)
+                    if name.startswith("st_")
+                }
+                values["st_uid"] = unrelated_uid
+                values["st_mode"] = (
+                    metadata.st_mode & ~0o022
+                )
+                return SimpleNamespace(**values)
+
+            return metadata
+
+        with mock.patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=unrelated_owner_lstat,
+        ):
+            with self.assertRaises(
+                ServiceSecretError
+            ) as captured:
+                secret_file._validate_parent_directory()
+
+        self.assertEqual(
+            captured.exception.code,
+            "service_secret_directory_owner_untrusted",
+        )
+
+
     def test_group_or_world_writable_secret_directory_is_rejected_on_create(
         self,
     ) -> None:
@@ -358,6 +412,15 @@ class Phase5ServiceSecretHardeningTests(unittest.TestCase):
             trustscan=replacement_trustscan,
         )
 
+        replacement_path = (
+            secret_path.parent
+            / "phase5-service-secret-replacement.json"
+        )
+        replacement_path.write_bytes(
+            replacement_document
+        )
+        replacement_path.chmod(0o600)
+
         real_open = os.open
         replaced = False
 
@@ -373,11 +436,10 @@ class Phase5ServiceSecretHardeningTests(unittest.TestCase):
                 not replaced
                 and Path(target) == secret_path
             ):
-                secret_path.unlink()
-                secret_path.write_bytes(
-                    replacement_document
+                os.replace(
+                    replacement_path,
+                    secret_path,
                 )
-                os.chmod(secret_path, 0o600)
                 replaced = True
 
             return real_open(

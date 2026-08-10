@@ -9,7 +9,7 @@ signing material, checkpoint keys, filesystem trust boundaries, generated
 artifacts, authentication-secret disclosure, and repository secret-scanning
 controls.
 
-Nine product findings were confirmed during this phase:
+Ten product findings were confirmed during this phase:
 
 - **P5-001 — Medium — Long-lived service signing secrets were directly coupled to the SQLite database.**
 - **P5-002 — Low — Default external service-secret paths could collide between databases in the same directory.**
@@ -20,6 +20,7 @@ Nine product findings were confirmed during this phase:
 - **P5-007 — Low — Checkpoint no-overwrite writes were not atomically no-clobber.**
 - **P5-008 — Medium — Checkpoint HMAC key directory trust and ownership were insufficiently enforced.**
 - **P5-009 — Low — Repository secret scanning did not inspect reachable Git history.**
+- **P5-010 — Medium — Service-secret parent directories owned by unrelated UIDs were trusted.**
 
 All confirmed findings were remediated and regression-tested before Phase 5
 technical closure.
@@ -193,14 +194,59 @@ A pathname replacement race therefore existed between validation and use.
 
 ### Remediation
 
-The implementation now compares validated pathname identity with the opened
-descriptor using filesystem device and inode identity.
+The implementation now opens the service-secret file using no-follow
+semantics where supported, validates the opened descriptor, and compares its
+device and inode identity with the previously inspected pathname.
 
-A replacement between validation and open fails closed.
+The device/inode comparison is defense-in-depth rather than the sole
+filesystem trust boundary.
+
+Linux portability testing demonstrated that an unlink/recreate sequence can
+immediately reuse the same device and inode. The service-secret security
+boundary therefore also requires the immediate parent directory to be
+protected from control by unrelated users.
+
+---
+
+### Finding P5-010
+
+**Severity:** Medium
+
+**Status:** Confirmed and remediated
+
+**Title:** Service-secret parent directories owned by unrelated UIDs were trusted
+
+### Initial behaviour
+
+A service-secret parent directory could be non-writable by group and other
+users while still being owned by an unrelated UID.
+
+Such a directory passed the original service-secret parent validation.
+
+### Security impact
+
+The owner of a directory controls its directory entries even when other users
+cannot write to that directory.
+
+An unrelated directory owner could therefore rename, remove, or replace the
+service-secret pathname despite the secret file itself being owner-only.
+
+### Remediation
+
+On POSIX systems, the immediate service-secret parent directory must now be
+owned by either:
+
+- the current effective service UID; or
+- root.
+
+Group-writable and world-writable parent directories remain rejected.
+
+Regression tests verify both rejection of an unrelated owner and acceptance
+of a legitimate protected directory.
 
 ### Result
 
-P5-002, P5-003 and P5-004 are recorded as:
+P5-002, P5-003, P5-004 and P5-010 are recorded as:
 
 **CONFIRMED -> REMEDIATED -> REGRESSION TESTED**
 
@@ -240,7 +286,13 @@ Checkpoint key loading now:
 - validates the opened file with `fstat`;
 - binds opened device/inode identity to the prior pathname validation;
 - performs bounded descriptor reads;
-- returns controlled errors on replacement.
+- returns controlled errors when the opened filesystem object differs from
+  the previously validated object.
+
+Device/inode identity checking is defense-in-depth. The trusted
+checkpoint-key parent-directory ownership and permission boundary documented
+in P5-008 prevents an unrelated local user from controlling the key pathname
+namespace.
 
 ---
 
@@ -264,6 +316,12 @@ substitution of another valid signed document.
 
 Checkpoint document loading now uses descriptor-bound identity validation and
 controlled bounded reads.
+
+Device/inode comparison detects replacement when filesystem identity changes,
+but is not treated as the sole authenticity control. Checkpoint documents
+remain HMAC authenticated, so control of the checkpoint-document pathname
+alone does not provide the signing authority required to forge arbitrary
+checkpoint state.
 
 ---
 
@@ -444,11 +502,48 @@ P5-009 is recorded as:
 
 ---
 
+## CI Filesystem Portability Follow-Up
+
+The first Linux pull-request CI run exposed three failures in adversarial
+pathname-replacement tests across Python 3.11, 3.12, 3.13 and 3.14.
+
+The affected tests simulated replacement using:
+
+`unlink -> recreate -> open`
+
+A Linux container probe demonstrated immediate reuse of the same device and
+inode identity in **100/100** iterations. In that environment, even the
+observed nanosecond change timestamp remained identical during the probe.
+
+This showed that the original race-injection technique was not portable and
+that device/inode identity must not be documented as an absolute guarantee
+against every unlink/recreate sequence.
+
+The adversarial tests now prepare a distinct replacement file before the
+race and publish it with `os.replace`. This deterministically presents a
+different filesystem object to the production loader without depending on
+filesystem inode-allocation behaviour.
+
+The same investigation identified P5-010: service-secret directory ownership
+was not validated even though equivalent ownership protection already
+existed for checkpoint HMAC-key directories.
+
+Post-remediation local verification confirmed:
+
+- all corrected pathname-replacement controls pass;
+- unrelated service-secret directory owners are rejected;
+- legitimate protected service-secret directories remain accepted.
+
+The follow-up remains subject to the pull-request Linux Python-version matrix
+before merge.
+
+---
+
 ## Phase 5 Verification Summary
 
 Dedicated Phase 5 security regression:
 
-**41/41 tests passed.**
+**42/42 tests passed.**
 
 Expanded Phase 5 persistence/resource diagnostic with `ResourceWarning`
 promoted to an error:
@@ -457,7 +552,7 @@ promoted to an error:
 
 Complete unit suite:
 
-**1073/1073 tests passed.**
+**1074/1074 tests passed.**
 
 Authorised OWASP Juice Shop integration:
 
@@ -516,6 +611,8 @@ P5-006 — Low — REMEDIATED / VERIFIED
 P5-007 — Low — REMEDIATED / VERIFIED
 P5-008 — Medium — REMEDIATED / VERIFIED
 P5-009 — Low — REMEDIATED / VERIFIED
+P5-010 — Medium — REMEDIATED / VERIFIED LOCALLY; PR CI PENDING
 
-Phase 5 is technically complete and is ready for staging review, commit,
-pull-request CI verification and merge.
+Phase 5 remediation is complete locally. Formal closure remains contingent
+on successful pull-request Linux Python 3.11–3.14 CI verification, security
+gates, authorised integration verification, and merge.
