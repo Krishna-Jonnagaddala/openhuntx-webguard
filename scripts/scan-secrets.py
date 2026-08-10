@@ -12,6 +12,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAX_TEXT_FILE_BYTES = 5 * 1024 * 1024
 
+GENERATED_ARTIFACT_DIRECTORIES = (
+    "scan-results",
+    "reports",
+    "artifacts",
+)
+
 
 @dataclass(frozen=True)
 class Rule:
@@ -86,6 +92,147 @@ def repository_files() -> list[Path]:
     return sorted(paths)
 
 
+
+def _git(
+    root: Path,
+    *arguments: str,
+    input_data: bytes | None = None,
+) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=root,
+            input=input_data,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        fail(
+            "unable to inspect Git repository history: "
+            f"{exc}"
+        )
+
+    return result.stdout
+
+
+def require_complete_git_history(
+    root: Path = ROOT,
+) -> None:
+    state = _git(
+        root,
+        "rev-parse",
+        "--is-shallow-repository",
+    ).strip()
+
+    if state != b"false":
+        fail(
+            "repository history is shallow; fetch complete "
+            "history before running the secret scan"
+        )
+
+
+def git_history_blobs(
+    root: Path = ROOT,
+) -> list[tuple[str, int]]:
+    require_complete_git_history(root)
+
+    objects = _git(
+        root,
+        "rev-list",
+        "--objects",
+        "--all",
+    )
+
+    object_ids: list[str] = []
+    seen: set[str] = set()
+
+    for line in objects.splitlines():
+        raw_oid = line.split(b" ", 1)[0]
+
+        try:
+            oid = raw_oid.decode("ascii")
+        except UnicodeDecodeError:
+            fail("Git returned a non-ASCII object identifier")
+
+        if oid and oid not in seen:
+            seen.add(oid)
+            object_ids.append(oid)
+
+    if not object_ids:
+        return []
+
+    request = "".join(
+        f"{oid}\n"
+        for oid in object_ids
+    ).encode("ascii")
+
+    metadata = _git(
+        root,
+        "cat-file",
+        "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        input_data=request,
+    )
+
+    blobs: list[tuple[str, int]] = []
+
+    for raw_line in metadata.splitlines():
+        try:
+            line = raw_line.decode("ascii")
+            oid, object_type, size_text = line.split(
+                " ",
+                2,
+            )
+            size = int(size_text)
+        except (UnicodeDecodeError, ValueError) as exc:
+            fail(
+                "Git returned invalid object metadata: "
+                f"{exc}"
+            )
+
+        if object_type == "blob":
+            blobs.append((oid, size))
+
+    return blobs
+
+
+def scan_git_history(
+    root: Path = ROOT,
+) -> tuple[list[tuple[str, str]], int]:
+    findings: list[tuple[str, str]] = []
+    scanned = 0
+
+    for oid, size in git_history_blobs(root):
+        if size > MAX_TEXT_FILE_BYTES:
+            fail(
+                "reachable Git blob exceeds secret-scan "
+                f"size limit: {oid[:12]} ({size} bytes)"
+            )
+
+        data = _git(
+            root,
+            "cat-file",
+            "blob",
+            oid,
+        )
+
+        if b"\0" in data:
+            continue
+
+        scanned += 1
+
+        for rule in RULES:
+            if rule.pattern.search(data) is not None:
+                findings.append(
+                    (
+                        rule.identifier,
+                        oid,
+                    )
+                )
+
+    return findings, scanned
+
+
 def self_test() -> None:
     synthetic = {
         "private-key": b"-----BEGIN " + b"PRIVATE KEY-----",
@@ -105,8 +252,12 @@ def self_test() -> None:
             fail(f"self-test failed for rule {identifier}")
 
 
-def scan_file(path: Path) -> list[tuple[str, int]]:
-    relative = path.relative_to(ROOT).as_posix()
+def scan_file(
+    path: Path,
+    *,
+    root: Path = ROOT,
+) -> list[tuple[str, int]]:
+    relative = path.relative_to(root).as_posix()
     size = path.stat().st_size
     if size > MAX_TEXT_FILE_BYTES:
         fail(f"tracked/unignored file exceeds scan size limit: {relative} ({size} bytes)")
@@ -123,26 +274,122 @@ def scan_file(path: Path) -> list[tuple[str, int]]:
     return findings
 
 
+def generated_artifact_files(
+    root: Path = ROOT,
+) -> list[Path]:
+    paths: list[Path] = []
+
+    for directory in GENERATED_ARTIFACT_DIRECTORIES:
+        base = root / directory
+
+        if base.is_symlink():
+            fail(
+                "refusing to scan symlinked generated-artifact "
+                f"directory: {directory}"
+            )
+
+        if not base.exists():
+            continue
+
+        if not base.is_dir():
+            fail(
+                "generated-artifact path is not a directory: "
+                f"{directory}"
+            )
+
+        for candidate in sorted(base.rglob("*")):
+            relative = candidate.relative_to(root).as_posix()
+
+            if candidate.is_symlink():
+                fail(
+                    "refusing to scan symlinked generated "
+                    f"artifact: {relative}"
+                )
+
+            if candidate.is_dir():
+                continue
+
+            if not candidate.is_file():
+                fail(
+                    "generated-artifact path is not a regular "
+                    f"file: {relative}"
+                )
+
+            paths.append(candidate)
+
+    return paths
+
+
 def main() -> int:
     self_test()
-    findings: list[tuple[str, str, int]] = []
-    scanned = 0
-    for path in repository_files():
-        scanned += 1
-        relative = path.relative_to(ROOT).as_posix()
-        for identifier, line in scan_file(path):
-            findings.append((identifier, relative, line))
 
-    if findings:
+    findings: list[tuple[str, str, int]] = []
+    repository_scanned = 0
+    generated_scanned = 0
+
+    repository_paths = repository_files()
+    repository_path_set = set(repository_paths)
+
+    for path in repository_paths:
+        repository_scanned += 1
+        relative = path.relative_to(ROOT).as_posix()
+
+        for identifier, line in scan_file(path):
+            findings.append(
+                (
+                    identifier,
+                    relative,
+                    line,
+                )
+            )
+
+    for path in generated_artifact_files():
+        if path in repository_path_set:
+            continue
+
+        generated_scanned += 1
+        relative = path.relative_to(ROOT).as_posix()
+
+        for identifier, line in scan_file(path):
+            findings.append(
+                (
+                    identifier,
+                    relative,
+                    line,
+                )
+            )
+
+    history_findings, history_scanned = scan_git_history()
+
+    if findings or history_findings:
         for identifier, relative, line in findings:
-            print(f"{relative}:{line}: probable secret ({identifier})", file=sys.stderr)
+            print(
+                f"{relative}:{line}: "
+                f"probable secret ({identifier})",
+                file=sys.stderr,
+            )
+
+        for identifier, oid in history_findings:
+            print(
+                "git-history:"
+                f"{oid[:12]}: probable secret "
+                f"({identifier})",
+                file=sys.stderr,
+            )
+
         print(
-            "Secret scan failed. Do not commit the credential; rotate/revoke it if real.",
+            "Secret scan failed. Do not commit the "
+            "credential; rotate/revoke it if real.",
             file=sys.stderr,
         )
         return 1
 
-    print(f"Secret scan passed ({scanned} repository files checked).")
+    print(
+        "Secret scan passed "
+        f"({repository_scanned} repository files, "
+        f"{generated_scanned} generated artifact files and "
+        f"{history_scanned} reachable Git blobs checked)."
+    )
     return 0
 
 

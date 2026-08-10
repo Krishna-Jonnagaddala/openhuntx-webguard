@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from webguard_api import JobStoreError, ScanJobStore
+from webguard_api import DATABASE_SCHEMA_VERSION, JobStoreError, ScanJobStore
 from webguard_contracts import ScanJobMode, ScanJobRequest, ScanJobState, ScanStatus
 
 from tests.unit.service_test_support import AUTH_ID, NOW, ORG_ID, OWNER_ID, TARGET
@@ -38,7 +38,7 @@ class TrustScanSafetyReceiptStoreTests(unittest.TestCase):
         self.assertIsNotNone(running)
         return running
 
-    def test_schema_six_contains_safety_receipt_table(self) -> None:
+    def test_current_schema_contains_safety_receipt_table(self) -> None:
         connection = sqlite3.connect(self.path)
         try:
             version = connection.execute(
@@ -49,7 +49,7 @@ class TrustScanSafetyReceiptStoreTests(unittest.TestCase):
             ).fetchone()
         finally:
             connection.close()
-        self.assertEqual(version, ("6",))
+        self.assertEqual(version, (str(DATABASE_SCHEMA_VERSION),))
         self.assertEqual(table, ("job_safety_receipts",))
 
     def test_terminal_result_persists_immutable_receipt_reference(self) -> None:
