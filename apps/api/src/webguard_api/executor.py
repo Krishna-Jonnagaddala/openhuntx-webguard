@@ -198,6 +198,9 @@ class ScanJobExecutor:
         single_scanner: Callable[..., WebGuardReport] = run_passive_header_scan,
         crawl_scanner: Callable[..., WebGuardReport] = run_passive_crawl_scan,
         organization_resolver: Callable[[str], str | None] | None = None,
+        authorization_assignment_checker: (
+            Callable[[str, str], bool] | None
+        ) = None,
     ) -> None:
         self.authorizations = authorizations
         self.store = store
@@ -207,6 +210,9 @@ class ScanJobExecutor:
         self.single_scanner = single_scanner
         self.crawl_scanner = crawl_scanner
         self.organization_resolver = organization_resolver
+        self.authorization_assignment_checker = (
+            authorization_assignment_checker
+        )
 
     def _policies(self, authorization, permit, mode: ScanJobMode):
         limits = authorization.limits
@@ -281,6 +287,32 @@ class ScanJobExecutor:
                 "trustscan_job_scope_missing",
                 "The service job does not contain organization scope metadata.",
             )
+        if self.authorization_assignment_checker is not None:
+            try:
+                assignment_current = (
+                    self.authorization_assignment_checker(
+                        scope[0],
+                        record.request.authorization_id,
+                    )
+                )
+            except Exception as exc:
+                raise JobExecutionError(
+                    "authorization_assignment_check_failed",
+                    (
+                        "Unable to verify the organization "
+                        "authorization assignment."
+                    ),
+                ) from exc
+
+            if not assignment_current:
+                raise JobExecutionError(
+                    "authorization_not_assigned",
+                    (
+                        "The authorization is no longer assigned "
+                        "to this organization."
+                    ),
+                )
+
         binding = self.store.get_job_permit_binding(record.job_id)
         if binding is None:
             raise JobExecutionError(
@@ -390,6 +422,32 @@ class ScanJobExecutor:
                     "authorization_changed_during_execution",
                     "The server-side authorization changed during scanner execution.",
                 )
+            if self.authorization_assignment_checker is not None:
+                try:
+                    assignment_current = (
+                        self.authorization_assignment_checker(
+                            scope[0],
+                            record.request.authorization_id,
+                        )
+                    )
+                except Exception as exc:
+                    raise TrustScanPermitError(
+                        "authorization_assignment_check_failed",
+                        (
+                            "Unable to verify the organization "
+                            "authorization assignment."
+                        ),
+                    ) from exc
+
+                if not assignment_current:
+                    raise TrustScanPermitError(
+                        "authorization_not_assigned",
+                        (
+                            "The authorization is no longer assigned "
+                            "to this organization."
+                        ),
+                    )
+
             current_binding = self.store.get_job_permit_binding(record.job_id)
             if current_binding is None or current_binding != binding:
                 raise TrustScanPermitError(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import closing
+
 import queue
 import sqlite3
 import tempfile
@@ -156,7 +158,7 @@ class Phase3TransactionScheduleSafetyTests(unittest.TestCase):
     ) -> None:
         schedule = self.create_schedule()
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute(
                 """
                 CREATE TRIGGER phase3_fail_job_scope_insert
@@ -183,7 +185,7 @@ class Phase3TransactionScheduleSafetyTests(unittest.TestCase):
             "schedule_enqueue_conflict",
         )
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             job_count = connection.execute(
                 "SELECT COUNT(*) FROM scan_jobs"
             ).fetchone()[0]
@@ -235,7 +237,7 @@ class Phase3TransactionScheduleSafetyTests(unittest.TestCase):
         self.assertIsNotNone(lease)
         assert lease is not None
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute(
                 """
                 CREATE TRIGGER phase3_fail_receipt_insert
@@ -278,7 +280,7 @@ class Phase3TransactionScheduleSafetyTests(unittest.TestCase):
         self.assertIsNone(persisted.report_ref)
         self.assertIsNone(persisted.audit_ref)
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             row = connection.execute(
                 """
                 SELECT worker_id, lease_token, attempt_count
@@ -328,7 +330,7 @@ class Phase3TransactionScheduleSafetyTests(unittest.TestCase):
         ordered_ids = sorted(record.job_id for record in records)
         failing_id = ordered_ids[1]
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute(
                 f"""
                 CREATE TRIGGER phase3_fail_second_recovery
@@ -361,7 +363,7 @@ class Phase3TransactionScheduleSafetyTests(unittest.TestCase):
                 ScanJobState.RUNNING,
             )
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             rows = connection.execute(
                 """
                 SELECT job_id, worker_id, lease_token,
@@ -398,7 +400,7 @@ class Phase3TransactionScheduleSafetyTests(unittest.TestCase):
         self.assertEqual(result.inspected, 0)
         self.assertEqual(result.enqueued, 0)
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             job_count = connection.execute(
                 "SELECT COUNT(*) FROM scan_jobs"
             ).fetchone()[0]
@@ -475,7 +477,7 @@ class Phase3TransactionScheduleSafetyTests(unittest.TestCase):
             ScanScheduleState.PAUSED,
         )
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             job_count = connection.execute(
                 "SELECT COUNT(*) FROM scan_jobs"
             ).fetchone()[0]
@@ -511,7 +513,7 @@ class Phase3TransactionScheduleSafetyTests(unittest.TestCase):
             catchup_time,
         )
 
-        with sqlite3.connect(self.path) as connection:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
             job_count = connection.execute(
                 """
                 SELECT COUNT(*)
