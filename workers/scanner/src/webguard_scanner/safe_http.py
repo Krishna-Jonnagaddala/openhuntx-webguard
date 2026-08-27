@@ -644,7 +644,17 @@ def _perform_request(
             tls=tls,
         )
     finally:
-        connection.close()
+        try:
+            connection.close()
+        except (
+            OSError,
+            ssl.SSLError,
+            http.client.HTTPException,
+        ):
+            # A cleanup-time failure must never replace the try block's
+            # outcome (a returned response or an already-raised error).
+            # The socket is being discarded either way.
+            pass
 
 @dataclass(frozen=True)
 class _ConnectionFailure:
