@@ -93,6 +93,13 @@ from .crawler import (
     PageVisitor,
     crawl_same_origin,
 )
+from .active_detection import (
+    ActiveDetectionContext,
+    ActiveDetectionError,
+    ActiveDetectionPolicy,
+    DetectionCandidate,
+    ProbeAttempt,
+)
 from .crawl_scan import CheckpointCallback, run_passive_crawl_scan
 from .disclosure_analyzer import (
     DISCLOSURE_CHECKS,
@@ -185,14 +192,29 @@ from .scope_validator import (
     resolve_host,
     validate_target_url,
 )
+from .xss_reflected_detector import (
+    DetectionOutcome,
+    DetectorRunRecord,
+    DetectorRunResult,
+    run_reflected_xss_detector,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "ActiveDetectionContext",
+    "ActiveDetectionError",
+    "ActiveDetectionPolicy",
     "AnalyzerOutputError",
     "BeforeRequestHook",
     "AfterRequestHook",
     "AnalyzerPipelineResult",
+    "DetectionCandidate",
+    "DetectionOutcome",
+    "DetectorRunRecord",
+    "DetectorRunResult",
+    "ProbeAttempt",
+    "run_reflected_xss_detector",
     "AnalyzerRegistryError",
     "COOKIE_CHECKS",
     "CORS_CHECKS",
