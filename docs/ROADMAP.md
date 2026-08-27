@@ -98,6 +98,22 @@ Planned areas may include:
 
 Active exploitation, denial-of-service testing, password attacks, persistence, destructive testing, or unverified third-party testing are not part of the current initial release scope.
 
+### Detection architecture and CWE coverage
+
+Today's passive analyzers (`cors_analyzer`, `header_analyzer`, `cookie_analyzer`, `html_analyzer`, `disclosure_analyzer`, `tls_analyzer`) already attach CWE identifiers to findings; see `docs/CWE_COVERAGE.md` for the current implemented/planned registry. Growing this into a standardised detection framework is planned, not yet built:
+
+- a common `SecurityCheck` interface (check ID, CWE/OWASP mapping, severity, confidence, detection mode, prerequisites) so new checks are additive rather than bespoke;
+- a finding model that separates severity from confidence, and separates "indicator detected" from "exploitability confirmed";
+- an evidence model (request, response, reproduction data, evidence hash) sufficient to reproduce a finding independently of the original scan run;
+- check and scanner-engine versioning, so historical findings remain reproducible against the check version that produced them;
+- finding lifecycle and deduplication (open/confirmed/false-positive/accepted-risk/resolved), so one underlying weakness does not produce duplicate findings across pages;
+- OWASP and CVSS classification layered on top of CWE, with CVSS only assigned when evidence supports it; and
+- SARIF, JSON, and CSV export alongside the existing report formats.
+
+Every new active check must still cross the TrustScan permit boundary described above; this section extends detection breadth, not the authorization model.
+
+CWE coverage claims must always be honest and specific: WebGuard tracks web-relevant, externally observable CWE classes with transparent per-CWE status (implemented / partial / planned / not applicable), not a claim of covering the full CWE catalog. See `docs/CWE_COVERAGE.md`.
+
 ### Reporting and interoperability
 
 Planned:
