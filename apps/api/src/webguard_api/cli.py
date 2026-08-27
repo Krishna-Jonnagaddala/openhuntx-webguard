@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
+from uuid import uuid4
 
 from webguard_contracts import OrganizationRole, PrincipalType
 
 from . import __version__
-from .auth import ApiTokenAuthenticator
+from .auth import ApiTokenAuthenticator, AuthenticationError
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .config import (
     DEFAULT_API_HOST,
@@ -40,7 +42,7 @@ from .identity import (
 from .rate_limit import FixedWindowRateLimiter
 from .permits import TrustScanSigner
 from .scheduler import ScanScheduleCoordinator
-from .service import WebGuardJobService
+from .service import ApiServiceError, WebGuardJobService
 from .store import JobStoreError, ScanJobStore
 from .worker import ScanJobWorker
 
@@ -224,6 +226,81 @@ def _authorization_assign_command(args: argparse.Namespace) -> int:
     )
     print(f"Assigned authorization: {args.authorization_id}")
     print(f"Organization ID: {args.organization_id}")
+    return EXIT_SUCCESS
+
+
+def _timestamp_text(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _permit_issue_command(args: argparse.Namespace) -> int:
+    """Issue a TrustScan permit through the same service path (RBAC,
+    authorization binding, audit) the HTTP API uses -- never a shortcut
+    that bypasses it. active_checks defaults to none (passive-only,
+    fail closed); requesting any active check requires the caller's
+    token to belong to an organization owner (see PERMIT_ISSUE_ACTIVE)."""
+
+    config = _config(args)
+    _, identity, service, _, _, authenticator, _ = _components(config)
+    now = _utc_now()
+    try:
+        context = authenticator.authenticate([f"Bearer {args.token}"], now=now)
+    except AuthenticationError as exc:
+        print(f"webguard-api: [{exc.code}] {exc.message}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    active_checks = sorted(set(args.active_check or []))
+    if len(active_checks) != len(args.active_check or []):
+        print(
+            "webguard-api: [active_checks_duplicate] "
+            "--active-check values must not repeat.",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    body = json.dumps(
+        {
+            "target": args.target,
+            "authorization_id": args.authorization_id,
+            "confirm_authorization": args.authorization_id,
+            "permitted_modes": sorted(set(args.mode)),
+            "allowed_http_methods": sorted(
+                {
+                    method.upper()
+                    for method in (args.allowed_http_method or ["GET", "HEAD"])
+                }
+            ),
+            # A small buffer avoids a spurious trustscan_permit_start_in_past
+            # rejection: the service independently re-reads its own clock a
+            # moment after this timestamp is generated, and that read must
+            # never land after not_before. Kept small so a freshly issued
+            # permit is usable almost immediately.
+            "not_before": _timestamp_text(now + timedelta(milliseconds=500)),
+            "expires_at": _timestamp_text(now + timedelta(days=args.valid_days)),
+            "maximum_request_attempts": args.maximum_request_attempts,
+            "maximum_requests_per_second": args.maximum_requests_per_second,
+            "maximum_concurrency": args.maximum_concurrency,
+            "active_checks": active_checks,
+        }
+    ).encode("utf-8")
+
+    try:
+        record = service.issue_permit(context, body, request_id=str(uuid4()))
+    except ApiServiceError as exc:
+        print(f"webguard-api: [{exc.code}] {exc.message}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    claims = record["permit"]["claims"]
+    print(f"Permit ID: {claims['permit_id']}")
+    print(f"Target: {claims['target']}")
+    print(f"Permitted modes: {', '.join(claims['permitted_modes'])}")
+    print(f"Expires at: {claims['expires_at']}")
+    if claims["active_checks"]:
+        print(f"Active checks authorized: {', '.join(claims['active_checks'])}")
+    else:
+        print("Active checks authorized: none (passive-only)")
     return EXIT_SUCCESS
 
 
@@ -466,6 +543,58 @@ def build_parser() -> argparse.ArgumentParser:
     assignment_create.add_argument("--principal-id", required=True)
     assignment_create.add_argument("--authorization-id", required=True)
     assignment_create.set_defaults(handler=_authorization_assign_command)
+
+    permit = subparsers.add_parser("permit", help="Issue TrustScan scan permits.")
+    permit_commands = permit.add_subparsers(dest="permit_command", required=True)
+    permit_issue = permit_commands.add_parser(
+        "issue",
+        help=(
+            "Issue a TrustScan permit. active_checks defaults to none "
+            "(passive-only); requesting any active check requires an "
+            "organization-owner token."
+        ),
+    )
+    _add_common_options(permit_issue)
+    permit_issue.add_argument(
+        "--token", required=True, help="Bearer API token authenticating this request."
+    )
+    permit_issue.add_argument("--target", required=True)
+    permit_issue.add_argument("--authorization-id", required=True)
+    permit_issue.add_argument(
+        "--mode",
+        action="append",
+        choices=["crawl", "single_page"],
+        required=True,
+        help="May be repeated. At least one permitted scan mode.",
+    )
+    permit_issue.add_argument(
+        "--allowed-http-method",
+        action="append",
+        default=None,
+        help="May be repeated. Defaults to GET and HEAD.",
+    )
+    permit_issue.add_argument("--valid-days", type=int, default=7)
+    permit_issue.add_argument(
+        "--maximum-request-attempts", type=int, default=15
+    )
+    permit_issue.add_argument(
+        "--maximum-requests-per-second", type=float, default=1.0
+    )
+    permit_issue.add_argument("--maximum-concurrency", type=int, default=1)
+    permit_issue.add_argument(
+        "--active-check",
+        action="append",
+        default=None,
+        help=(
+            "May be repeated. Authorizes one active-detector ID (for "
+            "example active.xss.reflected) for this permit. Omit entirely "
+            "for a passive-only permit -- the default and the fail-closed "
+            "behaviour for every permit that does not explicitly request "
+            "one. Requesting any value here requires an organization-owner "
+            "token."
+        ),
+    )
+    permit_issue.set_defaults(handler=_permit_issue_command)
 
     serve_parser = subparsers.add_parser(
         "serve", help="Run the loopback HTTP API with one background worker."

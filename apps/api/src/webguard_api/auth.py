@@ -22,13 +22,19 @@ class ApiPermission(str, Enum):
     IDENTITY_MANAGE = "identity.manage"
     AUTHORIZATION_ASSIGN = "authorization.assign"
     PERMIT_ISSUE = "permits.issue"
+    PERMIT_ISSUE_ACTIVE = "permits.issue_active"
     PERMIT_READ = "permits.read"
     PERMIT_REVOKE = "permits.revoke"
 
 
 _ROLE_PERMISSIONS = {
     OrganizationRole.OWNER: frozenset(ApiPermission),
-    OrganizationRole.ADMINISTRATOR: frozenset(ApiPermission),
+    # Administrators may issue ordinary (passive-only) permits, but not
+    # ones that authorize active/intrusive checks -- that is deliberately
+    # reserved for the organization owner. See PERMIT_ISSUE_ACTIVE.
+    OrganizationRole.ADMINISTRATOR: frozenset(ApiPermission) - {
+        ApiPermission.PERMIT_ISSUE_ACTIVE,
+    },
     OrganizationRole.ANALYST: frozenset(
         {
             ApiPermission.JOB_SUBMIT,

@@ -313,10 +313,17 @@ class Phase2AuthenticationAndRbacTests(unittest.TestCase):
         )
 
         for permission in ApiPermission:
+            if permission is ApiPermission.PERMIT_ISSUE_ACTIVE:
+                # Deliberately reserved to the organization owner -- see
+                # test_only_owner_may_issue_active_capability_permits.
+                continue
             self.assertTrue(
                 administrator.permits(permission),
                 permission.value,
             )
+        self.assertFalse(
+            administrator.permits(ApiPermission.PERMIT_ISSUE_ACTIVE)
+        )
 
     def test_analyst_cannot_invoke_privileged_service_operations(
         self,

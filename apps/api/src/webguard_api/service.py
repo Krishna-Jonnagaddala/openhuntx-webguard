@@ -44,6 +44,26 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _active_checks_audit_detail(active_checks: tuple[str, ...]) -> str | None:
+    """Return a bounded, non-sensitive audit detail_code naming the
+    authorized active-detector IDs, or None for a passive-only permit.
+
+    detail_code is a strict, bounded identifier (see
+    webguard_contracts.tenancy._IDENTIFIER) -- it can carry detector IDs
+    (structural names, never evidence or payload content) but not an
+    arbitrary structured list. Detector IDs already use dots as internal
+    separators and are joined here with "_and_", which itself satisfies
+    that identifier grammar.
+    """
+
+    if not active_checks:
+        return None
+    detail = "active_checks_" + "_and_".join(sorted(active_checks))
+    if len(detail) > 128:
+        return "active_checks_authorized"
+    return detail
+
+
 class ApiServiceError(ValueError):
     """Controlled API operation failure with an HTTP status."""
 
@@ -315,6 +335,15 @@ class WebGuardJobService:
                 detail_code=exc.code,
             )
             raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        if submission.active_checks:
+            self._require(
+                context,
+                ApiPermission.PERMIT_ISSUE_ACTIVE,
+                request_id=request_id,
+                action="permits.issue_active",
+                resource_type="trustscan_permit",
+                resource_id="pending",
+            )
         if not self.identity.authorization_is_assigned(
             context.organization_id, submission.authorization_id
         ):
@@ -385,6 +414,7 @@ class WebGuardJobService:
                 maximum_request_attempts=submission.maximum_request_attempts,
                 maximum_requests_per_second=submission.maximum_requests_per_second,
                 maximum_concurrency=submission.maximum_concurrency,
+                active_checks=submission.active_checks,
             )
             signed = self.trustscan_signer.sign(claims)
             record = self.store.create_scan_permit(signed)
@@ -400,6 +430,7 @@ class WebGuardJobService:
             resource_type="trustscan_permit",
             resource_id=claims.permit_id,
             outcome=AuditOutcome.SUCCEEDED,
+            detail_code=_active_checks_audit_detail(claims.active_checks),
         )
         return record.to_public_dict(now=now)
 

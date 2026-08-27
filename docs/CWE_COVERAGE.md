@@ -48,13 +48,13 @@ Detected today by the passive analyzers (`workers/scanner/src/webguard_scanner/`
 
 **18 CWEs implemented**, all passive (no active/intrusive requests), all covered by unit tests.
 
-## Implemented (active, permit-gated)
+## Implemented (active, permit-gated, operator-reachable)
 
 | CWE | Name | Detector | Notes |
 |---|---|---|---|
-| CWE-79 | Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting') | `xss_reflected_detector.py` | GET-parameter reflected-XSS only, GET-form candidates auto-discovered from the passively-scanned page. Runs end-to-end through the job executor when the bound TrustScan permit's `active_checks` claim authorizes `active.xss.reflected`; every existing permit (and every permit issued without explicitly requesting it) has an empty `active_checks` claim and therefore never triggers it — fail-closed by default. Not reachable through the standalone `webguard scan` CLI (no permit concept there). See `docs/audit/active-detection-phase1-xss.md` (detector validation) and `docs/audit/active-detection-phase2-orchestration.md` (orchestration wiring) for exactly what was validated. |
+| CWE-79 | Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting') | `xss_reflected_detector.py` | **Operator-reachable + authorization-controlled + end-to-end verified.** GET-parameter reflected-XSS, GET-form candidates auto-discovered from the passively-scanned page. Issuable via `webguard-api permit issue --active-check active.xss.reflected`, gated by a stricter owner-only RBAC permission (`PERMIT_ISSUE_ACTIVE`) beyond ordinary permit issuance, and audited (detector ID recorded, never payload/evidence). Runs end-to-end through the job executor when the bound TrustScan permit's `active_checks` claim authorizes it; every existing and default-issued permit has an empty `active_checks` claim and therefore never triggers it — fail-closed by default. A true end-to-end test (CLI → HTTP API → worker → executor → registry → detector → report) is verified against a local synthetic fixture, over real TLS, real permit/RBAC enforcement, and the real runtime safety engine. Not reachable through the standalone `webguard scan` CLI (no permit concept there). See `docs/audit/active-detection-phase1-xss.md` (detector validation), `docs/audit/active-detection-phase2-orchestration.md` (orchestration wiring), and `docs/audit/active-detection-phase3-operator-surface.md` (CLI/RBAC/audit surface + the end-to-end test) for exactly what was validated at each layer. |
 
-**1 CWE implemented as a permit-gated active detector, integrated into the job/executor orchestration.**
+**1 CWE implemented as a permit-gated, operator-reachable, end-to-end-verified active detector.**
 
 ## Planned
 
