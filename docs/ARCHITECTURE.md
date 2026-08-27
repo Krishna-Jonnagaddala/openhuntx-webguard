@@ -47,8 +47,9 @@ Scanner-side security logic including:
 - same-origin crawling;
 - execution budgets and cancellation;
 - checkpoint/resume logic;
-- owned-target preflight enforcement; and
-- runtime hooks used by the TrustScan safety engine.
+- owned-target preflight enforcement;
+- runtime hooks used by the TrustScan safety engine; and
+- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`) and the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`) — see `docs/audit/active-detection-phase1-xss.md` through `phase5-attack-surface-discovery.md`.
 
 ### `apps/api`
 
@@ -62,8 +63,9 @@ The local control-plane foundation including:
 - worker leases and recovery;
 - signed pagination cursors;
 - TrustScan permit signing, validation, and revocation;
-- TrustScan runtime safety orchestration; and
-- TrustScan Safety Receipt persistence.
+- TrustScan runtime safety orchestration;
+- TrustScan Safety Receipt persistence; and
+- active-detector orchestration (`executor.py`'s `_apply_active_detection`), which runs the same authorized-detector loop against every candidate the scanner's attack-surface discovery finds, regardless of which interface (CLI or API) requested the scan.
 
 ### `infra/compose`
 

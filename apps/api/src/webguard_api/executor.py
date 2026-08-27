@@ -24,8 +24,10 @@ from webguard_scanner import (
     ActiveDetectionContext,
     ActiveDetectionError,
     ActiveDetectionPolicy,
+    AttackSurfaceBudget,
     CrawlCancellationToken,
     CrawlPolicy,
+    DetectionCandidate,
     FetchPolicy,
     MAXIMUM_DISCOVERED_CANDIDATES,
     OWNED_DEFAULT_CRAWL_DELAY_SECONDS,
@@ -38,8 +40,10 @@ from webguard_scanner import (
     ValidatedTarget,
     ValidationMode,
     ValidationPolicy,
-    discover_get_form_candidates,
+    discover_page_attack_surface,
+    discover_site_attack_surface,
     fetch_same_origin_page,
+    to_detection_candidates,
     validate_owned_target_preflight,
     validate_target_url,
     run_passive_crawl_scan,
@@ -66,6 +70,7 @@ def _discover_and_detect_page(
     safety: TrustScanRuntimeSafetyEngine,
     cancellation_check: Callable[[], bool],
     restrict_to_page_path: str | None = None,
+    extra_candidates: tuple[DetectionCandidate, ...] = (),
 ) -> list:
     if cancellation_check():
         return []
@@ -80,7 +85,20 @@ def _discover_and_detect_page(
     if response is None:
         return []
 
-    candidates = discover_get_form_candidates(target, page_url, response.body)
+    surface = discover_page_attack_surface(
+        target, page_url, response.body, budget=AttackSurfaceBudget()
+    )
+    candidates = to_detection_candidates(surface)
+    if extra_candidates:
+        seen = {(candidate.url, candidate.parameter) for candidate in candidates}
+        merged = list(candidates)
+        for candidate in extra_candidates:
+            key = (candidate.url, candidate.parameter)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(candidate)
+        candidates = tuple(merged)
     if restrict_to_page_path is not None:
         # A crawl page's findings must all belong to that page's own URL
         # (an existing, audited CrawlPageScanResult invariant). A
@@ -205,6 +223,24 @@ def _apply_active_detection(
         or cancellation_check()
     ):
         return report
+
+    # Site-level discovery (sitemap.xml, robots.txt, common OpenAPI paths)
+    # only runs for single-page scans. Crawl-mode findings must be
+    # attributable to one specific crawled page's own URL (see
+    # restrict_to_page_path above); site-level candidates aren't tied to
+    # any one page, so folding them into crawl mode would either violate
+    # that invariant or require inventing an attribution rule this slice
+    # does not define. Deferred, not silently dropped -- see the phase 5
+    # audit doc.
+    site_surface = discover_site_attack_surface(
+        target,
+        policy=policy,
+        before_request=safety.before_request,
+        after_request=safety.after_request,
+        cancellation_check=cancellation_check,
+    )
+    site_candidates = to_detection_candidates(site_surface)
+
     active_findings = _discover_and_detect_page(
         target,
         target.normalised_url,
@@ -213,6 +249,7 @@ def _apply_active_detection(
         policy,
         safety,
         cancellation_check,
+        extra_candidates=site_candidates,
     )
     if not active_findings:
         return report
