@@ -81,6 +81,13 @@ from .active_detection import (
     issue_probe,
     throttle,
 )
+from .request_template import (
+    RequestTemplate,
+    RequestTemplateError,
+    get_template_parameter_value,
+    issue_templated_request,
+    mutate,
+)
 from .runtime_hooks import AfterRequestHook, BeforeRequestHook
 from .scope_validator import ValidatedTarget
 
@@ -191,9 +198,11 @@ _DATABASE_ERROR_SIGNATURES: Tuple[str, ...] = (
 class SqliDetectorRunRecord:
     """One probed candidate and its outcome, regardless of whether a
     finding was produced -- so "no finding" is always distinguishable
-    from "not tested"."""
+    from "not tested". ``candidate`` is either a legacy DetectionCandidate
+    (GET query/form parameter) or a RequestTemplate (POST form / JSON
+    body parameter, Slice 6) -- whichever transport actually probed it."""
 
-    candidate: DetectionCandidate
+    candidate: DetectionCandidate | RequestTemplate
     outcome: SqliDetectionOutcome
     baseline_url: str
     diagnostic_url: str
@@ -248,7 +257,8 @@ def _classify(
 
 def _build_finding(
     target: ValidatedTarget,
-    candidate: DetectionCandidate,
+    parameter: str,
+    method: str,
     outcome: SqliDetectionOutcome,
     matched_signature: str,
     diagnostic_url: str,
@@ -261,8 +271,8 @@ def _build_finding(
         asset=f"{target.scheme}://{target.hostname}"
         + (f":{target.port}" if target.port not in (80, 443) else ""),
         path=parsed.path or "/",
-        method="GET",
-        parameter=candidate.parameter,
+        method=method,
+        parameter=parameter,
     )
 
     provenance = (
@@ -291,9 +301,90 @@ def _build_finding(
     )
 
 
+def _issue_legacy_baseline_and_diagnostic(
+    target: ValidatedTarget,
+    candidate: DetectionCandidate,
+    *,
+    policy: ActiveDetectionPolicy,
+    before_request: BeforeRequestHook | None,
+    after_request: AfterRequestHook | None,
+):
+    """The original, unmodified GET-query issuance path (pre-Slice-6).
+    Kept byte-for-byte in its own function so nothing about it changes
+    for existing DetectionCandidate callers."""
+
+    baseline_value = candidate.original_value or _DEFAULT_BASELINE_VALUE
+    baseline_attempt = issue_probe(
+        target,
+        candidate,
+        baseline_value,
+        policy=policy,
+        before_request=before_request,
+        after_request=after_request,
+    )
+    if not baseline_attempt.succeeded:
+        return baseline_attempt, None, candidate.parameter, "GET"
+
+    throttle(policy)
+
+    diagnostic_attempt = issue_probe(
+        target,
+        candidate,
+        _DIAGNOSTIC_PAYLOAD,
+        policy=policy,
+        before_request=before_request,
+        after_request=after_request,
+    )
+    return baseline_attempt, diagnostic_attempt, candidate.parameter, "GET"
+
+
+def _issue_templated_baseline_and_diagnostic(
+    target: ValidatedTarget,
+    template: RequestTemplate,
+    *,
+    policy: ActiveDetectionPolicy,
+    before_request: BeforeRequestHook | None,
+    after_request: AfterRequestHook | None,
+):
+    """Slice 6: POST-form / JSON-body issuance path via the shared
+    mutation engine. The classification logic downstream is identical to
+    the legacy path -- only how the two requests get built and sent
+    differs by transport."""
+
+    parameter = template.parameter
+    try:
+        current_value = get_template_parameter_value(template, parameter)
+    except RequestTemplateError:
+        current_value = ""
+    baseline_value = current_value or _DEFAULT_BASELINE_VALUE
+
+    baseline_mutated = mutate(template, parameter, baseline_value)
+    baseline_attempt = issue_templated_request(
+        target,
+        baseline_mutated,
+        policy=policy,
+        before_request=before_request,
+        after_request=after_request,
+    )
+    if not baseline_attempt.succeeded:
+        return baseline_attempt, None, parameter, template.method
+
+    throttle(policy)
+
+    diagnostic_mutated = mutate(template, parameter, _DIAGNOSTIC_PAYLOAD)
+    diagnostic_attempt = issue_templated_request(
+        target,
+        diagnostic_mutated,
+        policy=policy,
+        before_request=before_request,
+        after_request=after_request,
+    )
+    return baseline_attempt, diagnostic_attempt, parameter, template.method
+
+
 def run_sqli_error_detector(
     target: ValidatedTarget,
-    candidates: Tuple[DetectionCandidate, ...],
+    candidates: Tuple[DetectionCandidate | RequestTemplate, ...],
     context: ActiveDetectionContext,
     *,
     policy: ActiveDetectionPolicy = ActiveDetectionPolicy(),
@@ -309,6 +400,18 @@ def run_sqli_error_detector(
     this function does not discover them. Each candidate costs two
     requests (baseline + diagnostic); ``policy.maximum_probe_requests`` is
     enforced against that real cost before any request is sent.
+
+    As of Slice 6, ``candidates`` may mix legacy ``DetectionCandidate``
+    items (GET query/form parameter, the only shape supported before this
+    slice) with ``RequestTemplate`` items (POST form or JSON body
+    parameter, built from attack-surface discovery via
+    ``build_request_template``). Both are probed with the identical
+    baseline-then-diagnostic-apostrophe methodology and the identical
+    signature-based classification -- only how the two requests are
+    constructed and sent differs by transport. This is deliberately one
+    detector, not three, per input transport: GET/POST/JSON are input
+    transports for the same underlying vulnerability class, not distinct
+    detection methodologies.
 
     ``cancellation_check``, if supplied, is polled before every
     candidate's baseline request. When it returns True, no further
@@ -332,34 +435,45 @@ def run_sqli_error_detector(
         if index > 0:
             throttle(policy)
 
-        baseline_value = candidate.original_value or _DEFAULT_BASELINE_VALUE
-        baseline_attempt = issue_probe(
-            target,
-            candidate,
-            baseline_value,
-            policy=policy,
-            before_request=before_request,
-            after_request=after_request,
-        )
+        try:
+            if isinstance(candidate, RequestTemplate):
+                baseline_attempt, diagnostic_attempt, parameter, method = (
+                    _issue_templated_baseline_and_diagnostic(
+                        target,
+                        candidate,
+                        policy=policy,
+                        before_request=before_request,
+                        after_request=after_request,
+                    )
+                )
+            else:
+                baseline_attempt, diagnostic_attempt, parameter, method = (
+                    _issue_legacy_baseline_and_diagnostic(
+                        target,
+                        candidate,
+                        policy=policy,
+                        before_request=before_request,
+                        after_request=after_request,
+                    )
+                )
+        except RequestTemplateError as exc:
+            # A malformed or unrepresentable template (e.g. invalid JSON,
+            # a parameter path that no longer exists) is this candidate's
+            # problem, not the whole run's -- skip it and keep going,
+            # exactly like any other per-candidate probe failure.
+            probe_errors.append(exc.code)
+            continue
+
         if not baseline_attempt.succeeded:
             probe_errors.append(
                 baseline_attempt.error_code or "unknown_probe_error"
             )
             continue
 
-        throttle(policy)
-
-        diagnostic_attempt = issue_probe(
-            target,
-            candidate,
-            _DIAGNOSTIC_PAYLOAD,
-            policy=policy,
-            before_request=before_request,
-            after_request=after_request,
-        )
-        if not diagnostic_attempt.succeeded:
+        if diagnostic_attempt is None or not diagnostic_attempt.succeeded:
             probe_errors.append(
-                diagnostic_attempt.error_code or "unknown_probe_error"
+                (diagnostic_attempt.error_code if diagnostic_attempt else None)
+                or "unknown_probe_error"
             )
             continue
 
@@ -393,7 +507,8 @@ def run_sqli_error_detector(
         findings.append(
             _build_finding(
                 target,
-                candidate,
+                parameter,
+                method,
                 outcome,
                 matched_signature,
                 diagnostic_attempt.requested_url,

@@ -2,27 +2,36 @@
 a purpose-built, deliberately vulnerable local fixture -- not Juice Shop,
 not a public site.
 
-The fixture runs a real in-memory SQLite database behind four HTTP
-endpoints with known, distinct behaviour:
+The fixture runs a real in-memory SQLite database behind HTTP endpoints
+with known, distinct behaviour, across all three transports the detector
+now supports (Slice 6):
 
-- /vulnerable?id=  -- string-concatenates the raw parameter into SQL
-  (genuinely vulnerable; a bare apostrophe breaks the query).
-- /safe?id=        -- uses a parameterised query (?, tuple binding); a
-  bare apostrophe is just a literal string value, never breaks syntax.
-- /broken?id=      -- always returns a generic HTTP 500 with no SQL
+- /vulnerable?id=            (GET query)      -- string-concatenates the
+  raw parameter into SQL (genuinely vulnerable; a bare apostrophe breaks
+  the query).
+- /vulnerable-post-form      (POST form)      -- same vulnerability, id
+  submitted as a form field.
+- /vulnerable-json           (POST JSON)      -- same vulnerability, id
+  submitted as a JSON body field.
+- /safe?id=, /safe-post-form, /safe-json      -- each uses a
+  parameterised query (?, tuple binding); a bare apostrophe is just a
+  literal string value, never breaks syntax, across all three transports.
+- /broken?id=  -- always returns a generic HTTP 500 with no SQL
   involvement at all, regardless of input.
-- /about?id=       -- always returns the same normal 200 page whose
-  static copy happens to mention a database-error-shaped phrase
+- /about?id=   -- always returns the same normal 200 page whose static
+  copy happens to mention a database-error-shaped phrase
   ("SQLite3.OperationalError handling"), identically for every input.
 
-The detector must fire (CONFIRMED) only on /vulnerable, and produce no
-finding on the other three -- this is the core false-positive-resistance
-claim of this slice, exercised over real sockets and a real SQLite
-engine, not mocked.
+The detector must fire (CONFIRMED) only on the three /vulnerable*
+endpoints, and produce no finding on any of the safe/control endpoints --
+this is the core false-positive-resistance claim of this slice, exercised
+over real sockets and a real SQLite engine, not mocked, now proven across
+GET, POST-form, and JSON transports identically.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -33,7 +42,10 @@ from urllib.parse import parse_qs, urlsplit
 from webguard_scanner import (
     ActiveDetectionContext,
     ActiveDetectionPolicy,
+    ContentType,
     DetectionCandidate,
+    FetchPolicy,
+    RequestTemplate,
     SqliDetectionOutcome,
     ValidatedTarget,
     run_sqli_error_detector,
@@ -115,6 +127,48 @@ class _SqliFixtureHandler(BaseHTTPRequestHandler):
 
         self._respond(b"<html>not found</html>", status=404)
 
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlsplit(self.path)
+        length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(length) if length else b""
+        content_type = self.headers.get("Content-Type", "")
+
+        if "application/json" in content_type:
+            try:
+                document = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                document = {}
+            value = str(document.get("id", ""))
+        else:
+            value = parse_qs(raw_body.decode()).get("id", [""])[0]
+
+        if parsed.path in ("/vulnerable-post-form", "/vulnerable-json"):
+            query = f"SELECT id, name FROM products WHERE id = {value}"
+            try:
+                with self._lock:
+                    rows = self.db.execute(query).fetchall()
+                self._respond(f"<html>Results: {len(rows)}</html>".encode())
+            except sqlite3.Error as exc:
+                self._respond(
+                    f"<html>Database error: {exc}</html>".encode(), status=500
+                )
+            return
+
+        if parsed.path in ("/safe-post-form", "/safe-json"):
+            try:
+                with self._lock:
+                    rows = self.db.execute(
+                        "SELECT id, name FROM products WHERE id = ?", (value,)
+                    ).fetchall()
+                self._respond(f"<html>Results: {len(rows)}</html>".encode())
+            except sqlite3.Error as exc:
+                self._respond(
+                    f"<html>Database error: {exc}</html>".encode(), status=500
+                )
+            return
+
+        self._respond(b"<html>not found</html>", status=404)
+
 
 @unittest.skipUnless(
     _integration_enabled(),
@@ -164,6 +218,44 @@ class SqliErrorDetectorLiveFixtureTests(unittest.TestCase):
             policy=ActiveDetectionPolicy(minimum_delay_seconds=0.0),
         )
 
+    def _post_policy(self) -> ActiveDetectionPolicy:
+        return ActiveDetectionPolicy(
+            minimum_delay_seconds=0.0,
+            fetch_policy=FetchPolicy(
+                allowed_methods=frozenset({"GET", "HEAD", "POST"})
+            ),
+        )
+
+    def _run_post_form(self, path: str):
+        template = RequestTemplate(
+            endpoint=f"http://127.0.0.1:{self.port}{path}",
+            method="POST",
+            content_type=ContentType.FORM_URLENCODED,
+            parameter="id",
+            form_parameters=(("id", "1"),),
+        )
+        return run_sqli_error_detector(
+            self._target(),
+            (template,),
+            self._context(),
+            policy=self._post_policy(),
+        )
+
+    def _run_json(self, path: str):
+        template = RequestTemplate(
+            endpoint=f"http://127.0.0.1:{self.port}{path}",
+            method="POST",
+            content_type=ContentType.JSON,
+            parameter="id",
+            json_body=json.dumps({"id": "1"}),
+        )
+        return run_sqli_error_detector(
+            self._target(),
+            (template,),
+            self._context(),
+            policy=self._post_policy(),
+        )
+
     def test_vulnerable_endpoint_is_confirmed(self) -> None:
         result = self._run("/vulnerable")
         self.assertEqual(len(result.findings), 1)
@@ -190,6 +282,40 @@ class SqliErrorDetectorLiveFixtureTests(unittest.TestCase):
 
     def test_database_looking_static_text_produces_no_finding(self) -> None:
         result = self._run("/about")
+        self.assertEqual(result.findings, ())
+        self.assertEqual(
+            result.records[0].outcome, SqliDetectionOutcome.INCONCLUSIVE
+        )
+
+    def test_vulnerable_post_form_endpoint_is_confirmed_over_real_socket(
+        self,
+    ) -> None:
+        result = self._run_post_form("/vulnerable-post-form")
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(
+            result.records[0].outcome, SqliDetectionOutcome.CONFIRMED
+        )
+        self.assertEqual(result.findings[0].identity.method, "POST")
+
+    def test_safe_post_form_endpoint_produces_no_finding_over_real_socket(
+        self,
+    ) -> None:
+        result = self._run_post_form("/safe-post-form")
+        self.assertEqual(result.findings, ())
+        self.assertEqual(
+            result.records[0].outcome, SqliDetectionOutcome.INCONCLUSIVE
+        )
+
+    def test_vulnerable_json_endpoint_is_confirmed_over_real_socket(self) -> None:
+        result = self._run_json("/vulnerable-json")
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(
+            result.records[0].outcome, SqliDetectionOutcome.CONFIRMED
+        )
+        self.assertEqual(result.findings[0].identity.method, "POST")
+
+    def test_safe_json_endpoint_produces_no_finding_over_real_socket(self) -> None:
+        result = self._run_json("/safe-json")
         self.assertEqual(result.findings, ())
         self.assertEqual(
             result.records[0].outcome, SqliDetectionOutcome.INCONCLUSIVE

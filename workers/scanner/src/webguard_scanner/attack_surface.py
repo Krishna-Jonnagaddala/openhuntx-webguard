@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from html.parser import HTMLParser
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from .active_detection import (
@@ -90,7 +90,16 @@ _STATE_CHANGING_KEYWORDS = (
     "checkout",
     "payment",
     "pay",
-    "password",
+    "transfer",
+    # Deliberately "change-password"/"reset-password", not bare
+    # "password": a login endpoint legitimately has a "password" field
+    # and is a normal, common, legitimate detection target (e.g. the
+    # classic login-SQLi case) -- it is not itself a state-changing
+    # action. Only the specific *mutation* of a password is.
+    "change-password",
+    "reset-password",
+    "register",
+    "create-user",
     "logout",
     "signout",
     "sign-out",
@@ -131,15 +140,22 @@ class AttackSurfaceCandidate:
     discovery_method: DiscoveryMethod
     safety: SafetyClassification
     authentication_required: bool | None = None
+    json_body_template: str = ""
     candidate_id: str = field(init=False)
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.endpoint)
         canonical_endpoint = f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
+        # Identity intentionally excludes volatile probe values (baseline_value,
+        # json_body_template) -- origin + path + method + content type +
+        # parameter location + parameter name is what makes two discovered
+        # candidates "the same place," per Slice 6's deterministic-identity
+        # requirement (dedup, findings, retesting, scan comparison).
         identity_key = "|".join(
             (
                 canonical_endpoint,
                 self.method.upper(),
+                self.content_type,
                 self.input_location.value,
                 self.parameter,
             )
@@ -482,6 +498,149 @@ _OPENAPI_WELL_KNOWN_PATHS = (
 )
 
 
+def _synthesize_example_from_schema(
+    schema: Any, *, depth: int = 0, maximum_depth: int = 4
+) -> Any:
+    """Bounded, safe synthesis of a plausible example JSON value from an
+    OpenAPI schema fragment when the document itself provides no
+    concrete example. Never executes anything -- pure structural
+    traversal of already-parsed JSON with an explicit depth cap."""
+
+    if depth > maximum_depth or not isinstance(schema, dict):
+        return None
+
+    if "example" in schema:
+        return schema["example"]
+
+    schema_type = schema.get("type")
+    if schema_type == "object" or isinstance(schema.get("properties"), dict):
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return {}
+        result: dict[str, Any] = {}
+        for name, subschema in list(properties.items())[:20]:
+            if isinstance(name, str):
+                result[name] = _synthesize_example_from_schema(
+                    subschema, depth=depth + 1, maximum_depth=maximum_depth
+                )
+        return result
+    if schema_type == "string":
+        return "sample"
+    if schema_type in ("integer", "number"):
+        return 1
+    if schema_type == "boolean":
+        return False
+    if schema_type == "array":
+        return []
+    return ""
+
+
+def _enumerate_json_leaf_paths(
+    document: Any,
+    *,
+    maximum_depth: int,
+    maximum_parameters: int,
+    maximum_array_index: int,
+) -> tuple[str, ...]:
+    """Deterministic, bounded leaf-path enumeration duplicated (not
+    imported) from request_template.py's enumerate_json_parameter_paths:
+    this discovery-layer module must not depend on the mutation-engine
+    module, which itself depends on this one for AttackSurfaceCandidate/
+    InputLocation/SafetyClassification -- importing the other direction
+    would create a cycle. Keep any behavioural change mirrored in both."""
+
+    paths: list[str] = []
+
+    def walk(node: Any, prefix: str, depth: int) -> None:
+        if len(paths) >= maximum_parameters or depth > maximum_depth:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if not isinstance(key, str) or len(paths) >= maximum_parameters:
+                    return
+                walk(value, f"{prefix}.{key}" if prefix else key, depth + 1)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                if index >= maximum_array_index or len(paths) >= maximum_parameters:
+                    return
+                walk(value, f"{prefix}[{index}]", depth + 1)
+        elif isinstance(node, (str, int, float, bool)) and prefix:
+            paths.append(prefix)
+
+    walk(document, "", 0)
+    return tuple(paths)
+
+
+def _extract_json_body_candidates(
+    endpoint: str,
+    method: str,
+    operation: Any,
+    document_url: str,
+    budget: AttackSurfaceBudget,
+) -> list[AttackSurfaceCandidate]:
+    """Derive JSON_BODY candidates from an OpenAPI operation's
+    requestBody, when it declares a concrete example (or enough schema
+    structure to synthesize one). No example/schema -> no JSON body
+    candidates for this operation; this is a valid, common result, not a
+    failure -- most OpenAPI documents in the wild are incomplete."""
+
+    if not isinstance(operation, dict):
+        return []
+    request_body = operation.get("requestBody")
+    if not isinstance(request_body, dict):
+        return []
+    content = request_body.get("content")
+    if not isinstance(content, dict):
+        return []
+    json_content = content.get("application/json")
+    if not isinstance(json_content, dict):
+        return []
+
+    example = json_content.get("example")
+    if not isinstance(example, dict):
+        schema = json_content.get("schema")
+        example = (
+            _synthesize_example_from_schema(schema)
+            if isinstance(schema, dict)
+            else None
+        )
+    if not isinstance(example, dict) or not example:
+        return []
+
+    try:
+        body_text = json.dumps(example)
+    except (TypeError, ValueError):
+        return []
+    if len(body_text.encode("utf-8")) > budget.maximum_response_bytes:
+        return []
+
+    paths = _enumerate_json_leaf_paths(
+        example,
+        maximum_depth=6,
+        maximum_parameters=budget.maximum_parameters_per_endpoint,
+        maximum_array_index=10,
+    )
+    if not paths:
+        return []
+
+    safety = _classify_safety(method, endpoint, paths)
+    return [
+        AttackSurfaceCandidate(
+            endpoint=endpoint,
+            method=method,
+            input_location=InputLocation.JSON_BODY,
+            parameter=path,
+            baseline_value="",
+            content_type="application/json",
+            source_page=document_url,
+            discovery_method=DiscoveryMethod.OPENAPI_DOCUMENT,
+            safety=safety,
+            json_body_template=body_text,
+        )
+        for path in paths
+    ]
+
+
 def _extract_openapi_candidates(
     target: ValidatedTarget,
     document_url: str,
@@ -545,6 +704,15 @@ def _extract_openapi_candidates(
                     source_page=document_url,
                     discovery_method=DiscoveryMethod.OPENAPI_DOCUMENT,
                     safety=safety,
+                )
+            )
+            candidates.extend(
+                _extract_json_body_candidates(
+                    absolute,
+                    upper_method,
+                    operations[method],
+                    document_url,
+                    budget,
                 )
             )
 

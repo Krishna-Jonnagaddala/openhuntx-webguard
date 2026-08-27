@@ -49,7 +49,26 @@ Scanner-side security logic including:
 - checkpoint/resume logic;
 - owned-target preflight enforcement;
 - runtime hooks used by the TrustScan safety engine; and
-- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`) and the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`) — see `docs/audit/active-detection-phase1-xss.md` through `phase5-attack-surface-discovery.md`.
+- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`), the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`), and the request-template/mutation layer between them (`request_template.py`) — see `docs/audit/active-detection-phase1-xss.md` through `phase6-request-mutation.md`.
+
+Active-detection data flow, current as of Slice 6:
+
+```
+Discovery (attack_surface.py)
+   -> AttackSurfaceCandidate (endpoint, method, input location, safety classification)
+   -> RequestTemplate (request_template.py: query/form/JSON shape, no secrets)
+   -> mutate() (one parameter changed, everything else preserved)
+   -> issue_templated_request() / issue_probe() (safe_http, same-origin + runtime-safety hooks)
+   -> xss_reflected_detector.py / sqli_error_detector.py (classification)
+   -> NormalizedFinding
+```
+
+Representability (can a request of this shape be built and mutated) is
+independent of authorization (is this detector, this HTTP method, this
+target, this budget allowed to send it). `RequestTemplate`/`mutate` only
+answer the first question; the TrustScan permit's `active_checks` and
+`allowed_http_methods` claims, enforced by the executor and the runtime
+safety engine, answer the second — unchanged by this layer's existence.
 
 ### `apps/api`
 

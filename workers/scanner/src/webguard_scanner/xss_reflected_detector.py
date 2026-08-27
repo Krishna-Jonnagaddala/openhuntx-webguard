@@ -66,6 +66,13 @@ from .active_detection import (
     issue_probe,
     throttle,
 )
+from .request_template import (
+    ContentType,
+    RequestTemplate,
+    RequestTemplateError,
+    issue_templated_request,
+    mutate,
+)
 from .runtime_hooks import AfterRequestHook, BeforeRequestHook
 from .scope_validator import ValidatedTarget
 
@@ -181,9 +188,11 @@ _REFERENCES = (
 class DetectorRunRecord:
     """One probed candidate and its outcome, regardless of whether a
     finding was produced. Exists so "no finding" is always distinguishable
-    from "not tested"."""
+    from "not tested". ``candidate`` is either a legacy DetectionCandidate
+    (GET query/form parameter) or a RequestTemplate (POST form parameter,
+    Slice 6) -- whichever transport actually probed it."""
 
-    candidate: DetectionCandidate
+    candidate: DetectionCandidate | RequestTemplate
     outcome: DetectionOutcome
     requested_url: str
     marker: str
@@ -232,7 +241,8 @@ def _classify_reflection(marker: str, body_text: str) -> DetectionOutcome:
 
 def _build_finding(
     target: ValidatedTarget,
-    candidate: DetectionCandidate,
+    parameter: str,
+    method: str,
     outcome: DetectionOutcome,
     marker: str,
     requested_url: str,
@@ -245,8 +255,8 @@ def _build_finding(
         asset=f"{target.scheme}://{target.hostname}"
         + (f":{target.port}" if target.port not in (80, 443) else ""),
         path=parsed.path or "/",
-        method="GET",
-        parameter=candidate.parameter,
+        method=method,
+        parameter=parameter,
     )
 
     provenance = (
@@ -285,9 +295,69 @@ def _build_finding(
     )
 
 
+def _issue_legacy_probe(
+    target: ValidatedTarget,
+    candidate: DetectionCandidate,
+    payload: str,
+    *,
+    policy: ActiveDetectionPolicy,
+    before_request: BeforeRequestHook | None,
+    after_request: AfterRequestHook | None,
+):
+    """The original, unmodified GET-query issuance path (pre-Slice-6)."""
+
+    attempt = issue_probe(
+        target,
+        candidate,
+        payload,
+        policy=policy,
+        before_request=before_request,
+        after_request=after_request,
+    )
+    return attempt, candidate.parameter, "GET"
+
+
+def _issue_templated_probe(
+    target: ValidatedTarget,
+    template: RequestTemplate,
+    payload: str,
+    *,
+    policy: ActiveDetectionPolicy,
+    before_request: BeforeRequestHook | None,
+    after_request: AfterRequestHook | None,
+):
+    """Slice 6: POST-form issuance path via the shared mutation engine.
+
+    JSON bodies are deliberately not supported here -- reflected-XSS's
+    evidence (attacker-controlled markup echoed into an HTML response)
+    only means something when the browser renders that HTML; a JSON API
+    response being reflected back is a different, unproven claim this
+    detector does not make. Feature-parity with SQLi is not a goal by
+    itself (see this slice's brief).
+    """
+
+    if template.content_type == ContentType.JSON:
+        raise RequestTemplateError(
+            "xss_json_body_not_supported",
+            "Reflected-XSS evidence semantics do not apply to a JSON "
+            "request/response body; this detector only probes "
+            "GET query/form and POST form parameters.",
+        )
+
+    mutated = mutate(template, template.parameter, payload)
+    attempt = issue_templated_request(
+        target,
+        mutated,
+        policy=policy,
+        before_request=before_request,
+        after_request=after_request,
+    )
+    return attempt, template.parameter, template.method
+
+
 def run_reflected_xss_detector(
     target: ValidatedTarget,
-    candidates: Tuple[DetectionCandidate, ...],
+    candidates: Tuple[DetectionCandidate | RequestTemplate, ...],
     context: ActiveDetectionContext,
     *,
     policy: ActiveDetectionPolicy = ActiveDetectionPolicy(),
@@ -303,6 +373,12 @@ def run_reflected_xss_detector(
     function does not discover them. ``policy.maximum_probe_requests`` is
     enforced before any request is sent (fail closed on an oversized
     candidate list rather than truncating it silently).
+
+    As of Slice 6, ``candidates`` may mix legacy ``DetectionCandidate``
+    items (GET query/form parameter) with ``RequestTemplate`` items (POST
+    form parameter, built via ``build_request_template``). JSON-body
+    RequestTemplate items are recorded as a probe error, never probed --
+    see ``_issue_templated_probe``'s docstring for why.
 
     ``cancellation_check``, if supplied, is polled before every probe
     (including the first). When it returns True, no further probes are
@@ -329,14 +405,28 @@ def run_reflected_xss_detector(
         marker = _new_marker()
         payload = f"<{marker}>"
 
-        attempt = issue_probe(
-            target,
-            candidate,
-            payload,
-            policy=policy,
-            before_request=before_request,
-            after_request=after_request,
-        )
+        try:
+            if isinstance(candidate, RequestTemplate):
+                attempt, parameter, method = _issue_templated_probe(
+                    target,
+                    candidate,
+                    payload,
+                    policy=policy,
+                    before_request=before_request,
+                    after_request=after_request,
+                )
+            else:
+                attempt, parameter, method = _issue_legacy_probe(
+                    target,
+                    candidate,
+                    payload,
+                    policy=policy,
+                    before_request=before_request,
+                    after_request=after_request,
+                )
+        except RequestTemplateError as exc:
+            probe_errors.append(exc.code)
+            continue
 
         if not attempt.succeeded:
             probe_errors.append(attempt.error_code or "unknown_probe_error")
@@ -361,7 +451,8 @@ def run_reflected_xss_detector(
         findings.append(
             _build_finding(
                 target,
-                candidate,
+                parameter,
+                method,
                 outcome,
                 marker,
                 attempt.requested_url,

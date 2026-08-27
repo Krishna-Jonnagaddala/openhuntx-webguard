@@ -26,6 +26,7 @@ class FetchPolicy:
     maximum_header_bytes: int = 65_536
     maximum_header_count: int = 100
     allowed_methods: FrozenSet[str] = frozenset({"GET", "HEAD"})
+    maximum_request_body_bytes: int = 65_536
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,6 +328,12 @@ def _validate_policy(policy: FetchPolicy) -> None:
             "The response header-count limit must be greater than zero.",
         )
 
+    if policy.maximum_request_body_bytes < 0:
+        raise SafeRequestError(
+            "request_body_limit_invalid",
+            "The request-body limit cannot be negative.",
+        )
+
 
 def _canonical_addresses(
     addresses: Iterable[str],
@@ -548,6 +555,9 @@ def _perform_request(
     method: str,
     path: str,
     policy: FetchPolicy,
+    *,
+    body: bytes = b"",
+    content_type: str = "",
 ) -> SafeHttpResponse:
     connection = _make_connection(
         target,
@@ -582,11 +592,26 @@ def _perform_request(
             "Accept-Encoding",
             "identity",
         )
+        if body:
+            connection.putheader(
+                "Content-Type",
+                content_type or "application/octet-stream",
+            )
+            connection.putheader("Content-Length", str(len(body)))
         connection.putheader(
             "Connection",
             "close",
         )
-        connection.endheaders()
+        # Calling endheaders() with zero arguments when there is no body
+        # is deliberately preserved byte-for-byte from before request
+        # bodies existed -- every existing fake connection in the test
+        # suite implements endheaders(self) with no parameters, and this
+        # keeps every GET/HEAD-only code path (the only paths those fakes
+        # exercise) calling it exactly as before.
+        if body:
+            connection.endheaders(body)
+        else:
+            connection.endheaders()
         tls = (
             _tls_connection_info(connection, target)
             if target.scheme == "https"
@@ -770,8 +795,18 @@ def fetch_once(
     target: ValidatedTarget,
     method: str = "GET",
     policy: FetchPolicy = FetchPolicy(),
+    *,
+    body: bytes = b"",
+    content_type: str = "",
 ) -> SafeHttpResponse:
-    """Make one bounded request to an already validated target."""
+    """Make one bounded request to an already validated target.
+
+    ``body``/``content_type`` are optional and empty by default -- every
+    pre-existing GET/HEAD-only caller is unaffected. When ``body`` is
+    supplied it is checked against ``policy.maximum_request_body_bytes``
+    before any connection is attempted (fail closed on an oversized
+    request body, mirroring the existing response-body limit).
+    """
 
     _validate_policy(policy)
 
@@ -781,6 +816,12 @@ def fetch_once(
         raise SafeRequestError(
             "method_not_allowed",
             f"HTTP method {normalised_method!r} is prohibited.",
+        )
+
+    if body and len(body) > policy.maximum_request_body_bytes:
+        raise SafeRequestError(
+            "request_body_too_large",
+            "The request body exceeds the configured limit.",
         )
 
     path = _request_path(target)
@@ -798,6 +839,8 @@ def fetch_once(
                 normalised_method,
                 path,
                 policy,
+                body=body,
+                content_type=content_type,
             )
         except SafeRequestError:
             raise

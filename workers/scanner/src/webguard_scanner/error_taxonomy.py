@@ -17,6 +17,7 @@ class ErrorCategory(str, Enum):
     RESPONSE_POLICY = "response-policy"
     RESPONSE_LIMIT = "response-limit"
     RESPONSE_FORMAT = "response-format"
+    REQUEST_LIMIT = "request-limit"
     ANALYSIS = "analysis"
     MIXED = "mixed"
     UNKNOWN = "unknown"
@@ -44,6 +45,10 @@ _REQUEST_POLICIES: dict[str, ErrorPolicy] = {
         _NON_RETRYABLE,
     ),
     "header_limit_invalid": ErrorPolicy(
+        ErrorCategory.CONFIGURATION,
+        _NON_RETRYABLE,
+    ),
+    "request_body_limit_invalid": ErrorPolicy(
         ErrorCategory.CONFIGURATION,
         _NON_RETRYABLE,
     ),
@@ -153,6 +158,12 @@ _REQUEST_POLICIES: dict[str, ErrorPolicy] = {
     ),
     "response_headers_too_large": ErrorPolicy(
         ErrorCategory.RESPONSE_LIMIT,
+        _NON_RETRYABLE,
+    ),
+
+    # Request-body safety limit (Slice 6: POST/JSON mutation).
+    "request_body_too_large": ErrorPolicy(
+        ErrorCategory.REQUEST_LIMIT,
         _NON_RETRYABLE,
     ),
 

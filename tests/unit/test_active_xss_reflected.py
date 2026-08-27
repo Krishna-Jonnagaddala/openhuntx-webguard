@@ -19,8 +19,11 @@ from webguard_scanner import (
     ActiveDetectionContext,
     ActiveDetectionError,
     ActiveDetectionPolicy,
+    ContentType,
     DetectionCandidate,
     DetectionOutcome,
+    FetchPolicy,
+    RequestTemplate,
     ValidatedTarget,
     run_reflected_xss_detector,
 )
@@ -381,6 +384,164 @@ class ReflectedXssSafetyBoundaryTests(unittest.TestCase):
                 parameter="q",
                 method="POST",
             )
+
+
+class _PostFormConnection:
+    """A fake connection whose reflection behaviour is driven by the
+    request *body* (form-urlencoded), simulating a POST search form."""
+
+    def __init__(self, *, reflect: bool) -> None:
+        self.reflect = reflect
+        self.sock = None
+        self._context = None
+        self.sent_bodies: list[bytes] = []
+
+    def putrequest(self, method, path, **kwargs) -> None:
+        return None
+
+    def putheader(self, name, value) -> None:
+        return None
+
+    def endheaders(self, message_body=None) -> None:
+        self.sent_bodies.append(message_body or b"")
+
+    def getresponse(self):
+        value = parse_qs(self.sent_bodies[-1].decode()).get("q", [""])[0]
+        if not self.reflect:
+            body = b"<html><body>no reflection here</body></html>"
+        else:
+            body = f"<html><body>{value}</body></html>".encode()
+        return _FakeResponse(body)
+
+    def close(self) -> None:
+        pass
+
+
+def _post_policy() -> ActiveDetectionPolicy:
+    return ActiveDetectionPolicy(
+        minimum_delay_seconds=0.0,
+        fetch_policy=FetchPolicy(allowed_methods=frozenset({"GET", "HEAD", "POST"})),
+    )
+
+
+class ReflectedXssPostFormTests(unittest.TestCase):
+    def test_post_form_candidate_is_probed_and_confirmed(self) -> None:
+        template = RequestTemplate(
+            endpoint="http://example.com/search",
+            method="POST",
+            content_type=ContentType.FORM_URLENCODED,
+            parameter="q",
+            form_parameters=(("q", "hello"),),
+        )
+        connection = _PostFormConnection(reflect=True)
+        with patch(
+            "webguard_scanner.safe_http._make_connection",
+            return_value=connection,
+        ):
+            result = run_reflected_xss_detector(
+                _target(), (template,), _context(), policy=_post_policy()
+            )
+        self.assertEqual(len(result.findings), 1)
+        finding = result.findings[0]
+        self.assertEqual(finding.identity.method, "POST")
+        self.assertEqual(finding.identity.parameter, "q")
+
+    def test_post_form_candidate_no_reflection_produces_no_finding(self) -> None:
+        template = RequestTemplate(
+            endpoint="http://example.com/search",
+            method="POST",
+            content_type=ContentType.FORM_URLENCODED,
+            parameter="q",
+            form_parameters=(("q", "hello"),),
+        )
+        connection = _PostFormConnection(reflect=False)
+        with patch(
+            "webguard_scanner.safe_http._make_connection",
+            return_value=connection,
+        ):
+            result = run_reflected_xss_detector(
+                _target(), (template,), _context(), policy=_post_policy()
+            )
+        self.assertEqual(result.findings, ())
+        self.assertEqual(
+            result.records[0].outcome, DetectionOutcome.INCONCLUSIVE
+        )
+
+    def test_json_body_candidate_is_never_probed(self) -> None:
+        template = RequestTemplate(
+            endpoint="http://example.com/api/search",
+            method="POST",
+            content_type=ContentType.JSON,
+            parameter="q",
+            json_body='{"q": "hello"}',
+        )
+        connection = _PostFormConnection(reflect=True)
+        with patch(
+            "webguard_scanner.safe_http._make_connection",
+            return_value=connection,
+        ) as make_connection:
+            result = run_reflected_xss_detector(
+                _target(), (template,), _context(), policy=_post_policy()
+            )
+        make_connection.assert_not_called()
+        self.assertEqual(result.findings, ())
+        self.assertEqual(result.records, ())
+        self.assertEqual(result.probe_errors, ("xss_json_body_not_supported",))
+
+    def test_mixed_legacy_get_and_templated_post_candidates(self) -> None:
+        get_candidate = _candidate()
+        post_template = RequestTemplate(
+            endpoint="http://example.com/search",
+            method="POST",
+            content_type=ContentType.FORM_URLENCODED,
+            parameter="q",
+            form_parameters=(("q", "hello"),),
+        )
+
+        class _MixedConnection:
+            def __init__(self) -> None:
+                self.sock = None
+                self._context = None
+                self._method = "GET"
+                self._path = ""
+                self._body = b""
+
+            def putrequest(self, method, path, **kwargs) -> None:
+                self._method = method
+                self._path = path
+
+            def putheader(self, name, value) -> None:
+                return None
+
+            def endheaders(self, message_body=None) -> None:
+                self._body = message_body or b""
+
+            def getresponse(self):
+                if self._method == "GET":
+                    value = parse_qs(urlsplit(self._path).query).get("q", [""])[0]
+                else:
+                    value = parse_qs(self._body.decode()).get("q", [""])[0]
+                return _FakeResponse(f"<html>{value}</html>".encode())
+
+            def close(self) -> None:
+                pass
+
+        connection = _MixedConnection()
+        with patch(
+            "webguard_scanner.safe_http._make_connection",
+            return_value=connection,
+        ):
+            result = run_reflected_xss_detector(
+                _target(),
+                (get_candidate, post_template),
+                _context(),
+                policy=_post_policy(),
+            )
+
+        self.assertEqual(len(result.records), 2)
+        self.assertEqual(len(result.findings), 2)
+        methods = {finding.identity.method for finding in result.findings}
+        self.assertEqual(methods, {"GET", "POST"})
 
 
 if __name__ == "__main__":

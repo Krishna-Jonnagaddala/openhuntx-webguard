@@ -36,6 +36,7 @@ from webguard_scanner import (
     OWNED_DEFAULT_CRAWL_LINKS_PER_PAGE,
     OWNED_DEFAULT_CRAWL_PAGES,
     OWNED_DEFAULT_CRAWL_REQUEST_ATTEMPTS,
+    RequestTemplate,
     RetryPolicy,
     ValidatedTarget,
     ValidationMode,
@@ -43,7 +44,7 @@ from webguard_scanner import (
     discover_page_attack_surface,
     discover_site_attack_surface,
     fetch_same_origin_page,
-    to_detection_candidates,
+    to_request_templates,
     validate_owned_target_preflight,
     validate_target_url,
     run_passive_crawl_scan,
@@ -61,6 +62,10 @@ _ACTIVE_DETECTION_ELIGIBLE_STATUSES = frozenset(
 )
 
 
+def _endpoint_of(candidate: DetectionCandidate | RequestTemplate) -> str:
+    return candidate.url if isinstance(candidate, DetectionCandidate) else candidate.endpoint
+
+
 def _discover_and_detect_page(
     target: ValidatedTarget,
     page_url: str,
@@ -70,7 +75,9 @@ def _discover_and_detect_page(
     safety: TrustScanRuntimeSafetyEngine,
     cancellation_check: Callable[[], bool],
     restrict_to_page_path: str | None = None,
-    extra_candidates: tuple[DetectionCandidate, ...] = (),
+    extra_candidates: tuple[DetectionCandidate | RequestTemplate, ...] = (),
+    allow_post: bool = False,
+    allow_json: bool = False,
 ) -> list:
     if cancellation_check():
         return []
@@ -88,12 +95,22 @@ def _discover_and_detect_page(
     surface = discover_page_attack_surface(
         target, page_url, response.body, budget=AttackSurfaceBudget()
     )
-    candidates = to_detection_candidates(surface)
+    # allow_post/allow_json come from the binding TrustScan permit's own
+    # allowed_http_methods claim (see _apply_active_detection) -- this is
+    # the "explicit active authorization" that lets a
+    # REQUIRES_EXPLICIT_ACTIVE_AUTHORIZATION POST-form/JSON candidate
+    # become representable as a RequestTemplate at all. It is still not
+    # itself a probe: every runtime safety check (budget, rate,
+    # concurrency, cancellation, method authorization at the safe_http
+    # layer) applies identically afterwards.
+    candidates = to_request_templates(
+        surface, allow_post=allow_post, allow_json=allow_json
+    )
     if extra_candidates:
-        seen = {(candidate.url, candidate.parameter) for candidate in candidates}
+        seen = {(_endpoint_of(c), c.parameter) for c in candidates}
         merged = list(candidates)
         for candidate in extra_candidates:
-            key = (candidate.url, candidate.parameter)
+            key = (_endpoint_of(candidate), candidate.parameter)
             if key in seen:
                 continue
             seen.add(key)
@@ -108,7 +125,7 @@ def _discover_and_detect_page(
         candidates = tuple(
             candidate
             for candidate in candidates
-            if urlsplit(candidate.url).path == restrict_to_page_path
+            if urlsplit(_endpoint_of(candidate)).path == restrict_to_page_path
         )
     if not candidates:
         return []
@@ -180,6 +197,14 @@ def _apply_active_detection(
         fetch_policy=fetch_policy,
         maximum_probe_requests=MAXIMUM_DISCOVERED_CANDIDATES,
     )
+    # The permit's own allowed_http_methods claim is the "explicit active
+    # authorization" gating POST/JSON candidate representability (see
+    # to_request_templates). This does not itself authorize a probe --
+    # safe_http.fetch_once and the runtime safety engine independently
+    # re-check the method against this exact same claim before any
+    # request is sent.
+    allow_post = "POST" in fetch_policy.allowed_methods
+    allow_json = allow_post
 
     def cancellation_check() -> bool:
         return cancellation_token.is_cancelled
@@ -203,6 +228,8 @@ def _apply_active_detection(
                 safety,
                 cancellation_check,
                 restrict_to_page_path=urlsplit(page.url).path or "/",
+                allow_post=allow_post,
+                allow_json=allow_json,
             )
             if not active_findings:
                 updated_pages.append(page)
@@ -239,7 +266,9 @@ def _apply_active_detection(
         after_request=safety.after_request,
         cancellation_check=cancellation_check,
     )
-    site_candidates = to_detection_candidates(site_surface)
+    site_candidates = to_request_templates(
+        site_surface, allow_post=allow_post, allow_json=allow_json
+    )
 
     active_findings = _discover_and_detect_page(
         target,
@@ -250,6 +279,8 @@ def _apply_active_detection(
         safety,
         cancellation_check,
         extra_candidates=site_candidates,
+        allow_post=allow_post,
+        allow_json=allow_json,
     )
     if not active_findings:
         return report
