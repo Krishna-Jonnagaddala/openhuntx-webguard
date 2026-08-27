@@ -15,8 +15,8 @@ from .owned_targets import OwnedTargetContractError, canonicalize_owned_target_u
 from .scan_jobs import ScanJobMode
 
 
-CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.0"
-SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.0",)
+CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.1"
+SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.1",)
 TRUSTSCAN_PERMIT_TYPE = "trustscan_scan_permit"
 TRUSTSCAN_SIGNATURE_ALGORITHM = "Ed25519"
 MAXIMUM_TRUSTSCAN_PERMIT_DOCUMENT_BYTES = 128 * 1024
@@ -35,6 +35,14 @@ TRUSTSCAN_PROHIBITED_OPERATIONS = (
     "persistence",
     "social_engineering",
 )
+
+# The catalog of active (non-passive) detectors a permit may explicitly
+# authorize. A permit's active_checks claim must be a subset of this tuple.
+# Empty active_checks (the default) means passive-only -- fail closed.
+# Schema 1.1 replaces 1.0 outright rather than supporting both: WebGuard is
+# still pre-production (README: "not yet a publicly hosted production
+# service"), so there is no deployed 1.0 permit this would break.
+KNOWN_TRUSTSCAN_ACTIVE_CHECKS = ("active.xss.reflected",)
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _KEY_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -224,6 +232,31 @@ def _http_methods(value: object) -> tuple[str, ...]:
     return canonical
 
 
+def _active_checks(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_active_checks_invalid",
+            "active_checks must be a tuple.",
+        )
+    if any(not isinstance(item, str) for item in value):
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_active_checks_invalid",
+            "active_checks must contain detector identifier strings.",
+        )
+    canonical = tuple(sorted(set(value)))
+    if canonical != tuple(sorted(value)) or len(canonical) != len(value):
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_active_checks_non_canonical",
+            "active_checks must be sorted and unique.",
+        )
+    if any(item not in KNOWN_TRUSTSCAN_ACTIVE_CHECKS for item in canonical):
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_active_checks_unknown",
+            "active_checks contains an unrecognized detector identifier.",
+        )
+    return canonical
+
+
 def _prohibited_operations(value: object) -> tuple[str, ...]:
     if not isinstance(value, tuple) or value != TRUSTSCAN_PROHIBITED_OPERATIONS:
         raise TrustScanPermitValidationError(
@@ -306,6 +339,7 @@ class TrustScanPermitSubmission:
     maximum_request_attempts: int
     maximum_requests_per_second: float
     maximum_concurrency: int = TRUSTSCAN_V1_MAXIMUM_CONCURRENCY
+    active_checks: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         try:
@@ -361,6 +395,7 @@ class TrustScanPermitSubmission:
                 "TrustScan permit v1 requires maximum_concurrency to be 1.",
             )
         object.__setattr__(self, "maximum_concurrency", concurrency)
+        object.__setattr__(self, "active_checks", _active_checks(self.active_checks))
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,6 +417,7 @@ class TrustScanPermitClaims:
     maximum_requests_per_second: float
     maximum_concurrency: int = TRUSTSCAN_V1_MAXIMUM_CONCURRENCY
     prohibited_operations: tuple[str, ...] = TRUSTSCAN_PROHIBITED_OPERATIONS
+    active_checks: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "permit_id", _uuid(self.permit_id, "permit_id"))
@@ -446,6 +482,7 @@ class TrustScanPermitClaims:
             "prohibited_operations",
             _prohibited_operations(self.prohibited_operations),
         )
+        object.__setattr__(self, "active_checks", _active_checks(self.active_checks))
 
     @property
     def fingerprint(self) -> str:
@@ -472,6 +509,7 @@ class TrustScanPermitClaims:
             "maximum_requests_per_second": self.maximum_requests_per_second,
             "maximum_concurrency": self.maximum_concurrency,
             "prohibited_operations": list(self.prohibited_operations),
+            "active_checks": list(self.active_checks),
         }
 
 
@@ -557,15 +595,22 @@ def load_trustscan_permit_submission_json(document: str | bytes) -> TrustScanPer
             "maximum_request_attempts",
             "maximum_requests_per_second",
             "maximum_concurrency",
+            "active_checks",
         },
         context="TrustScan permit submission",
     )
     mode_values = root["permitted_modes"]
     method_values = root["allowed_http_methods"]
-    if not isinstance(mode_values, list) or not isinstance(method_values, list):
+    active_check_values = root["active_checks"]
+    if (
+        not isinstance(mode_values, list)
+        or not isinstance(method_values, list)
+        or not isinstance(active_check_values, list)
+    ):
         raise TrustScanPermitLoadError(
             "trustscan_permit_list_required",
-            "permitted_modes and allowed_http_methods must be JSON arrays.",
+            "permitted_modes, allowed_http_methods, and active_checks must "
+            "be JSON arrays.",
         )
     try:
         submission = TrustScanPermitSubmission(
@@ -579,6 +624,7 @@ def load_trustscan_permit_submission_json(document: str | bytes) -> TrustScanPer
             maximum_request_attempts=root["maximum_request_attempts"],
             maximum_requests_per_second=root["maximum_requests_per_second"],
             maximum_concurrency=root["maximum_concurrency"],
+            active_checks=tuple(active_check_values),
         )
     except ValueError as exc:
         if isinstance(exc, TrustScanPermitContractError):
@@ -614,6 +660,7 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
             "maximum_requests_per_second",
             "maximum_concurrency",
             "prohibited_operations",
+            "active_checks",
         },
         context="TrustScan permit claims",
     )
@@ -625,7 +672,11 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
     mode_values = claims["permitted_modes"]
     method_values = claims["allowed_http_methods"]
     prohibited_values = claims["prohibited_operations"]
-    if not all(isinstance(value, list) for value in (mode_values, method_values, prohibited_values)):
+    active_check_values = claims["active_checks"]
+    if not all(
+        isinstance(value, list)
+        for value in (mode_values, method_values, prohibited_values, active_check_values)
+    ):
         raise TrustScanPermitLoadError(
             "trustscan_permit_list_required",
             "Permit list fields must be JSON arrays.",
@@ -650,6 +701,7 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
                 maximum_requests_per_second=claims["maximum_requests_per_second"],
                 maximum_concurrency=claims["maximum_concurrency"],
                 prohibited_operations=tuple(prohibited_values),
+                active_checks=tuple(active_check_values),
             ),
             signature_algorithm=signature["algorithm"],
             signing_key_id=signature["key_id"],
@@ -681,6 +733,7 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
 
 __all__ = [
     "CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION",
+    "KNOWN_TRUSTSCAN_ACTIVE_CHECKS",
     "MAXIMUM_TRUSTSCAN_PERMIT_DOCUMENT_BYTES",
     "MAXIMUM_TRUSTSCAN_PERMIT_VALIDITY_DAYS",
     "MAXIMUM_TRUSTSCAN_REQUEST_ATTEMPTS",

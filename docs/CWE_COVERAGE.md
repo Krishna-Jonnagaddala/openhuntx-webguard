@@ -16,7 +16,7 @@ This registry instead tracks only CWE classes that are:
 Each tracked CWE has one status:
 
 - **IMPLEMENTED** — detection logic exists in a scanner analyzer, runs as part of a normal scan, and is covered by tests.
-- **IMPLEMENTED (active, standalone)** — detector code exists and is tested, but is not yet reachable through `webguard scan`, the API, or a TrustScan permit. See the linked audit doc for exactly what was and wasn't validated.
+- **IMPLEMENTED (active, permit-gated)** — detector code exists, is tested, and is reachable end-to-end through the API job/executor pipeline when a TrustScan permit explicitly authorizes it (`active_checks` claim). Not reachable through the standalone `webguard scan` CLI, which does not use TrustScan permits at all. See the linked audit doc for exactly what was and wasn't validated.
 - **PARTIAL** — some indicators can be detected, but exploitability cannot always be established from the outside.
 - **PLANNED** — defined as in-scope, not yet implemented.
 - **NOT APPLICABLE** — cannot reasonably be tested externally; intentionally excluded.
@@ -48,13 +48,13 @@ Detected today by the passive analyzers (`workers/scanner/src/webguard_scanner/`
 
 **18 CWEs implemented**, all passive (no active/intrusive requests), all covered by unit tests.
 
-## Implemented (active, standalone)
+## Implemented (active, permit-gated)
 
 | CWE | Name | Detector | Notes |
 |---|---|---|---|
-| CWE-79 | Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting') | `xss_reflected_detector.py` | GET-parameter reflected-XSS only. Not wired into `webguard scan`, the API, or TrustScan permits yet. See `docs/audit/active-detection-phase1-xss.md` for exactly what was validated (a real-socket synthetic fixture; investigation against the Juice Shop lab found no server-side reflection point to validate against — DOM XSS there is client-rendered and out of reach for a no-JavaScript-execution scanner). |
+| CWE-79 | Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting') | `xss_reflected_detector.py` | GET-parameter reflected-XSS only, GET-form candidates auto-discovered from the passively-scanned page. Runs end-to-end through the job executor when the bound TrustScan permit's `active_checks` claim authorizes `active.xss.reflected`; every existing permit (and every permit issued without explicitly requesting it) has an empty `active_checks` claim and therefore never triggers it — fail-closed by default. Not reachable through the standalone `webguard scan` CLI (no permit concept there). See `docs/audit/active-detection-phase1-xss.md` (detector validation) and `docs/audit/active-detection-phase2-orchestration.md` (orchestration wiring) for exactly what was validated. |
 
-**1 CWE implemented as an active, standalone detector; 0 active detectors integrated into orchestration.**
+**1 CWE implemented as a permit-gated active detector, integrated into the job/executor orchestration.**
 
 ## Planned
 
@@ -84,7 +84,7 @@ Every other CWE, including the full breadth of the reference catalog consulted w
 
 ```
 18 Implemented (passive, in orchestration)
- 1 Implemented (active, standalone -- not yet integrated)
+ 1 Implemented (active, permit-gated, integrated into orchestration)
  0 Partial
 11 Planned
 ```

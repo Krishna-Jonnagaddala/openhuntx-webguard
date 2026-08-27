@@ -233,6 +233,23 @@ def validate_permit_scope(
         )
 
 
+def active_checks_authorized(
+    record: PersistedTrustScanPermit,
+    check_ids: tuple[str, ...],
+) -> bool:
+    """Return whether every requested active-detector ID is authorized by
+    this permit's active_checks claim.
+
+    An empty check_ids tuple is trivially authorized (no active checks
+    requested). A permit whose own active_checks claim is empty authorizes
+    nothing -- this is the fail-closed default for every existing and newly
+    issued permit that does not explicitly opt in.
+    """
+
+    claims = record.permit.claims
+    return all(check_id in claims.active_checks for check_id in check_ids)
+
+
 def validate_permit_use(
     record: PersistedTrustScanPermit,
     *,
@@ -265,6 +282,7 @@ __all__ = [
     "PersistedTrustScanPermit",
     "TrustScanPermitError",
     "TrustScanSigner",
+    "active_checks_authorized",
     "validate_permit_scope",
     "validate_permit_use",
 ]

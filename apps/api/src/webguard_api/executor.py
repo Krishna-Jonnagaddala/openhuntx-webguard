@@ -4,23 +4,30 @@ from __future__ import annotations
 
 import os
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclasses_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from webguard_contracts import (
     OwnedTargetContractError,
     ScanJobMode,
     ScanJobRecord,
+    ScanStatus,
     WebGuardReport,
     write_owned_target_audit_file,
 )
 from webguard_scanner import (
+    ACTIVE_DETECTOR_REGISTRY,
+    ActiveDetectionContext,
+    ActiveDetectionError,
+    ActiveDetectionPolicy,
     CrawlCancellationToken,
     CrawlPolicy,
     FetchPolicy,
+    MAXIMUM_DISCOVERED_CANDIDATES,
     OWNED_DEFAULT_CRAWL_DELAY_SECONDS,
     OWNED_DEFAULT_CRAWL_DEPTH,
     OWNED_DEFAULT_CRAWL_EXECUTION_SECONDS,
@@ -28,8 +35,11 @@ from webguard_scanner import (
     OWNED_DEFAULT_CRAWL_PAGES,
     OWNED_DEFAULT_CRAWL_REQUEST_ATTEMPTS,
     RetryPolicy,
+    ValidatedTarget,
     ValidationMode,
     ValidationPolicy,
+    discover_get_form_candidates,
+    fetch_same_origin_page,
     validate_owned_target_preflight,
     validate_target_url,
     run_passive_crawl_scan,
@@ -40,6 +50,176 @@ from .authorizations import AuthorizationRepository, AuthorizationRepositoryErro
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .safety import TrustScanRuntimeSafetyEngine, TrustScanRuntimeSafetyError
 from .store import JobStoreError, ScanJobStore
+
+
+_ACTIVE_DETECTION_ELIGIBLE_STATUSES = frozenset(
+    {ScanStatus.COMPLETED, ScanStatus.COMPLETED_WITH_ERRORS}
+)
+
+
+def _discover_and_detect_page(
+    target: ValidatedTarget,
+    page_url: str,
+    detectors: list[tuple[str, Callable]],
+    context: ActiveDetectionContext,
+    policy: ActiveDetectionPolicy,
+    safety: TrustScanRuntimeSafetyEngine,
+    cancellation_check: Callable[[], bool],
+    restrict_to_page_path: str | None = None,
+) -> list:
+    if cancellation_check():
+        return []
+
+    response = fetch_same_origin_page(
+        target,
+        page_url,
+        policy=policy,
+        before_request=safety.before_request,
+        after_request=safety.after_request,
+    )
+    if response is None:
+        return []
+
+    candidates = discover_get_form_candidates(target, page_url, response.body)
+    if restrict_to_page_path is not None:
+        # A crawl page's findings must all belong to that page's own URL
+        # (an existing, audited CrawlPageScanResult invariant). A
+        # discovered form whose action targets a different page cannot be
+        # attributed to this page slot, so only self-submitting forms
+        # (search boxes and similar) are testable in crawl mode today.
+        candidates = tuple(
+            candidate
+            for candidate in candidates
+            if urlsplit(candidate.url).path == restrict_to_page_path
+        )
+    if not candidates:
+        return []
+    candidates = candidates[: policy.maximum_probe_requests]
+
+    findings = []
+    for _check_id, runner in detectors:
+        if cancellation_check():
+            break
+        try:
+            result = runner(
+                target,
+                candidates,
+                context,
+                policy=policy,
+                before_request=safety.before_request,
+                after_request=safety.after_request,
+                cancellation_check=cancellation_check,
+            )
+        except ActiveDetectionError:
+            # A code-level active-detection guard (e.g. a candidate-budget
+            # mismatch), not a security-relevant runtime safety decision.
+            # The passive result already obtained must not be discarded
+            # over this -- skip this detector for this page.
+            continue
+        findings.extend(result.findings)
+    return findings
+
+
+def _apply_active_detection(
+    report: WebGuardReport,
+    *,
+    target: ValidatedTarget,
+    active_checks: tuple[str, ...],
+    scan_id: str,
+    authorization_id: str,
+    permit_id: str,
+    permit_fingerprint: str,
+    fetch_policy: FetchPolicy,
+    safety: TrustScanRuntimeSafetyEngine,
+    cancellation_token: CrawlCancellationToken,
+) -> WebGuardReport:
+    """Run authorized active detectors and merge findings into the report.
+
+    Fails closed by construction: if ``active_checks`` is empty (the
+    default for every permit that has not explicitly opted in), this
+    returns ``report`` completely unchanged -- no discovery fetch, no
+    probe, nothing observably different from passive-only execution.
+    """
+
+    if not active_checks:
+        return report
+
+    detectors = [
+        (check_id, ACTIVE_DETECTOR_REGISTRY[check_id])
+        for check_id in active_checks
+        if check_id in ACTIVE_DETECTOR_REGISTRY
+    ]
+    if not detectors:
+        return report
+
+    context = ActiveDetectionContext(
+        scan_id=scan_id,
+        authorization_id=authorization_id,
+        permit_id=permit_id,
+        permit_fingerprint=permit_fingerprint,
+    )
+    policy = ActiveDetectionPolicy(
+        fetch_policy=fetch_policy,
+        maximum_probe_requests=MAXIMUM_DISCOVERED_CANDIDATES,
+    )
+
+    def cancellation_check() -> bool:
+        return cancellation_token.is_cancelled
+
+    if hasattr(report, "pages"):
+        changed = False
+        updated_pages = []
+        for page in report.pages:
+            if (
+                cancellation_check()
+                or page.status not in _ACTIVE_DETECTION_ELIGIBLE_STATUSES
+            ):
+                updated_pages.append(page)
+                continue
+            active_findings = _discover_and_detect_page(
+                target,
+                page.url,
+                detectors,
+                context,
+                policy,
+                safety,
+                cancellation_check,
+                restrict_to_page_path=urlsplit(page.url).path or "/",
+            )
+            if not active_findings:
+                updated_pages.append(page)
+                continue
+            changed = True
+            updated_pages.append(
+                dataclasses_replace(
+                    page,
+                    findings=page.findings + tuple(active_findings),
+                )
+            )
+        if not changed:
+            return report
+        return dataclasses_replace(report, pages=tuple(updated_pages))
+
+    if (
+        report.status not in _ACTIVE_DETECTION_ELIGIBLE_STATUSES
+        or cancellation_check()
+    ):
+        return report
+    active_findings = _discover_and_detect_page(
+        target,
+        target.normalised_url,
+        detectors,
+        context,
+        policy,
+        safety,
+        cancellation_check,
+    )
+    if not active_findings:
+        return report
+    return dataclasses_replace(
+        report,
+        findings=report.findings + tuple(active_findings),
+    )
 
 
 class JobExecutionError(ValueError):
@@ -486,6 +666,7 @@ class ScanJobExecutor:
             clock=self.clock,
         )
 
+        token = cancellation_token or CrawlCancellationToken()
         try:
             if crawl_policy is None:
                 report = self.single_scanner(
@@ -497,7 +678,6 @@ class ScanJobExecutor:
                     after_request=safety.after_request,
                 )
             else:
-                token = cancellation_token or CrawlCancellationToken()
                 report = self.crawl_scanner(
                     target,
                     crawl_policy=crawl_policy,
@@ -508,6 +688,18 @@ class ScanJobExecutor:
                     before_request=safety.before_request,
                     after_request=safety.after_request,
                 )
+            report = _apply_active_detection(
+                report,
+                target=target,
+                active_checks=permit.permit.claims.active_checks,
+                scan_id=scan_id,
+                authorization_id=record.request.authorization_id,
+                permit_id=permit.permit.claims.permit_id,
+                permit_fingerprint=permit.permit.fingerprint,
+                fetch_policy=fetch_policy,
+                safety=safety,
+                cancellation_token=token,
+            )
         except TrustScanRuntimeSafetyError as exc:
             receipt = safety.signed_receipt(termination_reason="safety_blocked")
             digest = _write_signed_safety_receipt(receipt, safety_receipt_path)

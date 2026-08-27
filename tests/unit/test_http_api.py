@@ -55,6 +55,7 @@ def permit_submission() -> bytes:
             "maximum_request_attempts": 15,
             "maximum_requests_per_second": 1.0,
             "maximum_concurrency": 1,
+            "active_checks": [],
         }
     ).encode("utf-8")
 

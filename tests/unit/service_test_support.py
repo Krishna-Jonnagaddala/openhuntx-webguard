@@ -152,6 +152,7 @@ def create_trustscan_permit(
     maximum_request_attempts: int | None = None,
     maximum_requests_per_second: float | None = None,
     permit_id: str | None = None,
+    active_checks: tuple[str, ...] = (),
 ):
     """Create one valid persisted TrustScan v1 permit for unit tests."""
 
@@ -186,6 +187,7 @@ def create_trustscan_permit(
         maximum_request_attempts=effective_attempts,
         maximum_requests_per_second=effective_rate,
         maximum_concurrency=1,
+        active_checks=active_checks,
     )
     signed = trustscan_signer(store).sign(claims)
     return store.create_scan_permit(signed)

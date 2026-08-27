@@ -45,7 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Tuple
+from typing import Callable, Tuple
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -199,6 +199,7 @@ class DetectorRunResult:
     findings: Tuple[NormalizedFinding, ...]
     records: Tuple[DetectorRunRecord, ...]
     probe_errors: Tuple[str, ...]
+    cancelled: bool = False
 
 
 def _new_marker() -> str:
@@ -292,6 +293,7 @@ def run_reflected_xss_detector(
     policy: ActiveDetectionPolicy = ActiveDetectionPolicy(),
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> DetectorRunResult:
     """Run the reflected-XSS detector against a bounded set of candidates.
 
@@ -301,6 +303,12 @@ def run_reflected_xss_detector(
     function does not discover them. ``policy.maximum_probe_requests`` is
     enforced before any request is sent (fail closed on an oversized
     candidate list rather than truncating it silently).
+
+    ``cancellation_check``, if supplied, is polled before every probe
+    (including the first). When it returns True, no further probes are
+    issued and the result's ``cancelled`` flag is set -- candidates not yet
+    probed are simply absent from ``records``, never silently marked as any
+    detection outcome.
     """
 
     enforce_probe_budget(candidates, policy)
@@ -308,8 +316,13 @@ def run_reflected_xss_detector(
     findings: list[NormalizedFinding] = []
     records: list[DetectorRunRecord] = []
     probe_errors: list[str] = []
+    cancelled = False
 
     for index, candidate in enumerate(candidates):
+        if cancellation_check is not None and cancellation_check():
+            cancelled = True
+            break
+
         if index > 0:
             throttle(policy)
 
@@ -362,6 +375,7 @@ def run_reflected_xss_detector(
         findings=tuple(findings),
         records=tuple(records),
         probe_errors=tuple(probe_errors),
+        cancelled=cancelled,
     )
 
 

@@ -93,12 +93,22 @@ from .crawler import (
     PageVisitor,
     crawl_same_origin,
 )
+from .active_candidate_discovery import (
+    MAXIMUM_DISCOVERED_CANDIDATES,
+    MAXIMUM_DISCOVERED_FORMS,
+    discover_get_form_candidates,
+)
 from .active_detection import (
     ActiveDetectionContext,
     ActiveDetectionError,
     ActiveDetectionPolicy,
     DetectionCandidate,
     ProbeAttempt,
+    fetch_same_origin_page,
+)
+from .active_detector_registry import (
+    ACTIVE_DETECTOR_REGISTRY,
+    KNOWN_ACTIVE_DETECTOR_IDS,
 )
 from .crawl_scan import CheckpointCallback, run_passive_crawl_scan
 from .disclosure_analyzer import (
@@ -202,6 +212,7 @@ from .xss_reflected_detector import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "ACTIVE_DETECTOR_REGISTRY",
     "ActiveDetectionContext",
     "ActiveDetectionError",
     "ActiveDetectionPolicy",
@@ -213,7 +224,12 @@ __all__ = [
     "DetectionOutcome",
     "DetectorRunRecord",
     "DetectorRunResult",
+    "KNOWN_ACTIVE_DETECTOR_IDS",
+    "MAXIMUM_DISCOVERED_CANDIDATES",
+    "MAXIMUM_DISCOVERED_FORMS",
     "ProbeAttempt",
+    "discover_get_form_candidates",
+    "fetch_same_origin_page",
     "run_reflected_xss_detector",
     "AnalyzerRegistryError",
     "COOKIE_CHECKS",

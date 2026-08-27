@@ -265,6 +265,46 @@ def issue_probe(
     )
 
 
+def fetch_same_origin_page(
+    base_target: ValidatedTarget,
+    page_url: str,
+    *,
+    policy: ActiveDetectionPolicy,
+    before_request: BeforeRequestHook | None = None,
+    after_request: AfterRequestHook | None = None,
+) -> SafeHttpResponse | None:
+    """Fetch one page's HTML for candidate discovery.
+
+    Reuses the same same-origin enforcement and safety plumbing as
+    ``issue_probe``, but fetches ``page_url`` unmodified rather than
+    substituting a payload into a parameter. Returns None on any
+    controlled failure rather than raising, since discovery is best-effort
+    -- a page that fails to re-fetch simply yields no candidates from it.
+    """
+
+    _require_same_origin(base_target, page_url)
+    probe_target = _build_probe_target(base_target, page_url)
+
+    if before_request is not None:
+        before_request(probe_target, "GET")
+
+    try:
+        response = fetch_once(
+            probe_target,
+            method="GET",
+            policy=policy.fetch_policy,
+        )
+    except SafeRequestError as exc:
+        if after_request is not None:
+            after_request(probe_target, "GET", None, exc.code)
+        return None
+
+    if after_request is not None:
+        after_request(probe_target, "GET", response, None)
+
+    return response
+
+
 def enforce_probe_budget(
     candidates: Tuple[DetectionCandidate, ...],
     policy: ActiveDetectionPolicy,
@@ -294,6 +334,7 @@ __all__ = [
     "DetectionCandidate",
     "ProbeAttempt",
     "enforce_probe_budget",
+    "fetch_same_origin_page",
     "issue_probe",
     "throttle",
 ]
