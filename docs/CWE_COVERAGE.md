@@ -53,8 +53,9 @@ Detected today by the passive analyzers (`workers/scanner/src/webguard_scanner/`
 | CWE | Name | Detector | Notes |
 |---|---|---|---|
 | CWE-79 | Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting') | `xss_reflected_detector.py` | **Operator-reachable + authorization-controlled + end-to-end verified.** GET-parameter reflected-XSS, GET-form candidates auto-discovered from the passively-scanned page. Issuable via `webguard-api permit issue --active-check active.xss.reflected`, gated by a stricter owner-only RBAC permission (`PERMIT_ISSUE_ACTIVE`) beyond ordinary permit issuance, and audited (detector ID recorded, never payload/evidence). Runs end-to-end through the job executor when the bound TrustScan permit's `active_checks` claim authorizes it; every existing and default-issued permit has an empty `active_checks` claim and therefore never triggers it — fail-closed by default. A true end-to-end test (CLI → HTTP API → worker → executor → registry → detector → report) is verified against a local synthetic fixture, over real TLS, real permit/RBAC enforcement, and the real runtime safety engine. Not reachable through the standalone `webguard scan` CLI (no permit concept there). See `docs/audit/active-detection-phase1-xss.md` (detector validation), `docs/audit/active-detection-phase2-orchestration.md` (orchestration wiring), and `docs/audit/active-detection-phase3-operator-surface.md` (CLI/RBAC/audit surface + the end-to-end test) for exactly what was validated at each layer. |
+| CWE-89 | Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection') | `sqli_error_detector.py` | **Operator-reachable + authorization-controlled + end-to-end verified.** Conservative, error-based detection only (baseline request + one bounded apostrophe diagnostic per candidate; no boolean-differential, time-based, UNION, or stacked-query techniques). A finding requires a specific, database-engine-attributable error signature that is present in the diagnostic response and absent from the baseline — a generic status-code change alone never produces a finding. Issuable via `webguard-api permit issue --active-check active.sqli.error`, independently authorized from `active.xss.reflected` (proven: an XSS-only permit cannot trigger SQLi and vice versa, even against a field genuinely vulnerable to both). Verified over a real, purpose-built, deliberately vulnerable local SQLite-backed fixture (real sockets, real database engine) with three negative controls in the same run — a parameterised/safe endpoint, a generic-500 endpoint, and an endpoint with static database-looking text in normal output — none of which produced a finding. A true end-to-end test (CLI → HTTP API → worker → executor → registry → detector → report) is verified the same way as CWE-79. Investigated against the pinned Juice Shop lab target: **could not be validated there** — Juice Shop has zero server-rendered `<form>` elements (confirmed empirically, matching the CWE-79 investigation) and its actual SQLi challenge is a POST JSON login endpoint, structurally unreachable by this detector's GET-form-only candidate discovery. See `docs/audit/active-detection-phase4-sqli.md` for exactly what was and wasn't validated. |
 
-**1 CWE implemented as a permit-gated, operator-reachable, end-to-end-verified active detector.**
+**2 CWEs implemented as permit-gated, operator-reachable, end-to-end-verified active detectors.**
 
 ## Planned
 
@@ -62,7 +63,6 @@ The remaining active-detection target set (see `ROADMAP.md` — coverage growth)
 
 | CWE | Name | Category |
 |---|---|---|
-| CWE-89 | Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection') | Injection |
 | CWE-78 | Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection') | Injection |
 | CWE-22 | Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal') | File & path security |
 | CWE-611 | Improper Restriction of XML External Entity Reference | Injection |
@@ -74,7 +74,7 @@ The remaining active-detection target set (see `ROADMAP.md` — coverage growth)
 | CWE-639 | Authorization Bypass Through User-Controlled Key (IDOR) | Authorization |
 | CWE-601 | URL Redirection to Untrusted Site ('Open Redirect') | Configuration |
 
-**11 CWEs planned.**
+**10 CWEs planned.**
 
 ## Not yet classified
 
@@ -84,7 +84,7 @@ Every other CWE, including the full breadth of the reference catalog consulted w
 
 ```
 18 Implemented (passive, in orchestration)
- 1 Implemented (active, permit-gated, integrated into orchestration)
+ 2 Implemented (active, permit-gated, integrated into orchestration)
  0 Partial
-11 Planned
+10 Planned
 ```

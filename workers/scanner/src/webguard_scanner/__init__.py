@@ -202,6 +202,12 @@ from .scope_validator import (
     resolve_host,
     validate_target_url,
 )
+from .sqli_error_detector import (
+    SqliDetectionOutcome,
+    SqliDetectorRunRecord,
+    SqliDetectorRunResult,
+    run_sqli_error_detector,
+)
 from .xss_reflected_detector import (
     DetectionOutcome,
     DetectorRunRecord,
@@ -228,9 +234,13 @@ __all__ = [
     "MAXIMUM_DISCOVERED_CANDIDATES",
     "MAXIMUM_DISCOVERED_FORMS",
     "ProbeAttempt",
+    "SqliDetectionOutcome",
+    "SqliDetectorRunRecord",
+    "SqliDetectorRunResult",
     "discover_get_form_candidates",
     "fetch_same_origin_page",
     "run_reflected_xss_detector",
+    "run_sqli_error_detector",
     "AnalyzerRegistryError",
     "COOKIE_CHECKS",
     "CORS_CHECKS",

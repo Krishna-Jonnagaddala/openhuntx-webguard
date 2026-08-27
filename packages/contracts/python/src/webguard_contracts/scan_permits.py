@@ -42,7 +42,7 @@ TRUSTSCAN_PROHIBITED_OPERATIONS = (
 # Schema 1.1 replaces 1.0 outright rather than supporting both: WebGuard is
 # still pre-production (README: "not yet a publicly hosted production
 # service"), so there is no deployed 1.0 permit this would break.
-KNOWN_TRUSTSCAN_ACTIVE_CHECKS = ("active.xss.reflected",)
+KNOWN_TRUSTSCAN_ACTIVE_CHECKS = ("active.sqli.error", "active.xss.reflected")
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _KEY_ID = re.compile(r"^sha256:[0-9a-f]{64}$")

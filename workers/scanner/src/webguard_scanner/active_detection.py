@@ -308,13 +308,21 @@ def fetch_same_origin_page(
 def enforce_probe_budget(
     candidates: Tuple[DetectionCandidate, ...],
     policy: ActiveDetectionPolicy,
+    *,
+    requests_per_candidate: int = 1,
 ) -> None:
-    """Fail closed if the candidate list exceeds the run's probe budget."""
+    """Fail closed if the candidate list would exceed the run's probe
+    budget. requests_per_candidate lets a detector that issues more than
+    one request per candidate (for example a baseline plus a diagnostic
+    mutation) declare its real request cost so this check reflects actual
+    outbound requests, not just candidate count."""
 
-    if len(candidates) > policy.maximum_probe_requests:
+    total_requests = len(candidates) * requests_per_candidate
+    if total_requests > policy.maximum_probe_requests:
         raise ActiveDetectionError(
             "candidate_budget_exceeded",
-            f"{len(candidates)} candidates exceed the "
+            f"{len(candidates)} candidates at {requests_per_candidate} "
+            f"request(s) each ({total_requests} total) exceed the "
             f"maximum_probe_requests policy of "
             f"{policy.maximum_probe_requests}.",
         )

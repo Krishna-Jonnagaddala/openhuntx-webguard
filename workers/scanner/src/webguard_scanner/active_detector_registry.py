@@ -11,9 +11,11 @@ runtime coupling in either direction.
 
 from __future__ import annotations
 
+from .sqli_error_detector import run_sqli_error_detector
 from .xss_reflected_detector import run_reflected_xss_detector
 
 ACTIVE_DETECTOR_REGISTRY = {
+    "active.sqli.error": run_sqli_error_detector,
     "active.xss.reflected": run_reflected_xss_detector,
 }
 

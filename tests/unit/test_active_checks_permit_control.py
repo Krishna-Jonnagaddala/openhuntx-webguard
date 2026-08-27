@@ -126,7 +126,11 @@ class ActiveChecksPermitControlTests(unittest.TestCase):
 
     def test_unknown_detector_id_fails_closed(self) -> None:
         with self.assertRaises(ApiServiceError) as caught:
-            self.issue(payload=permit_body(active_checks=["active.sqli.error"]))
+            self.issue(
+                payload=permit_body(
+                    active_checks=["active.ssrf.callback"]
+                )
+            )
         self.assertEqual(
             caught.exception.code,
             "trustscan_permit_active_checks_unknown",
