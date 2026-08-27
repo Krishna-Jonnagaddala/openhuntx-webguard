@@ -110,6 +110,23 @@ from .active_detector_registry import (
     ACTIVE_DETECTOR_REGISTRY,
     KNOWN_ACTIVE_DETECTOR_IDS,
 )
+from .authentication import (
+    MAXIMUM_BEARER_TOKEN_BYTES,
+    MAXIMUM_COOKIES,
+    MAXIMUM_COOKIE_VALUE_BYTES,
+    AuthenticationError,
+    AuthenticationMaterial,
+    SessionCookie,
+    apply_authentication,
+)
+from .login_workflow import (
+    LoginCredentials,
+    LoginResult,
+    LoginSuccessCriterion,
+    LoginWorkflow,
+    LoginWorkflowError,
+    execute_login,
+)
 from .attack_surface import (
     AttackSurfaceBudget,
     AttackSurfaceCandidate,
@@ -259,6 +276,19 @@ __all__ = [
     "BeforeRequestHook",
     "AfterRequestHook",
     "AnalyzerPipelineResult",
+    "MAXIMUM_BEARER_TOKEN_BYTES",
+    "MAXIMUM_COOKIES",
+    "MAXIMUM_COOKIE_VALUE_BYTES",
+    "AuthenticationError",
+    "AuthenticationMaterial",
+    "SessionCookie",
+    "apply_authentication",
+    "LoginCredentials",
+    "LoginResult",
+    "LoginSuccessCriterion",
+    "LoginWorkflow",
+    "LoginWorkflowError",
+    "execute_login",
     "AttackSurfaceBudget",
     "AttackSurfaceCandidate",
     "AttackSurfaceDiscoveryResult",

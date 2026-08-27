@@ -49,26 +49,48 @@ Scanner-side security logic including:
 - checkpoint/resume logic;
 - owned-target preflight enforcement;
 - runtime hooks used by the TrustScan safety engine; and
-- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`), the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`), and the request-template/mutation layer between them (`request_template.py`) — see `docs/audit/active-detection-phase1-xss.md` through `phase6-request-mutation.md`.
+- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`), the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`), the request-template/mutation layer between them (`request_template.py`), and the authentication-context/session-application layer that lets any of these run against an authenticated surface (`authentication.py`, `login_workflow.py`) — see `docs/audit/active-detection-phase1-xss.md` through `phase7-authenticated-scanning.md`.
 
-Active-detection data flow, current as of Slice 6:
+Active-detection data flow, current as of Slice 7:
 
 ```
 Discovery (attack_surface.py)
    -> AttackSurfaceCandidate (endpoint, method, input location, safety classification)
    -> RequestTemplate (request_template.py: query/form/JSON shape, no secrets)
    -> mutate() (one parameter changed, everything else preserved)
-   -> issue_templated_request() / issue_probe() (safe_http, same-origin + runtime-safety hooks)
+                                AuthenticationContext (authentication_contexts.py, apps/api)
+                                     |  metadata: org/target/authorization/identity label/status
+                                     |  secret: AuthenticationMaterial, resolved separately, in-memory only
+                                     v
+   -> apply_authentication() (authentication.py: adds Authorization/Cookie, or nothing if unauthenticated)
+   -> issue_templated_request() / issue_probe() / fetch_same_origin_page() (safe_http, same-origin + runtime-safety hooks)
    -> xss_reflected_detector.py / sqli_error_detector.py (classification)
    -> NormalizedFinding
 ```
 
+`AuthenticationContext` metadata (organization/target/authorization
+binding, identity label, method, status) is safe to log and audit.
+Secret material (`AuthenticationMaterial` -- a bearer token, session
+cookies, basic-auth credentials) is looked up separately, held only in
+memory for the duration of one request-issuance call, and is never
+attached to a `RequestTemplate`, a `NormalizedFinding`, a report, an
+audit event, or a checkpoint -- `apply_authentication` is the *only*
+place headers carrying it are constructed, and it is applied
+immediately before a request is sent, never stored alongside it
+afterward. A TrustScan permit's signed `authentication_context_id` claim
+binds *which* context a scan may use; it never contains the secret
+itself. See `docs/audit/active-detection-phase7-authenticated-scanning.md`
+for the full secret/session lifecycle, expiration/revocation, and login
+verification model.
+
 Representability (can a request of this shape be built and mutated) is
 independent of authorization (is this detector, this HTTP method, this
-target, this budget allowed to send it). `RequestTemplate`/`mutate` only
-answer the first question; the TrustScan permit's `active_checks` and
-`allowed_http_methods` claims, enforced by the executor and the runtime
-safety engine, answer the second — unchanged by this layer's existence.
+target, this budget, this authentication context allowed to be used to
+send it). `RequestTemplate`/`mutate` only answer the first question; the
+TrustScan permit's `active_checks`, `allowed_http_methods`, and
+`authentication_context_id` claims, enforced by the executor and the
+runtime safety engine, answer the second — unchanged by this layer's
+existence.
 
 ### `apps/api`
 
@@ -83,8 +105,9 @@ The local control-plane foundation including:
 - signed pagination cursors;
 - TrustScan permit signing, validation, and revocation;
 - TrustScan runtime safety orchestration;
-- TrustScan Safety Receipt persistence; and
-- active-detector orchestration (`executor.py`'s `_apply_active_detection`), which runs the same authorized-detector loop against every candidate the scanner's attack-surface discovery finds, regardless of which interface (CLI or API) requested the scan.
+- TrustScan Safety Receipt persistence;
+- active-detector orchestration (`executor.py`'s `_apply_active_detection`), which runs the same authorized-detector loop against every candidate the scanner's attack-surface discovery finds, regardless of which interface (CLI or API) requested the scan; and
+- authentication-context metadata/secret storage (`authentication_contexts.py`) for authenticated scanning — deliberately in-memory only this slice, not SQLite (see its module docstring and `docs/audit/active-detection-phase7-authenticated-scanning.md` for why), so it does not yet persist across separate CLI/worker process invocations.
 
 ### `infra/compose`
 

@@ -283,6 +283,7 @@ def _permit_issue_command(args: argparse.Namespace) -> int:
             "maximum_requests_per_second": args.maximum_requests_per_second,
             "maximum_concurrency": args.maximum_concurrency,
             "active_checks": active_checks,
+            "authentication_context_id": args.authentication_context_id,
         }
     ).encode("utf-8")
 
@@ -301,6 +302,50 @@ def _permit_issue_command(args: argparse.Namespace) -> int:
         print(f"Active checks authorized: {', '.join(claims['active_checks'])}")
     else:
         print("Active checks authorized: none (passive-only)")
+    return EXIT_SUCCESS
+
+
+def _authentication_context_register_command(args: argparse.Namespace) -> int:
+    """Register a new authentication context through the same service
+    path (RBAC, authorization binding, audit) the HTTP API uses.
+    Owner-only. The secret is read from the flag once and never printed
+    back -- only the resulting context's metadata is shown."""
+
+    config = _config(args)
+    _, identity, service, _, _, authenticator, _ = _components(config)
+    now = _utc_now()
+    try:
+        context = authenticator.authenticate([f"Bearer {args.token}"], now=now)
+    except AuthenticationError as exc:
+        print(f"webguard-api: [{exc.code}] {exc.message}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    body = {
+        "target": args.target,
+        "authorization_id": args.authorization_id,
+        "identity_label": args.identity_label,
+        "method": args.method,
+        "expires_at": _timestamp_text(now + timedelta(days=args.valid_days)),
+    }
+    if args.bearer_token is not None:
+        body["bearer_token"] = args.bearer_token
+    if args.basic_username is not None:
+        body["basic_username"] = args.basic_username
+    if args.basic_password is not None:
+        body["basic_password"] = args.basic_password
+
+    try:
+        record = service.register_authentication_context(
+            context, body, request_id=str(uuid4())
+        )
+    except ApiServiceError as exc:
+        print(f"webguard-api: [{exc.code}] {exc.message}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    print(f"Authentication context ID: {record['authentication_context_id']}")
+    print(f"Identity label: {record['identity_label']}")
+    print(f"Method: {record['method']}")
+    print(f"Expires at: {record['expires_at']}")
     return EXIT_SUCCESS
 
 
@@ -594,7 +639,53 @@ def build_parser() -> argparse.ArgumentParser:
             "token."
         ),
     )
+    permit_issue.add_argument(
+        "--authentication-context-id",
+        default=None,
+        help=(
+            "Bind this permit to a previously registered authentication "
+            "context, authorizing authenticated scanning of the target "
+            "under that context. Omit entirely for an unauthenticated "
+            "permit -- the default and the fail-closed behaviour for "
+            "every permit that does not explicitly request one. "
+            "Requesting this requires an organization-owner token."
+        ),
+    )
     permit_issue.set_defaults(handler=_permit_issue_command)
+
+    authentication_context = subparsers.add_parser(
+        "authentication-context",
+        help="Register authentication contexts for authenticated scanning.",
+    )
+    authentication_context_commands = authentication_context.add_subparsers(
+        dest="authentication_context_command", required=True
+    )
+    authentication_context_register = authentication_context_commands.add_parser(
+        "register",
+        help=(
+            "Register a bearer-token or basic-auth authentication context. "
+            "Owner-only. The secret is never echoed back."
+        ),
+    )
+    _add_common_options(authentication_context_register)
+    authentication_context_register.add_argument(
+        "--token", required=True, help="Bearer API token authenticating this request."
+    )
+    authentication_context_register.add_argument("--target", required=True)
+    authentication_context_register.add_argument("--authorization-id", required=True)
+    authentication_context_register.add_argument("--identity-label", required=True)
+    authentication_context_register.add_argument(
+        "--method",
+        required=True,
+        choices=["bearer_token", "cookie_session", "basic_auth", "login_workflow"],
+    )
+    authentication_context_register.add_argument("--valid-days", type=int, default=1)
+    authentication_context_register.add_argument("--bearer-token", default=None)
+    authentication_context_register.add_argument("--basic-username", default=None)
+    authentication_context_register.add_argument("--basic-password", default=None)
+    authentication_context_register.set_defaults(
+        handler=_authentication_context_register_command
+    )
 
     serve_parser = subparsers.add_parser(
         "serve", help="Run the loopback HTTP API with one background worker."

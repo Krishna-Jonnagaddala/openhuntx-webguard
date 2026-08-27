@@ -2,7 +2,13 @@
 
 ## Status
 
-Current schema: **1.1**. This document must be read and followed before any real production deployment issues a permit that another version of this codebase might need to read back.
+Current schema: **1.2**. This document must be read and followed before any real production deployment issues a permit that another version of this codebase might need to read back.
+
+## What changed in 1.2
+
+Schema 1.1 → 1.2 added exactly one signed claim: `authentication_context_id: str | None` (`None` by default). This binds a signed permit to a specific, separately-stored authentication context (Slice 7) -- never the secret material itself, only its ID. Same replace-in-place treatment as 1.0 → 1.1, for the identical, re-verified reason: WebGuard has still never been deployed as a publicly hosted production service, so there is no real, persisted 1.1 permit this change could invalidate. See `docs/audit/active-detection-phase7-authenticated-scanning.md` for the full rationale.
+
+Note: `TRUSTSCAN_ALLOWED_HTTP_METHODS` widening to include `POST` (Slice 6) did *not* require a schema bump -- that was an additive vocabulary extension to an existing field's accepted values, not a wire-shape change. Adding a new signed claim, as `authentication_context_id` does, is the kind of change this policy exists to gate.
 
 ## What changed in 1.1
 
@@ -35,6 +41,6 @@ Nothing else in the permit contract has non-versioned wire flexibility either (s
 
 ## Verification that this policy is currently satisfied
 
-- `CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.1"`, `SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.1",)` — single supported version, consistent, no partial support gap.
-- No persisted 1.0 permits exist in this repository's test fixtures, lab environment, or (to the best of this audit's knowledge) anywhere else, since the product has never been deployed.
+- `CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.2"`, `SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.2",)` — single supported version, consistent, no partial support gap.
+- No persisted 1.0 or 1.1 permits exist in this repository's test fixtures, lab environment, or (to the best of this audit's knowledge) anywhere else, since the product has never been deployed.
 - The safety-receipt contract (`TrustScanSafetyReceiptClaims`, schema `"1.0"`, unchanged this slice) was deliberately **not** touched, since its existing fields already account for active-probe activity without needing new ones (see the orchestration audit doc) — so this policy does not currently apply to it, but would under the identical reasoning if it ever needs a field added.

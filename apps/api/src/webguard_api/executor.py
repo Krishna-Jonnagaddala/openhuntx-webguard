@@ -51,6 +51,10 @@ from webguard_scanner import (
     run_passive_header_scan,
 )
 
+from .authentication_contexts import (
+    AuthenticationContextError,
+    AuthenticationContextRepository,
+)
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .safety import TrustScanRuntimeSafetyEngine, TrustScanRuntimeSafetyError
@@ -78,6 +82,7 @@ def _discover_and_detect_page(
     extra_candidates: tuple[DetectionCandidate | RequestTemplate, ...] = (),
     allow_post: bool = False,
     allow_json: bool = False,
+    authentication_material=None,
 ) -> list:
     if cancellation_check():
         return []
@@ -88,6 +93,7 @@ def _discover_and_detect_page(
         policy=policy,
         before_request=safety.before_request,
         after_request=safety.after_request,
+        authentication_material=authentication_material,
     )
     if response is None:
         return []
@@ -144,6 +150,7 @@ def _discover_and_detect_page(
                 before_request=safety.before_request,
                 after_request=safety.after_request,
                 cancellation_check=cancellation_check,
+                authentication_material=authentication_material,
             )
         except ActiveDetectionError:
             # A code-level active-detection guard (e.g. a candidate-budget
@@ -161,9 +168,12 @@ def _apply_active_detection(
     target: ValidatedTarget,
     active_checks: tuple[str, ...],
     scan_id: str,
+    organization_id: str,
     authorization_id: str,
     permit_id: str,
     permit_fingerprint: str,
+    authentication_context_id: str | None,
+    authentication_contexts,
     fetch_policy: FetchPolicy,
     safety: TrustScanRuntimeSafetyEngine,
     cancellation_token: CrawlCancellationToken,
@@ -174,10 +184,38 @@ def _apply_active_detection(
     default for every permit that has not explicitly opted in), this
     returns ``report`` completely unchanged -- no discovery fetch, no
     probe, nothing observably different from passive-only execution.
+
+    If ``authentication_context_id`` is set (Slice 7), the referenced
+    context is re-validated here -- organization/target/authorization
+    binding and ACTIVE status -- independently of the check already made
+    at permit-issuance time (the same defense-in-depth pattern already
+    used for permit validation itself: a context could be revoked after
+    the permit was issued but before this scan actually runs). Secret
+    material is resolved once per scan, held only in this function's
+    local scope, and passed to the discovery/detector layer as an
+    in-memory ``AuthenticationMaterial`` -- it is never assigned to
+    anything returned from this function, logged, or included in
+    ``report``.
     """
 
     if not active_checks:
         return report
+
+    authentication_material = None
+    if authentication_context_id is not None:
+        try:
+            authentication_contexts.require_bound(
+                authentication_context_id,
+                organization_id=organization_id,
+                target=target.normalised_url,
+                authorization_id=authorization_id,
+                now=safety.clock(),
+            )
+            authentication_material = authentication_contexts.get_secret(
+                authentication_context_id
+            )
+        except AuthenticationContextError as exc:
+            raise TrustScanRuntimeSafetyError(exc.code, exc.message) from exc
 
     detectors = [
         (check_id, ACTIVE_DETECTOR_REGISTRY[check_id])
@@ -230,6 +268,7 @@ def _apply_active_detection(
                 restrict_to_page_path=urlsplit(page.url).path or "/",
                 allow_post=allow_post,
                 allow_json=allow_json,
+                authentication_material=authentication_material,
             )
             if not active_findings:
                 updated_pages.append(page)
@@ -281,6 +320,7 @@ def _apply_active_detection(
         extra_candidates=site_candidates,
         allow_post=allow_post,
         allow_json=allow_json,
+        authentication_material=authentication_material,
     )
     if not active_findings:
         return report
@@ -449,6 +489,7 @@ class ScanJobExecutor:
         authorization_assignment_checker: (
             Callable[[str, str], bool] | None
         ) = None,
+        authentication_contexts: AuthenticationContextRepository | None = None,
     ) -> None:
         self.authorizations = authorizations
         self.store = store
@@ -460,6 +501,16 @@ class ScanJobExecutor:
         self.organization_resolver = organization_resolver
         self.authorization_assignment_checker = (
             authorization_assignment_checker
+        )
+        # See WebGuardJobService's identical parameter for the rationale:
+        # optional and defaulted so every pre-Slice-7 constructor call
+        # site is unaffected; a caller that needs contexts registered via
+        # the service to be usable by this executor must pass the same
+        # repository instance to both.
+        self.authentication_contexts = (
+            authentication_contexts
+            if authentication_contexts is not None
+            else AuthenticationContextRepository()
         )
 
     def _policies(self, authorization, permit, mode: ScanJobMode):
@@ -761,9 +812,12 @@ class ScanJobExecutor:
                 target=target,
                 active_checks=permit.permit.claims.active_checks,
                 scan_id=scan_id,
+                organization_id=scope[0],
                 authorization_id=record.request.authorization_id,
                 permit_id=permit.permit.claims.permit_id,
                 permit_fingerprint=permit.permit.fingerprint,
+                authentication_context_id=permit.permit.claims.authentication_context_id,
+                authentication_contexts=self.authentication_contexts,
                 fetch_policy=fetch_policy,
                 safety=safety,
                 cancellation_token=token,

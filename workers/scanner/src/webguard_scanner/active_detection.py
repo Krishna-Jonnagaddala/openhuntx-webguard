@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Tuple
 from urllib.parse import urlencode, urlsplit
 
+from .authentication import AuthenticationMaterial, apply_authentication
 from .runtime_hooks import AfterRequestHook, BeforeRequestHook
 from .safe_http import FetchPolicy, SafeHttpResponse, SafeRequestError, fetch_once
 from .scope_validator import ValidatedTarget
@@ -214,6 +215,7 @@ def issue_probe(
     policy: ActiveDetectionPolicy,
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
+    authentication_material: AuthenticationMaterial | None = None,
 ) -> ProbeAttempt:
     """Send exactly one bounded GET probe request.
 
@@ -221,6 +223,12 @@ def issue_probe(
     through ``safe_http.fetch_once`` with the caller's fetch policy, so
     response size, header, method, and TLS enforcement are unchanged from
     passive scanning.
+
+    ``authentication_material`` (Slice 7), when supplied, is applied via
+    the single shared ``authentication.apply_authentication`` mechanism
+    -- this function never builds an Authorization/Cookie header itself.
+    Every existing caller passes nothing here and probes exactly as
+    before (unauthenticated).
     """
 
     _require_same_origin(base_target, candidate.url)
@@ -232,6 +240,9 @@ def issue_probe(
     )
 
     probe_target = _build_probe_target(base_target, url_with_query)
+    extra_headers = apply_authentication(
+        url_with_query, authentication_material, now=_utc_now()
+    )
 
     if before_request is not None:
         before_request(probe_target, "GET")
@@ -241,6 +252,7 @@ def issue_probe(
             probe_target,
             method="GET",
             policy=policy.fetch_policy,
+            extra_headers=extra_headers,
         )
     except SafeRequestError as exc:
         if after_request is not None:
@@ -272,6 +284,7 @@ def fetch_same_origin_page(
     policy: ActiveDetectionPolicy,
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
+    authentication_material: AuthenticationMaterial | None = None,
 ) -> SafeHttpResponse | None:
     """Fetch one page's HTML for candidate discovery.
 
@@ -280,10 +293,17 @@ def fetch_same_origin_page(
     substituting a payload into a parameter. Returns None on any
     controlled failure rather than raising, since discovery is best-effort
     -- a page that fails to re-fetch simply yields no candidates from it.
+
+    ``authentication_material`` (Slice 7): see ``issue_probe``. This is
+    what lets an authenticated crawl/discovery pass reach pages an
+    unauthenticated one cannot -- the fetch itself is otherwise identical.
     """
 
     _require_same_origin(base_target, page_url)
     probe_target = _build_probe_target(base_target, page_url)
+    extra_headers = apply_authentication(
+        page_url, authentication_material, now=_utc_now()
+    )
 
     if before_request is not None:
         before_request(probe_target, "GET")
@@ -293,6 +313,7 @@ def fetch_same_origin_page(
             probe_target,
             method="GET",
             policy=policy.fetch_policy,
+            extra_headers=extra_headers,
         )
     except SafeRequestError as exc:
         if after_request is not None:

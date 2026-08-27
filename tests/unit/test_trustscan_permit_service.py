@@ -39,6 +39,7 @@ def permit_body(**changes) -> bytes:
         "maximum_requests_per_second": 1.0,
         "maximum_concurrency": 1,
         "active_checks": [],
+        "authentication_context_id": None,
     }
     values.update(changes)
     return json.dumps(values).encode("utf-8")

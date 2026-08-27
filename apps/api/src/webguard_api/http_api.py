@@ -28,6 +28,9 @@ _SCHEDULE_PAUSE_PATH = re.compile(r"^/v1/schedules/([0-9a-f-]{36})/pause$")
 _SCHEDULE_RESUME_PATH = re.compile(r"^/v1/schedules/([0-9a-f-]{36})/resume$")
 _PERMIT_PATH = re.compile(r"^/v1/permits/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _PERMIT_REVOKE_PATH = re.compile(r"^/v1/permits/([0-9a-f-]{36})/revoke$")
+_AUTHENTICATION_CONTEXT_REVOKE_PATH = re.compile(
+    r"^/v1/authentication-contexts/([0-9a-f-]{36})/revoke$"
+)
 
 
 class ApiTransportError(ValueError):
@@ -451,6 +454,56 @@ def build_handler(
                     )
                     self._send_json(
                         201,
+                        payload,
+                        request_id=request_id,
+                        extra_headers=self._rate_headers(decision),
+                    )
+                    return
+                if path == "/v1/authentication-contexts":
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "authentication_context_body_invalid",
+                            "Request body must be valid JSON.",
+                            status=400,
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "authentication_context_body_invalid",
+                            "Request body must be a JSON object.",
+                            status=400,
+                        )
+                    payload = service.register_authentication_context(
+                        context, body, request_id=request_id
+                    )
+                    self._send_json(
+                        201,
+                        payload,
+                        request_id=request_id,
+                        extra_headers=self._rate_headers(decision),
+                    )
+                    return
+                authentication_context_revoke_match = (
+                    _AUTHENTICATION_CONTEXT_REVOKE_PATH.fullmatch(path)
+                )
+                if authentication_context_revoke_match:
+                    lengths = self.headers.get_all("Content-Length") or []
+                    if lengths and any(value != "0" for value in lengths):
+                        raise ApiTransportError(
+                            "authentication_context_body_not_allowed",
+                            "Authentication-context revocation requests cannot "
+                            "contain a body.",
+                            status=400,
+                        )
+                    payload = service.revoke_authentication_context(
+                        context,
+                        authentication_context_revoke_match.group(1),
+                        request_id=request_id,
+                    )
+                    self._send_json(
+                        200,
                         payload,
                         request_id=request_id,
                         extra_headers=self._rate_headers(decision),

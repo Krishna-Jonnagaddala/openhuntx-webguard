@@ -26,7 +26,14 @@ from webguard_contracts import (
     load_trustscan_permit_submission_json,
 )
 
+from webguard_scanner.authentication import AuthenticationMaterial, SessionCookie
+
 from .auth import ApiPermission, AuthContext, AuthenticationError
+from .authentication_contexts import (
+    AuthenticationContextError,
+    AuthenticationContextRepository,
+    AuthenticationMethod,
+)
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .identity import IdentityStore, IdentityStoreError
 from .pagination import PageRequest, PaginationError, SignedCursorCodec
@@ -86,11 +93,23 @@ class WebGuardJobService:
         clock: Callable[[], datetime] = _utc_now,
         cursor_codec: SignedCursorCodec | None = None,
         trustscan_signer: TrustScanSigner | None = None,
+        authentication_contexts: AuthenticationContextRepository | None = None,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
         self.identity = identity
         self.clock = clock
+        # Optional and defaulted so every pre-Slice-7 constructor call
+        # site is unaffected. A caller that needs authentication contexts
+        # shared across a service and its worker/executor must pass one
+        # explicitly; the default is a fresh, empty, per-instance
+        # repository, which behaves as fail-closed for any context ID
+        # nothing on this instance ever registered.
+        self.authentication_contexts = (
+            authentication_contexts
+            if authentication_contexts is not None
+            else AuthenticationContextRepository()
+        )
         try:
             key = store.cursor_signing_key() if cursor_codec is None else None
         except JobStoreError as exc:
@@ -344,6 +363,15 @@ class WebGuardJobService:
                 resource_type="trustscan_permit",
                 resource_id="pending",
             )
+        if submission.authentication_context_id is not None:
+            self._require(
+                context,
+                ApiPermission.AUTHENTICATION_CONTEXT_REGISTER,
+                request_id=request_id,
+                action="permits.issue_authenticated",
+                resource_type="trustscan_permit",
+                resource_id="pending",
+            )
         if not self.identity.authorization_is_assigned(
             context.organization_id, submission.authorization_id
         ):
@@ -398,6 +426,24 @@ class WebGuardJobService:
                 "TrustScan request rate cannot exceed the underlying authorization.",
                 status=400,
             )
+        if submission.authentication_context_id is not None:
+            # The permit's authentication_context_id claim binds a signed
+            # permit to a specific, separately-stored authentication
+            # context -- never the secret material itself. Fail closed
+            # unless that context already exists, is currently active,
+            # and is bound to exactly this organization/target/
+            # authorization; re-checked again at execution time (defense
+            # in depth, same pattern as permit validation itself).
+            try:
+                self.authentication_contexts.require_bound(
+                    submission.authentication_context_id,
+                    organization_id=context.organization_id,
+                    target=submission.target,
+                    authorization_id=authorization.authorization_id,
+                    now=now,
+                )
+            except AuthenticationContextError as exc:
+                raise ApiServiceError(exc.code, exc.message, status=400) from exc
         try:
             claims = TrustScanPermitClaims(
                 permit_id=str(uuid4()),
@@ -415,6 +461,7 @@ class WebGuardJobService:
                 maximum_requests_per_second=submission.maximum_requests_per_second,
                 maximum_concurrency=submission.maximum_concurrency,
                 active_checks=submission.active_checks,
+                authentication_context_id=submission.authentication_context_id,
             )
             signed = self.trustscan_signer.sign(claims)
             record = self.store.create_scan_permit(signed)
@@ -423,6 +470,17 @@ class WebGuardJobService:
         except JobStoreError as exc:
             status = 409 if exc.code == "trustscan_permit_conflict" else 500
             raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        detail_code = _active_checks_audit_detail(claims.active_checks)
+        if claims.authentication_context_id is not None:
+            # Records that this permit was bound to authenticated scanning
+            # and its structural detail_code -- never the referenced
+            # context's secret material, which this audit path never even
+            # has access to (only the metadata repository does).
+            detail_code = (
+                (detail_code + "_and_authenticated")
+                if detail_code
+                else "authenticated_scan_authorized"
+            )
         self._audit(
             context,
             request_id=request_id,
@@ -430,7 +488,7 @@ class WebGuardJobService:
             resource_type="trustscan_permit",
             resource_id=claims.permit_id,
             outcome=AuditOutcome.SUCCEEDED,
-            detail_code=_active_checks_audit_detail(claims.active_checks),
+            detail_code=detail_code,
         )
         return record.to_public_dict(now=now)
 
@@ -487,6 +545,163 @@ class WebGuardJobService:
             action="permits.revoke",
             resource_type="trustscan_permit",
             resource_id=permit_id,
+            outcome=AuditOutcome.SUCCEEDED,
+        )
+        return record.to_public_dict(now=self.clock())
+
+    def register_authentication_context(
+        self, context: AuthContext, body: dict, *, request_id: str
+    ) -> dict:
+        """Register a new authentication context: bearer token, cookie
+        session, or basic-auth credentials supplied explicitly by the
+        operator. Owner-only. Returns metadata only -- the caller never
+        sees the secret material echoed back, even though they just
+        supplied it (a write-only credential-registration pattern, the
+        same principle as never returning a password after account
+        creation)."""
+
+        self._require(
+            context,
+            ApiPermission.AUTHENTICATION_CONTEXT_REGISTER,
+            request_id=request_id,
+            action="authentication_contexts.register",
+            resource_type="authentication_context",
+            resource_id="pending",
+        )
+        required = {
+            "target",
+            "authorization_id",
+            "identity_label",
+            "method",
+            "expires_at",
+        }
+        missing = required - set(body)
+        if missing:
+            raise ApiServiceError(
+                "authentication_context_field_missing",
+                f"Missing required field {sorted(missing)[0]!r}.",
+                status=400,
+            )
+        if not self.identity.authorization_is_assigned(
+            context.organization_id, body["authorization_id"]
+        ):
+            raise ApiServiceError(
+                "authorization_not_found",
+                "Authorization was not found for this organization.",
+                status=404,
+            )
+        try:
+            authorization = self.authorizations.get(body["authorization_id"])
+        except AuthorizationRepositoryError as exc:
+            status = 404 if exc.code == "authorization_not_found" else 500
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        if authorization.target != body["target"]:
+            raise ApiServiceError(
+                "authorization_target_mismatch",
+                "The requested target does not match the server-side authorization.",
+                status=400,
+            )
+        try:
+            method = AuthenticationMethod(body["method"])
+        except ValueError as exc:
+            raise ApiServiceError(
+                "authentication_context_method_invalid",
+                "method must be one of: "
+                + ", ".join(m.value for m in AuthenticationMethod),
+                status=400,
+            ) from exc
+        now = self.clock()
+        try:
+            expires_at = datetime.fromisoformat(
+                str(body["expires_at"]).replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ApiServiceError(
+                "authentication_context_expiry_invalid",
+                "expires_at must be an ISO-8601 timestamp.",
+                status=400,
+            ) from exc
+        try:
+            raw_cookies = body.get("cookies") or ()
+            cookies = tuple(
+                SessionCookie(
+                    name=raw["name"],
+                    value=raw["value"],
+                    domain=raw["domain"],
+                    port=raw["port"],
+                    path=raw.get("path", "/"),
+                    secure=raw.get("secure", False),
+                )
+                for raw in raw_cookies
+            )
+            secret = AuthenticationMaterial(
+                bearer_token=body.get("bearer_token"),
+                cookies=cookies,
+                basic_username=body.get("basic_username"),
+                basic_password=body.get("basic_password"),
+            )
+        except Exception as exc:  # noqa: BLE001 - AuthenticationError from webguard_scanner
+            raise ApiServiceError(
+                getattr(exc, "code", "authentication_context_secret_invalid"),
+                getattr(exc, "message", "The supplied credential material is invalid."),
+                status=400,
+            ) from exc
+        try:
+            record = self.authentication_contexts.create(
+                organization_id=context.organization_id,
+                target=body["target"],
+                authorization_id=authorization.authorization_id,
+                identity_label=body["identity_label"],
+                method=method,
+                secret=secret,
+                expires_at=expires_at,
+                now=now,
+            )
+        except AuthenticationContextError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        self._audit(
+            context,
+            request_id=request_id,
+            action="authentication_contexts.register",
+            resource_type="authentication_context",
+            resource_id=record.authentication_context_id,
+            outcome=AuditOutcome.SUCCEEDED,
+            detail_code=f"identity_{record.method.value}",
+        )
+        return record.to_public_dict(now=now)
+
+    def revoke_authentication_context(
+        self, context: AuthContext, authentication_context_id: str, *, request_id: str
+    ) -> dict:
+        self._require(
+            context,
+            ApiPermission.AUTHENTICATION_CONTEXT_REVOKE,
+            request_id=request_id,
+            action="authentication_contexts.revoke",
+            resource_type="authentication_context",
+            resource_id=authentication_context_id,
+        )
+        try:
+            record = self.authentication_contexts.get_metadata(
+                authentication_context_id
+            )
+            if record.organization_id != context.organization_id:
+                raise AuthenticationContextError(
+                    "authentication_context_not_found",
+                    "No authentication context matches the requested ID.",
+                )
+            record = self.authentication_contexts.revoke(
+                authentication_context_id, now=self.clock()
+            )
+        except AuthenticationContextError as exc:
+            status = 404 if exc.code == "authentication_context_not_found" else 400
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        self._audit(
+            context,
+            request_id=request_id,
+            action="authentication_contexts.revoke",
+            resource_type="authentication_context",
+            resource_id=authentication_context_id,
             outcome=AuditOutcome.SUCCEEDED,
         )
         return record.to_public_dict(now=self.clock())

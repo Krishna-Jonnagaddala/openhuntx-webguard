@@ -308,6 +308,7 @@ def _issue_legacy_baseline_and_diagnostic(
     policy: ActiveDetectionPolicy,
     before_request: BeforeRequestHook | None,
     after_request: AfterRequestHook | None,
+    authentication_material=None,
 ):
     """The original, unmodified GET-query issuance path (pre-Slice-6).
     Kept byte-for-byte in its own function so nothing about it changes
@@ -321,6 +322,7 @@ def _issue_legacy_baseline_and_diagnostic(
         policy=policy,
         before_request=before_request,
         after_request=after_request,
+        authentication_material=authentication_material,
     )
     if not baseline_attempt.succeeded:
         return baseline_attempt, None, candidate.parameter, "GET"
@@ -334,6 +336,7 @@ def _issue_legacy_baseline_and_diagnostic(
         policy=policy,
         before_request=before_request,
         after_request=after_request,
+        authentication_material=authentication_material,
     )
     return baseline_attempt, diagnostic_attempt, candidate.parameter, "GET"
 
@@ -345,6 +348,7 @@ def _issue_templated_baseline_and_diagnostic(
     policy: ActiveDetectionPolicy,
     before_request: BeforeRequestHook | None,
     after_request: AfterRequestHook | None,
+    authentication_material=None,
 ):
     """Slice 6: POST-form / JSON-body issuance path via the shared
     mutation engine. The classification logic downstream is identical to
@@ -365,6 +369,7 @@ def _issue_templated_baseline_and_diagnostic(
         policy=policy,
         before_request=before_request,
         after_request=after_request,
+        authentication_material=authentication_material,
     )
     if not baseline_attempt.succeeded:
         return baseline_attempt, None, parameter, template.method
@@ -378,6 +383,7 @@ def _issue_templated_baseline_and_diagnostic(
         policy=policy,
         before_request=before_request,
         after_request=after_request,
+        authentication_material=authentication_material,
     )
     return baseline_attempt, diagnostic_attempt, parameter, template.method
 
@@ -391,6 +397,7 @@ def run_sqli_error_detector(
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
     cancellation_check: Callable[[], bool] | None = None,
+    authentication_material=None,
 ) -> SqliDetectorRunResult:
     """Run the error-based SQL injection detector against a bounded set
     of candidates.
@@ -444,6 +451,7 @@ def run_sqli_error_detector(
                         policy=policy,
                         before_request=before_request,
                         after_request=after_request,
+                        authentication_material=authentication_material,
                     )
                 )
             else:
@@ -454,6 +462,7 @@ def run_sqli_error_detector(
                         policy=policy,
                         before_request=before_request,
                         after_request=after_request,
+                        authentication_material=authentication_material,
                     )
                 )
         except RequestTemplateError as exc:

@@ -167,6 +167,12 @@ _REQUEST_POLICIES: dict[str, ErrorPolicy] = {
         _NON_RETRYABLE,
     ),
 
+    # Header-injection guard (Slice 7: authentication support).
+    "forbidden_request_header": ErrorPolicy(
+        ErrorCategory.CONFIGURATION,
+        _NON_RETRYABLE,
+    ),
+
     # Malformed response metadata.
     "content_length_invalid": ErrorPolicy(
         ErrorCategory.RESPONSE_FORMAT,

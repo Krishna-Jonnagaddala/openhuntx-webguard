@@ -33,6 +33,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
@@ -48,9 +49,16 @@ from .attack_surface import (
     InputLocation,
     SafetyClassification,
 )
+from .authentication import AuthenticationMaterial, apply_authentication
 from .runtime_hooks import AfterRequestHook, BeforeRequestHook
 from .safe_http import SafeHttpResponse, SafeRequestError, fetch_once
 from .scope_validator import ValidatedTarget
+
+
+def _utc_now() -> datetime:
+    from datetime import timezone
+
+    return datetime.now(timezone.utc)
 
 
 class RequestTemplateError(RuntimeError):
@@ -605,6 +613,7 @@ def issue_templated_request(
     policy: ActiveDetectionPolicy,
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
+    authentication_material: AuthenticationMaterial | None = None,
 ) -> TemplatedProbeAttempt:
     """Send exactly one bounded request for a MutatedRequest.
 
@@ -613,10 +622,16 @@ def issue_templated_request(
     supports. Runtime safety (budgets, rate limiting, permit
     revalidation, HTTP-method authorization) is entirely the caller's
     hooks' responsibility, unchanged from every other active probe.
+
+    ``authentication_material`` (Slice 7): see
+    ``active_detection.issue_probe``.
     """
 
     _require_same_origin(base_target, mutated.url)
     probe_target = _build_probe_target(base_target, mutated.url)
+    extra_headers = apply_authentication(
+        mutated.url, authentication_material, now=_utc_now()
+    )
 
     if before_request is not None:
         before_request(probe_target, mutated.method)
@@ -628,6 +643,7 @@ def issue_templated_request(
             policy=policy.fetch_policy,
             body=mutated.body,
             content_type=mutated.content_type,
+            extra_headers=extra_headers,
         )
     except SafeRequestError as exc:
         if after_request is not None:
@@ -689,6 +705,7 @@ def execute_baseline(
     policy: ActiveDetectionPolicy,
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
+    authentication_material: AuthenticationMaterial | None = None,
 ) -> BaselineObservation | None:
     """Issue exactly one request using a template's own, unmutated
     baseline values and record bounded response characteristics.
@@ -697,6 +714,9 @@ def execute_baseline(
     as "no observation," never fabricated, and is never itself treated as
     a detection outcome by this function (callers decide what a missing
     baseline means for their own methodology).
+
+    ``authentication_material`` (Slice 7): see
+    ``active_detection.issue_probe``.
     """
 
     url = _template_baseline_url(template)
@@ -704,6 +724,9 @@ def execute_baseline(
 
     _require_same_origin(base_target, url)
     probe_target = _build_probe_target(base_target, url)
+    extra_headers = apply_authentication(
+        url, authentication_material, now=_utc_now()
+    )
 
     if before_request is not None:
         before_request(probe_target, template.method)
@@ -715,6 +738,7 @@ def execute_baseline(
             policy=policy.fetch_policy,
             body=body,
             content_type=template.content_type,
+            extra_headers=extra_headers,
         )
     except SafeRequestError as exc:
         if after_request is not None:

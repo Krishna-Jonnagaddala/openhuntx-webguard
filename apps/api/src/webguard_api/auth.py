@@ -25,15 +25,23 @@ class ApiPermission(str, Enum):
     PERMIT_ISSUE_ACTIVE = "permits.issue_active"
     PERMIT_READ = "permits.read"
     PERMIT_REVOKE = "permits.revoke"
+    AUTHENTICATION_CONTEXT_REGISTER = "authentication_contexts.register"
+    AUTHENTICATION_CONTEXT_READ = "authentication_contexts.read"
+    AUTHENTICATION_CONTEXT_REVOKE = "authentication_contexts.revoke"
 
 
 _ROLE_PERMISSIONS = {
     OrganizationRole.OWNER: frozenset(ApiPermission),
     # Administrators may issue ordinary (passive-only) permits, but not
-    # ones that authorize active/intrusive checks -- that is deliberately
-    # reserved for the organization owner. See PERMIT_ISSUE_ACTIVE.
+    # ones that authorize active/intrusive checks, nor anything involving
+    # authenticated-scanning credentials -- both deliberately reserved
+    # for the organization owner. See PERMIT_ISSUE_ACTIVE and the
+    # AUTHENTICATION_CONTEXT_* permissions.
     OrganizationRole.ADMINISTRATOR: frozenset(ApiPermission) - {
         ApiPermission.PERMIT_ISSUE_ACTIVE,
+        ApiPermission.AUTHENTICATION_CONTEXT_REGISTER,
+        ApiPermission.AUTHENTICATION_CONTEXT_READ,
+        ApiPermission.AUTHENTICATION_CONTEXT_REVOKE,
     },
     OrganizationRole.ANALYST: frozenset(
         {

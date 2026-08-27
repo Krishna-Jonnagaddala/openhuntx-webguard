@@ -303,6 +303,7 @@ def _issue_legacy_probe(
     policy: ActiveDetectionPolicy,
     before_request: BeforeRequestHook | None,
     after_request: AfterRequestHook | None,
+    authentication_material=None,
 ):
     """The original, unmodified GET-query issuance path (pre-Slice-6)."""
 
@@ -313,6 +314,7 @@ def _issue_legacy_probe(
         policy=policy,
         before_request=before_request,
         after_request=after_request,
+        authentication_material=authentication_material,
     )
     return attempt, candidate.parameter, "GET"
 
@@ -325,6 +327,7 @@ def _issue_templated_probe(
     policy: ActiveDetectionPolicy,
     before_request: BeforeRequestHook | None,
     after_request: AfterRequestHook | None,
+    authentication_material=None,
 ):
     """Slice 6: POST-form issuance path via the shared mutation engine.
 
@@ -351,6 +354,7 @@ def _issue_templated_probe(
         policy=policy,
         before_request=before_request,
         after_request=after_request,
+        authentication_material=authentication_material,
     )
     return attempt, template.parameter, template.method
 
@@ -364,6 +368,7 @@ def run_reflected_xss_detector(
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
     cancellation_check: Callable[[], bool] | None = None,
+    authentication_material=None,
 ) -> DetectorRunResult:
     """Run the reflected-XSS detector against a bounded set of candidates.
 
@@ -414,6 +419,7 @@ def run_reflected_xss_detector(
                     policy=policy,
                     before_request=before_request,
                     after_request=after_request,
+                    authentication_material=authentication_material,
                 )
             else:
                 attempt, parameter, method = _issue_legacy_probe(
@@ -423,6 +429,7 @@ def run_reflected_xss_detector(
                     policy=policy,
                     before_request=before_request,
                     after_request=after_request,
+                    authentication_material=authentication_material,
                 )
         except RequestTemplateError as exc:
             probe_errors.append(exc.code)

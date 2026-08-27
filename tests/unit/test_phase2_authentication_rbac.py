@@ -312,18 +312,24 @@ class Phase2AuthenticationAndRbacTests(unittest.TestCase):
             token_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
         )
 
+        _OWNER_ONLY_PERMISSIONS = {
+            # Deliberately reserved to the organization owner -- see
+            # test_only_owner_may_issue_active_capability_permits and
+            # the authentication-context RBAC tests (Slice 7).
+            ApiPermission.PERMIT_ISSUE_ACTIVE,
+            ApiPermission.AUTHENTICATION_CONTEXT_REGISTER,
+            ApiPermission.AUTHENTICATION_CONTEXT_READ,
+            ApiPermission.AUTHENTICATION_CONTEXT_REVOKE,
+        }
         for permission in ApiPermission:
-            if permission is ApiPermission.PERMIT_ISSUE_ACTIVE:
-                # Deliberately reserved to the organization owner -- see
-                # test_only_owner_may_issue_active_capability_permits.
+            if permission in _OWNER_ONLY_PERMISSIONS:
                 continue
             self.assertTrue(
                 administrator.permits(permission),
                 permission.value,
             )
-        self.assertFalse(
-            administrator.permits(ApiPermission.PERMIT_ISSUE_ACTIVE)
-        )
+        for permission in _OWNER_ONLY_PERMISSIONS:
+            self.assertFalse(administrator.permits(permission), permission.value)
 
     def test_analyst_cannot_invoke_privileged_service_operations(
         self,

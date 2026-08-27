@@ -15,8 +15,8 @@ from .owned_targets import OwnedTargetContractError, canonicalize_owned_target_u
 from .scan_jobs import ScanJobMode
 
 
-CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.1"
-SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.1",)
+CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.2"
+SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.2",)
 TRUSTSCAN_PERMIT_TYPE = "trustscan_scan_permit"
 TRUSTSCAN_SIGNATURE_ALGORITHM = "Ed25519"
 MAXIMUM_TRUSTSCAN_PERMIT_DOCUMENT_BYTES = 128 * 1024
@@ -257,6 +257,18 @@ def _active_checks(value: object) -> tuple[str, ...]:
     return canonical
 
 
+def _authentication_context_id(value: object) -> str | None:
+    """authentication_context_id is the signed binding that authorizes a
+    scan to apply a specific, separately-stored authentication context
+    (Slice 7) -- never the secret material itself, only its ID. None
+    (the default, and the only value every pre-Slice-7 permit can carry)
+    means this permit authorizes no authenticated scanning at all."""
+
+    if value is None:
+        return None
+    return _uuid(value, "authentication_context_id")
+
+
 def _prohibited_operations(value: object) -> tuple[str, ...]:
     if not isinstance(value, tuple) or value != TRUSTSCAN_PROHIBITED_OPERATIONS:
         raise TrustScanPermitValidationError(
@@ -340,6 +352,7 @@ class TrustScanPermitSubmission:
     maximum_requests_per_second: float
     maximum_concurrency: int = TRUSTSCAN_V1_MAXIMUM_CONCURRENCY
     active_checks: tuple[str, ...] = ()
+    authentication_context_id: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -396,6 +409,11 @@ class TrustScanPermitSubmission:
             )
         object.__setattr__(self, "maximum_concurrency", concurrency)
         object.__setattr__(self, "active_checks", _active_checks(self.active_checks))
+        object.__setattr__(
+            self,
+            "authentication_context_id",
+            _authentication_context_id(self.authentication_context_id),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,6 +436,7 @@ class TrustScanPermitClaims:
     maximum_concurrency: int = TRUSTSCAN_V1_MAXIMUM_CONCURRENCY
     prohibited_operations: tuple[str, ...] = TRUSTSCAN_PROHIBITED_OPERATIONS
     active_checks: tuple[str, ...] = ()
+    authentication_context_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "permit_id", _uuid(self.permit_id, "permit_id"))
@@ -483,6 +502,11 @@ class TrustScanPermitClaims:
             _prohibited_operations(self.prohibited_operations),
         )
         object.__setattr__(self, "active_checks", _active_checks(self.active_checks))
+        object.__setattr__(
+            self,
+            "authentication_context_id",
+            _authentication_context_id(self.authentication_context_id),
+        )
 
     @property
     def fingerprint(self) -> str:
@@ -510,6 +534,7 @@ class TrustScanPermitClaims:
             "maximum_concurrency": self.maximum_concurrency,
             "prohibited_operations": list(self.prohibited_operations),
             "active_checks": list(self.active_checks),
+            "authentication_context_id": self.authentication_context_id,
         }
 
 
@@ -596,6 +621,7 @@ def load_trustscan_permit_submission_json(document: str | bytes) -> TrustScanPer
             "maximum_requests_per_second",
             "maximum_concurrency",
             "active_checks",
+            "authentication_context_id",
         },
         context="TrustScan permit submission",
     )
@@ -625,6 +651,7 @@ def load_trustscan_permit_submission_json(document: str | bytes) -> TrustScanPer
             maximum_requests_per_second=root["maximum_requests_per_second"],
             maximum_concurrency=root["maximum_concurrency"],
             active_checks=tuple(active_check_values),
+            authentication_context_id=root["authentication_context_id"],
         )
     except ValueError as exc:
         if isinstance(exc, TrustScanPermitContractError):
@@ -661,6 +688,7 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
             "maximum_concurrency",
             "prohibited_operations",
             "active_checks",
+            "authentication_context_id",
         },
         context="TrustScan permit claims",
     )
@@ -702,6 +730,7 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
                 maximum_concurrency=claims["maximum_concurrency"],
                 prohibited_operations=tuple(prohibited_values),
                 active_checks=tuple(active_check_values),
+                authentication_context_id=claims["authentication_context_id"],
             ),
             signature_algorithm=signature["algorithm"],
             signing_key_id=signature["key_id"],

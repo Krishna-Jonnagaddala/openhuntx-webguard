@@ -89,6 +89,7 @@ class TrustScanPermitServiceIntegrationTests(unittest.TestCase):
                         "maximum_requests_per_second": 1.0,
                         "maximum_concurrency": 1,
                         "active_checks": [],
+                        "authentication_context_id": None,
                     }
                 ).encode("utf-8")
                 status, issued = request(
