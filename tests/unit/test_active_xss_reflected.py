@@ -544,5 +544,48 @@ class ReflectedXssPostFormTests(unittest.TestCase):
         self.assertEqual(methods, {"GET", "POST"})
 
 
+class EvidenceSanitizationTests(unittest.TestCase):
+    """Slice 11 stabilization audit: IDOR, SSRF, and SQLi each already had
+    a dedicated evidence-sanitization test; reflected-XSS did not. This
+    closes that gap by planting a secret in the authentication material
+    used for the probe and confirming it never surfaces in the finding's
+    evidence text, exactly like the other three detectors' equivalents."""
+
+    def test_evidence_never_contains_bearer_token_or_raw_response_body(
+        self,
+    ) -> None:
+        from webguard_scanner import AuthenticationMaterial
+
+        connection = _ReflectingConnection(reflect=True, encode=False)
+        with patch(
+            "webguard_scanner.safe_http._make_connection",
+            return_value=connection,
+        ):
+            result = run_reflected_xss_detector(
+                _target(),
+                (_candidate(),),
+                _context(),
+                authentication_material=AuthenticationMaterial(
+                    bearer_token="super-secret-xss-probe-token"
+                ),
+            )
+
+        self.assertEqual(len(result.findings), 1)
+        evidence_text = " ".join(
+            e.summary for e in result.findings[0].evidence
+        )
+        self.assertNotIn("super-secret-xss-probe-token", evidence_text)
+        self.assertNotIn("Bearer", evidence_text)
+        # ("Authorization: auth-1" from context.authorization_id is an
+        # expected, non-secret structural provenance field -- the same
+        # pattern IDOR/SQLi/SSRF's own evidence already uses -- so it is
+        # deliberately not asserted absent here, only the header value.)
+        # The reflected payload/marker itself is a WebGuard-generated,
+        # non-secret probe value -- but the raw response body must still
+        # never appear verbatim in evidence, only the bounded, structural
+        # provenance fields.
+        self.assertNotIn("no reflection here", evidence_text)
+
+
 if __name__ == "__main__":
     unittest.main()
