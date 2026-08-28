@@ -2,7 +2,13 @@
 
 ## Status
 
-Current schema: **1.2**. This document must be read and followed before any real production deployment issues a permit that another version of this codebase might need to read back.
+Current schema: **1.3**. This document must be read and followed before any real production deployment issues a permit that another version of this codebase might need to read back.
+
+## What changed in 1.3
+
+Schema 1.2 → 1.3 added exactly one signed claim: `authorization_comparison_plan_id: str | None` (`None` by default). This binds a signed permit to a specific, separately-stored `AuthorizationComparisonPlan` (Slice 8), which itself references exactly two already-registered authentication contexts to compare -- never their secret material, and never the two context IDs directly on the permit. This is a deliberately *separate* claim from `authentication_context_id`, not a reinterpretation of it: a single-identity authenticated scan and a two-identity authorization-comparison (IDOR/BOLA) scan are different capabilities with different safety bounds, independently authorized by independent claims. Same replace-in-place treatment as 1.0 → 1.1 and 1.1 → 1.2, for the identical, re-verified reason: WebGuard has still never been deployed as a publicly hosted production service, so there is no real, persisted 1.2 permit this change could invalidate. See `docs/audit/active-detection-phase8-idor-bola.md` for the full rationale, including why the existing singular `authentication_context_id` claim was deliberately *not* reused or overloaded for this.
+
+Also new in this slice: `"active.authorization.idor"` was added to `KNOWN_TRUSTSCAN_ACTIVE_CHECKS` -- an additive vocabulary extension (the same class of change as Slice 4's `active.sqli.error` and Slice 6's `allowed_http_methods` POST addition), not a schema-shape change, so it alone would not have required a version bump.
 
 ## What changed in 1.2
 
@@ -41,6 +47,6 @@ Nothing else in the permit contract has non-versioned wire flexibility either (s
 
 ## Verification that this policy is currently satisfied
 
-- `CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.2"`, `SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.2",)` — single supported version, consistent, no partial support gap.
-- No persisted 1.0 or 1.1 permits exist in this repository's test fixtures, lab environment, or (to the best of this audit's knowledge) anywhere else, since the product has never been deployed.
+- `CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.3"`, `SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.3",)` — single supported version, consistent, no partial support gap.
+- No persisted 1.0, 1.1, or 1.2 permits exist in this repository's test fixtures, lab environment, or (to the best of this audit's knowledge) anywhere else, since the product has never been deployed.
 - The safety-receipt contract (`TrustScanSafetyReceiptClaims`, schema `"1.0"`, unchanged this slice) was deliberately **not** touched, since its existing fields already account for active-probe activity without needing new ones (see the orchestration audit doc) — so this policy does not currently apply to it, but would under the identical reasoning if it ever needs a field added.

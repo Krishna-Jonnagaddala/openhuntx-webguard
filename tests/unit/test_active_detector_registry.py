@@ -9,6 +9,7 @@ import unittest
 
 from webguard_contracts import KNOWN_TRUSTSCAN_ACTIVE_CHECKS
 from webguard_scanner import ACTIVE_DETECTOR_REGISTRY, KNOWN_ACTIVE_DETECTOR_IDS
+from webguard_scanner.active_detector_registry import COMPARISON_ACTIVE_CHECK_IDS
 
 
 class ActiveDetectorRegistryConsistencyTests(unittest.TestCase):
@@ -18,10 +19,22 @@ class ActiveDetectorRegistryConsistencyTests(unittest.TestCase):
             set(KNOWN_TRUSTSCAN_ACTIVE_CHECKS),
         )
 
-    def test_registry_keys_match_known_ids(self) -> None:
+    def test_registry_keys_plus_comparison_checks_match_known_ids(self) -> None:
+        """active.authorization.idor is deliberately excluded from
+        ACTIVE_DETECTOR_REGISTRY (see that module's docstring) -- it uses
+        a separate orchestration path, not the generic per-candidate
+        detector loop. This test asserts that split is complete and
+        explicit, not an accidental gap: every known active-check ID is
+        either in the generic registry or in COMPARISON_ACTIVE_CHECK_IDS,
+        never neither, never both."""
+
         self.assertEqual(
-            set(ACTIVE_DETECTOR_REGISTRY),
+            set(ACTIVE_DETECTOR_REGISTRY) | COMPARISON_ACTIVE_CHECK_IDS,
             KNOWN_ACTIVE_DETECTOR_IDS,
+        )
+        self.assertEqual(
+            set(ACTIVE_DETECTOR_REGISTRY) & COMPARISON_ACTIVE_CHECK_IDS,
+            set(),
         )
 
     def test_registry_values_are_callable(self) -> None:

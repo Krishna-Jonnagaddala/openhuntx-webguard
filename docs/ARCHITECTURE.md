@@ -49,9 +49,9 @@ Scanner-side security logic including:
 - checkpoint/resume logic;
 - owned-target preflight enforcement;
 - runtime hooks used by the TrustScan safety engine; and
-- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`), the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`), the request-template/mutation layer between them (`request_template.py`), and the authentication-context/session-application layer that lets any of these run against an authenticated surface (`authentication.py`, `login_workflow.py`) — see `docs/audit/active-detection-phase1-xss.md` through `phase7-authenticated-scanning.md`.
+- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`), the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`), the request-template/mutation layer between them (`request_template.py`), the authentication-context/session-application layer that lets any of these run against an authenticated surface (`authentication.py`, `login_workflow.py`), and the multi-identity authorization-comparison engine (`authorization_resource.py`, `idor_authorization_detector.py`) that IDOR/BOLA detection is built on — see `docs/audit/active-detection-phase1-xss.md` through `phase8-idor-bola.md`.
 
-Active-detection data flow, current as of Slice 7:
+Active-detection data flow, current as of Slice 7 (single-identity detectors — XSS, SQLi):
 
 ```
 Discovery (attack_surface.py)
@@ -92,6 +92,50 @@ TrustScan permit's `active_checks`, `allowed_http_methods`, and
 runtime safety engine, answer the second — unchanged by this layer's
 existence.
 
+#### Authorization-comparison (IDOR/BOLA) data flow, added Slice 8
+
+IDOR/BOLA detection is architecturally separate from the single-
+identity detectors above, not a variant of them: it compares behavior
+across *two* controlled identities rather than classifying one
+response in isolation, so it runs through a dedicated orchestration
+path instead of the generic `ACTIVE_DETECTOR_REGISTRY` used by
+`active.xss.reflected`/`active.sqli.error`
+(`COMPARISON_ACTIVE_CHECK_IDS` tracks check IDs that opt out of that
+per-page dispatch table for this reason).
+
+```
+AuthorizationComparisonPlan (authorization_comparison.py, apps/api)
+   |  references: primary_context_id, secondary_context_id (two
+   |  AuthenticationContexts -- never a reinterpretation of the
+   |  single-identity authentication_context_id claim), an explicit
+   |  operator-supplied resource_scope (ResourcePairSpec list) --
+   |  never a generated or enumerated identifier
+   v
+_resource_pair_from_spec() (executor.py)
+   -> AuthorizationResource x2 (authorization_resource.py: structural
+      resource_id = SHA-256 of endpoint+method+identifier location/
+      name/value only -- never response content)
+   v
+run_idor_authorization_detector() (idor_authorization_detector.py)
+   -> apply_authentication() (the same Slice-7 mechanism, once per
+      identity -- baseline A->A, baseline B->B, cross A->B, cross B->A)
+   -> content-fingerprint differential classification
+   -> CONFIRMED / PROBABLE / INCONCLUSIVE / NOT_VULNERABLE / ERROR
+   -> NormalizedFinding (CWE-639 + OWASP-API, only for CONFIRMED/PROBABLE)
+```
+
+A permit's `authorization_comparison_plan_id` claim (schema 1.3) is a
+second, independent signed reference alongside `authentication_context_id`
+— the plan references two contexts, the permit references the plan.
+Both the plan and both contexts are validated (organization/target/
+authorization/active-status) at permit-issuance time and again at
+execution time. A permit can carry this claim only if `active_checks`
+also includes `active.authorization.idor`; the reverse is equally
+enforced — referencing the plan without requesting the check, or
+requesting the check without a plan, are both rejected. See
+`docs/audit/active-detection-phase8-idor-bola.md` for the full
+classification logic, false-positive controls, and safety budgets.
+
 ### `apps/api`
 
 The local control-plane foundation including:
@@ -107,7 +151,8 @@ The local control-plane foundation including:
 - TrustScan runtime safety orchestration;
 - TrustScan Safety Receipt persistence;
 - active-detector orchestration (`executor.py`'s `_apply_active_detection`), which runs the same authorized-detector loop against every candidate the scanner's attack-surface discovery finds, regardless of which interface (CLI or API) requested the scan; and
-- authentication-context metadata/secret storage (`authentication_contexts.py`) for authenticated scanning — deliberately in-memory only this slice, not SQLite (see its module docstring and `docs/audit/active-detection-phase7-authenticated-scanning.md` for why), so it does not yet persist across separate CLI/worker process invocations.
+- authentication-context metadata/secret storage (`authentication_contexts.py`) for authenticated scanning — deliberately in-memory only this slice, not SQLite (see its module docstring and `docs/audit/active-detection-phase7-authenticated-scanning.md` for why), so it does not yet persist across separate CLI/worker process invocations; and
+- authorization-comparison plan storage (`authorization_comparison.py`) for IDOR/BOLA scanning — a reference-only record (two authentication-context IDs plus an explicit resource scope, never a secret itself), in-memory only for the same reason as authentication-context storage, so it shares the same cross-process persistence limitation.
 
 ### `infra/compose`
 

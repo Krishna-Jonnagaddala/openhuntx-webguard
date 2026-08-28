@@ -31,6 +31,9 @@ _PERMIT_REVOKE_PATH = re.compile(r"^/v1/permits/([0-9a-f-]{36})/revoke$")
 _AUTHENTICATION_CONTEXT_REVOKE_PATH = re.compile(
     r"^/v1/authentication-contexts/([0-9a-f-]{36})/revoke$"
 )
+_AUTHORIZATION_COMPARISON_REVOKE_PATH = re.compile(
+    r"^/v1/authorization-comparisons/([0-9a-f-]{36})/revoke$"
+)
 
 
 class ApiTransportError(ValueError):
@@ -500,6 +503,56 @@ def build_handler(
                     payload = service.revoke_authentication_context(
                         context,
                         authentication_context_revoke_match.group(1),
+                        request_id=request_id,
+                    )
+                    self._send_json(
+                        200,
+                        payload,
+                        request_id=request_id,
+                        extra_headers=self._rate_headers(decision),
+                    )
+                    return
+                if path == "/v1/authorization-comparisons":
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "authorization_comparison_body_invalid",
+                            "Request body must be valid JSON.",
+                            status=400,
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "authorization_comparison_body_invalid",
+                            "Request body must be a JSON object.",
+                            status=400,
+                        )
+                    payload = service.register_authorization_comparison_plan(
+                        context, body, request_id=request_id
+                    )
+                    self._send_json(
+                        201,
+                        payload,
+                        request_id=request_id,
+                        extra_headers=self._rate_headers(decision),
+                    )
+                    return
+                authorization_comparison_revoke_match = (
+                    _AUTHORIZATION_COMPARISON_REVOKE_PATH.fullmatch(path)
+                )
+                if authorization_comparison_revoke_match:
+                    lengths = self.headers.get_all("Content-Length") or []
+                    if lengths and any(value != "0" for value in lengths):
+                        raise ApiTransportError(
+                            "authorization_comparison_body_not_allowed",
+                            "Authorization-comparison revocation requests cannot "
+                            "contain a body.",
+                            status=400,
+                        )
+                    payload = service.revoke_authorization_comparison_plan(
+                        context,
+                        authorization_comparison_revoke_match.group(1),
                         request_id=request_id,
                     )
                     self._send_json(

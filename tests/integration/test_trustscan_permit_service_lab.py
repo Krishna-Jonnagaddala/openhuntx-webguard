@@ -90,6 +90,7 @@ class TrustScanPermitServiceIntegrationTests(unittest.TestCase):
                         "maximum_concurrency": 1,
                         "active_checks": [],
                         "authentication_context_id": None,
+                        "authorization_comparison_plan_id": None,
                     }
                 ).encode("utf-8")
                 status, issued = request(

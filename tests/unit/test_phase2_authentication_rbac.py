@@ -320,6 +320,9 @@ class Phase2AuthenticationAndRbacTests(unittest.TestCase):
             ApiPermission.AUTHENTICATION_CONTEXT_REGISTER,
             ApiPermission.AUTHENTICATION_CONTEXT_READ,
             ApiPermission.AUTHENTICATION_CONTEXT_REVOKE,
+            ApiPermission.AUTHORIZATION_COMPARISON_REGISTER,
+            ApiPermission.AUTHORIZATION_COMPARISON_READ,
+            ApiPermission.AUTHORIZATION_COMPARISON_REVOKE,
         }
         for permission in ApiPermission:
             if permission in _OWNER_ONLY_PERMISSIONS:

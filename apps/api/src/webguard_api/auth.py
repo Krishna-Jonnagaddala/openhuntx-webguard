@@ -28,6 +28,9 @@ class ApiPermission(str, Enum):
     AUTHENTICATION_CONTEXT_REGISTER = "authentication_contexts.register"
     AUTHENTICATION_CONTEXT_READ = "authentication_contexts.read"
     AUTHENTICATION_CONTEXT_REVOKE = "authentication_contexts.revoke"
+    AUTHORIZATION_COMPARISON_REGISTER = "authorization_comparisons.register"
+    AUTHORIZATION_COMPARISON_READ = "authorization_comparisons.read"
+    AUTHORIZATION_COMPARISON_REVOKE = "authorization_comparisons.revoke"
 
 
 _ROLE_PERMISSIONS = {
@@ -42,6 +45,9 @@ _ROLE_PERMISSIONS = {
         ApiPermission.AUTHENTICATION_CONTEXT_REGISTER,
         ApiPermission.AUTHENTICATION_CONTEXT_READ,
         ApiPermission.AUTHENTICATION_CONTEXT_REVOKE,
+        ApiPermission.AUTHORIZATION_COMPARISON_REGISTER,
+        ApiPermission.AUTHORIZATION_COMPARISON_READ,
+        ApiPermission.AUTHORIZATION_COMPARISON_REVOKE,
     },
     OrganizationRole.ANALYST: frozenset(
         {

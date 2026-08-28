@@ -15,8 +15,8 @@ from .owned_targets import OwnedTargetContractError, canonicalize_owned_target_u
 from .scan_jobs import ScanJobMode
 
 
-CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.2"
-SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.2",)
+CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.3"
+SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.3",)
 TRUSTSCAN_PERMIT_TYPE = "trustscan_scan_permit"
 TRUSTSCAN_SIGNATURE_ALGORITHM = "Ed25519"
 MAXIMUM_TRUSTSCAN_PERMIT_DOCUMENT_BYTES = 128 * 1024
@@ -42,7 +42,11 @@ TRUSTSCAN_PROHIBITED_OPERATIONS = (
 # Schema 1.1 replaces 1.0 outright rather than supporting both: WebGuard is
 # still pre-production (README: "not yet a publicly hosted production
 # service"), so there is no deployed 1.0 permit this would break.
-KNOWN_TRUSTSCAN_ACTIVE_CHECKS = ("active.sqli.error", "active.xss.reflected")
+KNOWN_TRUSTSCAN_ACTIVE_CHECKS = (
+    "active.authorization.idor",
+    "active.sqli.error",
+    "active.xss.reflected",
+)
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _KEY_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -269,6 +273,24 @@ def _authentication_context_id(value: object) -> str | None:
     return _uuid(value, "authentication_context_id")
 
 
+def _authorization_comparison_plan_id(value: object) -> str | None:
+    """authorization_comparison_plan_id is the signed binding that
+    authorizes a scan to run the authorization-comparison (IDOR/BOLA)
+    detector under a specific, separately-stored comparison plan (Slice
+    8) -- never the two identities' secret material, only a reference to
+    the plan that names which two already-registered authentication
+    contexts may be compared. Deliberately a separate claim from
+    authentication_context_id, not a reinterpretation of it: a single-
+    identity authenticated scan and a two-identity comparison scan are
+    different capabilities, independently authorized. None (the default,
+    and the only value every pre-Slice-8 permit can carry) means this
+    permit authorizes no authorization-comparison scanning at all."""
+
+    if value is None:
+        return None
+    return _uuid(value, "authorization_comparison_plan_id")
+
+
 def _prohibited_operations(value: object) -> tuple[str, ...]:
     if not isinstance(value, tuple) or value != TRUSTSCAN_PROHIBITED_OPERATIONS:
         raise TrustScanPermitValidationError(
@@ -353,6 +375,7 @@ class TrustScanPermitSubmission:
     maximum_concurrency: int = TRUSTSCAN_V1_MAXIMUM_CONCURRENCY
     active_checks: tuple[str, ...] = ()
     authentication_context_id: str | None = None
+    authorization_comparison_plan_id: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -414,6 +437,11 @@ class TrustScanPermitSubmission:
             "authentication_context_id",
             _authentication_context_id(self.authentication_context_id),
         )
+        object.__setattr__(
+            self,
+            "authorization_comparison_plan_id",
+            _authorization_comparison_plan_id(self.authorization_comparison_plan_id),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,6 +465,7 @@ class TrustScanPermitClaims:
     prohibited_operations: tuple[str, ...] = TRUSTSCAN_PROHIBITED_OPERATIONS
     active_checks: tuple[str, ...] = ()
     authentication_context_id: str | None = None
+    authorization_comparison_plan_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "permit_id", _uuid(self.permit_id, "permit_id"))
@@ -507,6 +536,11 @@ class TrustScanPermitClaims:
             "authentication_context_id",
             _authentication_context_id(self.authentication_context_id),
         )
+        object.__setattr__(
+            self,
+            "authorization_comparison_plan_id",
+            _authorization_comparison_plan_id(self.authorization_comparison_plan_id),
+        )
 
     @property
     def fingerprint(self) -> str:
@@ -535,6 +569,7 @@ class TrustScanPermitClaims:
             "prohibited_operations": list(self.prohibited_operations),
             "active_checks": list(self.active_checks),
             "authentication_context_id": self.authentication_context_id,
+            "authorization_comparison_plan_id": self.authorization_comparison_plan_id,
         }
 
 
@@ -622,6 +657,7 @@ def load_trustscan_permit_submission_json(document: str | bytes) -> TrustScanPer
             "maximum_concurrency",
             "active_checks",
             "authentication_context_id",
+            "authorization_comparison_plan_id",
         },
         context="TrustScan permit submission",
     )
@@ -652,6 +688,7 @@ def load_trustscan_permit_submission_json(document: str | bytes) -> TrustScanPer
             maximum_concurrency=root["maximum_concurrency"],
             active_checks=tuple(active_check_values),
             authentication_context_id=root["authentication_context_id"],
+            authorization_comparison_plan_id=root["authorization_comparison_plan_id"],
         )
     except ValueError as exc:
         if isinstance(exc, TrustScanPermitContractError):
@@ -689,6 +726,7 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
             "prohibited_operations",
             "active_checks",
             "authentication_context_id",
+            "authorization_comparison_plan_id",
         },
         context="TrustScan permit claims",
     )
@@ -731,6 +769,7 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
                 prohibited_operations=tuple(prohibited_values),
                 active_checks=tuple(active_check_values),
                 authentication_context_id=claims["authentication_context_id"],
+                authorization_comparison_plan_id=claims["authorization_comparison_plan_id"],
             ),
             signature_algorithm=signature["algorithm"],
             signing_key_id=signature["key_id"],

@@ -34,6 +34,11 @@ from .authentication_contexts import (
     AuthenticationContextRepository,
     AuthenticationMethod,
 )
+from .authorization_comparison import (
+    AuthorizationComparisonError,
+    AuthorizationComparisonPlanRepository,
+    ResourcePairSpec,
+)
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .identity import IdentityStore, IdentityStoreError
 from .pagination import PageRequest, PaginationError, SignedCursorCodec
@@ -94,6 +99,7 @@ class WebGuardJobService:
         cursor_codec: SignedCursorCodec | None = None,
         trustscan_signer: TrustScanSigner | None = None,
         authentication_contexts: AuthenticationContextRepository | None = None,
+        authorization_comparison_plans: AuthorizationComparisonPlanRepository | None = None,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
@@ -109,6 +115,12 @@ class WebGuardJobService:
             authentication_contexts
             if authentication_contexts is not None
             else AuthenticationContextRepository()
+        )
+        # Same rationale, same pattern, Slice 8.
+        self.authorization_comparison_plans = (
+            authorization_comparison_plans
+            if authorization_comparison_plans is not None
+            else AuthorizationComparisonPlanRepository()
         )
         try:
             key = store.cursor_signing_key() if cursor_codec is None else None
@@ -372,6 +384,15 @@ class WebGuardJobService:
                 resource_type="trustscan_permit",
                 resource_id="pending",
             )
+        if submission.authorization_comparison_plan_id is not None:
+            self._require(
+                context,
+                ApiPermission.AUTHORIZATION_COMPARISON_REGISTER,
+                request_id=request_id,
+                action="permits.issue_authorization_comparison",
+                resource_type="trustscan_permit",
+                resource_id="pending",
+            )
         if not self.identity.authorization_is_assigned(
             context.organization_id, submission.authorization_id
         ):
@@ -444,6 +465,32 @@ class WebGuardJobService:
                 )
             except AuthenticationContextError as exc:
                 raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        if submission.authorization_comparison_plan_id is not None:
+            # Mirrors the authentication_context_id binding check above,
+            # plus one additional rule that is specific to comparison
+            # plans: the plan's own permitted_active_check must actually
+            # be requested in this submission's active_checks. A permit
+            # cannot reference a comparison plan without also explicitly
+            # authorizing the detector that plan exists to run --
+            # referencing the plan alone must never be sufficient.
+            try:
+                comparison_plan = self.authorization_comparison_plans.require_bound(
+                    submission.authorization_comparison_plan_id,
+                    organization_id=context.organization_id,
+                    target=submission.target,
+                    authorization_id=authorization.authorization_id,
+                    now=now,
+                )
+            except AuthorizationComparisonError as exc:
+                raise ApiServiceError(exc.code, exc.message, status=400) from exc
+            if comparison_plan.permitted_active_check not in submission.active_checks:
+                raise ApiServiceError(
+                    "authorization_comparison_check_not_requested",
+                    "authorization_comparison_plan_id requires "
+                    f"{comparison_plan.permitted_active_check!r} to also be "
+                    "present in active_checks.",
+                    status=400,
+                )
         try:
             claims = TrustScanPermitClaims(
                 permit_id=str(uuid4()),
@@ -462,6 +509,7 @@ class WebGuardJobService:
                 maximum_concurrency=submission.maximum_concurrency,
                 active_checks=submission.active_checks,
                 authentication_context_id=submission.authentication_context_id,
+                authorization_comparison_plan_id=submission.authorization_comparison_plan_id,
             )
             signed = self.trustscan_signer.sign(claims)
             record = self.store.create_scan_permit(signed)
@@ -480,6 +528,12 @@ class WebGuardJobService:
                 (detail_code + "_and_authenticated")
                 if detail_code
                 else "authenticated_scan_authorized"
+            )
+        if claims.authorization_comparison_plan_id is not None:
+            detail_code = (
+                (detail_code + "_and_comparison")
+                if detail_code
+                else "authorization_comparison_authorized"
             )
         self._audit(
             context,
@@ -702,6 +756,173 @@ class WebGuardJobService:
             action="authentication_contexts.revoke",
             resource_type="authentication_context",
             resource_id=authentication_context_id,
+            outcome=AuditOutcome.SUCCEEDED,
+        )
+        return record.to_public_dict(now=self.clock())
+
+    def register_authorization_comparison_plan(
+        self, context: AuthContext, body: dict, *, request_id: str
+    ) -> dict:
+        """Register a new authorization-comparison plan (Slice 8): a
+        reference to two already-registered authentication contexts,
+        plus an explicit, operator-supplied resource scope. Owner-only.
+
+        The two-identity requirement is enforced here, not merely
+        documented: both context IDs must already exist, must both be
+        ACTIVE, and must both be bound to this exact organization/
+        target/authorization -- the same binding a single-identity
+        authenticated permit requires, checked twice (once per
+        identity).
+        """
+
+        self._require(
+            context,
+            ApiPermission.AUTHORIZATION_COMPARISON_REGISTER,
+            request_id=request_id,
+            action="authorization_comparisons.register",
+            resource_type="authorization_comparison_plan",
+            resource_id="pending",
+        )
+        required = {
+            "target",
+            "authorization_id",
+            "primary_context_id",
+            "secondary_context_id",
+            "resource_scope",
+            "expires_at",
+        }
+        missing = required - set(body)
+        if missing:
+            raise ApiServiceError(
+                "authorization_comparison_field_missing",
+                f"Missing required field {sorted(missing)[0]!r}.",
+                status=400,
+            )
+        if not self.identity.authorization_is_assigned(
+            context.organization_id, body["authorization_id"]
+        ):
+            raise ApiServiceError(
+                "authorization_not_found",
+                "Authorization was not found for this organization.",
+                status=404,
+            )
+        try:
+            authorization = self.authorizations.get(body["authorization_id"])
+        except AuthorizationRepositoryError as exc:
+            status = 404 if exc.code == "authorization_not_found" else 500
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        if authorization.target != body["target"]:
+            raise ApiServiceError(
+                "authorization_target_mismatch",
+                "The requested target does not match the server-side authorization.",
+                status=400,
+            )
+        now = self.clock()
+        try:
+            expires_at = datetime.fromisoformat(
+                str(body["expires_at"]).replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ApiServiceError(
+                "authorization_comparison_expiry_invalid",
+                "expires_at must be an ISO-8601 timestamp.",
+                status=400,
+            ) from exc
+
+        # Requirement 3: both identities must already be registered,
+        # active, and bound to this exact organization/target/
+        # authorization -- checked independently for each.
+        for context_id in (body["primary_context_id"], body["secondary_context_id"]):
+            try:
+                self.authentication_contexts.require_bound(
+                    context_id,
+                    organization_id=context.organization_id,
+                    target=body["target"],
+                    authorization_id=authorization.authorization_id,
+                    now=now,
+                )
+            except AuthenticationContextError as exc:
+                raise ApiServiceError(exc.code, exc.message, status=400) from exc
+
+        raw_resource_scope = body["resource_scope"]
+        if not isinstance(raw_resource_scope, list):
+            raise ApiServiceError(
+                "authorization_comparison_resource_scope_invalid",
+                "resource_scope must be a JSON array.",
+                status=400,
+            )
+        try:
+            resource_scope = tuple(
+                ResourcePairSpec.from_dict(item) for item in raw_resource_scope
+            )
+        except AuthorizationComparisonError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+
+        allowed_http_methods = tuple(
+            sorted(set(body.get("allowed_http_methods", ["GET"])))
+        )
+
+        try:
+            record = self.authorization_comparison_plans.create(
+                organization_id=context.organization_id,
+                target=body["target"],
+                authorization_id=authorization.authorization_id,
+                primary_context_id=body["primary_context_id"],
+                secondary_context_id=body["secondary_context_id"],
+                permitted_active_check="active.authorization.idor",
+                allowed_http_methods=allowed_http_methods,
+                resource_scope=resource_scope,
+                expires_at=expires_at,
+                now=now,
+            )
+        except AuthorizationComparisonError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+
+        self._audit(
+            context,
+            request_id=request_id,
+            action="authorization_comparisons.register",
+            resource_type="authorization_comparison_plan",
+            resource_id=record.comparison_plan_id,
+            outcome=AuditOutcome.SUCCEEDED,
+            detail_code=f"resource_pairs_{len(resource_scope)}",
+        )
+        return record.to_public_dict(now=now)
+
+    def revoke_authorization_comparison_plan(
+        self, context: AuthContext, comparison_plan_id: str, *, request_id: str
+    ) -> dict:
+        self._require(
+            context,
+            ApiPermission.AUTHORIZATION_COMPARISON_REVOKE,
+            request_id=request_id,
+            action="authorization_comparisons.revoke",
+            resource_type="authorization_comparison_plan",
+            resource_id=comparison_plan_id,
+        )
+        try:
+            record = self.authorization_comparison_plans.get(comparison_plan_id)
+            if record.organization_id != context.organization_id:
+                raise AuthorizationComparisonError(
+                    "authorization_comparison_plan_not_found",
+                    "No authorization-comparison plan matches the requested ID.",
+                )
+            record = self.authorization_comparison_plans.revoke(
+                comparison_plan_id, now=self.clock()
+            )
+        except AuthorizationComparisonError as exc:
+            status = (
+                404
+                if exc.code == "authorization_comparison_plan_not_found"
+                else 400
+            )
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        self._audit(
+            context,
+            request_id=request_id,
+            action="authorization_comparisons.revoke",
+            resource_type="authorization_comparison_plan",
+            resource_id=comparison_plan_id,
             outcome=AuditOutcome.SUCCEEDED,
         )
         return record.to_public_dict(now=self.clock())

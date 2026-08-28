@@ -284,6 +284,7 @@ def _permit_issue_command(args: argparse.Namespace) -> int:
             "maximum_concurrency": args.maximum_concurrency,
             "active_checks": active_checks,
             "authentication_context_id": args.authentication_context_id,
+            "authorization_comparison_plan_id": args.authorization_comparison_plan_id,
         }
     ).encode("utf-8")
 
@@ -649,6 +650,19 @@ def build_parser() -> argparse.ArgumentParser:
             "permit -- the default and the fail-closed behaviour for "
             "every permit that does not explicitly request one. "
             "Requesting this requires an organization-owner token."
+        ),
+    )
+    permit_issue.add_argument(
+        "--authorization-comparison-plan-id",
+        default=None,
+        help=(
+            "Bind this permit to a previously registered authorization-"
+            "comparison plan, authorizing the IDOR/BOLA differential "
+            "detector to compare the two identities that plan names. "
+            "Omit entirely for a permit with no comparison capability -- "
+            "the default and the fail-closed behaviour for every permit "
+            "that does not explicitly request one. Requesting this "
+            "requires an organization-owner token."
         ),
     )
     permit_issue.set_defaults(handler=_permit_issue_command)

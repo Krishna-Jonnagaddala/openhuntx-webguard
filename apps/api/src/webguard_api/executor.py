@@ -25,10 +25,13 @@ from webguard_scanner import (
     ActiveDetectionError,
     ActiveDetectionPolicy,
     AttackSurfaceBudget,
+    AuthorizationResource,
+    AuthorizationResourcePair,
     CrawlCancellationToken,
     CrawlPolicy,
     DetectionCandidate,
     FetchPolicy,
+    IdentifierLocation,
     MAXIMUM_DISCOVERED_CANDIDATES,
     OWNED_DEFAULT_CRAWL_DELAY_SECONDS,
     OWNED_DEFAULT_CRAWL_DEPTH,
@@ -36,6 +39,8 @@ from webguard_scanner import (
     OWNED_DEFAULT_CRAWL_LINKS_PER_PAGE,
     OWNED_DEFAULT_CRAWL_PAGES,
     OWNED_DEFAULT_CRAWL_REQUEST_ATTEMPTS,
+    ResourceOwnership,
+    ResourceSource,
     RequestTemplate,
     RetryPolicy,
     ValidatedTarget,
@@ -44,6 +49,7 @@ from webguard_scanner import (
     discover_page_attack_surface,
     discover_site_attack_surface,
     fetch_same_origin_page,
+    run_idor_authorization_detector,
     to_request_templates,
     validate_owned_target_preflight,
     validate_target_url,
@@ -54,6 +60,10 @@ from webguard_scanner import (
 from .authentication_contexts import (
     AuthenticationContextError,
     AuthenticationContextRepository,
+)
+from .authorization_comparison import (
+    AuthorizationComparisonError,
+    AuthorizationComparisonPlanRepository,
 )
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
@@ -472,6 +482,192 @@ def _write_signed_safety_receipt(receipt, path: Path) -> str:
     return receipt.fingerprint
 
 
+_IDENTIFIER_LOCATION_MAP = {
+    "path": IdentifierLocation.PATH,
+    "query": IdentifierLocation.QUERY,
+    "none": IdentifierLocation.NONE,
+}
+_RESOURCE_OWNERSHIP_MAP = {
+    "private_to_owner": ResourceOwnership.PRIVATE_TO_OWNER,
+    "shared": ResourceOwnership.SHARED,
+    "public": ResourceOwnership.PUBLIC,
+    "unknown": ResourceOwnership.UNKNOWN,
+}
+
+
+def _resource_pair_from_spec(spec, *, primary_identity: str, secondary_identity: str):
+    identifier_location = _IDENTIFIER_LOCATION_MAP.get(
+        spec.identifier_location, IdentifierLocation.NONE
+    )
+    expected_access = _RESOURCE_OWNERSHIP_MAP.get(
+        spec.expected_access, ResourceOwnership.PRIVATE_TO_OWNER
+    )
+    # Every resource this orchestration path ever constructs is sourced
+    # from an operator-supplied comparison-plan resource_scope entry --
+    # EXPLICIT_TEST_RESOURCE is the only provenance value used here.
+    # There is no code path anywhere in this module that generates,
+    # enumerates, or guesses an identifier.
+    primary_resource = AuthorizationResource(
+        resource_type=spec.resource_type,
+        endpoint=spec.primary_endpoint,
+        method=spec.method,
+        identifier_location=identifier_location,
+        identifier_name=spec.identifier_name,
+        identifier_value=spec.primary_endpoint.rsplit("/", 1)[-1],
+        owning_test_identity=primary_identity,
+        source=ResourceSource.EXPLICIT_TEST_RESOURCE,
+        expected_access=expected_access,
+    )
+    secondary_resource = AuthorizationResource(
+        resource_type=spec.resource_type,
+        endpoint=spec.secondary_endpoint,
+        method=spec.method,
+        identifier_location=identifier_location,
+        identifier_name=spec.identifier_name,
+        identifier_value=spec.secondary_endpoint.rsplit("/", 1)[-1],
+        owning_test_identity=secondary_identity,
+        source=ResourceSource.EXPLICIT_TEST_RESOURCE,
+        expected_access=expected_access,
+    )
+    return AuthorizationResourcePair(
+        primary_resource=primary_resource, secondary_resource=secondary_resource
+    )
+
+
+def _apply_authorization_comparison(
+    report: WebGuardReport,
+    *,
+    target: ValidatedTarget,
+    active_checks: tuple[str, ...],
+    scan_id: str,
+    organization_id: str,
+    authorization_id: str,
+    permit_id: str,
+    permit_fingerprint: str,
+    comparison_plan_id: str | None,
+    authorization_comparison_plans: AuthorizationComparisonPlanRepository,
+    authentication_contexts: AuthenticationContextRepository,
+    fetch_policy: FetchPolicy,
+    safety: TrustScanRuntimeSafetyEngine,
+    cancellation_token: CrawlCancellationToken,
+) -> WebGuardReport:
+    """Run the authorization-differential (IDOR/BOLA) detector and merge
+    findings into the report.
+
+    Fails closed by construction: if ``active.authorization.idor`` is not
+    in ``active_checks``, or ``comparison_plan_id`` is not set, this
+    returns ``report`` completely unchanged. The permit's active_checks
+    claim alone is not sufficient either -- see ``service.issue_permit``,
+    which additionally requires the plan's own ``permitted_active_check``
+    to already be present in ``active_checks`` before the permit can ever
+    be issued with both set inconsistently.
+
+    Single-page scans only this slice (see the phase 8 audit doc): a
+    crawled page's findings must be attributable to that one page's own
+    URL (the same invariant that already defers site-level attack-surface
+    discovery in crawl mode), and this detector's resources are explicit,
+    scan-wide endpoints, not tied to any one crawled page.
+    """
+
+    if "active.authorization.idor" not in active_checks or comparison_plan_id is None:
+        return report
+
+    if hasattr(report, "pages"):
+        # Crawl mode: deferred, not silently dropped -- see the module
+        # docstring above and the phase 8 audit doc's "Known limitations."
+        return report
+
+    if report.status not in _ACTIVE_DETECTION_ELIGIBLE_STATUSES:
+        return report
+
+    def cancellation_check() -> bool:
+        return cancellation_token.is_cancelled
+
+    if cancellation_check():
+        return report
+
+    try:
+        plan = authorization_comparison_plans.require_bound(
+            comparison_plan_id,
+            organization_id=organization_id,
+            target=target.normalised_url,
+            authorization_id=authorization_id,
+            now=safety.clock(),
+        )
+        authentication_contexts.require_bound(
+            plan.primary_context_id,
+            organization_id=organization_id,
+            target=target.normalised_url,
+            authorization_id=authorization_id,
+            now=safety.clock(),
+        )
+        authentication_contexts.require_bound(
+            plan.secondary_context_id,
+            organization_id=organization_id,
+            target=target.normalised_url,
+            authorization_id=authorization_id,
+            now=safety.clock(),
+        )
+        primary_material = authentication_contexts.get_secret(plan.primary_context_id)
+        secondary_material = authentication_contexts.get_secret(
+            plan.secondary_context_id
+        )
+        # Identity *labels* (never secret material) come from each
+        # context's own metadata record -- the same non-sensitive label
+        # an operator chose when registering that identity.
+        primary_identity_label = authentication_contexts.get_metadata(
+            plan.primary_context_id
+        ).identity_label
+        secondary_identity_label = authentication_contexts.get_metadata(
+            plan.secondary_context_id
+        ).identity_label
+    except (AuthorizationComparisonError, AuthenticationContextError) as exc:
+        raise TrustScanRuntimeSafetyError(exc.code, exc.message) from exc
+
+    resource_pairs = tuple(
+        _resource_pair_from_spec(
+            spec,
+            primary_identity=primary_identity_label,
+            secondary_identity=secondary_identity_label,
+        )
+        for spec in plan.resource_scope
+    )
+
+    context = ActiveDetectionContext(
+        scan_id=scan_id,
+        authorization_id=authorization_id,
+        permit_id=permit_id,
+        permit_fingerprint=permit_fingerprint,
+    )
+    policy = ActiveDetectionPolicy(
+        fetch_policy=fetch_policy,
+        maximum_probe_requests=max(MAXIMUM_DISCOVERED_CANDIDATES, len(resource_pairs) * 4),
+    )
+
+    try:
+        result = run_idor_authorization_detector(
+            target,
+            resource_pairs,
+            context,
+            primary_identity_label=primary_identity_label,
+            primary_material=primary_material,
+            secondary_identity_label=secondary_identity_label,
+            secondary_material=secondary_material,
+            policy=policy,
+            before_request=safety.before_request,
+            after_request=safety.after_request,
+            cancellation_check=cancellation_check,
+        )
+    except ActiveDetectionError:
+        return report
+
+    if not result.findings:
+        return report
+    return dataclasses_replace(
+        report, findings=report.findings + tuple(result.findings)
+    )
+
+
 class ScanJobExecutor:
     """Execute one validated, server-authorized passive scanner job."""
 
@@ -490,6 +686,7 @@ class ScanJobExecutor:
             Callable[[str, str], bool] | None
         ) = None,
         authentication_contexts: AuthenticationContextRepository | None = None,
+        authorization_comparison_plans: AuthorizationComparisonPlanRepository | None = None,
     ) -> None:
         self.authorizations = authorizations
         self.store = store
@@ -511,6 +708,12 @@ class ScanJobExecutor:
             authentication_contexts
             if authentication_contexts is not None
             else AuthenticationContextRepository()
+        )
+        # Same rationale, same pattern, Slice 8.
+        self.authorization_comparison_plans = (
+            authorization_comparison_plans
+            if authorization_comparison_plans is not None
+            else AuthorizationComparisonPlanRepository()
         )
 
     def _policies(self, authorization, permit, mode: ScanJobMode):
@@ -817,6 +1020,22 @@ class ScanJobExecutor:
                 permit_id=permit.permit.claims.permit_id,
                 permit_fingerprint=permit.permit.fingerprint,
                 authentication_context_id=permit.permit.claims.authentication_context_id,
+                authentication_contexts=self.authentication_contexts,
+                fetch_policy=fetch_policy,
+                safety=safety,
+                cancellation_token=token,
+            )
+            report = _apply_authorization_comparison(
+                report,
+                target=target,
+                active_checks=permit.permit.claims.active_checks,
+                scan_id=scan_id,
+                organization_id=scope[0],
+                authorization_id=record.request.authorization_id,
+                permit_id=permit.permit.claims.permit_id,
+                permit_fingerprint=permit.permit.fingerprint,
+                comparison_plan_id=permit.permit.claims.authorization_comparison_plan_id,
+                authorization_comparison_plans=self.authorization_comparison_plans,
                 authentication_contexts=self.authentication_contexts,
                 fetch_policy=fetch_policy,
                 safety=safety,

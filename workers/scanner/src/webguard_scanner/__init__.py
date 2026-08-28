@@ -258,6 +258,21 @@ from .sqli_error_detector import (
     SqliDetectorRunResult,
     run_sqli_error_detector,
 )
+from .authorization_resource import (
+    AuthorizationResource,
+    AuthorizationResourceError,
+    IdentifierLocation,
+    ResourceOwnership,
+    ResourceSource,
+)
+from .idor_authorization_detector import (
+    AuthorizationDifferentialObservation,
+    AuthorizationResourcePair,
+    IdorComparisonRecord,
+    IdorDetectionOutcome,
+    IdorDetectorRunResult,
+    run_idor_authorization_detector,
+)
 from .xss_reflected_detector import (
     DetectionOutcome,
     DetectorRunRecord,
@@ -315,6 +330,17 @@ __all__ = [
     "SqliDetectorRunRecord",
     "SqliDetectorRunResult",
     "TemplatedProbeAttempt",
+    "AuthorizationResource",
+    "AuthorizationResourceError",
+    "IdentifierLocation",
+    "ResourceOwnership",
+    "ResourceSource",
+    "AuthorizationDifferentialObservation",
+    "AuthorizationResourcePair",
+    "IdorComparisonRecord",
+    "IdorDetectionOutcome",
+    "IdorDetectorRunResult",
+    "run_idor_authorization_detector",
     "build_request_template",
     "discover_get_form_candidates",
     "discover_page_attack_surface",

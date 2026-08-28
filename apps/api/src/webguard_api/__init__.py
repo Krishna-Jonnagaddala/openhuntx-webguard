@@ -8,6 +8,15 @@ from .authentication_contexts import (
     AuthenticationContextStatus,
     AuthenticationMethod,
 )
+from .authorization_comparison import (
+    MAXIMUM_COMPARISONS_PER_PLAN,
+    MAXIMUM_RESOURCE_PAIRS_PER_PLAN,
+    AuthorizationComparisonError,
+    AuthorizationComparisonPlanRecord,
+    AuthorizationComparisonPlanRepository,
+    AuthorizationComparisonPlanStatus,
+    ResourcePairSpec,
+)
 from .authorizations import (
     MAXIMUM_AUTHORIZATION_FILES,
     AuthorizationRepository,
@@ -89,6 +98,13 @@ __all__ = [
     "AuthenticationContextRepository",
     "AuthenticationContextStatus",
     "AuthenticationMethod",
+    "MAXIMUM_COMPARISONS_PER_PLAN",
+    "MAXIMUM_RESOURCE_PAIRS_PER_PLAN",
+    "AuthorizationComparisonError",
+    "AuthorizationComparisonPlanRecord",
+    "AuthorizationComparisonPlanRepository",
+    "AuthorizationComparisonPlanStatus",
+    "ResourcePairSpec",
     "AuthorizationRepository",
     "AuthorizationRepositoryError",
     "DATABASE_SCHEMA_VERSION",

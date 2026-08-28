@@ -1,12 +1,26 @@
 """Registry mapping active-detector IDs to their runner callables.
 
-The set of keys here must exactly match
-``webguard_contracts.KNOWN_TRUSTSCAN_ACTIVE_CHECKS`` -- a permit can only
-authorize a detector ID that both sides recognize. A dedicated test
-(tests/unit/test_active_detector_registry.py) asserts they stay in sync;
-this module does not import the contracts package to check it directly,
-since it is the scanner-side half of a boundary that intentionally has no
-runtime coupling in either direction.
+The union of keys here and ``COMPARISON_ACTIVE_CHECK_IDS`` must exactly
+match ``webguard_contracts.KNOWN_TRUSTSCAN_ACTIVE_CHECKS`` -- a permit
+can only authorize a detector ID that both sides recognize. A dedicated
+test (tests/unit/test_active_detector_registry.py) asserts they stay in
+sync; this module does not import the contracts package to check it
+directly, since it is the scanner-side half of a boundary that
+intentionally has no runtime coupling in either direction.
+
+``active.authorization.idor`` is deliberately **not** in
+``ACTIVE_DETECTOR_REGISTRY``. Every detector in that registry shares one
+calling convention -- ``runner(target, candidates, context, policy=,
+before_request=, after_request=, cancellation_check=,
+authentication_material=)`` -- dispatched generically by the executor's
+per-page detector loop. The IDOR/BOLA detector's actual signature is
+fundamentally different (two identities' resolved authentication
+material plus a bounded set of resource pairs, not a flat candidate
+list), so it is authorized the same way through ``active_checks`` but
+executed through its own dedicated orchestration path
+(``executor._apply_authorization_comparison``), never through the
+generic loop. ``COMPARISON_ACTIVE_CHECK_IDS`` exists so that split is
+explicit and tested, not an accidental omission.
 """
 
 from __future__ import annotations
@@ -19,6 +33,12 @@ ACTIVE_DETECTOR_REGISTRY = {
     "active.xss.reflected": run_reflected_xss_detector,
 }
 
-KNOWN_ACTIVE_DETECTOR_IDS = frozenset(ACTIVE_DETECTOR_REGISTRY)
+COMPARISON_ACTIVE_CHECK_IDS = frozenset({"active.authorization.idor"})
 
-__all__ = ["ACTIVE_DETECTOR_REGISTRY", "KNOWN_ACTIVE_DETECTOR_IDS"]
+KNOWN_ACTIVE_DETECTOR_IDS = frozenset(ACTIVE_DETECTOR_REGISTRY) | COMPARISON_ACTIVE_CHECK_IDS
+
+__all__ = [
+    "ACTIVE_DETECTOR_REGISTRY",
+    "COMPARISON_ACTIVE_CHECK_IDS",
+    "KNOWN_ACTIVE_DETECTOR_IDS",
+]

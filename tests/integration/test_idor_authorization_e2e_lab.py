@@ -1,32 +1,31 @@
-"""True end-to-end test of authenticated scanning (Slice 7):
+"""True end-to-end test of authorization-comparison (IDOR/BOLA) scanning
+(Slice 8):
 
-    login (execute_login) -> register authentication context (real HTTP)
-    -> issue authenticated permit (real HTTP) -> submit job (real HTTP)
-    -> real worker -> real executor -> authenticated discovery ->
-    RequestTemplate -> reflected-XSS detector -> finding -> report
-    (real HTTP retrieval)
+    register user-A context + register user-B context (real HTTP)
+    -> register authorization-comparison plan (real HTTP, resource_scope
+       explicitly supplied -- never generated or enumerated)
+    -> issue permit (active.authorization.idor + comparison plan, real
+       HTTP)
+    -> submit job (real HTTP) -> real worker -> real executor
+    -> authorization-differential detector -> CWE-639/OWASP-API finding
+    -> persisted report -> API retrieval
 
 Uses a purpose-built, clearly-labeled local fixture with two isolated
-identities (user-a, user-b) -- not Juice Shop, not a public site.
+identities and both a secure and a deliberately vulnerable object-access
+endpoint -- not Juice Shop, not a public site.
 
-Scoping note (stated here rather than left implicit): the authentication
-context repository is deliberately in-memory only (see
-webguard_api.authentication_contexts's module docstring for why). It
-does not persist across separate OS-process invocations the way the
-SQLite-backed job/permit/identity stores do, so this test constructs the
-service, executor, and worker directly (as the pre-existing
-test_active_checks_e2e_lab.py already does for its own "real API + real
-worker" section) and shares one repository instance between them, rather
-than issuing the authentication-context-registration step through
-separate `webguard-api` CLI subprocess invocations. Every other step
-(permit issuance, job submission, job-result retrieval) goes through
-real HTTP over a real socket, exactly like the existing active-checks
-E2E test.
+Scoping note (same as Slice 7's authenticated-scanning E2E test, for the
+identical reason): both AuthenticationContextRepository and
+AuthorizationComparisonPlanRepository are in-memory only, so this test
+constructs the service, executor, and worker directly and shares both
+repositories between them, using real HTTP for every step that
+references them, exactly mirroring the established pattern.
 """
 
 from __future__ import annotations
 
 import http.client
+import io
 import ipaddress
 import json
 import os
@@ -35,12 +34,13 @@ import ssl
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -53,17 +53,11 @@ from webguard_contracts import (
     load_webguard_report_json,
     write_owned_target_authorization_file,
 )
-from webguard_scanner import ActiveDetectionPolicy, FetchPolicy, ValidatedTarget
-from webguard_scanner.login_workflow import (
-    LoginCredentials,
-    LoginSuccessCriterion,
-    LoginWorkflow,
-    execute_login,
-)
 from webguard_api.cli import main
 from webguard_api import (
     ApiTokenAuthenticator,
     AuthenticationContextRepository,
+    AuthorizationComparisonPlanRepository,
     AuthorizationRepository,
     FixedWindowRateLimiter,
     IdentityStore,
@@ -77,104 +71,84 @@ from webguard_api import (
 
 RUN_INTEGRATION = os.environ.get("WEBGUARD_RUN_INTEGRATION") == "1"
 
-_REAL_CREATE_DEFAULT_CONTEXT = ssl.create_default_context
+_TOKENS = {"user-a": "token-user-a-xyz", "user-b": "token-user-b-xyz"}
+_ORDERS = {
+    "A-001": {"owner": "user-a", "content": '{"order":"A-001","owner":"user-a","total":42}'},
+    "B-001": {"owner": "user-b", "content": '{"order":"B-001","owner":"user-b","total":77}'},
+}
 
-_USERS = {"user-a": "correct-horse-battery-staple-a", "user-b": "correct-horse-battery-staple-b"}
 
-
-class _AuthenticatedFixtureHandler(BaseHTTPRequestHandler):
-    """Two isolated identities (user-a, user-b), five routes:
-    /login, /public, /account, /api/profile, /logout.
-
-    /account and /api/profile only reveal real content with a valid
-    session cookie; /api/profile reflects ?q= unescaped (deliberate,
-    bounded XSS surface for the detector) only when authenticated.
-    """
-
-    sessions: dict[str, str] = {}
+class _IdorFixtureHandler(BaseHTTPRequestHandler):
+    """Two identities (bearer tokens), secure and vulnerable order-lookup
+    endpoints sharing the same underlying data, plus a shared/public
+    endpoint for false-positive coverage."""
 
     def log_message(self, *args) -> None:  # noqa: D401
         return None
 
-    def _respond(
-        self, body: bytes, *, status: int = 200, headers: list[tuple[str, str]] | None = None
-    ) -> None:
+    def _identity(self) -> str | None:
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return None
+        token = auth[len("Bearer ") :]
+        for identity, expected in _TOKENS.items():
+            if token == expected:
+                return identity
+        return None
+
+    def _respond(self, body: bytes, status: int = 200) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        for name, value in headers or []:
-            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def _session_identity(self) -> str | None:
-        cookie_header = self.headers.get("Cookie", "")
-        for part in cookie_header.split(";"):
-            name, _, value = part.strip().partition("=")
-            if name == "session":
-                return self.sessions.get(value)
-        return None
-
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
-        identity = self._session_identity()
+        identity = self._identity()
 
-        if parsed.path in ("/", "/public"):
-            self._respond(b"<html><body>Public page. Nothing sensitive here.</body></html>")
+        if parsed.path == "/api/public/info":
+            self._respond(b'{"info":"public, same for everyone"}')
             return
 
-        if parsed.path == "/account":
+        if parsed.path == "/api/shared/team-document":
             if identity is None:
-                self._respond(b"<html><body>Please log in to view your account.</body></html>")
+                self._respond(b'{"error":"unauthenticated"}', status=403)
                 return
-            body = (
-                f"<html><body>Welcome, {identity}!"
-                f'<form method="GET" action="/api/profile"><input name="q"></form>'
-                f"</body></html>"
-            ).encode()
-            self._respond(body)
+            self._respond(b'{"document":"team roadmap, shared by design"}')
             return
 
-        if parsed.path == "/api/profile":
+        if parsed.path.startswith("/api/orders/"):
+            order_id = parsed.path.rsplit("/", 1)[-1]
+            order = _ORDERS.get(order_id)
             if identity is None:
-                self._respond(b"<html><body>Please log in.</body></html>")
+                self._respond(b'{"error":"unauthenticated"}', status=403)
                 return
-            value = parse_qs(parsed.query).get("q", [""])[0]
-            body = f"<html><body>Profile for {identity}: {value}</body></html>".encode()
-            self._respond(body)
+            if order is None:
+                self._respond(b'{"error":"not found"}', status=404)
+                return
+            # SECURE: ownership is actually checked.
+            if order["owner"] != identity:
+                self._respond(b'{"error":"forbidden"}', status=403)
+                return
+            self._respond(order["content"].encode())
             return
 
-        if parsed.path == "/logout":
-            cookie_header = self.headers.get("Cookie", "")
-            for part in cookie_header.split(";"):
-                name, _, value = part.strip().partition("=")
-                if name == "session":
-                    self.sessions.pop(value, None)
-            self._respond(b"<html><body>Logged out.</body></html>")
+        if parsed.path.startswith("/api/orders-vuln/"):
+            order_id = parsed.path.rsplit("/", 1)[-1]
+            order = _ORDERS.get(order_id)
+            if identity is None:
+                self._respond(b'{"error":"unauthenticated"}', status=403)
+                return
+            if order is None:
+                self._respond(b'{"error":"not found"}', status=404)
+                return
+            # VULNERABLE: any authenticated identity, regardless of who,
+            # gets the real content -- no ownership check at all.
+            self._respond(order["content"].encode())
             return
 
-        self._respond(b"<html><body>not found</body></html>", status=404)
-
-    def do_POST(self) -> None:  # noqa: N802
-        parsed = urlsplit(self.path)
-        if parsed.path != "/login":
-            self._respond(b"<html><body>not found</body></html>", status=404)
-            return
-        length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(length) if length else b""
-        fields = parse_qs(raw_body.decode())
-        username = fields.get("username", [""])[0]
-        password = fields.get("password", [""])[0]
-        if _USERS.get(username) == password:
-            token = f"tok-{username}-{len(self.sessions)}"
-            self.sessions[token] = username
-            self._respond(
-                b"",
-                status=302,
-                headers=[("Location", "/account"), ("Set-Cookie", f"session={token}; Path=/")],
-            )
-            return
-        self._respond(b"<html><body>Invalid credentials.</body></html>", status=200)
+        self._respond(b'{"error":"not found"}', status=404)
 
 
 def _extract(pattern: str, text: str) -> str:
@@ -199,7 +173,7 @@ def _generate_self_signed_certificate(directory: Path) -> Path:
             x509.SubjectAlternativeName(
                 [
                     x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
-                    x509.DNSName("auth-e2e-lab-fixture.test"),
+                    x509.DNSName("idor-e2e-lab-fixture.test"),
                 ]
             ),
             critical=False,
@@ -219,20 +193,20 @@ def _generate_self_signed_certificate(directory: Path) -> Path:
     return cert_path
 
 
+_REAL_CREATE_DEFAULT_CONTEXT = ssl.create_default_context
+
+
 @unittest.skipUnless(
     RUN_INTEGRATION, "Set WEBGUARD_RUN_INTEGRATION=1 to run this end-to-end lab test."
 )
-class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
+class IdorAuthorizationEndToEndLabTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.certificate_directory = TemporaryDirectory()
         cls.certificate_path = _generate_self_signed_certificate(
             Path(cls.certificate_directory.name)
         )
-        _AuthenticatedFixtureHandler.sessions = {}
-        cls.fixture_server = ThreadingHTTPServer(
-            ("127.0.0.1", 0), _AuthenticatedFixtureHandler
-        )
+        cls.fixture_server = ThreadingHTTPServer(("127.0.0.1", 0), _IdorFixtureHandler)
         tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         tls_context.load_cert_chain(certfile=cls.certificate_path)
         cls.fixture_server.socket = tls_context.wrap_socket(
@@ -243,7 +217,7 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
         )
         cls.fixture_thread.start()
         cls.fixture_port = cls.fixture_server.server_address[1]
-        cls.target = f"https://auth-e2e-lab-fixture.test:{cls.fixture_port}/account"
+        cls.target = f"https://idor-e2e-lab-fixture.test:{cls.fixture_port}/"
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -252,13 +226,14 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
         cls.fixture_thread.join(timeout=5)
         cls.certificate_directory.cleanup()
 
-    def _validated_target(self, path: str = "/account") -> ValidatedTarget:
-        url = f"https://auth-e2e-lab-fixture.test:{self.fixture_port}{path}"
+    def _validated_target(self) -> object:
+        from webguard_scanner import ValidatedTarget
+
         return ValidatedTarget(
-            original_url=url,
-            normalised_url=url,
+            original_url=self.target,
+            normalised_url=self.target,
             scheme="https",
-            hostname="auth-e2e-lab-fixture.test",
+            hostname="idor-e2e-lab-fixture.test",
             port=self.fixture_port,
             resolved_addresses=("127.0.0.1",),
         )
@@ -268,21 +243,7 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
         context.load_verify_locations(cafile=str(self.certificate_path))
         return context
 
-    def test_authenticated_pages_are_unreachable_without_login(self) -> None:
-        """Sanity precondition for the rest of this test: an
-        unauthenticated fetch of /account never reveals the real page."""
-        target = self._validated_target()
-        with patch(
-            "webguard_scanner.safe_http.ssl.create_default_context",
-            side_effect=self._trusting_tls_context,
-        ):
-            from webguard_scanner.safe_http import fetch_once
-
-            response = fetch_once(target, method="GET", policy=FetchPolicy())
-        self.assertNotIn(b"Welcome", response.body)
-        self.assertIn(b"Please log in", response.body)
-
-    def test_full_authenticated_scanning_pipeline(self) -> None:
+    def test_full_idor_comparison_pipeline(self) -> None:
         with TemporaryDirectory() as directory, patch(
             "webguard_scanner.safe_http.ssl.create_default_context",
             side_effect=self._trusting_tls_context,
@@ -292,54 +253,26 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
             auth_dir = root / "authorizations"
             artifacts = root / "artifacts"
 
-            # -- Step 1: acquire a real session by actually logging in ---
-            # (mirrors what a future `webguard-api login` CLI helper would
-            # automate; not built this slice -- see the phase 7 audit doc)
-            login_target = self._validated_target("/login")
-            login_workflow = LoginWorkflow(
-                target_url=f"https://auth-e2e-lab-fixture.test:{self.fixture_port}/login",
-                method="POST",
-                content_type="application/x-www-form-urlencoded",
-                username_field="username",
-                password_field="password",
-                success=LoginSuccessCriterion(expected_redirect_contains="/account"),
-            )
-            login_policy = ActiveDetectionPolicy(
-                fetch_policy=FetchPolicy(allowed_methods=frozenset({"GET", "HEAD", "POST"}))
-            )
-            login_result = execute_login(
-                login_target,
-                login_workflow,
-                LoginCredentials(username="user-a", password=_USERS["user-a"]),
-                policy=login_policy,
-            )
-            self.assertTrue(login_result.success, login_result.reason)
-            self.assertEqual(len(login_result.cookies), 1)
-            session_cookie = login_result.cookies[0]
-            self.assertEqual(session_cookie.name, "session")
-
-            # -- Authorization (fixture-owned, wide real-clock window) --
             now = datetime.now(timezone.utc)
-            authorization_id = "a1a2a3a4-b5b6-4978-8899-aabbccddeeff"
+            authorization_id = "b1b2b3b4-c5c6-4978-8899-aabbccddeeff"
             auth_dir.mkdir(parents=True, exist_ok=True)
             write_owned_target_authorization_file(
                 OwnedTargetAuthorization(
                     authorization_id=authorization_id,
-                    organization="Auth E2E Lab Org",
-                    authorized_by="Auth E2E Lab Operator",
+                    organization="IDOR E2E Lab Org",
+                    authorized_by="IDOR E2E Lab Operator",
                     target=self.target,
-                    allowed_hosts=("auth-e2e-lab-fixture.test",),
+                    allowed_hosts=("idor-e2e-lab-fixture.test",),
                     issued_at=now - timedelta(days=1),
                     expires_at=now + timedelta(days=300),
-                    purpose="True end-to-end authenticated-scanning validation",
-                    limits=OwnedTargetLimits(),
+                    purpose="True end-to-end IDOR/BOLA validation",
+                    limits=OwnedTargetLimits(
+                        maximum_request_attempts=30,
+                        minimum_delay_seconds=0.5,
+                    ),
                 ),
                 auth_dir / "fixture.json",
             )
-
-            # -- CLI: bootstrap owner --------------------------------------
-            import io
-            from contextlib import redirect_stdout
 
             output = io.StringIO()
             with redirect_stdout(output):
@@ -347,7 +280,7 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                     [
                         "bootstrap",
                         "--organization",
-                        "Auth E2E Lab Org",
+                        "IDOR E2E Lab Org",
                         "--principal",
                         "Owner",
                         "--database",
@@ -385,12 +318,12 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                 )
             self.assertEqual(result, 0)
 
-            # -- Real API + real worker, sharing one AuthenticationContextRepository --
             store = ScanJobStore(database)
             identity = IdentityStore(database)
             authorizations = AuthorizationRepository(auth_dir)
             trustscan_signer = TrustScanSigner(store.trustscan_signing_private_key())
             shared_authentication_contexts = AuthenticationContextRepository()
+            shared_comparison_plans = AuthorizationComparisonPlanRepository()
             executor = ScanJobExecutor(
                 authorizations=authorizations,
                 store=store,
@@ -399,6 +332,7 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                 organization_resolver=store.organization_id_for_job,
                 authorization_assignment_checker=identity.authorization_is_assigned,
                 authentication_contexts=shared_authentication_contexts,
+                authorization_comparison_plans=shared_comparison_plans,
             )
             service = WebGuardJobService(
                 store=store,
@@ -406,6 +340,7 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                 identity=identity,
                 trustscan_signer=trustscan_signer,
                 authentication_contexts=shared_authentication_contexts,
+                authorization_comparison_plans=shared_comparison_plans,
             )
             worker = ScanJobWorker(store=store, executor=executor, poll_seconds=0.02)
             server = create_server(
@@ -414,7 +349,7 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                 service,
                 authenticator=ApiTokenAuthenticator(identity),
                 rate_limiter=FixedWindowRateLimiter(requests=1000, window_seconds=60),
-                maximum_request_bytes=16384,
+                maximum_request_bytes=32768,
             )
             stop = threading.Event()
             worker_thread = threading.Thread(target=worker.run_forever, args=(stop,), daemon=True)
@@ -425,53 +360,107 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                 side_effect=lambda *a, **k: self._validated_target(),
             ), patch(
                 "webguard_scanner.owned_target._public_addresses",
-                side_effect=lambda target: target.resolved_addresses,
+                side_effect=lambda t: t.resolved_addresses,
             ):
                 worker_thread.start()
                 server_thread.start()
                 host, port = server.server_address[:2]
                 try:
-                    # -- Step 2: register the authentication context (real HTTP) --
-                    context_body = json.dumps(
+                    # -- Register user-A and user-B authentication contexts (real HTTP) --
+                    context_ids = {}
+                    for label, token in _TOKENS.items():
+                        body = json.dumps(
+                            {
+                                "target": self.target,
+                                "authorization_id": authorization_id,
+                                "identity_label": label,
+                                "method": "bearer_token",
+                                "expires_at": (now + timedelta(days=1))
+                                .isoformat(timespec="microseconds")
+                                .replace("+00:00", "Z"),
+                                "bearer_token": token,
+                            }
+                        ).encode("utf-8")
+                        connection = http.client.HTTPConnection(host, port, timeout=5)
+                        connection.request(
+                            "POST",
+                            "/v1/authentication-contexts",
+                            body=body,
+                            headers={
+                                "Authorization": f"Bearer {owner_token}",
+                                "Content-Type": "application/json",
+                                "Content-Length": str(len(body)),
+                            },
+                        )
+                        response = connection.getresponse()
+                        payload = json.loads(response.read())
+                        connection.close()
+                        self.assertEqual(response.status, 201, payload)
+                        context_ids[label] = payload["authentication_context_id"]
+
+                    # -- Register the comparison plan (real HTTP), resource_scope
+                    # explicitly supplied -- both the secure and the vulnerable
+                    # endpoint, plus a shared resource for false-positive proof.
+                    resource_scope = [
+                        {
+                            "resource_type": "order",
+                            "method": "GET",
+                            "primary_endpoint": f"{self.target}api/orders/A-001",
+                            "secondary_endpoint": f"{self.target}api/orders/B-001",
+                            "identifier_location": "path",
+                            "identifier_name": "id",
+                            "expected_access": "private_to_owner",
+                        },
+                        {
+                            "resource_type": "order-vuln",
+                            "method": "GET",
+                            "primary_endpoint": f"{self.target}api/orders-vuln/A-001",
+                            "secondary_endpoint": f"{self.target}api/orders-vuln/B-001",
+                            "identifier_location": "path",
+                            "identifier_name": "id",
+                            "expected_access": "private_to_owner",
+                        },
+                        {
+                            "resource_type": "shared_document",
+                            "method": "GET",
+                            "primary_endpoint": f"{self.target}api/shared/team-document",
+                            "secondary_endpoint": f"{self.target}api/shared/team-document",
+                            "identifier_location": "none",
+                            "identifier_name": "",
+                            "expected_access": "shared",
+                        },
+                    ]
+                    plan_body = json.dumps(
                         {
                             "target": self.target,
                             "authorization_id": authorization_id,
-                            "identity_label": "user-a",
-                            "method": "cookie_session",
+                            "primary_context_id": context_ids["user-a"],
+                            "secondary_context_id": context_ids["user-b"],
+                            "resource_scope": resource_scope,
                             "expires_at": (now + timedelta(days=1))
                             .isoformat(timespec="microseconds")
                             .replace("+00:00", "Z"),
-                            "cookies": [
-                                {
-                                    "name": session_cookie.name,
-                                    "value": session_cookie.value,
-                                    "domain": "auth-e2e-lab-fixture.test",
-                                    "port": self.fixture_port,
-                                    "path": "/",
-                                }
-                            ],
                         }
                     ).encode("utf-8")
                     connection = http.client.HTTPConnection(host, port, timeout=5)
                     connection.request(
                         "POST",
-                        "/v1/authentication-contexts",
-                        body=context_body,
+                        "/v1/authorization-comparisons",
+                        body=plan_body,
                         headers={
                             "Authorization": f"Bearer {owner_token}",
                             "Content-Type": "application/json",
-                            "Content-Length": str(len(context_body)),
+                            "Content-Length": str(len(plan_body)),
                         },
                     )
                     response = connection.getresponse()
-                    context_payload = json.loads(response.read())
+                    plan_payload = json.loads(response.read())
                     connection.close()
-                    self.assertEqual(response.status, 201, context_payload)
-                    authentication_context_id = context_payload["authentication_context_id"]
-                    # The secret must never be echoed back over the wire.
-                    self.assertNotIn(session_cookie.value, json.dumps(context_payload))
+                    self.assertEqual(response.status, 201, plan_payload)
+                    comparison_plan_id = plan_payload["comparison_plan_id"]
 
-                    # -- Step 3: issue an authenticated, XSS-authorized permit (real HTTP) --
+                    # -- Issue the permit (real HTTP): IDOR active_check +
+                    # the comparison plan reference, both required together.
                     permit_body = json.dumps(
                         {
                             "target": self.target,
@@ -485,12 +474,12 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                             "expires_at": (now + timedelta(days=7))
                             .isoformat(timespec="microseconds")
                             .replace("+00:00", "Z"),
-                            "maximum_request_attempts": 15,
-                            "maximum_requests_per_second": 1.0,
+                            "maximum_request_attempts": 30,
+                            "maximum_requests_per_second": 2.0,
                             "maximum_concurrency": 1,
-                            "active_checks": ["active.xss.reflected"],
-                            "authentication_context_id": authentication_context_id,
-                            "authorization_comparison_plan_id": None,
+                            "active_checks": ["active.authorization.idor"],
+                            "authentication_context_id": None,
+                            "authorization_comparison_plan_id": comparison_plan_id,
                         }
                     ).encode("utf-8")
                     connection = http.client.HTTPConnection(host, port, timeout=5)
@@ -510,12 +499,14 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                     self.assertEqual(response.status, 201, permit_payload)
                     permit_id = permit_payload["permit"]["claims"]["permit_id"]
                     self.assertEqual(
-                        permit_payload["permit"]["claims"]["authentication_context_id"],
-                        authentication_context_id,
+                        permit_payload["permit"]["claims"][
+                            "authorization_comparison_plan_id"
+                        ],
+                        comparison_plan_id,
                     )
                     time.sleep(0.6)
 
-                    # -- Step 4: submit the scan job (real HTTP) --
+                    # -- Submit the job (real HTTP) --
                     job_body = json.dumps(
                         {
                             "target": self.target,
@@ -534,7 +525,7 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                             "TrustScan-Permit": permit_id,
                             "Content-Type": "application/json",
                             "Content-Length": str(len(job_body)),
-                            "Idempotency-Key": "auth-e2e-1",
+                            "Idempotency-Key": "idor-e2e-1",
                         },
                     )
                     response = connection.getresponse()
@@ -543,8 +534,7 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                     self.assertEqual(response.status, 201, created)
                     job_id = created["job_id"]
 
-                    # -- Step 5: wait for the real worker to finish --
-                    deadline = time.monotonic() + 10
+                    deadline = time.monotonic() + 20
                     result_payload = None
                     while time.monotonic() < deadline:
                         connection = http.client.HTTPConnection(host, port, timeout=5)
@@ -563,26 +553,6 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                     self.assertIsNotNone(result_payload)
                     assert result_payload is not None
                     self.assertEqual(result_payload["state"], "completed", result_payload)
-
-                    # -- Audit trail check while the server is still up --
-                    # (real HTTP), which recorded both the authentication-
-                    # context registration and the authenticated-permit
-                    # issuance.
-                    connection = http.client.HTTPConnection(host, port, timeout=5)
-                    connection.request(
-                        "GET",
-                        "/v1/audit-events",
-                        headers={"Authorization": f"Bearer {owner_token}"},
-                    )
-                    response = connection.getresponse()
-                    audit_events_text = response.read().decode()
-                    connection.close()
-                    self.assertEqual(response.status, 200, audit_events_text)
-                    self.assertNotIn(session_cookie.value, audit_events_text)
-                    self.assertNotIn(_USERS["user-a"], audit_events_text)
-                    self.assertIn(
-                        "authentication_contexts.register", audit_events_text
-                    )
                 finally:
                     stop.set()
                     server.shutdown()
@@ -590,30 +560,35 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                     worker_thread.join(timeout=3)
                     server_thread.join(timeout=3)
 
-            # -- Step 6: verify the finding, and that credentials never leaked --
             report_path = artifacts / result_payload["report_ref"]
             report_text = report_path.read_text(encoding="utf-8")
             report = load_webguard_report_json(report_text)
-            active_findings = [f for f in report.findings if f.source == "webguard-active"]
+            idor_findings = [f for f in report.findings if "idor" in f.tags]
             self.assertTrue(
-                active_findings,
-                f"expected an active finding on the authenticated page; "
+                idor_findings,
+                f"expected an IDOR finding on the vulnerable endpoint; "
                 f"report findings: {[f.identity.rule_id for f in report.findings]}",
             )
-            finding = active_findings[0]
-            self.assertEqual([i.value for i in finding.identifiers], ["CWE-79"])
-            self.assertIn("/api/profile", finding.identity.path)
+            finding = idor_findings[0]
+            cwe_values = [i.value for i in finding.identifiers if i.namespace == "CWE"]
+            self.assertEqual(cwe_values, ["CWE-639"])
+            owasp_values = [
+                i.value for i in finding.identifiers if i.namespace == "OWASP-API"
+            ]
+            self.assertTrue(owasp_values)
+            self.assertIn("orders-vuln", finding.identity.path)
+            # The secure endpoint and the shared resource must never
+            # appear as findings.
+            self.assertFalse(
+                any("orders/" in f.identity.path and "vuln" not in f.identity.path
+                    for f in idor_findings)
+            )
+            self.assertFalse(any("shared" in f.identity.path for f in idor_findings))
 
-            # Credentials/session values must never appear anywhere in the
-            # persisted report, regardless of finding content.
-            self.assertNotIn(session_cookie.value, report_text)
-            self.assertNotIn(_USERS["user-a"], report_text)
+            # Bearer tokens must never appear anywhere in the report.
+            self.assertNotIn(_TOKENS["user-a"], report_text)
+            self.assertNotIn(_TOKENS["user-b"], report_text)
 
-            # Nor in the owned-target preflight audit file.
-            audit_path = artifacts / result_payload["audit_ref"]
-            audit_text = audit_path.read_text(encoding="utf-8")
-            self.assertNotIn(session_cookie.value, audit_text)
-            self.assertNotIn(_USERS["user-a"], audit_text)
 
 if __name__ == "__main__":
     unittest.main()
