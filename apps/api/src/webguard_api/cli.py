@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import threading
@@ -32,6 +33,7 @@ from .config import (
     ServiceConfig,
     ServiceConfigError,
 )
+from .environment import Environment
 from .executor import ScanJobExecutor
 from .http_api import create_server
 from .identity import (
@@ -39,6 +41,8 @@ from .identity import (
     IdentityStore,
     IdentityStoreError,
 )
+from .production_config import ProductionConfigError, ProductionServiceConfig
+from .production_startup import ProductionComponents, build_production_components
 from .rate_limit import FixedWindowRateLimiter
 from .permits import TrustScanSigner
 from .scheduler import ScanScheduleCoordinator
@@ -129,6 +133,28 @@ def _components(config: ServiceConfig):
         window_seconds=config.rate_limit_window_seconds,
     )
     return store, identity, service, worker, scheduler, authenticator, limiter
+
+
+def _resolve_environment(args: argparse.Namespace) -> Environment:
+    return Environment(args.environment)
+
+
+def _production_components() -> tuple[ProductionServiceConfig, ProductionComponents]:
+    """The production-mode counterpart to `_components()` (Slice 13
+    requirement 1): selected explicitly via `--environment production`
+    / `WEBGUARD_ENVIRONMENT=production`, never inferred. `boto3` is
+    imported here, at the one call site that actually needs a real AWS
+    KMS client, and nowhere else in this package -- see
+    `production_startup.py`'s module docstring for why it is not a
+    package-level dependency."""
+
+    config = ProductionServiceConfig.from_environment()
+
+    import boto3
+
+    kms_client = boto3.client("kms")
+    components = build_production_components(config, kms_client=kms_client)
+    return config, components
 
 
 def _init_command(args: argparse.Namespace) -> int:
@@ -435,40 +461,61 @@ def _authorization_comparison_revoke_command(args: argparse.Namespace) -> int:
 
 
 def _worker_command(args: argparse.Namespace) -> int:
-    config = _config(args)
-    _, _, _, worker, _, _, _ = _components(config)
-    if args.once:
-        processed = worker.run_once()
-        recovery = worker.last_recovery_summary
-        if recovery.total:
-            print(
-                "Recovered expired leases: "
-                f"requeued={recovery.requeued}, "
-                f"cancelled={recovery.cancelled}, failed={recovery.failed}."
-            )
-        print("Processed one job." if processed else "No queued job was available.")
+    environment = _resolve_environment(args)
+    pool = None
+    if environment is Environment.PRODUCTION:
+        _, components = _production_components()
+        worker = components.worker
+        pool = components.pool
+    else:
+        config = _config(args)
+        _, _, _, worker, _, _, _ = _components(config)
+    try:
+        if args.once:
+            processed = worker.run_once()
+            recovery = worker.last_recovery_summary
+            if recovery.total:
+                print(
+                    "Recovered expired leases: "
+                    f"requeued={recovery.requeued}, "
+                    f"cancelled={recovery.cancelled}, failed={recovery.failed}."
+                )
+            print("Processed one job." if processed else "No queued job was available.")
+            return EXIT_SUCCESS
+        stop_event = threading.Event()
+
+        def request_stop(_signum: int, _frame: object) -> None:
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGTERM, request_stop)
+        print(f"WebGuard worker started: {worker.worker_id} (environment={environment.value})")
+        print(
+            "Lease: "
+            f"{worker.lease_seconds:g}s; heartbeat: "
+            f"{worker.heartbeat_seconds:g}s; maximum attempts: "
+            f"{worker.maximum_attempts}."
+        )
+        print("Press Ctrl+C to stop.")
+        worker.run_forever(stop_event)
+        print("WebGuard worker stopped.")
         return EXIT_SUCCESS
-    stop_event = threading.Event()
-
-    def request_stop(_signum: int, _frame: object) -> None:
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, request_stop)
-    signal.signal(signal.SIGTERM, request_stop)
-    print(f"WebGuard worker started: {worker.worker_id}")
-    print(
-        "Lease: "
-        f"{worker.lease_seconds:g}s; heartbeat: "
-        f"{worker.heartbeat_seconds:g}s; maximum attempts: "
-        f"{worker.maximum_attempts}."
-    )
-    print("Press Ctrl+C to stop.")
-    worker.run_forever(stop_event)
-    print("WebGuard worker stopped.")
-    return EXIT_SUCCESS
+    finally:
+        if pool is not None:
+            pool.close()
 
 
 def _scheduler_command(args: argparse.Namespace) -> int:
+    environment = _resolve_environment(args)
+    if environment is Environment.PRODUCTION:
+        print(
+            "Recurring-schedule execution is not wired to PostgreSQL "
+            "in this release: POSTGRES_REPOSITORY_READY, "
+            "LIVE_RUNTIME_WIRING_DEFERRED (Slice 13). Run the scheduler "
+            "against a non-production environment instead.",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
     config = _config(args)
     _, _, _, _, scheduler, _, _ = _components(config)
     if args.once:
@@ -497,8 +544,31 @@ def _scheduler_command(args: argparse.Namespace) -> int:
 
 
 def _serve_command(args: argparse.Namespace) -> int:
-    config = _config(args)
-    _, _, service, worker, scheduler, authenticator, limiter = _components(config)
+    environment = _resolve_environment(args)
+    pool = None
+    scheduler = None
+    if environment is Environment.PRODUCTION:
+        # Requirement 1: production selection is explicit
+        # (--environment / WEBGUARD_ENVIRONMENT), never inferred, and
+        # fails closed via ProductionServiceConfig.from_environment()
+        # if required settings are missing. Requirement 5/11: schedules
+        # are POSTGRES_REPOSITORY_READY but LIVE_RUNTIME_WIRING_DEFERRED
+        # this slice, so no scheduler thread is started in production --
+        # running one against SQLite while claiming production would be
+        # the silent, dishonest fallback this project explicitly rejects.
+        production_config, components = _production_components()
+        host, port = production_config.host, production_config.port
+        maximum_request_bytes = DEFAULT_API_MAXIMUM_REQUEST_BYTES
+        service = components.service
+        worker = components.worker
+        authenticator = components.authenticator
+        limiter = components.rate_limiter
+        pool = components.pool
+    else:
+        config = _config(args)
+        _, _, service, worker, scheduler, authenticator, limiter = _components(config)
+        host, port = config.host, config.port
+        maximum_request_bytes = config.maximum_request_bytes
     stop_event = threading.Event()
     worker_thread = threading.Thread(
         target=worker.run_forever,
@@ -506,19 +576,23 @@ def _serve_command(args: argparse.Namespace) -> int:
         name="webguard-job-worker",
         daemon=True,
     )
-    scheduler_thread = threading.Thread(
-        target=scheduler.run_forever,
-        args=(stop_event,),
-        name="webguard-scan-scheduler",
-        daemon=True,
+    scheduler_thread = (
+        threading.Thread(
+            target=scheduler.run_forever,
+            args=(stop_event,),
+            name="webguard-scan-scheduler",
+            daemon=True,
+        )
+        if scheduler is not None
+        else None
     )
     server = create_server(
-        config.host,
-        config.port,
+        host,
+        port,
         service,
         authenticator=authenticator,
         rate_limiter=limiter,
-        maximum_request_bytes=config.maximum_request_bytes,
+        maximum_request_bytes=maximum_request_bytes,
     )
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -528,18 +602,26 @@ def _serve_command(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     worker_thread.start()
-    scheduler_thread.start()
+    if scheduler_thread is not None:
+        scheduler_thread.start()
     bound_host, bound_port = server.server_address[:2]
-    print(f"WebGuard API listening on http://{bound_host}:{bound_port}")
+    print(f"WebGuard API listening on http://{bound_host}:{bound_port} (environment={environment.value})")
     print("Bearer authentication and organization RBAC are enabled.")
     print(
         f"Worker {worker.worker_id} uses renewable database leases "
         f"({worker.lease_seconds:g}s)."
     )
-    print(
-        "Recurring scan scheduler is enabled "
-        f"({scheduler.poll_seconds:g}s poll interval)."
-    )
+    if scheduler is not None:
+        print(
+            "Recurring scan scheduler is enabled "
+            f"({scheduler.poll_seconds:g}s poll interval)."
+        )
+    else:
+        print(
+            "Recurring scan scheduler is not started: schedule execution is "
+            "not yet wired to PostgreSQL (POSTGRES_REPOSITORY_READY, "
+            "LIVE_RUNTIME_WIRING_DEFERRED)."
+        )
     print("Binding is loopback-only. Press Ctrl+C to stop.")
     try:
         server.serve_forever(poll_interval=0.25)
@@ -547,7 +629,10 @@ def _serve_command(args: argparse.Namespace) -> int:
         stop_event.set()
         server.server_close()
         worker_thread.join(timeout=2.0)
-        scheduler_thread.join(timeout=2.0)
+        if scheduler_thread is not None:
+            scheduler_thread.join(timeout=2.0)
+        if pool is not None:
+            pool.close()
     print("WebGuard API stopped.")
     return EXIT_SUCCESS
 
@@ -860,10 +945,25 @@ def build_parser() -> argparse.ArgumentParser:
         handler=_authorization_comparison_revoke_command
     )
 
+    environment_choices = [item.value for item in Environment]
+    environment_default = os.environ.get("WEBGUARD_ENVIRONMENT", Environment.DEVELOPMENT.value)
+    environment_help = (
+        "Explicit deployment environment (Slice 13 requirement 1) -- "
+        "never inferred. \"production\" fails closed to "
+        "ProductionServiceConfig.from_environment()'s own PostgreSQL/KMS "
+        "requirements and ignores --database/--host/--port in favour of "
+        "WEBGUARD_DATABASE_URL/WEBGUARD_HOST/WEBGUARD_PORT. Every other "
+        "value runs the unchanged local SQLite/in-memory baseline. "
+        f"Defaults to $WEBGUARD_ENVIRONMENT, or \"{Environment.DEVELOPMENT.value}\"."
+    )
+
     serve_parser = subparsers.add_parser(
         "serve", help="Run the loopback HTTP API with one background worker."
     )
     _add_common_options(serve_parser)
+    serve_parser.add_argument(
+        "--environment", choices=environment_choices, default=environment_default, help=environment_help
+    )
     serve_parser.set_defaults(handler=_serve_command)
 
     worker_parser = subparsers.add_parser(
@@ -871,6 +971,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_options(worker_parser)
     worker_parser.add_argument("--once", action="store_true")
+    worker_parser.add_argument(
+        "--environment", choices=environment_choices, default=environment_default, help=environment_help
+    )
     worker_parser.set_defaults(handler=_worker_command)
 
     scheduler_parser = subparsers.add_parser(
@@ -878,6 +981,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_options(scheduler_parser)
     scheduler_parser.add_argument("--once", action="store_true")
+    scheduler_parser.add_argument(
+        "--environment", choices=environment_choices, default=environment_default, help=environment_help
+    )
     scheduler_parser.set_defaults(handler=_scheduler_command)
     return parser
 
@@ -892,6 +998,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         IdentityStoreError,
         ServiceConfigError,
         JobStoreError,
+        ProductionConfigError,
     ) as exc:
         print(f"ERROR [{exc.code}]: {exc.message}", file=sys.stderr)
         return EXIT_FAILURE

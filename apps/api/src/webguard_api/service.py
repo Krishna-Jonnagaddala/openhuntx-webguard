@@ -40,7 +40,8 @@ from .authorization_comparison import (
     ResourcePairSpec,
 )
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
-from .identity import IdentityStore, IdentityStoreError
+from .finding_store import FindingStatus, FindingStoreError
+from .identity import IdentityStoreError
 from .pagination import PageRequest, PaginationError, SignedCursorCodec
 from .permits import (
     PersistedTrustScanPermit,
@@ -49,7 +50,8 @@ from .permits import (
     validate_permit_scope,
     validate_permit_use,
 )
-from .store import JobStoreError, ScanJobStore
+from .repository_contracts import IdentityRepository, JobRepository
+from .store import JobStoreError
 
 
 def _utc_now() -> datetime:
@@ -92,20 +94,32 @@ class WebGuardJobService:
     def __init__(
         self,
         *,
-        store: ScanJobStore,
+        store: JobRepository,
         authorizations: AuthorizationRepository,
-        identity: IdentityStore,
+        identity: IdentityRepository,
         clock: Callable[[], datetime] = _utc_now,
         cursor_codec: SignedCursorCodec | None = None,
         trustscan_signer: TrustScanSigner | None = None,
         authentication_contexts: AuthenticationContextRepository | None = None,
         authorization_comparison_plans: AuthorizationComparisonPlanRepository | None = None,
         readiness_check: Callable[[], None] | None = None,
+        finding_repository=None,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
         self.identity = identity
         self.clock = clock
+        # Slice 13: optional and defaulted to an in-memory backend so
+        # every pre-Slice-13 constructor call site is unaffected --
+        # local/unit/lab GET /v1/findings behavior is identical to
+        # before this slice existed. Production wiring passes the same
+        # `PostgresFindingRepository` instance the executor writes to,
+        # so what a worker persists is immediately readable here.
+        from .finding_store import InMemoryFindingRepository
+
+        self.finding_repository = (
+            finding_repository if finding_repository is not None else InMemoryFindingRepository()
+        )
         # Slice 12 requirement 14: a cheap, dependency-specific probe
         # `/ready` invokes. Defaults to a no-op, matching the honest
         # behavior of the pre-Slice-12 default deployment (a local
@@ -957,6 +971,104 @@ class WebGuardJobService:
             outcome=AuditOutcome.SUCCEEDED,
         )
         return record.to_public_dict(now=self.clock())
+
+    @staticmethod
+    def _finding_public_dict(finding) -> dict[str, object]:
+        return {
+            "finding_id": finding.finding_id,
+            "organization_id": finding.organization_id,
+            "scan_id": finding.scan_id,
+            "fingerprint": finding.fingerprint,
+            "check_id": finding.check_id,
+            "scanner_version": finding.scanner_version,
+            "check_version": finding.check_version,
+            "title": finding.title,
+            "severity": finding.severity,
+            "confidence": finding.confidence,
+            "cwe_id": finding.cwe_id,
+            "owasp_category": finding.owasp_category,
+            "asset": finding.asset,
+            "endpoint": finding.endpoint,
+            "http_method": finding.http_method,
+            "parameter": finding.parameter,
+            "evidence": finding.evidence,
+            "remediation": finding.remediation,
+            "references": list(finding.references),
+            "status": finding.status.value,
+            "first_seen_at": finding.first_seen_at.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "last_seen_at": finding.last_seen_at.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+        }
+
+    def list_findings(
+        self,
+        context: AuthContext,
+        page: PageRequest,
+        *,
+        request_id: str,
+    ) -> dict:
+        """Requirement 16: findings, retrieved through the existing
+        `/v1/...` API surface -- the tenant-scoped signed-cursor
+        pagination pattern every other list endpoint already uses
+        (requirement 15)."""
+
+        self._require(
+            context,
+            ApiPermission.FINDING_READ,
+            request_id=request_id,
+            action="findings.list",
+            resource_type="organization",
+            resource_id=context.organization_id,
+        )
+        filters = page.filter_map
+        scan_id = filters.get("scan_id")
+        status = FindingStatus(filters["status"]) if "status" in filters else None
+        try:
+            records, has_more = self.finding_repository.list_findings_scoped_page(
+                context.organization_id,
+                limit=page.limit,
+                after=self._decode_page(context, page, resource="findings"),
+                scan_id=scan_id,
+                status=status,
+            )
+        except FindingStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        next_cursor = None
+        if has_more and records:
+            last = records[-1]
+            next_cursor = self._next_cursor(
+                context, page, resource="findings", ordered_at=last.last_seen_at, resource_id=last.finding_id,
+            )
+        self._audit(
+            context, request_id=request_id, action="findings.list",
+            resource_type="organization", resource_id=context.organization_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {
+            "findings": [self._finding_public_dict(record) for record in records],
+            "page": self._page_payload(page.limit, next_cursor),
+        }
+
+    def get_finding(self, context: AuthContext, finding_id: str, *, request_id: str) -> dict:
+        self._require(
+            context, ApiPermission.FINDING_READ, request_id=request_id,
+            action="findings.get", resource_type="finding", resource_id=finding_id,
+        )
+        try:
+            record = self.finding_repository.get_finding_scoped(finding_id, organization_id=context.organization_id)
+        except FindingStoreError as exc:
+            self._audit(
+                context, request_id=request_id, action="findings.get", resource_type="finding",
+                resource_id=finding_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        self._audit(
+            context, request_id=request_id, action="findings.get", resource_type="finding",
+            resource_id=finding_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return self._finding_public_dict(record)
 
     def list_jobs(
         self,

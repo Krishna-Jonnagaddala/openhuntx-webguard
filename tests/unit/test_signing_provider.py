@@ -100,7 +100,26 @@ class KmsSigningProviderTests(unittest.TestCase):
         provider = KmsSigningProvider(client, key_id="arn:aws:kms:test-key")
         material = provider.public_key_material()
         self.assertEqual(material, b"\x01" * 91)
-        self.assertEqual(client.public_key_calls, [{"KeyId": "arn:aws:kms:test-key"}])
+        # Construction itself already called get_public_key once, to
+        # derive .key_id (see test_key_id_is_derived_from_public_key_material
+        # below) -- every recorded call used the real AWS key id.
+        self.assertTrue(client.public_key_calls)
+        for call in client.public_key_calls:
+            self.assertEqual(call, {"KeyId": "arn:aws:kms:test-key"})
+
+    def test_key_id_is_derived_from_public_key_material_not_the_aws_key_id(self) -> None:
+        import hashlib
+
+        client = FakeKmsClient()
+        provider = KmsSigningProvider(client, key_id="arn:aws:kms:test-key")
+        # TrustScanPermitClaims.signing_key_id is contract-validated as
+        # ^sha256:[0-9a-f]{64}$ -- an AWS ARN would fail that check, so
+        # .key_id must never be the raw provider key id.
+        self.assertNotEqual(provider.key_id, "arn:aws:kms:test-key")
+        self.assertEqual(provider.provider_key_id, "arn:aws:kms:test-key")
+        fake_public_key_bytes = b"\x01" * 91
+        expected = "sha256:" + hashlib.sha256(fake_public_key_bytes).hexdigest()
+        self.assertEqual(provider.key_id, expected)
 
     def test_sign_failure_is_normalized_not_leaked(self) -> None:
         provider = KmsSigningProvider(
@@ -110,12 +129,12 @@ class KmsSigningProviderTests(unittest.TestCase):
             provider.sign(b"message-bytes")
         self.assertEqual(caught.exception.code, "kms_signing_request_failed")
 
-    def test_public_key_failure_is_normalized_not_leaked(self) -> None:
-        provider = KmsSigningProvider(
-            FakeKmsClient(fail_public_key=True), key_id="arn:aws:kms:test-key"
-        )
+    def test_construction_fails_closed_when_public_key_is_unavailable(self) -> None:
+        # Deriving .key_id requires the public key up front, so a KMS
+        # outage on get_public_key now fails at construction time
+        # rather than being deferred to first use.
         with self.assertRaises(SigningProviderError) as caught:
-            provider.public_key_material()
+            KmsSigningProvider(FakeKmsClient(fail_public_key=True), key_id="arn:aws:kms:test-key")
         self.assertEqual(caught.exception.code, "kms_public_key_request_failed")
 
     def test_no_boto3_import_required(self) -> None:

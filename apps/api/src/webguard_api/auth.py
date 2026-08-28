@@ -8,7 +8,8 @@ from enum import Enum
 
 from webguard_contracts import OrganizationRole
 
-from .identity import IdentityStore, IdentityStoreError
+from .identity import IdentityStoreError
+from .repository_contracts import IdentityRepository
 
 
 class ApiPermission(str, Enum):
@@ -31,6 +32,7 @@ class ApiPermission(str, Enum):
     AUTHORIZATION_COMPARISON_REGISTER = "authorization_comparisons.register"
     AUTHORIZATION_COMPARISON_READ = "authorization_comparisons.read"
     AUTHORIZATION_COMPARISON_REVOKE = "authorization_comparisons.revoke"
+    FINDING_READ = "findings.read"
 
 
 _ROLE_PERMISSIONS = {
@@ -58,10 +60,16 @@ _ROLE_PERMISSIONS = {
             ApiPermission.SCHEDULE_READ,
             ApiPermission.SCHEDULE_UPDATE,
             ApiPermission.PERMIT_READ,
+            ApiPermission.FINDING_READ,
         }
     ),
     OrganizationRole.VIEWER: frozenset(
-        {ApiPermission.JOB_READ, ApiPermission.SCHEDULE_READ, ApiPermission.PERMIT_READ}
+        {
+            ApiPermission.JOB_READ,
+            ApiPermission.SCHEDULE_READ,
+            ApiPermission.PERMIT_READ,
+            ApiPermission.FINDING_READ,
+        }
     ),
 }
 
@@ -110,7 +118,7 @@ class AuthContext:
 class ApiTokenAuthenticator:
     """Authenticate exactly one HTTP Bearer token against the identity store."""
 
-    def __init__(self, identity: IdentityStore) -> None:
+    def __init__(self, identity: IdentityRepository) -> None:
         self.identity = identity
 
     def authenticate(self, authorization_headers: list[str], *, now: datetime) -> AuthContext:

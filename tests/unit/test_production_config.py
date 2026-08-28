@@ -19,6 +19,9 @@ VALID_KWARGS = dict(
     kms_key_id="arn:aws:kms:eu-west-2:111111111111:key/abc-123",
     callback_service_hostname="callback.openhuntx.example",
     migration_mode="pre_applied",
+    authorization_directory="/var/webguard/authorizations",
+    artifact_directory="/var/webguard/artifacts",
+    cursor_signing_secret="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
 )
 
 
@@ -65,6 +68,24 @@ class ProductionServiceConfigTests(unittest.TestCase):
             ProductionServiceConfig(**{**VALID_KWARGS, "migration_mode": "yolo"})
         self.assertEqual(caught.exception.code, "production_config_migration_mode_invalid")
 
+    def test_missing_authorization_directory_is_rejected(self) -> None:
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "authorization_directory": ""})
+        self.assertEqual(caught.exception.code, "production_config_missing")
+
+    def test_cursor_signing_secret_too_short_is_rejected(self) -> None:
+        import base64
+
+        short = base64.urlsafe_b64encode(b"short").decode()
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "cursor_signing_secret": short})
+        self.assertEqual(caught.exception.code, "production_config_invalid")
+
+    def test_non_loopback_host_is_rejected(self) -> None:
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "host": "0.0.0.0"})
+        self.assertEqual(caught.exception.code, "production_config_non_loopback_binding_rejected")
+
     def test_pool_maximum_below_minimum_is_rejected(self) -> None:
         with self.assertRaises(ProductionConfigError) as caught:
             ProductionServiceConfig(
@@ -106,6 +127,9 @@ class ProductionServiceConfigTests(unittest.TestCase):
                     "WEBGUARD_KMS_KEY_ID": "arn:aws:kms:eu-west-2:111111111111:key/abc-123",
                     "WEBGUARD_CALLBACK_SERVICE_HOSTNAME": "callback.openhuntx.example",
                     "WEBGUARD_MIGRATION_MODE": "pre_applied",
+                    "WEBGUARD_AUTHORIZATION_DIRECTORY": "/var/webguard/authorizations",
+                    "WEBGUARD_ARTIFACT_DIRECTORY": "/var/webguard/artifacts",
+                    "WEBGUARD_CURSOR_SIGNING_SECRET": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
                 }
             )
             config = ProductionServiceConfig.from_environment()

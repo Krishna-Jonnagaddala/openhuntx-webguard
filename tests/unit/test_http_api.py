@@ -546,6 +546,69 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["events"])
 
+    def test_owner_can_list_and_get_findings(self) -> None:
+        finding = self.service.finding_repository.record_finding(
+            organization_id=self.context.organization_id,
+            scan_id="11111111-1111-4111-8111-111111111111",
+            fingerprint="fp-http-test-1",
+            check_id="active.xss.reflected",
+            scanner_version="1.0",
+            title="Reflected XSS",
+            severity="high",
+            confidence="confirmed",
+            asset="https://example.com",
+            endpoint="/search",
+            http_method="GET",
+            now=NOW,
+        )
+        status, _, listing = self.request("GET", "/v1/findings")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listing["findings"]), 1)
+        self.assertEqual(listing["findings"][0]["finding_id"], finding.finding_id)
+        self.assertEqual(listing["findings"][0]["status"], "open")
+
+        status, _, fetched = self.request("GET", f"/v1/findings/{finding.finding_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["check_id"], "active.xss.reflected")
+
+    def test_viewer_can_read_findings(self) -> None:
+        self.service.finding_repository.record_finding(
+            organization_id=self.context.organization_id,
+            scan_id="11111111-1111-4111-8111-111111111111",
+            fingerprint="fp-http-test-viewer",
+            check_id="active.sqli.error",
+            scanner_version="1.0",
+            title="SQLi",
+            severity="high",
+            confidence="confirmed",
+            asset="https://example.com",
+            endpoint="/login",
+            http_method="POST",
+            now=NOW,
+        )
+        status, _, listing = self.request("GET", "/v1/findings", token="viewer")
+        self.assertEqual(status, 200)
+        self.assertTrue(listing["findings"])
+
+    def test_findings_are_tenant_scoped(self) -> None:
+        self.service.finding_repository.record_finding(
+            organization_id="99999999-9999-4999-8999-999999999999",
+            scan_id="11111111-1111-4111-8111-111111111111",
+            fingerprint="fp-http-test-other-org",
+            check_id="active.sqli.error",
+            scanner_version="1.0",
+            title="SQLi",
+            severity="high",
+            confidence="confirmed",
+            asset="https://other.example",
+            endpoint="/x",
+            http_method="GET",
+            now=NOW,
+        )
+        status, _, listing = self.request("GET", "/v1/findings")
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["findings"], [])
+
     def test_schedule_create_list_pause_and_resume(self) -> None:
         body = schedule_submission()
         status, _, created = self.request(

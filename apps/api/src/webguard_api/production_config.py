@@ -22,12 +22,16 @@ than by convention.
 
 from __future__ import annotations
 
+import base64
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 DEFAULT_DATABASE_POOL_MINIMUM = 1
 DEFAULT_DATABASE_POOL_MAXIMUM = 10
 MAXIMUM_DATABASE_POOL_MAXIMUM = 100
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
 
 
 class ProductionConfigError(ValueError):
@@ -92,6 +96,11 @@ class ProductionServiceConfig:
     kms_key_id: str
     callback_service_hostname: str
     migration_mode: str
+    authorization_directory: str
+    artifact_directory: str
+    cursor_signing_secret: str
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
     database_pool_minimum: int = DEFAULT_DATABASE_POOL_MINIMUM
     database_pool_maximum: int = DEFAULT_DATABASE_POOL_MAXIMUM
 
@@ -136,6 +145,47 @@ class ProductionServiceConfig:
                 "production_config_migration_mode_invalid",
                 'migration_mode must be "apply_at_startup" or "pre_applied".',
             )
+        if not self.authorization_directory.strip():
+            raise ProductionConfigError(
+                "production_config_missing",
+                "authorization_directory is required for a production deployment.",
+            )
+        if not self.artifact_directory.strip():
+            raise ProductionConfigError(
+                "production_config_missing",
+                "artifact_directory is required for a production deployment.",
+            )
+        try:
+            decoded_cursor_secret = base64.urlsafe_b64decode(
+                self.cursor_signing_secret + "=" * (-len(self.cursor_signing_secret) % 4)
+            )
+        except (ValueError, TypeError) as exc:
+            raise ProductionConfigError(
+                "production_config_invalid",
+                "cursor_signing_secret must be base64url-encoded.",
+            ) from exc
+        if len(decoded_cursor_secret) < 32:
+            raise ProductionConfigError(
+                "production_config_invalid",
+                "cursor_signing_secret must decode to at least 32 bytes.",
+            )
+        if self.port != DEFAULT_PORT or self.host != DEFAULT_HOST:
+            import ipaddress
+
+            try:
+                address = ipaddress.ip_address(self.host)
+            except ValueError as exc:
+                raise ProductionConfigError(
+                    "production_config_invalid", "host must be a valid IP literal."
+                ) from exc
+            if not address.is_loopback:
+                raise ProductionConfigError(
+                    "production_config_non_loopback_binding_rejected",
+                    "Production API binding is currently limited to loopback, matching "
+                    "the pre-production API's own constraint -- public exposure requires "
+                    "the reverse-proxy/TLS/WAF layer documented as not-yet-built in "
+                    "docs/production/INFRASTRUCTURE_REQUIREMENTS.md.",
+                )
         if (
             isinstance(self.database_pool_minimum, bool)
             or not isinstance(self.database_pool_minimum, int)
@@ -156,6 +206,12 @@ class ProductionServiceConfig:
                 "production_config_invalid",
                 f"database_pool_maximum must be from database_pool_minimum to {MAXIMUM_DATABASE_POOL_MAXIMUM}.",
             )
+
+    @property
+    def cursor_signing_key_bytes(self) -> bytes:
+        return base64.urlsafe_b64decode(
+            self.cursor_signing_secret + "=" * (-len(self.cursor_signing_secret) % 4)
+        )
 
     @classmethod
     def from_environment(cls) -> "ProductionServiceConfig":
@@ -181,6 +237,11 @@ class ProductionServiceConfig:
             kms_key_id=_require_env("WEBGUARD_KMS_KEY_ID"),
             callback_service_hostname=_require_env("WEBGUARD_CALLBACK_SERVICE_HOSTNAME"),
             migration_mode=_require_env("WEBGUARD_MIGRATION_MODE"),
+            authorization_directory=_require_env("WEBGUARD_AUTHORIZATION_DIRECTORY"),
+            artifact_directory=_require_env("WEBGUARD_ARTIFACT_DIRECTORY"),
+            cursor_signing_secret=_require_env("WEBGUARD_CURSOR_SIGNING_SECRET"),
+            host=os.environ.get("WEBGUARD_HOST", DEFAULT_HOST),
+            port=int(os.environ.get("WEBGUARD_PORT", str(DEFAULT_PORT))),
             database_pool_minimum=pool_minimum,
             database_pool_maximum=pool_maximum,
         )

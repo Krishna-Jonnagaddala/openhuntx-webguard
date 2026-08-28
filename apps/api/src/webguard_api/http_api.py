@@ -27,6 +27,7 @@ _SCHEDULE_PATH = re.compile(r"^/v1/schedules/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 _SCHEDULE_PAUSE_PATH = re.compile(r"^/v1/schedules/([0-9a-f-]{36})/pause$")
 _SCHEDULE_RESUME_PATH = re.compile(r"^/v1/schedules/([0-9a-f-]{36})/resume$")
 _PERMIT_PATH = re.compile(r"^/v1/permits/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+_FINDING_PATH = re.compile(r"^/v1/findings/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _PERMIT_REVOKE_PATH = re.compile(r"^/v1/permits/([0-9a-f-]{36})/revoke$")
 _AUTHENTICATION_CONTEXT_REVOKE_PATH = re.compile(
     r"^/v1/authentication-contexts/([0-9a-f-]{36})/revoke$"
@@ -419,37 +420,62 @@ def build_handler(
                     payload = service.list_schedules(
                         context, page, request_id=request_id
                     )
+                elif path == "/v1/findings":
+                    page = self._page_request(
+                        query,
+                        filters={
+                            "status": frozenset(
+                                {
+                                    "open",
+                                    "confirmed",
+                                    "false_positive",
+                                    "accepted_risk",
+                                    "resolved",
+                                    "reopened",
+                                }
+                            ),
+                        },
+                    )
+                    payload = service.list_findings(
+                        context, page, request_id=request_id
+                    )
                 else:
                     self._require_empty_query(query)
-                    permit_match = _PERMIT_PATH.fullmatch(path)
-                    if permit_match:
-                        payload = service.get_permit(
-                            context, permit_match.group(1), request_id=request_id
+                    finding_match = _FINDING_PATH.fullmatch(path)
+                    if finding_match:
+                        payload = service.get_finding(
+                            context, finding_match.group(1), request_id=request_id
                         )
                     else:
-                        schedule_match = _SCHEDULE_PATH.fullmatch(path)
-                        if schedule_match:
-                            payload = service.get_schedule(
-                                context, schedule_match.group(1), request_id=request_id
+                        permit_match = _PERMIT_PATH.fullmatch(path)
+                        if permit_match:
+                            payload = service.get_permit(
+                                context, permit_match.group(1), request_id=request_id
                             )
                         else:
-                            match = _JOB_PATH.fullmatch(path)
-                            if match:
-                                payload = service.get(
-                                    context, match.group(1), request_id=request_id
+                            schedule_match = _SCHEDULE_PATH.fullmatch(path)
+                            if schedule_match:
+                                payload = service.get_schedule(
+                                    context, schedule_match.group(1), request_id=request_id
                                 )
                             else:
-                                match = _JOB_RESULT_PATH.fullmatch(path)
+                                match = _JOB_PATH.fullmatch(path)
                                 if match:
-                                    payload = service.result(
+                                    payload = service.get(
                                         context, match.group(1), request_id=request_id
                                     )
                                 else:
-                                    raise ApiTransportError(
-                                        "route_not_found",
-                                        "API route was not found.",
-                                        status=404,
-                                    )
+                                    match = _JOB_RESULT_PATH.fullmatch(path)
+                                    if match:
+                                        payload = service.result(
+                                            context, match.group(1), request_id=request_id
+                                        )
+                                    else:
+                                        raise ApiTransportError(
+                                            "route_not_found",
+                                            "API route was not found.",
+                                            status=404,
+                                        )
                 self._send_json(
                     200,
                     payload,

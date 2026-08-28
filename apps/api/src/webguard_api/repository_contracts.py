@@ -156,8 +156,131 @@ class CallbackRegistrationRepository(Protocol):
     ) -> bool: ...
 
 
+@runtime_checkable
+class JobRepository(Protocol):
+    """Scan-job queue, lease, and TrustScan-permit-binding surface
+    (Slice 13 requirements 1-4). Matches ``store.ScanJobStore``'s real
+    method surface exactly -- ``WebGuardJobService``, ``ScanJobExecutor``,
+    and ``ScanJobWorker`` are typed against this protocol rather than
+    the concrete SQLite class, so ``PostgresJobRepository`` is a drop-in
+    production implementation with zero changes to those three classes'
+    call sites. Schedule methods are part of this protocol's surface
+    (``ScanJobStore`` satisfies them) but a production implementation
+    may legitimately raise a controlled error for them if schedule
+    runtime-wiring is deferred -- see ``PostgresJobRepository``'s
+    module docstring."""
+
+    def submit(
+        self,
+        request,
+        *,
+        job_id: str | None = None,
+        organization_id: str | None = None,
+        submitted_by: str | None = None,
+        permit_id: str | None = None,
+        permit_sha256: str | None = None,
+    ): ...
+
+    def get(self, job_id: str): ...
+    def get_scope(self, job_id: str) -> tuple[str, str] | None: ...
+    def get_scoped(self, job_id: str, organization_id: str): ...
+    def list_jobs_scoped_page(self, organization_id: str, *, limit: int, after=None, state=None, mode=None): ...
+    def request_cancellation_scoped(self, job_id: str, organization_id: str, *, now: datetime): ...
+    def is_cancellation_requested(self, job_id: str) -> bool: ...
+
+    def claim_next_leased(self, *, now: datetime, worker_id: str, lease_seconds: float): ...
+    def renew_lease(self, job_id: str, *, worker_id: str, lease_token: str, now: datetime, lease_seconds: float): ...
+    def recover_expired_leases(self, *, now: datetime, maximum_attempts: int): ...
+    def finish_result_leased(self, job_id: str, *, worker_id, lease_token, scan_id, result_status, report_ref, audit_ref, now, safety_receipt_ref=None, safety_receipt_sha256=None): ...
+    def fail_leased(self, job_id: str, *, worker_id: str, lease_token: str, error_code: str, error_message: str, now: datetime, safety_receipt_ref=None, safety_receipt_sha256=None): ...
+    def cancel_running_leased(self, job_id: str, *, worker_id: str, lease_token: str, now: datetime): ...
+
+    def create_scan_permit(self, permit): ...
+    def get_scan_permit_scoped(self, permit_id: str, organization_id: str): ...
+    def revoke_scan_permit_scoped(self, permit_id: str, organization_id: str, *, revoked_by: str, now: datetime): ...
+    def get_job_permit_binding(self, job_id: str) -> tuple[str, str] | None: ...
+    def get_job_safety_receipt(self, job_id: str) -> tuple[str, str] | None: ...
+
+    # Config-validation helpers `ScanJobWorker` calls on its `store` to
+    # keep worker and persistence validation rules aligned.
+    def _worker_id(self, value: object) -> str: ...
+    def _lease_seconds(self, value: object) -> float: ...
+    def _maximum_attempts(self, value: object) -> int: ...
+
+
+@runtime_checkable
+class ScanRepository(Protocol):
+    """Durable scan-run records (Slice 13 requirement 2) -- distinct
+    from ``JobRepository``'s queue/lease entity: a scan record is
+    created once execution actually begins and captures the permit
+    reference, requested checks, and summary/count metadata a Scans
+    page needs. Both ``scan_store.InMemoryScanRepository`` (local/lab)
+    and ``postgres_scans.PostgresScanRepository`` (production) satisfy
+    this."""
+
+    def create_scan(
+        self,
+        *,
+        organization_id: str,
+        job_id: str,
+        target: str,
+        authorization_id: str,
+        mode: str,
+        scanner_version: str,
+        now: datetime,
+        permit_id: str | None = None,
+        permit_fingerprint: str | None = None,
+        requested_checks: tuple[str, ...] = (),
+        scan_id: str | None = None,
+    ): ...
+
+    def complete_scan(self, scan_id: str, *, organization_id: str, status: str, report_ref, finding_count: int, now: datetime): ...
+    def get_scan_scoped(self, scan_id: str, *, organization_id: str): ...
+    def list_scans_scoped(self, organization_id: str): ...
+
+
+@runtime_checkable
+class FindingRepository(Protocol):
+    """Deterministic-fingerprint finding persistence, deduplication,
+    and lifecycle (Slice 13 requirements 6-8) -- see
+    ``finding_store``'s module docstring for the exact dedup/lifecycle
+    rules both ``InMemoryFindingRepository`` (local/lab) and
+    ``PostgresFindingRepository`` (production) enforce identically."""
+
+    def record_finding(
+        self,
+        *,
+        organization_id: str,
+        scan_id: str,
+        fingerprint: str,
+        check_id: str,
+        scanner_version: str,
+        title: str,
+        severity: str,
+        confidence: str,
+        asset: str,
+        endpoint: str,
+        http_method: str,
+        now: datetime,
+        parameter: str | None = None,
+        check_version: str | None = None,
+        cwe_id: str | None = None,
+        owasp_category: str | None = None,
+        evidence: str | None = None,
+        remediation: str | None = None,
+        references: tuple[str, ...] = (),
+    ): ...
+
+    def get_finding_scoped(self, finding_id: str, *, organization_id: str): ...
+    def list_findings_scoped_page(self, organization_id: str, *, limit: int, after=None, scan_id=None, status=None): ...
+    def update_status(self, finding_id: str, *, organization_id: str, new_status, now: datetime): ...
+
+
 __all__ = [
     "CallbackRegistrationRepository",
+    "FindingRepository",
     "IdentityRepository",
+    "JobRepository",
+    "ScanRepository",
     "TargetRepository",
 ]

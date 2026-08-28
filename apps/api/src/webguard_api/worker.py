@@ -18,11 +18,11 @@ from .config import (
     DEFAULT_WORKER_MAXIMUM_ATTEMPTS,
 )
 from .executor import JobExecutionError, ScanJobExecutor
+from .repository_contracts import JobRepository
 from .store import (
     JobStoreError,
     LeaseRecoverySummary,
     LeasedScanJob,
-    ScanJobStore,
 )
 
 _STALE_LEASE_CODES = {
@@ -51,7 +51,7 @@ class ScanJobWorker:
     def __init__(
         self,
         *,
-        store: ScanJobStore,
+        store: JobRepository,
         executor: ScanJobExecutor,
         poll_seconds: float = 0.25,
         worker_id: str | None = None,

@@ -20,6 +20,8 @@ The current architecture is not approved as a directly internet-exposed SaaS con
 
 **Slice 12 addition**: a parallel, opt-in production persistence and signing path now exists alongside the local baseline above, not in place of it. `ProductionServiceConfig` (`apps/api/src/webguard_api/production_config.py`) is a separate, fail-closed configuration type that requires PostgreSQL and KMS-backed signing to be explicitly configured — it never silently activates from a missing setting, and the local SQLite/in-memory/local-development-signing baseline described in this section remains the default and the only thing `ServiceConfig` (the pre-existing local config type) can produce. See §7 and §8 below, and `docs/audit/production-platform-phase1-postgres-kms-tenancy.md` for the full slice.
 
+**Slice 13 addition**: the production path above is now actually reachable. `webguard-api serve`/`worker`/`scheduler` accept an explicit `--environment`/`$WEBGUARD_ENVIRONMENT` selector (`Environment` enum: `development`/`test`/`lab`/`production`, never inferred); selecting `production` builds `ProductionServiceConfig.from_environment()` and constructs the same `WebGuardJobService`/`ScanJobExecutor`/`ScanJobWorker`/`ApiTokenAuthenticator` classes the local path uses, injected with PostgreSQL-backed repositories instead of SQLite (`production_startup.py`'s `build_production_components()`) — no second service implementation. Live in production: organizations/principals/memberships, targets, authorizations, scans, jobs, findings, audit events. Repository-complete but not runtime-wired in production: schedules, authentication-context metadata, authorization-comparison plans, report metadata (`webguard-api scheduler --environment production` fails closed rather than running against SQLite while claiming production). See `docs/audit/production-platform-phase2-runtime-durable-execution.md` for the full slice, including the RLS and Redis boundary decisions.
+
 ## 3. Repository components
 
 ### `packages/contracts/python`
@@ -445,7 +447,13 @@ A production PostgreSQL schema and a defensible subset of repository implementat
 - **Migrations** (`scripts/run-postgres-migrations.py`): a hand-rolled, checksum-verified runner over numbered `.sql` files, matching this project's existing no-ORM convention (raw `sqlite3` elsewhere; raw `psycopg` here, not SQLAlchemy/Alembic).
 - **Deferred repositories** (jobs, schedules, scan records, findings, reports, authentication contexts, comparison plans): schema exists; Python repository classes are explicitly next-platform-slice work, not attempted this slice.
 
-None of this is wired into `webguard-api serve`'s default startup — the local SQLite/in-memory baseline remains what actually runs today. Wiring `ProductionServiceConfig` into the service's real startup path is future work.
+None of this was wired into `webguard-api serve`'s default startup as of Slice 12 — the local SQLite/in-memory baseline remained what actually ran.
+
+### Production runtime wiring (Slice 13)
+
+`webguard-api serve`/`worker` now select PostgreSQL when explicitly started with `--environment production` (or `$WEBGUARD_ENVIRONMENT=production`); every other value runs the unchanged local path. Live this slice: `PostgresJobRepository` (jobs, leases, permits — atomic `SELECT ... FOR UPDATE SKIP LOCKED` claiming, proven race-free under 20 concurrent threads), `PostgresScanRepository` (one durable row per scan execution), `PostgresFindingRepository` (fingerprint-deduplicated via a single atomic `INSERT ... ON CONFLICT` statement, with an explicit `OPEN`/`CONFIRMED`/`FALSE_POSITIVE`/`ACCEPTED_RISK`/`RESOLVED`/`REOPENED` lifecycle). `webguard-api scheduler --environment production` fails closed rather than running schedule materialization against SQLite while claiming production, because schedule execution itself is not yet PostgreSQL-backed — see `docs/audit/production-platform-phase2-runtime-durable-execution.md` for the full live/deferred entity split and the reasoning behind it.
+
+**Row-level security**: still not implemented, deliberately, as of Slice 13. The connection pool (`WebGuardPostgresPool`) reuses raw connections across unrelated requests without resetting session-scoped state on checkout; adding RLS policies today, without first adding a checkout hook that sets or clears the tenant-context GUC on every connection reuse, would introduce a new cross-tenant leakage vector rather than removing one. Application-layer enforcement (every repository method requires and checks `organization_id` explicitly, contract-tested per repository) remains the sole tenant boundary until that checkout hook exists and is itself proven under real pool reuse.
 
 ## 8. Cryptographic uses
 

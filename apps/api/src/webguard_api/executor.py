@@ -33,6 +33,7 @@ from webguard_scanner import (
     CrawlCancellationToken,
     CrawlPolicy,
     DetectionCandidate,
+    ENGINE_VERSION,
     FetchPolicy,
     IdentifierLocation,
     MAXIMUM_DISCOVERED_CANDIDATES,
@@ -74,9 +75,12 @@ from .authorization_comparison import (
 )
 from .callback_service import CallbackRepository, CallbackServiceError
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
+from .finding_store import InMemoryFindingRepository
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .safety import TrustScanRuntimeSafetyEngine, TrustScanRuntimeSafetyError
-from .store import JobStoreError, ScanJobStore
+from .scan_store import InMemoryScanRepository
+from .repository_contracts import JobRepository
+from .store import JobStoreError
 
 
 # A fixed, conservative sub-budget for authenticated resource-discovery
@@ -929,7 +933,7 @@ class ScanJobExecutor:
         self,
         *,
         authorizations: AuthorizationRepository,
-        store: ScanJobStore,
+        store: JobRepository,
         trustscan_signer: TrustScanSigner,
         artifact_directory: Path,
         clock: Callable[[], datetime] = _utc_now,
@@ -942,6 +946,8 @@ class ScanJobExecutor:
         authentication_contexts: AuthenticationContextRepository | None = None,
         authorization_comparison_plans: AuthorizationComparisonPlanRepository | None = None,
         callback_repository: CallbackRepository | None = None,
+        scan_repository=None,
+        finding_repository=None,
     ) -> None:
         self.authorizations = authorizations
         self.store = store
@@ -981,6 +987,20 @@ class ScanJobExecutor:
             callback_repository
             if callback_repository is not None
             else CallbackRepository(base_url="http://127.0.0.1:0/")
+        )
+        # Slice 13: durable scan-record and finding persistence.
+        # Optional and defaulted to an in-memory backend so every
+        # pre-Slice-13 constructor call site is unaffected -- local/
+        # unit/lab behavior is identical to before (findings are
+        # tracked in-memory, same as authentication contexts/
+        # comparison plans/callback registrations already were).
+        # Production wiring passes `PostgresScanRepository`/
+        # `PostgresFindingRepository` explicitly.
+        self.scan_repository = (
+            scan_repository if scan_repository is not None else InMemoryScanRepository()
+        )
+        self.finding_repository = (
+            finding_repository if finding_repository is not None else InMemoryFindingRepository()
         )
 
     def _policies(self, authorization, permit, mode: ScanJobMode):
@@ -1155,6 +1175,25 @@ class ScanJobExecutor:
             if self.organization_resolver is None
             else self.organization_resolver(record.job_id)
         )
+        # Slice 13 requirement 2: the durable scan record starts here,
+        # the moment execution genuinely begins -- before any actual
+        # scanner request is made -- so a scan that fails immediately
+        # after this point still has a persisted RUNNING record rather
+        # than appearing to have never started.
+        if organization_id is not None:
+            self.scan_repository.create_scan(
+                organization_id=scope[0],
+                job_id=record.job_id,
+                target=record.request.target,
+                authorization_id=record.request.authorization_id,
+                mode=record.request.mode.value,
+                scanner_version=ENGINE_VERSION,
+                now=self.clock(),
+                permit_id=permit.permit.claims.permit_id,
+                permit_fingerprint=permit.permit.fingerprint,
+                requested_checks=tuple(permit.permit.claims.active_checks),
+                scan_id=scan_id,
+            )
         relative_directory = (
             Path("jobs") / record.job_id
             if organization_id is None
@@ -1338,6 +1377,44 @@ class ScanJobExecutor:
         receipt = safety.signed_receipt(termination_reason=report.status.value)
         _write_report(report, report_path)
         digest = _write_signed_safety_receipt(receipt, safety_receipt_path)
+
+        if organization_id is not None:
+            for finding in report.findings:
+                cwe_id = next(
+                    (i.value for i in finding.identifiers if i.namespace == "CWE"), None
+                )
+                owasp_category = next(
+                    (i.value for i in finding.identifiers if i.namespace == "OWASP"), None
+                )
+                self.finding_repository.record_finding(
+                    organization_id=scope[0],
+                    scan_id=scan_id,
+                    fingerprint=finding.identity.fingerprint,
+                    check_id=finding.identity.rule_id,
+                    scanner_version=ENGINE_VERSION,
+                    title=finding.title,
+                    severity=finding.severity.value,
+                    confidence=finding.confidence.value,
+                    asset=finding.identity.asset,
+                    endpoint=finding.identity.path,
+                    http_method=finding.identity.method,
+                    now=self.clock(),
+                    parameter=finding.identity.parameter,
+                    cwe_id=cwe_id,
+                    owasp_category=owasp_category,
+                    evidence="; ".join(item.summary for item in finding.evidence) or None,
+                    remediation=finding.remediation,
+                    references=finding.references,
+                )
+            self.scan_repository.complete_scan(
+                scan_id,
+                organization_id=scope[0],
+                status=report.status.value,
+                report_ref=report_ref,
+                finding_count=len(report.findings),
+                now=self.clock(),
+            )
+
         return JobExecutionOutcome(
             report=report,
             report_ref=report_ref,

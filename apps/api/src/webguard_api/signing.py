@@ -170,13 +170,46 @@ class KmsSigningProvider:
     algorithm = "ECDSA_SHA_256"
 
     def __init__(self, client: KmsClientProtocol, *, key_id: str) -> None:
+        """``key_id`` here is AWS's own key identifier (an ARN, key ID,
+        or alias) -- used only for the ``KeyId=`` parameter on the
+        underlying KMS calls. ``self.key_id`` (the attribute other
+        code reads, e.g. to write into a signed permit's
+        ``signing_key_id``) is instead derived as ``sha256:<hex>`` of
+        this key's own public material, matching
+        ``LocalDevelopmentSigner``'s scheme exactly. This is required,
+        not cosmetic: ``TrustScanPermitClaims.signing_key_id`` is
+        contract-validated against ``^sha256:[0-9a-f]{64}$`` (a
+        constraint that predates this slice's signing abstraction) --
+        surfacing AWS's own ARN there would fail that validation on
+        every KMS-signed permit. The AWS key identifier is preserved
+        as ``self.provider_key_id`` for anything that genuinely needs
+        it (KMS console lookups, IaC cross-references)."""
+
         self._client = client
-        self.key_id = key_id
+        self.provider_key_id = key_id
+        self.key_id = f"sha256:{hashlib.sha256(self._fetch_public_key_material(client, key_id)).hexdigest()}"
+
+    @staticmethod
+    def _fetch_public_key_material(client: KmsClientProtocol, key_id: str) -> bytes:
+        try:
+            response = client.get_public_key(KeyId=key_id)
+        except Exception as exc:  # noqa: BLE001 - normalized below
+            raise SigningProviderError(
+                "kms_public_key_request_failed",
+                "The KMS get-public-key request failed.",
+            ) from exc
+        public_key = response.get("PublicKey")
+        if not isinstance(public_key, (bytes, bytearray)):
+            raise SigningProviderError(
+                "kms_public_key_response_invalid",
+                "The KMS get-public-key response did not contain usable key material.",
+            )
+        return bytes(public_key)
 
     def sign(self, message: bytes) -> bytes:
         try:
             response = self._client.sign(
-                KeyId=self.key_id,
+                KeyId=self.provider_key_id,
                 Message=message,
                 MessageType="RAW",
                 SigningAlgorithm=self.algorithm,
@@ -195,20 +228,7 @@ class KmsSigningProvider:
         return bytes(signature)
 
     def public_key_material(self) -> bytes:
-        try:
-            response = self._client.get_public_key(KeyId=self.key_id)
-        except Exception as exc:  # noqa: BLE001 - normalized below
-            raise SigningProviderError(
-                "kms_public_key_request_failed",
-                "The KMS get-public-key request failed.",
-            ) from exc
-        public_key = response.get("PublicKey")
-        if not isinstance(public_key, (bytes, bytearray)):
-            raise SigningProviderError(
-                "kms_public_key_response_invalid",
-                "The KMS get-public-key response did not contain usable key material.",
-            )
-        return bytes(public_key)
+        return self._fetch_public_key_material(self._client, self.provider_key_id)
 
 
 def _verify_ed25519(public_key_material: bytes, message: bytes, signature: bytes) -> bool:
