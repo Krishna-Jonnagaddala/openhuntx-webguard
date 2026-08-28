@@ -52,6 +52,26 @@ class IdentifierLocation(str, Enum):
     NONE = "none"
 
 
+class IdentifierProvenance(str, Enum):
+    """How a resource identifier's *value* was actually observed
+    (Slice 9) -- a more granular, discovery-mechanism-specific axis
+    than ``ResourceSource``'s "controlled origin category". Every
+    member here names a legitimate, non-generative origin; there is no
+    member for a generated, sequential, or brute-forced value, and
+    there must never be one. The comparison-eligibility logic in
+    ``resource_graph.py`` uses this value to decide whether an
+    identifier is even allowed to be compared -- provenance is a gate,
+    not decoration."""
+
+    HTML_LINK = "html_link"
+    API_RESPONSE = "api_response"
+    JSON_FIELD = "json_field"
+    FORM_VALUE = "form_value"
+    OPENAPI_DECLARATION = "openapi_declaration"
+    EXPLICIT_OPERATOR_INPUT = "explicit_operator_input"
+    CONTROLLED_FIXTURE = "controlled_fixture"
+
+
 class AuthorizationResourceError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -91,6 +111,7 @@ class AuthorizationResource:
     content_type: str = ""
     expected_access: ResourceOwnership = ResourceOwnership.PRIVATE_TO_OWNER
     owner_marker: str = ""
+    provenance: IdentifierProvenance = IdentifierProvenance.EXPLICIT_OPERATOR_INPUT
     resource_id: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -125,6 +146,7 @@ __all__ = [
     "AuthorizationResource",
     "AuthorizationResourceError",
     "IdentifierLocation",
+    "IdentifierProvenance",
     "ResourceOwnership",
     "ResourceSource",
 ]

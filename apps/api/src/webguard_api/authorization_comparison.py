@@ -116,6 +116,16 @@ class AuthorizationComparisonPlanRecord:
     created_at: datetime
     expires_at: datetime
     revoked_at: datetime | None = None
+    # Slice 9: when set, the executor additionally runs an authenticated
+    # resource-discovery crawl for each identity and feeds any
+    # structurally-eligible discovered pairs into the same detector
+    # call, alongside (not instead of) any explicit resource_scope
+    # entries above. discovery_login_page_marker is an optional,
+    # operator-supplied string (e.g. a fixture's own login-page marker)
+    # used only to detect an expired session during that crawl -- never
+    # a resource identifier itself, and never required.
+    enable_discovery: bool = False
+    discovery_login_page_marker: str = ""
 
     def status_at(self, now: datetime) -> AuthorizationComparisonPlanStatus:
         if self.revoked_at is not None:
@@ -137,6 +147,7 @@ class AuthorizationComparisonPlanRecord:
             "resource_scope": [spec.to_dict() for spec in self.resource_scope],
             "maximum_resources": self.maximum_resources,
             "maximum_comparisons": self.maximum_comparisons,
+            "enable_discovery": self.enable_discovery,
             "status": self.status_at(now).value,
             "created_at": self.created_at.isoformat(timespec="microseconds").replace(
                 "+00:00", "Z"
@@ -172,6 +183,8 @@ class AuthorizationComparisonPlanRepository:
         resource_scope: tuple[ResourcePairSpec, ...],
         expires_at: datetime,
         now: datetime,
+        enable_discovery: bool = False,
+        discovery_login_page_marker: str = "",
     ) -> AuthorizationComparisonPlanRecord:
         if primary_context_id == secondary_context_id:
             raise AuthorizationComparisonError(
@@ -179,10 +192,11 @@ class AuthorizationComparisonPlanRepository:
                 "primary_context_id and secondary_context_id must reference "
                 "two distinct authentication contexts.",
             )
-        if not resource_scope:
+        if not resource_scope and not enable_discovery:
             raise AuthorizationComparisonError(
                 "authorization_comparison_resource_scope_empty",
-                "A comparison plan requires at least one resource pair.",
+                "A comparison plan requires at least one resource pair, "
+                "unless enable_discovery is set.",
             )
         if len(resource_scope) > MAXIMUM_RESOURCE_PAIRS_PER_PLAN:
             raise AuthorizationComparisonError(
@@ -215,6 +229,8 @@ class AuthorizationComparisonPlanRepository:
             maximum_comparisons=len(resource_scope) * 2,
             created_at=now,
             expires_at=expires_at,
+            enable_discovery=enable_discovery,
+            discovery_login_page_marker=discovery_login_page_marker,
         )
         with self._lock:
             self._plans[record.comparison_plan_id] = record
@@ -256,6 +272,8 @@ class AuthorizationComparisonPlanRepository:
                     created_at=record.created_at,
                     expires_at=record.expires_at,
                     revoked_at=now,
+                    enable_discovery=record.enable_discovery,
+                    discovery_login_page_marker=record.discovery_login_page_marker,
                 )
                 self._plans[comparison_plan_id] = record
         return record

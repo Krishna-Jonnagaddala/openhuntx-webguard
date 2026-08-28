@@ -861,6 +861,10 @@ class WebGuardJobService:
         allowed_http_methods = tuple(
             sorted(set(body.get("allowed_http_methods", ["GET"])))
         )
+        enable_discovery = bool(body.get("enable_discovery", False))
+        discovery_login_page_marker = str(
+            body.get("discovery_login_page_marker", "") or ""
+        )
 
         try:
             record = self.authorization_comparison_plans.create(
@@ -874,6 +878,8 @@ class WebGuardJobService:
                 resource_scope=resource_scope,
                 expires_at=expires_at,
                 now=now,
+                enable_discovery=enable_discovery,
+                discovery_login_page_marker=discovery_login_page_marker,
             )
         except AuthorizationComparisonError as exc:
             raise ApiServiceError(exc.code, exc.message, status=400) from exc

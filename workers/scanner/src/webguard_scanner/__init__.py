@@ -262,6 +262,7 @@ from .authorization_resource import (
     AuthorizationResource,
     AuthorizationResourceError,
     IdentifierLocation,
+    IdentifierProvenance,
     ResourceOwnership,
     ResourceSource,
 )
@@ -272,6 +273,23 @@ from .idor_authorization_detector import (
     IdorDetectionOutcome,
     IdorDetectorRunResult,
     run_idor_authorization_detector,
+)
+from .authorization_resource_discovery import (
+    DEFAULT_IDENTIFIER_FIELD_PATTERNS,
+    AuthenticatedCrawlStatus,
+    AuthenticationHealthCriterion,
+    ResourceDiscoveryBudget,
+    ResourceDiscoverySink,
+)
+from .authorization_crawl import (
+    AuthenticatedResourceDiscoveryResult,
+    run_authenticated_resource_discovery_crawl,
+)
+from .resource_graph import (
+    APPROVED_COMPARISON_PROVENANCE,
+    AuthorizationResourceGraph,
+    build_comparison_pairs,
+    is_eligible_for_comparison,
 )
 from .xss_reflected_detector import (
     DetectionOutcome,
@@ -333,6 +351,7 @@ __all__ = [
     "AuthorizationResource",
     "AuthorizationResourceError",
     "IdentifierLocation",
+    "IdentifierProvenance",
     "ResourceOwnership",
     "ResourceSource",
     "AuthorizationDifferentialObservation",
@@ -341,6 +360,17 @@ __all__ = [
     "IdorDetectionOutcome",
     "IdorDetectorRunResult",
     "run_idor_authorization_detector",
+    "DEFAULT_IDENTIFIER_FIELD_PATTERNS",
+    "AuthenticatedCrawlStatus",
+    "AuthenticationHealthCriterion",
+    "ResourceDiscoveryBudget",
+    "ResourceDiscoverySink",
+    "AuthenticatedResourceDiscoveryResult",
+    "run_authenticated_resource_discovery_crawl",
+    "APPROVED_COMPARISON_PROVENANCE",
+    "AuthorizationResourceGraph",
+    "build_comparison_pairs",
+    "is_eligible_for_comparison",
     "build_request_template",
     "discover_get_form_candidates",
     "discover_page_attack_surface",

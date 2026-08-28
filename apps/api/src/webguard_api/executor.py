@@ -25,7 +25,10 @@ from webguard_scanner import (
     ActiveDetectionError,
     ActiveDetectionPolicy,
     AttackSurfaceBudget,
+    AuthenticatedCrawlStatus,
+    AuthenticationHealthCriterion,
     AuthorizationResource,
+    AuthorizationResourceGraph,
     AuthorizationResourcePair,
     CrawlCancellationToken,
     CrawlPolicy,
@@ -46,9 +49,11 @@ from webguard_scanner import (
     ValidatedTarget,
     ValidationMode,
     ValidationPolicy,
+    build_comparison_pairs,
     discover_page_attack_surface,
     discover_site_attack_surface,
     fetch_same_origin_page,
+    run_authenticated_resource_discovery_crawl,
     run_idor_authorization_detector,
     to_request_templates,
     validate_owned_target_preflight,
@@ -70,6 +75,22 @@ from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .safety import TrustScanRuntimeSafetyEngine, TrustScanRuntimeSafetyError
 from .store import JobStoreError, ScanJobStore
 
+
+# A fixed, conservative sub-budget for authenticated resource-discovery
+# crawls (Slice 9) -- deliberately not operator-configurable this
+# slice (see the phase 9 audit doc's "Known limitations"), and
+# independent of both the main scan's own CrawlPolicy (if the job
+# itself is a crawl) and the IDOR detector's own comparison-request
+# budget (ActiveDetectionPolicy.maximum_probe_requests, unchanged from
+# Slice 8). Every request issued under it still goes through the same
+# before_request/after_request runtime-safety hooks as every other
+# request this executor issues, so it still counts toward the overall
+# TrustScan runtime safety engine's limits.
+_DISCOVERY_CRAWL_POLICY = CrawlPolicy(
+    maximum_pages=5,
+    maximum_depth=1,
+    maximum_request_attempts=20,
+)
 
 _ACTIVE_DETECTION_ELIGIBLE_STATUSES = frozenset(
     {ScanStatus.COMPLETED, ScanStatus.COMPLETED_WITH_ERRORS}
@@ -624,7 +645,7 @@ def _apply_authorization_comparison(
     except (AuthorizationComparisonError, AuthenticationContextError) as exc:
         raise TrustScanRuntimeSafetyError(exc.code, exc.message) from exc
 
-    resource_pairs = tuple(
+    resource_pairs = list(
         _resource_pair_from_spec(
             spec,
             primary_identity=primary_identity_label,
@@ -632,6 +653,54 @@ def _apply_authorization_comparison(
         )
         for spec in plan.resource_scope
     )
+
+    if plan.enable_discovery and not cancellation_check():
+        graph = AuthorizationResourceGraph()
+        for identity_label, material in (
+            (primary_identity_label, primary_material),
+            (secondary_identity_label, secondary_material),
+        ):
+            discovery = run_authenticated_resource_discovery_crawl(
+                target,
+                authentication_material=material,
+                owning_identity=identity_label,
+                crawl_policy=_DISCOVERY_CRAWL_POLICY,
+                fetch_policy=fetch_policy,
+                authentication_health_criterion=AuthenticationHealthCriterion(
+                    login_page_marker=plan.discovery_login_page_marker or None,
+                ),
+                before_request=safety.before_request,
+                after_request=safety.after_request,
+            )
+            if discovery.status is AuthenticatedCrawlStatus.SUCCEEDED:
+                graph.add_resources(identity_label, discovery.resources)
+            # A discovery-phase authentication failure for one identity
+            # does not raise: it simply means that identity contributes
+            # no discovered resources this run (fail closed on data, not
+            # on the whole scan) -- an expired session must never be
+            # silently treated as "this identity legitimately has no
+            # resources."
+        existing_pair_ids = {
+            (p.primary_resource.resource_id, p.secondary_resource.resource_id)
+            for p in resource_pairs
+        }
+        for pair in build_comparison_pairs(
+            graph,
+            primary_identity=primary_identity_label,
+            secondary_identity=secondary_identity_label,
+        ):
+            pair_id = (
+                pair.primary_resource.resource_id,
+                pair.secondary_resource.resource_id,
+            )
+            if pair_id in existing_pair_ids:
+                continue
+            existing_pair_ids.add(pair_id)
+            resource_pairs.append(pair)
+
+    resource_pairs = tuple(resource_pairs)
+    if not resource_pairs:
+        return report
 
     context = ActiveDetectionContext(
         scan_id=scan_id,

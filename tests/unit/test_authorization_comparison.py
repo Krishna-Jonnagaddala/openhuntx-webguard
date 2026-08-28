@@ -70,6 +70,22 @@ class AuthorizationComparisonPlanRepositoryTests(unittest.TestCase):
             caught.exception.code, "authorization_comparison_resource_scope_empty"
         )
 
+    def test_empty_resource_scope_allowed_when_discovery_enabled(self) -> None:
+        """Slice 9: enable_discovery=True relaxes the empty-resource-scope
+        rule, since discovered resources will populate the comparison at
+        scan time instead of an operator-supplied list."""
+
+        record = self._create(resource_scope=(), enable_discovery=True)
+        self.assertEqual(record.resource_scope, ())
+        self.assertTrue(record.enable_discovery)
+
+    def test_empty_resource_scope_still_rejected_without_discovery(self) -> None:
+        with self.assertRaises(AuthorizationComparisonError) as caught:
+            self._create(resource_scope=(), enable_discovery=False)
+        self.assertEqual(
+            caught.exception.code, "authorization_comparison_resource_scope_empty"
+        )
+
     def test_too_many_resource_pairs_is_rejected(self) -> None:
         pairs = tuple(
             _resource_pair(

@@ -27,6 +27,7 @@ from webguard_contracts import (
     RequestAttemptOutcome,
 )
 
+from .authentication import AuthenticationMaterial, apply_authentication
 from .error_taxonomy import is_retryable_error
 from .retry_policy import RetryPolicy
 from .runtime_hooks import AfterRequestHook, BeforeRequestHook
@@ -1346,6 +1347,7 @@ def _fetch_with_retry(
     budget: _ExecutionBudget,
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
+    authentication_material: AuthenticationMaterial | None = None,
 ) -> _FetchOutcome:
     attempts: list[RequestAttempt] = []
 
@@ -1382,11 +1384,16 @@ def _fetch_with_retry(
         if before_request is not None:
             before_request(target, "GET")
 
+        extra_headers = apply_authentication(
+            target.normalised_url, authentication_material, now=_utc_now()
+        )
+
         try:
             response = fetch_once(
                 target,
                 method="GET",
                 policy=fetch_policy,
+                extra_headers=extra_headers,
             )
         except SafeRequestError as exc:
             attempt_completed_at = _utc_now()
@@ -1496,6 +1503,7 @@ def crawl_same_origin(
     on_checkpoint: CheckpointObserver | None = None,
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
+    authentication_material: AuthenticationMaterial | None = None,
 ) -> CrawlExecution:
     """Fetch or resume a budgeted breadth-first same-origin HTML crawl.
 
@@ -1506,6 +1514,14 @@ def crawl_same_origin(
 
     Response bodies remain transient. They are used only for bounded anchor
     extraction and the synchronous ``on_page`` analyser callback.
+
+    ``authentication_material`` (Slice 9), when supplied, is applied to
+    every page fetch through the single shared
+    ``authentication.apply_authentication`` mechanism -- this function
+    never builds an ``Authorization``/``Cookie`` header itself, and no
+    detector-specific authentication handling exists anywhere in this
+    module. Every existing caller passes nothing here and crawls exactly
+    as before (unauthenticated).
     """
 
     if not isinstance(root_target, ValidatedTarget):
@@ -1708,6 +1724,7 @@ def crawl_same_origin(
             budget=budget,
             before_request=before_request,
             after_request=after_request,
+            authentication_material=authentication_material,
         )
 
         if fetch_outcome.response is None:

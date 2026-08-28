@@ -49,7 +49,7 @@ Scanner-side security logic including:
 - checkpoint/resume logic;
 - owned-target preflight enforcement;
 - runtime hooks used by the TrustScan safety engine; and
-- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`), the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`), the request-template/mutation layer between them (`request_template.py`), the authentication-context/session-application layer that lets any of these run against an authenticated surface (`authentication.py`, `login_workflow.py`), and the multi-identity authorization-comparison engine (`authorization_resource.py`, `idor_authorization_detector.py`) that IDOR/BOLA detection is built on — see `docs/audit/active-detection-phase1-xss.md` through `phase8-idor-bola.md`.
+- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`), the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`), the request-template/mutation layer between them (`request_template.py`), the authentication-context/session-application layer that lets any of these run against an authenticated surface (`authentication.py`, `login_workflow.py`), the multi-identity authorization-comparison engine (`authorization_resource.py`, `idor_authorization_detector.py`) that IDOR/BOLA detection is built on, and the authenticated crawl/resource-discovery layer (`authorization_crawl.py`, `authorization_resource_discovery.py`, `resource_graph.py`) that turns legitimate authenticated observation into resource pairs for that engine — see `docs/audit/active-detection-phase1-xss.md` through `phase9-authenticated-resource-discovery.md`.
 
 Active-detection data flow, current as of Slice 7 (single-identity detectors — XSS, SQLi):
 
@@ -135,6 +135,59 @@ enforced — referencing the plan without requesting the check, or
 requesting the check without a plan, are both rejected. See
 `docs/audit/active-detection-phase8-idor-bola.md` for the full
 classification logic, false-positive controls, and safety budgets.
+
+#### Authenticated crawl & authorization resource discovery, added Slice 9
+
+Resource pairs for the engine above no longer need to be entirely
+operator-supplied. When a comparison plan sets `enable_discovery`, the
+executor runs one small, bounded authenticated crawl per identity and
+turns what it legitimately observes into the same `AuthorizationResource`
+type Slice 8 already consumes — discovery is a second *source* of
+resource pairs, not a second detector, and the classification engine
+above is completely unmodified by its existence.
+
+```
+AuthorizationComparisonPlan.enable_discovery (authorization_comparison.py)
+   v
+run_authenticated_resource_discovery_crawl() (authorization_crawl.py), once per identity
+   -> crawl_same_origin() (crawler.py: authentication_material now
+      threaded through the one shared apply_authentication() mechanism
+      -- same-origin/DNS/budget/rate/checkpoint/cancellation controls
+      all unchanged from Slice 5)
+   -> ResourceDiscoverySink.visit_page() per crawled page
+        -> AuthenticationHealthCriterion (login-page/expired-session
+           detection -- an unhealthy page halts discovery for that
+           identity via the crawl's own CrawlCancellationToken,
+           contributes zero resources, never mistaken for content)
+        -> HTML-link / JSON-field extraction (authorization_resource_discovery.py),
+           bounded, provenance-tagged (IdentifierProvenance), never
+           generated or enumerated
+   v
+AuthorizationResourceGraph (resource_graph.py) -- identity-keyed, deduplicated
+   v
+build_comparison_pairs() -- deterministic eligibility: distinct
+   identities, matching resource_type/method/identifier_location,
+   PRIVATE_TO_OWNER on both sides, approved provenance, distinct
+   identifier values, matching endpoint template
+   v
+merged into the SAME resource_pairs list Slice 8's explicit
+   resource_scope already populates
+   v
+run_idor_authorization_detector() -- unchanged
+```
+
+A resource shared identically between both identities (same endpoint,
+same identifier value, because it is literally the same object) is
+excluded from comparison automatically by the "distinct identifier
+values" eligibility rule alone — no separate shared/public
+classification signal is needed for *discovered* resources to get this
+right. Discovery requests flow through the executor's own
+`before_request`/`after_request` runtime-safety hooks exactly like
+every other request this executor issues, so they count toward the
+same TrustScan budget and rate limits. See
+`docs/audit/active-detection-phase9-authenticated-resource-discovery.md`
+for the full eligibility rules, false-positive controls, and the Juice
+Shop discovery validation.
 
 ### `apps/api`
 

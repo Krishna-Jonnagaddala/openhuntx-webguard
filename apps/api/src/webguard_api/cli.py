@@ -350,6 +350,90 @@ def _authentication_context_register_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _authorization_comparison_register_command(args: argparse.Namespace) -> int:
+    """Register a new authorization-comparison plan (Slice 9) through the
+    same service path (RBAC, binding validation, audit) the HTTP API
+    uses. Owner-only. Closes the CLI/HTTP parity gap the phase 8 audit
+    doc flagged: the CLI now uses the identical
+    ``register_authorization_comparison_plan`` service method, not a
+    hand-authored HTTP request."""
+
+    config = _config(args)
+    _, identity, service, _, _, authenticator, _ = _components(config)
+    now = _utc_now()
+    try:
+        context = authenticator.authenticate([f"Bearer {args.token}"], now=now)
+    except AuthenticationError as exc:
+        print(f"webguard-api: [{exc.code}] {exc.message}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    try:
+        resource_scope = json.loads(args.resource_scope_json)
+    except json.JSONDecodeError as exc:
+        print(
+            f"webguard-api: [resource_scope_json_invalid] {exc}",
+            file=sys.stderr,
+        )
+        return EXIT_FAILURE
+    if not isinstance(resource_scope, list):
+        print(
+            "webguard-api: [resource_scope_json_invalid] "
+            "--resource-scope-json must be a JSON array.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILURE
+
+    body = {
+        "target": args.target,
+        "authorization_id": args.authorization_id,
+        "primary_context_id": args.primary_context_id,
+        "secondary_context_id": args.secondary_context_id,
+        "resource_scope": resource_scope,
+        "expires_at": _timestamp_text(now + timedelta(days=args.valid_days)),
+        "enable_discovery": args.enable_discovery,
+    }
+    if args.discovery_login_page_marker is not None:
+        body["discovery_login_page_marker"] = args.discovery_login_page_marker
+
+    try:
+        record = service.register_authorization_comparison_plan(
+            context, body, request_id=str(uuid4())
+        )
+    except ApiServiceError as exc:
+        print(f"webguard-api: [{exc.code}] {exc.message}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    print(f"Comparison plan ID: {record['comparison_plan_id']}")
+    print(f"Permitted active check: {record['permitted_active_check']}")
+    print(f"Resource pairs: {len(record['resource_scope'])}")
+    print(f"Discovery enabled: {record['enable_discovery']}")
+    print(f"Expires at: {record['expires_at']}")
+    return EXIT_SUCCESS
+
+
+def _authorization_comparison_revoke_command(args: argparse.Namespace) -> int:
+    config = _config(args)
+    _, identity, service, _, _, authenticator, _ = _components(config)
+    now = _utc_now()
+    try:
+        context = authenticator.authenticate([f"Bearer {args.token}"], now=now)
+    except AuthenticationError as exc:
+        print(f"webguard-api: [{exc.code}] {exc.message}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    try:
+        record = service.revoke_authorization_comparison_plan(
+            context, args.comparison_plan_id, request_id=str(uuid4())
+        )
+    except ApiServiceError as exc:
+        print(f"webguard-api: [{exc.code}] {exc.message}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    print(f"Comparison plan ID: {record['comparison_plan_id']}")
+    print(f"Status: {record['status']}")
+    return EXIT_SUCCESS
+
+
 def _worker_command(args: argparse.Namespace) -> int:
     config = _config(args)
     _, _, _, worker, _, _, _ = _components(config)
@@ -699,6 +783,81 @@ def build_parser() -> argparse.ArgumentParser:
     authentication_context_register.add_argument("--basic-password", default=None)
     authentication_context_register.set_defaults(
         handler=_authentication_context_register_command
+    )
+
+    authorization_comparison = subparsers.add_parser(
+        "authorization-comparison",
+        help="Manage authorization-comparison plans for IDOR/BOLA scanning.",
+    )
+    authorization_comparison_commands = authorization_comparison.add_subparsers(
+        dest="authorization_comparison_command", required=True
+    )
+    authorization_comparison_register = authorization_comparison_commands.add_parser(
+        "register",
+        help=(
+            "Register an authorization-comparison plan referencing two "
+            "already-registered, distinct authentication contexts. "
+            "Owner-only."
+        ),
+    )
+    _add_common_options(authorization_comparison_register)
+    authorization_comparison_register.add_argument(
+        "--token", required=True, help="Bearer API token authenticating this request."
+    )
+    authorization_comparison_register.add_argument("--target", required=True)
+    authorization_comparison_register.add_argument("--authorization-id", required=True)
+    authorization_comparison_register.add_argument(
+        "--primary-context-id", required=True
+    )
+    authorization_comparison_register.add_argument(
+        "--secondary-context-id", required=True
+    )
+    authorization_comparison_register.add_argument(
+        "--resource-scope-json",
+        default="[]",
+        help=(
+            "JSON array of explicit resource-pair objects (resource_type, "
+            "method, primary_endpoint, secondary_endpoint, "
+            "identifier_location, identifier_name, expected_access). "
+            "May be empty (\"[]\") when --enable-discovery is set."
+        ),
+    )
+    authorization_comparison_register.add_argument(
+        "--enable-discovery",
+        action="store_true",
+        help=(
+            "Also run an authenticated resource-discovery crawl for each "
+            "identity at scan time (Slice 9), feeding structurally-"
+            "eligible discovered resources into the same comparison "
+            "alongside any explicit resource pairs above."
+        ),
+    )
+    authorization_comparison_register.add_argument(
+        "--discovery-login-page-marker",
+        default=None,
+        help=(
+            "Optional string that, if present in a discovery-crawl "
+            "page's body, marks that page as an expired-session login "
+            "page rather than ordinary application content."
+        ),
+    )
+    authorization_comparison_register.add_argument("--valid-days", type=int, default=1)
+    authorization_comparison_register.set_defaults(
+        handler=_authorization_comparison_register_command
+    )
+
+    authorization_comparison_revoke = authorization_comparison_commands.add_parser(
+        "revoke", help="Revoke an authorization-comparison plan. Owner-only."
+    )
+    _add_common_options(authorization_comparison_revoke)
+    authorization_comparison_revoke.add_argument(
+        "--token", required=True, help="Bearer API token authenticating this request."
+    )
+    authorization_comparison_revoke.add_argument(
+        "--comparison-plan-id", required=True
+    )
+    authorization_comparison_revoke.set_defaults(
+        handler=_authorization_comparison_revoke_command
     )
 
     serve_parser = subparsers.add_parser(
