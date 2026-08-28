@@ -274,6 +274,9 @@ class Phase2AuthenticationAndRbacTests(unittest.TestCase):
             ApiPermission.SCHEDULE_UPDATE,
             ApiPermission.PERMIT_READ,
             ApiPermission.FINDING_READ,
+            ApiPermission.FINDING_UPDATE,
+            ApiPermission.REPORT_CREATE,
+            ApiPermission.REPORT_READ,
         }
 
         for permission in ApiPermission:
@@ -289,6 +292,7 @@ class Phase2AuthenticationAndRbacTests(unittest.TestCase):
             ApiPermission.SCHEDULE_READ,
             ApiPermission.PERMIT_READ,
             ApiPermission.FINDING_READ,
+            ApiPermission.REPORT_READ,
         }
 
         for permission in ApiPermission:

@@ -185,6 +185,74 @@ class PostgresJobRepositoryContractTests(JobRepositoryContractMixin, unittest.Te
     def assign_authorization(self, organization_id: str, authorization_id: str, owner_id: str) -> None:
         self._identity.assign_authorization(organization_id, authorization_id, assigned_by=owner_id, now=NOW)
 
+    def test_failing_a_job_reconciles_its_incomplete_scan_record(self) -> None:
+        """Slice 14 requirements 7-8: a job reaching FAILED must not
+        leave an associated scan record stuck incomplete forever -- the
+        reconciliation in `_terminal_update` runs in the same
+        transaction as the job's own terminal write."""
+
+        from webguard_api.postgres_scans import PostgresScanRepository
+
+        scans = PostgresScanRepository(self._pool)
+        organization_id, owner_id = self.make_organization_and_owner()
+        record, _ = self._submit_claimable_job(self._jobs, organization_id, owner_id)
+        leased = self._jobs.claim_next_leased(now=NOW, worker_id="contract-worker", lease_seconds=30)
+        self.assertEqual(leased.record.job_id, record.job_id)
+
+        scan = scans.create_scan(
+            organization_id=organization_id, job_id=record.job_id, target="https://contract.example/",
+            authorization_id=leased.record.request.authorization_id, mode="single_page",
+            scanner_version="1.0", now=NOW,
+        )
+        self.assertIsNone(scan.completed_at)
+
+        self._jobs.fail_leased(
+            record.job_id, worker_id=leased.worker_id, lease_token=leased.lease_token,
+            error_code="worker_internal_error", error_message="simulated failure", now=NOW,
+        )
+
+        reread = scans.get_scan_scoped(scan.scan_id, organization_id=organization_id)
+        self.assertEqual(reread.status, "failed")
+        self.assertIsNotNone(reread.completed_at)
+
+    def test_cancelling_a_job_reconciles_its_incomplete_scan_record(self) -> None:
+        from webguard_api.postgres_scans import PostgresScanRepository
+
+        scans = PostgresScanRepository(self._pool)
+        organization_id, owner_id = self.make_organization_and_owner()
+        record, _ = self._submit_claimable_job(self._jobs, organization_id, owner_id)
+        leased = self._jobs.claim_next_leased(now=NOW, worker_id="contract-worker", lease_seconds=30)
+
+        scan = scans.create_scan(
+            organization_id=organization_id, job_id=record.job_id, target="https://contract.example/",
+            authorization_id=leased.record.request.authorization_id, mode="single_page",
+            scanner_version="1.0", now=NOW,
+        )
+
+        self._jobs.cancel_running_leased(
+            record.job_id, worker_id=leased.worker_id, lease_token=leased.lease_token, now=NOW,
+        )
+
+        reread = scans.get_scan_scoped(scan.scan_id, organization_id=organization_id)
+        self.assertEqual(reread.status, "cancelled")
+        self.assertIsNotNone(reread.completed_at)
+
+    def test_scan_record_cannot_reference_a_nonexistent_job(self) -> None:
+        """Requirement 7's first invariant ("a submitted scan cannot
+        exist without its initial job") is enforced by the database's
+        own foreign key, not merely by application convention."""
+
+        from webguard_api.db_errors import DatabaseIntegrityError
+        from webguard_api.postgres_scans import PostgresScanRepository
+
+        scans = PostgresScanRepository(self._pool)
+        organization_id, _ = self.make_organization_and_owner()
+        with self.assertRaises(DatabaseIntegrityError):
+            scans.create_scan(
+                organization_id=organization_id, job_id=str(uuid4()), target="https://contract.example/",
+                authorization_id=str(uuid4()), mode="single_page", scanner_version="1.0", now=NOW,
+            )
+
 
 class ScanRepositoryContractMixin:
     def make_repository(self):  # pragma: no cover - overridden

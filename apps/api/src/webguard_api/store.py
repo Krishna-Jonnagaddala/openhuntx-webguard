@@ -2542,6 +2542,7 @@ class ScanJobStore:
         limit: int,
         after: tuple[str, str] | None = None,
         state: ScanScheduleState | None = None,
+        target: str | None = None,
     ) -> tuple[tuple[ScanScheduleRecord, ...], bool]:
         """List one stable descending organization schedule page."""
 
@@ -2560,6 +2561,9 @@ class ScanJobStore:
                 )
             clauses.append("state = ?")
             parameters.append(state.value)
+        if target is not None:
+            clauses.append("target = ?")
+            parameters.append(target)
         if after is not None:
             if (
                 not isinstance(after, tuple)

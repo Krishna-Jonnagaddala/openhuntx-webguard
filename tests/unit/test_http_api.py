@@ -17,6 +17,7 @@ from webguard_api import (
     WebGuardJobService,
     create_server,
 )
+from webguard_api.artifact_store import LocalArtifactStore
 from webguard_contracts import OrganizationRole
 
 from tests.unit.service_test_support import (
@@ -608,6 +609,177 @@ class HttpApiTests(unittest.TestCase):
         status, _, listing = self.request("GET", "/v1/findings")
         self.assertEqual(status, 200)
         self.assertEqual(listing["findings"], [])
+
+    def test_owner_can_confirm_a_finding_with_a_reason_and_it_is_audited(self) -> None:
+        finding = self.service.finding_repository.record_finding(
+            organization_id=self.context.organization_id,
+            scan_id="11111111-1111-4111-8111-111111111111",
+            fingerprint="fp-http-lifecycle-1",
+            check_id="active.xss.reflected",
+            scanner_version="1.0",
+            title="Reflected XSS",
+            severity="high",
+            confidence="confirmed",
+            asset="https://example.com",
+            endpoint="/search",
+            http_method="GET",
+            now=NOW,
+        )
+        status, _, updated = self.request(
+            "POST",
+            f"/v1/findings/{finding.finding_id}/status",
+            body=json.dumps({"status": "confirmed", "reason": "Verified manually."}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200, updated)
+        self.assertEqual(updated["status"], "confirmed")
+
+        status, _, events = self.request("GET", f"/v1/findings/{finding.finding_id}/events")
+        self.assertEqual(status, 200, events)
+        self.assertEqual(len(events["events"]), 1)
+        self.assertEqual(events["events"][0]["previous_status"], "open")
+        self.assertEqual(events["events"][0]["new_status"], "confirmed")
+        self.assertEqual(events["events"][0]["reason"], "Verified manually.")
+        self.assertEqual(events["events"][0]["changed_by"], self.context.principal_id)
+
+    def test_repeating_the_identical_status_change_is_idempotent(self) -> None:
+        finding = self.service.finding_repository.record_finding(
+            organization_id=self.context.organization_id,
+            scan_id="11111111-1111-4111-8111-111111111111",
+            fingerprint="fp-http-lifecycle-idempotent",
+            check_id="active.xss.reflected",
+            scanner_version="1.0",
+            title="Reflected XSS",
+            severity="high",
+            confidence="confirmed",
+            asset="https://example.com",
+            endpoint="/search",
+            http_method="GET",
+            now=NOW,
+        )
+        for _ in range(2):
+            status, _, updated = self.request(
+                "POST",
+                f"/v1/findings/{finding.finding_id}/status",
+                body=json.dumps({"status": "confirmed"}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(status, 200, updated)
+        status, _, events = self.request("GET", f"/v1/findings/{finding.finding_id}/events")
+        self.assertEqual(len(events["events"]), 1, "a repeated identical transition must not duplicate history")
+
+    def test_client_cannot_set_reopened_directly(self) -> None:
+        finding = self.service.finding_repository.record_finding(
+            organization_id=self.context.organization_id,
+            scan_id="11111111-1111-4111-8111-111111111111",
+            fingerprint="fp-http-lifecycle-reopen",
+            check_id="active.xss.reflected",
+            scanner_version="1.0",
+            title="Reflected XSS",
+            severity="high",
+            confidence="confirmed",
+            asset="https://example.com",
+            endpoint="/search",
+            http_method="GET",
+            now=NOW,
+        )
+        status, _, payload = self.request(
+            "POST",
+            f"/v1/findings/{finding.finding_id}/status",
+            body=json.dumps({"status": "reopened"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["error"]["code"], "finding_status_not_client_settable")
+
+    def test_viewer_cannot_update_finding_status(self) -> None:
+        finding = self.service.finding_repository.record_finding(
+            organization_id=self.context.organization_id,
+            scan_id="11111111-1111-4111-8111-111111111111",
+            fingerprint="fp-http-lifecycle-viewer",
+            check_id="active.xss.reflected",
+            scanner_version="1.0",
+            title="Reflected XSS",
+            severity="high",
+            confidence="confirmed",
+            asset="https://example.com",
+            endpoint="/search",
+            http_method="GET",
+            now=NOW,
+        )
+        status, _, payload = self.request(
+            "POST",
+            f"/v1/findings/{finding.finding_id}/status",
+            body=json.dumps({"status": "confirmed"}).encode(),
+            headers={"Content-Type": "application/json"},
+            token="viewer",
+        )
+        self.assertEqual(status, 403, payload)
+
+    def test_scans_list_and_get_are_tenant_scoped(self) -> None:
+        scan = self.service.scan_repository.create_scan(
+            organization_id=self.context.organization_id,
+            job_id="22222222-2222-4222-8222-222222222222",
+            target=TARGET,
+            authorization_id=AUTH_ID,
+            mode="single_page",
+            scanner_version="1.0",
+            now=NOW,
+        )
+        self.service.scan_repository.create_scan(
+            organization_id="99999999-9999-4999-8999-999999999999",
+            job_id="33333333-3333-4333-8333-333333333333",
+            target="https://other.example/",
+            authorization_id=AUTH_ID,
+            mode="single_page",
+            scanner_version="1.0",
+            now=NOW,
+        )
+        status, _, listing = self.request("GET", "/v1/scans")
+        self.assertEqual(status, 200, listing)
+        self.assertEqual(len(listing["scans"]), 1)
+        self.assertEqual(listing["scans"][0]["scan_id"], scan.scan_id)
+
+        status, _, fetched = self.request("GET", f"/v1/scans/{scan.scan_id}")
+        self.assertEqual(status, 200, fetched)
+        self.assertEqual(fetched["target"], TARGET)
+
+    def test_report_create_list_and_get(self) -> None:
+        scan = self.service.scan_repository.create_scan(
+            organization_id=self.context.organization_id,
+            job_id="44444444-4444-4444-8444-444444444444",
+            target=TARGET,
+            authorization_id=AUTH_ID,
+            mode="single_page",
+            scanner_version="1.0",
+            now=NOW,
+        )
+        report_path = Path(self.temporary.name) / "report.json"
+        report_path.write_text('{"status": "completed"}', encoding="utf-8")
+        self.service.scan_repository.complete_scan(
+            scan.scan_id,
+            organization_id=self.context.organization_id,
+            status="completed",
+            report_ref="report.json",
+            finding_count=0,
+            now=NOW,
+        )
+        self.service.artifact_store = LocalArtifactStore(Path(self.temporary.name))
+
+        status, _, created = self.request(
+            "POST", "/v1/reports", body=json.dumps({"scan_id": scan.scan_id}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 201, created)
+        self.assertEqual(len(created["checksum"]), 64)
+
+        status, _, listing = self.request("GET", "/v1/reports")
+        self.assertEqual(status, 200, listing)
+        self.assertEqual(len(listing["reports"]), 1)
+
+        status, _, fetched = self.request("GET", f"/v1/reports/{created['report_id']}")
+        self.assertEqual(status, 200, fetched)
+        self.assertEqual(fetched["checksum"], created["checksum"])
 
     def test_schedule_create_list_pause_and_resume(self) -> None:
         body = schedule_submission()

@@ -47,6 +47,7 @@ from webguard_contracts import (
 from .db_errors import DatabaseIntegrityError
 from .permits import PersistedTrustScanPermit
 from .postgres_pool import WebGuardPostgresPool
+from .postgres_schedules import PostgresScheduleRepository
 from .store import JobStoreError, LeasedScanJob, LeaseRecoverySummary
 
 DEFAULT_LEASE_SECONDS = 30.0
@@ -97,6 +98,14 @@ class PostgresJobRepository:
 
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
+        # Slice 14 requirement 3: schedule-shaped methods delegate to the
+        # one real implementation (`postgres_schedules.py`) rather than
+        # duplicating its SQL here -- `WebGuardJobService` and
+        # `ScanScheduleCoordinator` both call these method names on
+        # whatever `store` they were constructed with, so in production
+        # that is this class, and this class simply is not where the
+        # schedule SQL lives.
+        self._schedules = PostgresScheduleRepository(pool)
 
     # -- config validation (ScanJobWorker calls these on `self.store`
     # to keep worker and persistence validation rules aligned -- see
@@ -218,44 +227,39 @@ class PostgresJobRepository:
             ).fetchone()
         return None if row is None else (str(row[0]), row[1])
 
-    # -- schedules: POSTGRES_REPOSITORY_READY, LIVE_RUNTIME_WIRING_DEFERRED --
-    #
-    # Schedule persistence has a real, contract-tested implementation
-    # this slice (`PostgresScheduleRepository`, in
-    # `postgres_schedules.py`) -- it is simply not the object injected
-    # here. `WebGuardJobService`'s schedule-handling HTTP methods call
-    # these same method names on whatever `store` it was constructed
-    # with; in production mode that is this class, so every schedule
-    # operation fails closed with one clear, fixed error rather than
-    # an `AttributeError` or a silent no-op. This is the deliberate
-    # scope boundary confirmed for this slice: the live `/v1/...` path
-    # covers organizations/principals/targets/authorizations/scans/
-    # jobs/findings/audit only.
-
-    @staticmethod
-    def _schedules_not_available() -> JobStoreError:
-        return JobStoreError(
-            "schedule_runtime_wiring_deferred",
-            "Schedule management is not yet wired into the production PostgreSQL runtime.",
-        )
+    # -- schedules (Slice 14 requirement 3): every method below is a
+    # one-line delegation to the one real implementation
+    # (`PostgresScheduleRepository`) -- see `__init__`'s comment. This
+    # class does not duplicate schedule SQL; it is the object
+    # `WebGuardJobService` and `ScanScheduleCoordinator` are constructed
+    # with in production, and this is how it satisfies both.
 
     def create_schedule(self, *args, **kwargs):
-        raise self._schedules_not_available()
+        return self._schedules.create_schedule(*args, **kwargs)
 
     def get_schedule_scoped(self, *args, **kwargs):
-        raise self._schedules_not_available()
+        return self._schedules.get_schedule_scoped(*args, **kwargs)
 
     def list_schedules_scoped_page(self, *args, **kwargs):
-        raise self._schedules_not_available()
+        return self._schedules.list_schedules_scoped_page(*args, **kwargs)
 
     def pause_schedule_scoped(self, *args, **kwargs):
-        raise self._schedules_not_available()
+        return self._schedules.pause_schedule_scoped(*args, **kwargs)
 
     def resume_schedule_scoped(self, *args, **kwargs):
-        raise self._schedules_not_available()
+        return self._schedules.resume_schedule_scoped(*args, **kwargs)
 
     def get_schedule_permit_binding(self, schedule_id: str) -> tuple[str, str] | None:
-        raise self._schedules_not_available()
+        return self._schedules.get_schedule_permit_binding(schedule_id)
+
+    def list_due_schedules(self, *args, **kwargs):
+        return self._schedules.list_due_schedules(*args, **kwargs)
+
+    def enqueue_due_schedule(self, *args, **kwargs):
+        return self._schedules.enqueue_due_schedule(*args, **kwargs)
+
+    def block_due_schedule(self, *args, **kwargs):
+        return self._schedules.block_due_schedule(*args, **kwargs)
 
     def get_job_safety_receipt(self, job_id: str) -> tuple[str, str] | None:
         with self._pool.connection() as connection:
@@ -737,6 +741,14 @@ class PostgresJobRepository:
                             (ScanJobState.CANCELLED.value, timestamp, timestamp, *common),
                         )
                         cancelled += result.rowcount
+                        if result.rowcount:
+                            connection.execute(
+                                """
+                                UPDATE scan_records SET status = %s, completed_at = COALESCE(completed_at, %s)
+                                WHERE job_id = %s AND completed_at IS NULL
+                                """,
+                                (ScanJobState.CANCELLED.value, timestamp, job_id),
+                            )
                     elif attempt_count >= limit:
                         result = connection.execute(
                             """
@@ -754,6 +766,14 @@ class PostgresJobRepository:
                             ),
                         )
                         failed += result.rowcount
+                        if result.rowcount:
+                            connection.execute(
+                                """
+                                UPDATE scan_records SET status = %s, completed_at = COALESCE(completed_at, %s)
+                                WHERE job_id = %s AND completed_at IS NULL
+                                """,
+                                (ScanJobState.FAILED.value, timestamp, job_id),
+                            )
                     else:
                         result = connection.execute(
                             """
@@ -848,6 +868,31 @@ class PostgresJobRepository:
                     else "The scan-job state changed before the transition completed."
                 )
                 raise JobStoreError(code, message)
+            # Slice 14 requirement 7-8: a job reaching FAILED or
+            # CANCELLED must not leave an associated scan record stuck
+            # incomplete forever (crash consistency: "cancellation state
+            # cannot disagree across job and scan," "no scan should
+            # remain permanently orphaned"). This runs in the SAME
+            # transaction as the job's own terminal write above, so the
+            # two either both commit or both roll back -- true atomicity
+            # for this specific, bounded pair, achieved by writing one
+            # extra statement against a table this repository already
+            # has pool access to, not by introducing a cross-repository
+            # transaction abstraction (see the audit doc's reasoning for
+            # why that would be disproportionate for this invariant).
+            # A SUCCEEDED job needs no reconciliation here: the
+            # executor's own `complete_scan()` call already runs, in a
+            # separate short transaction, before this method is ever
+            # invoked -- see worker.py's call order.
+            if state in (ScanJobState.FAILED, ScanJobState.CANCELLED):
+                connection.execute(
+                    """
+                    UPDATE scan_records
+                    SET status = %s, completed_at = COALESCE(completed_at, %s)
+                    WHERE job_id = %s AND completed_at IS NULL
+                    """,
+                    (state.value, timestamp, job_id),
+                )
             if safety_receipt_ref is not None:
                 if (
                     not isinstance(safety_receipt_ref, str)

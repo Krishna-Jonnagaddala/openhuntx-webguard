@@ -28,6 +28,7 @@ from webguard_contracts import (
 
 from webguard_scanner.authentication import AuthenticationMaterial, SessionCookie
 
+from .artifact_store import ArtifactStoreError
 from .auth import ApiPermission, AuthContext, AuthenticationError
 from .authentication_contexts import (
     AuthenticationContextError,
@@ -42,6 +43,8 @@ from .authorization_comparison import (
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .finding_store import FindingStatus, FindingStoreError
 from .identity import IdentityStoreError
+from .report_store import ReportStoreError
+from .scan_store import ScanStoreError
 from .pagination import PageRequest, PaginationError, SignedCursorCodec
 from .permits import (
     PersistedTrustScanPermit,
@@ -104,6 +107,9 @@ class WebGuardJobService:
         authorization_comparison_plans: AuthorizationComparisonPlanRepository | None = None,
         readiness_check: Callable[[], None] | None = None,
         finding_repository=None,
+        scan_repository=None,
+        report_repository=None,
+        artifact_store=None,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
@@ -120,6 +126,28 @@ class WebGuardJobService:
         self.finding_repository = (
             finding_repository if finding_repository is not None else InMemoryFindingRepository()
         )
+        # Same rationale, same pattern -- requirement 5 needs a
+        # completed scan's own report_ref to register a report against.
+        from .scan_store import InMemoryScanRepository
+
+        self.scan_repository = (
+            scan_repository if scan_repository is not None else InMemoryScanRepository()
+        )
+        # Slice 14 requirement 5: same optional/defaulted pattern as
+        # every other repository above -- local/unit/lab behavior is
+        # unaffected; production wiring passes `PostgresReportRepository`
+        # and a `LocalArtifactStore`/future object-storage backend.
+        from .report_store import InMemoryReportRepository
+
+        self.report_repository = (
+            report_repository if report_repository is not None else InMemoryReportRepository()
+        )
+        if artifact_store is None:
+            from .artifact_store import LocalArtifactStore
+            from pathlib import Path
+
+            artifact_store = LocalArtifactStore(Path("scan-results/service"))
+        self.artifact_store = artifact_store
         # Slice 12 requirement 14: a cheap, dependency-specific probe
         # `/ready` invokes. Defaults to a no-op, matching the honest
         # behavior of the pre-Slice-12 default deployment (a local
@@ -714,44 +742,86 @@ class WebGuardJobService:
                 "expires_at must be an ISO-8601 timestamp.",
                 status=400,
             ) from exc
-        try:
-            raw_cookies = body.get("cookies") or ()
-            cookies = tuple(
-                SessionCookie(
-                    name=raw["name"],
-                    value=raw["value"],
-                    domain=raw["domain"],
-                    port=raw["port"],
-                    path=raw.get("path", "/"),
-                    secure=raw.get("secure", False),
+        # Slice 14 requirement 1: the in-memory (local/dev/test/lab)
+        # repository holds secret material directly, keyed by context ID
+        # -- an operator supplies it inline in this request, exactly as
+        # every prior slice's E2E tests already do. The PostgreSQL
+        # (production) repository never does; it only ever stores a
+        # reference to secret material that already exists wherever the
+        # configured SecretProvider resolves it from (e.g. an AWS
+        # Secrets Manager secret an operator provisioned out-of-band).
+        # `hasattr(..., "get_secret")` is the same local-vs-production
+        # test `secret_provider.py`'s `LocalSecretProvider` already uses.
+        if hasattr(self.authentication_contexts, "get_secret"):
+            try:
+                raw_cookies = body.get("cookies") or ()
+                cookies = tuple(
+                    SessionCookie(
+                        name=raw["name"],
+                        value=raw["value"],
+                        domain=raw["domain"],
+                        port=raw["port"],
+                        path=raw.get("path", "/"),
+                        secure=raw.get("secure", False),
+                    )
+                    for raw in raw_cookies
                 )
-                for raw in raw_cookies
-            )
-            secret = AuthenticationMaterial(
-                bearer_token=body.get("bearer_token"),
-                cookies=cookies,
-                basic_username=body.get("basic_username"),
-                basic_password=body.get("basic_password"),
-            )
-        except Exception as exc:  # noqa: BLE001 - AuthenticationError from webguard_scanner
-            raise ApiServiceError(
-                getattr(exc, "code", "authentication_context_secret_invalid"),
-                getattr(exc, "message", "The supplied credential material is invalid."),
-                status=400,
-            ) from exc
-        try:
-            record = self.authentication_contexts.create(
-                organization_id=context.organization_id,
-                target=body["target"],
-                authorization_id=authorization.authorization_id,
-                identity_label=body["identity_label"],
-                method=method,
-                secret=secret,
-                expires_at=expires_at,
-                now=now,
-            )
-        except AuthenticationContextError as exc:
-            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+                secret = AuthenticationMaterial(
+                    bearer_token=body.get("bearer_token"),
+                    cookies=cookies,
+                    basic_username=body.get("basic_username"),
+                    basic_password=body.get("basic_password"),
+                )
+            except Exception as exc:  # noqa: BLE001 - AuthenticationError from webguard_scanner
+                raise ApiServiceError(
+                    getattr(exc, "code", "authentication_context_secret_invalid"),
+                    getattr(exc, "message", "The supplied credential material is invalid."),
+                    status=400,
+                ) from exc
+            try:
+                record = self.authentication_contexts.create(
+                    organization_id=context.organization_id,
+                    target=body["target"],
+                    authorization_id=authorization.authorization_id,
+                    identity_label=body["identity_label"],
+                    method=method,
+                    secret=secret,
+                    expires_at=expires_at,
+                    now=now,
+                )
+            except AuthenticationContextError as exc:
+                raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        else:
+            secret_reference_id = body.get("secret_reference_id")
+            if not isinstance(secret_reference_id, str) or not secret_reference_id:
+                raise ApiServiceError(
+                    "authentication_context_secret_reference_missing",
+                    "secret_reference_id is required: this deployment's authentication-context "
+                    "repository does not store secret material directly. Register the secret "
+                    "with the configured secret provider out-of-band and supply its reference.",
+                    status=400,
+                )
+            for raw_field in ("bearer_token", "cookies", "basic_username", "basic_password"):
+                if raw_field in body:
+                    raise ApiServiceError(
+                        "authentication_context_raw_secret_not_accepted",
+                        f"{raw_field!r} cannot be submitted directly in this deployment; "
+                        "supply secret_reference_id instead.",
+                        status=400,
+                    )
+            try:
+                record = self.authentication_contexts.create(
+                    organization_id=context.organization_id,
+                    target=body["target"],
+                    authorization_id=authorization.authorization_id,
+                    identity_label=body["identity_label"],
+                    method=method,
+                    secret_reference_id=secret_reference_id,
+                    expires_at=expires_at,
+                    now=now,
+                )
+            except AuthenticationContextError as exc:
+                raise ApiServiceError(exc.code, exc.message, status=400) from exc
         self._audit(
             context,
             request_id=request_id,
@@ -1033,6 +1103,9 @@ class WebGuardJobService:
                 after=self._decode_page(context, page, resource="findings"),
                 scan_id=scan_id,
                 status=status,
+                severity=filters.get("severity"),
+                cwe_id=filters.get("cwe_id"),
+                asset=filters.get("asset"),
             )
         except FindingStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=500) from exc
@@ -1069,6 +1142,333 @@ class WebGuardJobService:
             resource_id=finding_id, outcome=AuditOutcome.SUCCEEDED,
         )
         return self._finding_public_dict(record)
+
+    # A client may only ever request these four -- REOPENED is reached
+    # exclusively via re-detection (finding_store.py's own re-detection
+    # rule), never via this API, matching requirement 9's explicit
+    # instruction. Rejecting it here, before it ever reaches
+    # `assert_valid_transition`, gives a clearer error than "invalid
+    # transition" would for a status that is not merely unreachable
+    # from the current one but unreachable from *any* client request.
+    _CLIENT_SETTABLE_FINDING_STATUSES = frozenset(
+        {
+            FindingStatus.CONFIRMED,
+            FindingStatus.FALSE_POSITIVE,
+            FindingStatus.ACCEPTED_RISK,
+            FindingStatus.RESOLVED,
+        }
+    )
+
+    def update_finding_status(
+        self,
+        context: AuthContext,
+        finding_id: str,
+        body: dict,
+        *,
+        request_id: str,
+    ) -> dict:
+        """Requirement 9: CONFIRMED/FALSE_POSITIVE/ACCEPTED_RISK/RESOLVED
+        only, tenant-scoped, RBAC-controlled, audited, idempotent on a
+        repeated identical request. Never lets a client rewrite detector
+        evidence -- only ``status`` and an optional ``reason`` are
+        accepted; every other field on the finding is untouched."""
+
+        self._require(
+            context, ApiPermission.FINDING_UPDATE, request_id=request_id,
+            action="findings.update_status", resource_type="finding", resource_id=finding_id,
+        )
+        if not isinstance(body, dict) or not isinstance(body.get("status"), str):
+            raise ApiServiceError(
+                "finding_status_body_invalid", "Request body must include a string status field.", status=400
+            )
+        try:
+            new_status = FindingStatus(body["status"])
+        except ValueError as exc:
+            raise ApiServiceError(
+                "finding_status_invalid", f"Unknown finding status: {body['status']!r}.", status=400
+            ) from exc
+        if new_status not in self._CLIENT_SETTABLE_FINDING_STATUSES:
+            self._audit(
+                context, request_id=request_id, action="findings.update_status", resource_type="finding",
+                resource_id=finding_id, outcome=AuditOutcome.DENIED, detail_code="finding_status_not_client_settable",
+            )
+            raise ApiServiceError(
+                "finding_status_not_client_settable",
+                f"{new_status.value!r} cannot be set through the API; it is reached only by re-detection.",
+                status=400,
+            )
+        reason = body.get("reason")
+        if reason is not None and (not isinstance(reason, str) or len(reason) > 2000):
+            raise ApiServiceError(
+                "finding_status_reason_invalid", "reason must be a string of at most 2000 characters.", status=400
+            )
+        try:
+            record = self.finding_repository.update_status(
+                finding_id,
+                organization_id=context.organization_id,
+                new_status=new_status,
+                now=self.clock(),
+                reason=reason,
+                changed_by=context.principal_id,
+            )
+        except FindingStoreError as exc:
+            status = 404 if exc.code == "finding_not_found" else 409
+            self._audit(
+                context, request_id=request_id, action="findings.update_status", resource_type="finding",
+                resource_id=finding_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        self._audit(
+            context, request_id=request_id, action="findings.update_status", resource_type="finding",
+            resource_id=finding_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return self._finding_public_dict(record)
+
+    def list_finding_events(self, context: AuthContext, finding_id: str, *, request_id: str) -> dict:
+        """Requirement 10: the append-only history a finding's current
+        status alone cannot answer -- first found, latest occurrence,
+        when/why/by-whom status changed, when it reopened."""
+
+        self._require(
+            context, ApiPermission.FINDING_READ, request_id=request_id,
+            action="findings.list_events", resource_type="finding", resource_id=finding_id,
+        )
+        try:
+            self.finding_repository.get_finding_scoped(finding_id, organization_id=context.organization_id)
+            events = self.finding_repository.list_events_scoped(
+                finding_id, organization_id=context.organization_id
+            )
+        except FindingStoreError as exc:
+            self._audit(
+                context, request_id=request_id, action="findings.list_events", resource_type="finding",
+                resource_id=finding_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        self._audit(
+            context, request_id=request_id, action="findings.list_events", resource_type="finding",
+            resource_id=finding_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {
+            "finding_id": finding_id,
+            "events": [
+                {
+                    "event_id": event.event_id,
+                    "previous_status": event.previous_status.value,
+                    "new_status": event.new_status.value,
+                    "reason": event.reason,
+                    "changed_by": event.changed_by,
+                    "created_at": event.created_at.astimezone(timezone.utc)
+                    .isoformat(timespec="microseconds")
+                    .replace("+00:00", "Z"),
+                }
+                for event in events
+            ],
+        }
+
+    @staticmethod
+    def _report_public_dict(report) -> dict[str, object]:
+        return {
+            "report_id": report.report_id,
+            "organization_id": report.organization_id,
+            "scan_id": report.scan_id,
+            "format": report.format,
+            "state": report.state,
+            "report_ref": report.report_ref,
+            "checksum": report.checksum,
+            "created_at": report.created_at.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "completed_at": None
+            if report.completed_at is None
+            else report.completed_at.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+        }
+
+    def create_report(self, context: AuthContext, body: dict, *, request_id: str) -> dict:
+        """Requirement 5: registers the completed scan's existing report
+        artifact as a first-class, durably-tracked entity -- it does not
+        render a new report body (Scanner v1's reporting format is
+        unchanged and frozen this slice); it persists metadata about the
+        artifact the scan already produced, plus a checksum computed
+        from the artifact's actual bytes via the injected
+        ``ArtifactStore`` (requirement 6), never a trusted client-
+        supplied value."""
+
+        self._require(
+            context, ApiPermission.REPORT_CREATE, request_id=request_id,
+            action="reports.create", resource_type="report", resource_id="-",
+        )
+        if not isinstance(body, dict) or not isinstance(body.get("scan_id"), str):
+            raise ApiServiceError(
+                "report_body_invalid", "Request body must include a string scan_id field.", status=400
+            )
+        scan_id = body["scan_id"]
+        try:
+            scan = self.scan_repository.get_scan_scoped(scan_id, organization_id=context.organization_id)
+        except ScanStoreError as exc:
+            self._audit(
+                context, request_id=request_id, action="reports.create", resource_type="scan",
+                resource_id=scan_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        if scan.completed_at is None or not scan.report_ref:
+            raise ApiServiceError(
+                "report_scan_not_completed", "A report can only be created for a completed scan.", status=409
+            )
+        try:
+            checksum = self.artifact_store.checksum(scan.report_ref)
+        except ArtifactStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        record = self.report_repository.create_report(
+            organization_id=context.organization_id,
+            scan_id=scan_id,
+            report_ref=scan.report_ref,
+            now=self.clock(),
+            format="json",
+            state="completed",
+            checksum=checksum,
+            completed_at=self.clock(),
+        )
+        self._audit(
+            context, request_id=request_id, action="reports.create", resource_type="report",
+            resource_id=record.report_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return self._report_public_dict(record)
+
+    def get_report(self, context: AuthContext, report_id: str, *, request_id: str) -> dict:
+        self._require(
+            context, ApiPermission.REPORT_READ, request_id=request_id,
+            action="reports.get", resource_type="report", resource_id=report_id,
+        )
+        try:
+            record = self.report_repository.get_report_scoped(report_id, organization_id=context.organization_id)
+        except ReportStoreError as exc:
+            self._audit(
+                context, request_id=request_id, action="reports.get", resource_type="report",
+                resource_id=report_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        self._audit(
+            context, request_id=request_id, action="reports.get", resource_type="report",
+            resource_id=report_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return self._report_public_dict(record)
+
+    def list_reports(self, context: AuthContext, page: PageRequest, *, request_id: str) -> dict:
+        self._require(
+            context, ApiPermission.REPORT_READ, request_id=request_id,
+            action="reports.list", resource_type="organization", resource_id=context.organization_id,
+        )
+        filters = page.filter_map
+        scan_id = filters.get("scan_id")
+        try:
+            records, has_more = self.report_repository.list_reports_scoped_page(
+                context.organization_id,
+                limit=page.limit,
+                after=self._decode_page(context, page, resource="reports"),
+                scan_id=scan_id,
+            )
+        except ReportStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        next_cursor = None
+        if has_more and records:
+            last = records[-1]
+            next_cursor = self._next_cursor(
+                context, page, resource="reports", ordered_at=last.created_at, resource_id=last.report_id,
+            )
+        self._audit(
+            context, request_id=request_id, action="reports.list", resource_type="organization",
+            resource_id=context.organization_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {
+            "reports": [self._report_public_dict(record) for record in records],
+            "page": self._page_payload(page.limit, next_cursor),
+        }
+
+    @staticmethod
+    def _scan_public_dict(scan) -> dict[str, object]:
+        def _ts(value):
+            return None if value is None else value.astimezone(timezone.utc).isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z")
+
+        return {
+            "scan_id": scan.scan_id,
+            "organization_id": scan.organization_id,
+            "job_id": scan.job_id,
+            "target": scan.target,
+            "authorization_id": scan.authorization_id,
+            "mode": scan.mode,
+            "status": scan.status,
+            "scanner_version": scan.scanner_version,
+            "permit_id": scan.permit_id,
+            "requested_checks": list(scan.requested_checks),
+            "finding_count": scan.finding_count,
+            "report_ref": scan.report_ref,
+            "cancellation_requested": scan.cancellation_requested,
+            "created_at": _ts(scan.created_at),
+            "started_at": _ts(scan.started_at),
+            "completed_at": _ts(scan.completed_at),
+            "cancelled_at": _ts(scan.cancelled_at),
+        }
+
+    def list_scans(self, context: AuthContext, page: PageRequest, *, request_id: str) -> dict:
+        """Requirement 11/12: scans are now a first-class listable
+        resource -- previously reachable only indirectly through a
+        job's own `scan_id`. Filterable by target/state, per
+        requirement 12's explicit list."""
+
+        self._require(
+            context, ApiPermission.JOB_READ, request_id=request_id,
+            action="scans.list", resource_type="organization", resource_id=context.organization_id,
+        )
+        filters = page.filter_map
+        target = filters.get("target")
+        status = filters.get("status")
+        try:
+            records, has_more = self.scan_repository.list_scans_scoped_page(
+                context.organization_id,
+                limit=page.limit,
+                after=self._decode_page(context, page, resource="scans"),
+                target=target,
+                status=status,
+            )
+        except ScanStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        next_cursor = None
+        if has_more and records:
+            last = records[-1]
+            next_cursor = self._next_cursor(
+                context, page, resource="scans", ordered_at=last.created_at, resource_id=last.scan_id,
+            )
+        self._audit(
+            context, request_id=request_id, action="scans.list", resource_type="organization",
+            resource_id=context.organization_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {
+            "scans": [self._scan_public_dict(record) for record in records],
+            "page": self._page_payload(page.limit, next_cursor),
+        }
+
+    def get_scan(self, context: AuthContext, scan_id: str, *, request_id: str) -> dict:
+        self._require(
+            context, ApiPermission.JOB_READ, request_id=request_id,
+            action="scans.get", resource_type="scan", resource_id=scan_id,
+        )
+        try:
+            record = self.scan_repository.get_scan_scoped(scan_id, organization_id=context.organization_id)
+        except ScanStoreError as exc:
+            self._audit(
+                context, request_id=request_id, action="scans.get", resource_type="scan",
+                resource_id=scan_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        self._audit(
+            context, request_id=request_id, action="scans.get", resource_type="scan",
+            resource_id=scan_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return self._scan_public_dict(record)
 
     def list_jobs(
         self,
@@ -1488,6 +1888,7 @@ class WebGuardJobService:
                 limit=page.limit,
                 after=self._decode_page(context, page, resource="schedules"),
                 state=state,
+                target=filters.get("target"),
             )
         except JobStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=500) from exc

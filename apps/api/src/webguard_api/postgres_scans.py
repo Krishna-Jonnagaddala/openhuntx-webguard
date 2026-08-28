@@ -127,5 +127,39 @@ class PostgresScanRepository:
             ).fetchall()
         return tuple(self._record_from_row(row) for row in rows)
 
+    def list_scans_scoped_page(
+        self,
+        organization_id: str,
+        *,
+        limit: int,
+        after: tuple[str, str] | None = None,
+        target: str | None = None,
+        status: str | None = None,
+    ) -> tuple[tuple[ScanRecord, ...], bool]:
+        clauses = ["organization_id = %s"]
+        parameters: list[object] = [organization_id]
+        if target is not None:
+            clauses.append("target = %s")
+            parameters.append(target)
+        if status is not None:
+            clauses.append("status = %s")
+            parameters.append(status)
+        if after is not None:
+            clauses.append("(created_at < %s OR (created_at = %s AND scan_id::text < %s))")
+            parameters.extend((after[0], after[0], after[1]))
+        parameters.append(limit + 1)
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_COLUMNS} FROM scan_records
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at DESC, scan_id DESC
+                LIMIT %s
+                """,  # noqa: S608
+                tuple(parameters),
+            ).fetchall()
+        has_more = len(rows) > limit
+        return tuple(self._record_from_row(row) for row in rows[:limit]), has_more
+
 
 __all__ = ["PostgresScanRepository"]

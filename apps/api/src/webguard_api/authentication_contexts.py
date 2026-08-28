@@ -73,6 +73,12 @@ class AuthenticationContextRecord:
     created_at: datetime
     expires_at: datetime
     revoked_at: datetime | None = None
+    # Slice 14 requirement 1: a pointer to where a SecretProvider should
+    # resolve real secret material -- never the secret itself. None in
+    # every local/dev/test/lab context (the in-memory repository below
+    # keeps the secret directly, keyed by this record's own ID) and in
+    # every context created before this field existed.
+    secret_reference_id: str | None = None
 
     def status_at(self, now: datetime) -> AuthenticationContextStatus:
         if self.revoked_at is not None:
@@ -192,6 +198,7 @@ class AuthenticationContextRepository:
                     created_at=record.created_at,
                     expires_at=record.expires_at,
                     revoked_at=now,
+                    secret_reference_id=record.secret_reference_id,
                 )
                 self._metadata[authentication_context_id] = record
         return record

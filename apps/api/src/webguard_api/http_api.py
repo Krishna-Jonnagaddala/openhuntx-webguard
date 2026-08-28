@@ -28,6 +28,10 @@ _SCHEDULE_PAUSE_PATH = re.compile(r"^/v1/schedules/([0-9a-f-]{36})/pause$")
 _SCHEDULE_RESUME_PATH = re.compile(r"^/v1/schedules/([0-9a-f-]{36})/resume$")
 _PERMIT_PATH = re.compile(r"^/v1/permits/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _FINDING_PATH = re.compile(r"^/v1/findings/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+_FINDING_STATUS_PATH = re.compile(r"^/v1/findings/([0-9a-f-]{36})/status$")
+_FINDING_EVENTS_PATH = re.compile(r"^/v1/findings/([0-9a-f-]{36})/events$")
+_REPORT_PATH = re.compile(r"^/v1/reports/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+_SCAN_PATH = re.compile(r"^/v1/scans/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _PERMIT_REVOKE_PATH = re.compile(r"^/v1/permits/([0-9a-f-]{36})/revoke$")
 _AUTHENTICATION_CONTEXT_REVOKE_PATH = re.compile(
     r"^/v1/authentication-contexts/([0-9a-f-]{36})/revoke$"
@@ -162,9 +166,12 @@ def build_handler(
             query: dict[str, tuple[str, ...]],
             *,
             filters: dict[str, frozenset[str]],
+            free_form_filters: frozenset[str] = frozenset(),
         ):
             try:
-                return parse_page_request(query, allowed_filters=filters)
+                return parse_page_request(
+                    query, allowed_filters=filters, free_form_filters=free_form_filters
+                )
             except PaginationError as exc:
                 raise ApiTransportError(exc.code, exc.message, status=400) from exc
 
@@ -416,6 +423,7 @@ def build_handler(
                     page = self._page_request(
                         query,
                         filters={"state": frozenset({"active", "paused"})},
+                        free_form_filters=frozenset({"target"}),
                     )
                     payload = service.list_schedules(
                         context, page, request_id=request_id
@@ -434,17 +442,61 @@ def build_handler(
                                     "reopened",
                                 }
                             ),
+                            "severity": frozenset(
+                                {"informational", "low", "medium", "high", "critical"}
+                            ),
                         },
+                        free_form_filters=frozenset({"scan_id", "cwe_id", "asset"}),
                     )
                     payload = service.list_findings(
                         context, page, request_id=request_id
                     )
+                elif path == "/v1/reports":
+                    page = self._page_request(query, filters={}, free_form_filters=frozenset({"scan_id"}))
+                    payload = service.list_reports(
+                        context, page, request_id=request_id
+                    )
+                elif path == "/v1/scans":
+                    page = self._page_request(
+                        query,
+                        filters={
+                            "status": frozenset(
+                                {
+                                    "queued",
+                                    "running",
+                                    "completed",
+                                    "completed_with_errors",
+                                    "failed",
+                                    "cancelled",
+                                }
+                            ),
+                        },
+                        free_form_filters=frozenset({"target"}),
+                    )
+                    payload = service.list_scans(
+                        context, page, request_id=request_id
+                    )
                 else:
                     self._require_empty_query(query)
+                    finding_events_match = _FINDING_EVENTS_PATH.fullmatch(path)
                     finding_match = _FINDING_PATH.fullmatch(path)
-                    if finding_match:
+                    report_match = _REPORT_PATH.fullmatch(path)
+                    scan_match = _SCAN_PATH.fullmatch(path)
+                    if finding_events_match:
+                        payload = service.list_finding_events(
+                            context, finding_events_match.group(1), request_id=request_id
+                        )
+                    elif finding_match:
                         payload = service.get_finding(
                             context, finding_match.group(1), request_id=request_id
+                        )
+                    elif report_match:
+                        payload = service.get_report(
+                            context, report_match.group(1), request_id=request_id
+                        )
+                    elif scan_match:
+                        payload = service.get_scan(
+                            context, scan_match.group(1), request_id=request_id
                         )
                     else:
                         permit_match = _PERMIT_PATH.fullmatch(path)
@@ -507,6 +559,43 @@ def build_handler(
                         payload,
                         request_id=request_id,
                         extra_headers=self._rate_headers(decision),
+                    )
+                    return
+                if path == "/v1/reports":
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "report_body_invalid", "Request body must be valid JSON.", status=400
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "report_body_invalid", "Request body must be a JSON object.", status=400
+                        )
+                    payload = service.create_report(context, body, request_id=request_id)
+                    self._send_json(
+                        201, payload, request_id=request_id, extra_headers=self._rate_headers(decision),
+                    )
+                    return
+                finding_status_match = _FINDING_STATUS_PATH.fullmatch(path)
+                if finding_status_match:
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "finding_status_body_invalid", "Request body must be valid JSON.", status=400
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "finding_status_body_invalid", "Request body must be a JSON object.", status=400
+                        )
+                    payload = service.update_finding_status(
+                        context, finding_status_match.group(1), body, request_id=request_id
+                    )
+                    self._send_json(
+                        200, payload, request_id=request_id, extra_headers=self._rate_headers(decision),
                     )
                     return
                 if path == "/v1/authentication-contexts":

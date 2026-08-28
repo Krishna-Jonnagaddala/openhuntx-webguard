@@ -79,6 +79,7 @@ from .finding_store import InMemoryFindingRepository
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .safety import TrustScanRuntimeSafetyEngine, TrustScanRuntimeSafetyError
 from .scan_store import InMemoryScanRepository
+from .secret_provider import LocalSecretProvider, SecretProvider, SecretProviderError
 from .repository_contracts import JobRepository
 from .store import JobStoreError
 
@@ -212,6 +213,7 @@ def _apply_active_detection(
     permit_fingerprint: str,
     authentication_context_id: str | None,
     authentication_contexts,
+    secret_provider: SecretProvider,
     fetch_policy: FetchPolicy,
     safety: TrustScanRuntimeSafetyEngine,
     cancellation_token: CrawlCancellationToken,
@@ -242,17 +244,17 @@ def _apply_active_detection(
     authentication_material = None
     if authentication_context_id is not None:
         try:
-            authentication_contexts.require_bound(
+            context_record = authentication_contexts.require_bound(
                 authentication_context_id,
                 organization_id=organization_id,
                 target=target.normalised_url,
                 authorization_id=authorization_id,
                 now=safety.clock(),
             )
-            authentication_material = authentication_contexts.get_secret(
-                authentication_context_id
+            authentication_material = secret_provider.resolve(
+                context_record.secret_reference_id or authentication_context_id
             )
-        except AuthenticationContextError as exc:
+        except (AuthenticationContextError, SecretProviderError) as exc:
             raise TrustScanRuntimeSafetyError(exc.code, exc.message) from exc
 
     detectors = [
@@ -575,6 +577,7 @@ def _apply_authorization_comparison(
     comparison_plan_id: str | None,
     authorization_comparison_plans: AuthorizationComparisonPlanRepository,
     authentication_contexts: AuthenticationContextRepository,
+    secret_provider: SecretProvider,
     fetch_policy: FetchPolicy,
     safety: TrustScanRuntimeSafetyEngine,
     cancellation_token: CrawlCancellationToken,
@@ -622,34 +625,32 @@ def _apply_authorization_comparison(
             authorization_id=authorization_id,
             now=safety.clock(),
         )
-        authentication_contexts.require_bound(
+        primary_context_record = authentication_contexts.require_bound(
             plan.primary_context_id,
             organization_id=organization_id,
             target=target.normalised_url,
             authorization_id=authorization_id,
             now=safety.clock(),
         )
-        authentication_contexts.require_bound(
+        secondary_context_record = authentication_contexts.require_bound(
             plan.secondary_context_id,
             organization_id=organization_id,
             target=target.normalised_url,
             authorization_id=authorization_id,
             now=safety.clock(),
         )
-        primary_material = authentication_contexts.get_secret(plan.primary_context_id)
-        secondary_material = authentication_contexts.get_secret(
-            plan.secondary_context_id
+        primary_material = secret_provider.resolve(
+            primary_context_record.secret_reference_id or plan.primary_context_id
+        )
+        secondary_material = secret_provider.resolve(
+            secondary_context_record.secret_reference_id or plan.secondary_context_id
         )
         # Identity *labels* (never secret material) come from each
         # context's own metadata record -- the same non-sensitive label
         # an operator chose when registering that identity.
-        primary_identity_label = authentication_contexts.get_metadata(
-            plan.primary_context_id
-        ).identity_label
-        secondary_identity_label = authentication_contexts.get_metadata(
-            plan.secondary_context_id
-        ).identity_label
-    except (AuthorizationComparisonError, AuthenticationContextError) as exc:
+        primary_identity_label = primary_context_record.identity_label
+        secondary_identity_label = secondary_context_record.identity_label
+    except (AuthorizationComparisonError, AuthenticationContextError, SecretProviderError) as exc:
         raise TrustScanRuntimeSafetyError(exc.code, exc.message) from exc
 
     resource_pairs = list(
@@ -806,6 +807,7 @@ def _apply_ssrf_callback_detection(
     permit_fingerprint: str,
     authentication_context_id: str | None,
     authentication_contexts: AuthenticationContextRepository,
+    secret_provider: SecretProvider,
     callback_repository: CallbackRepository,
     fetch_policy: FetchPolicy,
     safety: TrustScanRuntimeSafetyEngine,
@@ -848,17 +850,17 @@ def _apply_ssrf_callback_detection(
     authentication_material = None
     if authentication_context_id is not None:
         try:
-            authentication_contexts.require_bound(
+            context_record = authentication_contexts.require_bound(
                 authentication_context_id,
                 organization_id=organization_id,
                 target=target.normalised_url,
                 authorization_id=authorization_id,
                 now=safety.clock(),
             )
-            authentication_material = authentication_contexts.get_secret(
-                authentication_context_id
+            authentication_material = secret_provider.resolve(
+                context_record.secret_reference_id or authentication_context_id
             )
-        except AuthenticationContextError as exc:
+        except (AuthenticationContextError, SecretProviderError) as exc:
             raise TrustScanRuntimeSafetyError(exc.code, exc.message) from exc
 
     response = fetch_same_origin_page(
@@ -948,6 +950,7 @@ class ScanJobExecutor:
         callback_repository: CallbackRepository | None = None,
         scan_repository=None,
         finding_repository=None,
+        secret_provider: SecretProvider | None = None,
     ) -> None:
         self.authorizations = authorizations
         self.store = store
@@ -1001,6 +1004,19 @@ class ScanJobExecutor:
         )
         self.finding_repository = (
             finding_repository if finding_repository is not None else InMemoryFindingRepository()
+        )
+        # Slice 14 requirement 1: secret resolution goes through one
+        # provider-neutral interface, mirroring TrustScanSigner/
+        # SigningProvider (signing.py). Defaulted to a local adapter
+        # over whatever `authentication_contexts` repository this
+        # executor holds -- unchanged local/dev/test/lab behavior when
+        # that repository is the in-memory one (it has `get_secret`);
+        # fails closed, not silently, if it is the PostgreSQL metadata-
+        # only repository and no real provider was explicitly injected.
+        self.secret_provider = (
+            secret_provider
+            if secret_provider is not None
+            else LocalSecretProvider(self.authentication_contexts)
         )
 
     def _policies(self, authorization, permit, mode: ScanJobMode):
@@ -1327,6 +1343,7 @@ class ScanJobExecutor:
                 permit_fingerprint=permit.permit.fingerprint,
                 authentication_context_id=permit.permit.claims.authentication_context_id,
                 authentication_contexts=self.authentication_contexts,
+                secret_provider=self.secret_provider,
                 fetch_policy=fetch_policy,
                 safety=safety,
                 cancellation_token=token,
@@ -1343,6 +1360,7 @@ class ScanJobExecutor:
                 comparison_plan_id=permit.permit.claims.authorization_comparison_plan_id,
                 authorization_comparison_plans=self.authorization_comparison_plans,
                 authentication_contexts=self.authentication_contexts,
+                secret_provider=self.secret_provider,
                 fetch_policy=fetch_policy,
                 safety=safety,
                 cancellation_token=token,
@@ -1358,6 +1376,7 @@ class ScanJobExecutor:
                 permit_fingerprint=permit.permit.fingerprint,
                 authentication_context_id=permit.permit.claims.authentication_context_id,
                 authentication_contexts=self.authentication_contexts,
+                secret_provider=self.secret_provider,
                 callback_repository=self.callback_repository,
                 fetch_policy=fetch_policy,
                 safety=safety,

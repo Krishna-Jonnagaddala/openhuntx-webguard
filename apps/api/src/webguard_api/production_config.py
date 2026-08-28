@@ -103,6 +103,18 @@ class ProductionServiceConfig:
     port: int = DEFAULT_PORT
     database_pool_minimum: int = DEFAULT_DATABASE_POOL_MINIMUM
     database_pool_maximum: int = DEFAULT_DATABASE_POOL_MAXIMUM
+    # Slice 14 requirement 1: deliberately optional, unlike every field
+    # above. Most production deployments never use authenticated
+    # scanning at all; requiring a secret provider unconditionally would
+    # fail closed on deployments that have no use for one. Instead,
+    # resolution itself fails closed at the moment an authenticated scan
+    # actually needs a secret and none is configured (see
+    # `secret_provider.py`'s `LocalSecretProvider` -- the production
+    # runtime's `authentication_contexts` repository has no local
+    # secret storage to silently fall back to). When set, it is
+    # constrained to one accepted value for the same typo-safety reason
+    # `signing_provider` is.
+    secret_provider: str | None = None
 
     def __post_init__(self) -> None:
         if self.environment != "production":
@@ -154,6 +166,11 @@ class ProductionServiceConfig:
             raise ProductionConfigError(
                 "production_config_missing",
                 "artifact_directory is required for a production deployment.",
+            )
+        if self.secret_provider is not None and self.secret_provider != "aws_secrets_manager":  # noqa: S105 - a provider-selector enum value, not a credential
+            raise ProductionConfigError(
+                "production_config_secret_provider_invalid",
+                'secret_provider must be unset or exactly "aws_secrets_manager".',
             )
         try:
             decoded_cursor_secret = base64.urlsafe_b64decode(
@@ -244,6 +261,7 @@ class ProductionServiceConfig:
             port=int(os.environ.get("WEBGUARD_PORT", str(DEFAULT_PORT))),
             database_pool_minimum=pool_minimum,
             database_pool_maximum=pool_maximum,
+            secret_provider=os.environ.get("WEBGUARD_SECRET_PROVIDER") or None,
         )
 
 

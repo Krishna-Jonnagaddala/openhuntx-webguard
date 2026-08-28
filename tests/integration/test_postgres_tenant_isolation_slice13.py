@@ -255,7 +255,9 @@ class Slice13TenantIsolationTests(unittest.TestCase):
             reports.get_report_scoped(str(uuid4()), organization_id=self.org_b.organization_id)
         self.assertEqual(cross_org.exception.code, "report_not_found")
         self.assertEqual(unknown.exception.code, "report_not_found")
-        self.assertEqual(reports.list_reports_scoped(self.org_b.organization_id), ())
+        records, has_more = reports.list_reports_scoped_page(self.org_b.organization_id, limit=10)
+        self.assertEqual(records, ())
+        self.assertFalse(has_more)
 
 
 if __name__ == "__main__":

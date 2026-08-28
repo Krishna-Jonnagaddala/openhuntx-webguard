@@ -21,7 +21,13 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from .db_errors import DatabaseIntegrityError
-from .finding_store import FindingRecord, FindingStatus, FindingStoreError, assert_valid_transition
+from .finding_store import (
+    FindingEventRecord,
+    FindingRecord,
+    FindingStatus,
+    FindingStoreError,
+    assert_valid_transition,
+)
 from .postgres_pool import WebGuardPostgresPool
 
 _COLUMNS = (
@@ -94,6 +100,10 @@ class PostgresFindingRepository:
     ) -> FindingRecord:
         finding_id = str(uuid4())
         with self._pool.connection() as connection:
+            existing = connection.execute(
+                "SELECT status FROM findings WHERE organization_id = %s AND fingerprint = %s",
+                (organization_id, fingerprint),
+            ).fetchone()
             row = connection.execute(
                 f"""
                 INSERT INTO findings (
@@ -146,7 +156,28 @@ class PostgresFindingRepository:
                     "references_list": json.dumps(list(references)),
                 },
             ).fetchone()
-        return self._record_from_row(row)
+            record = self._record_from_row(row)
+            if existing is not None:
+                previous_status = FindingStatus(existing[0])
+                if record.status is not previous_status:
+                    # Requirement 10: the one scanner-driven history
+                    # entry, in the same transaction as the upsert above
+                    # so the event can never exist without the status
+                    # change it describes, or vice versa.
+                    connection.execute(
+                        """
+                        INSERT INTO finding_events (
+                            event_id, finding_id, organization_id, previous_status,
+                            new_status, reason, changed_by, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            str(uuid4()), record.finding_id, organization_id,
+                            previous_status.value, record.status.value,
+                            "Re-detected on a subsequent scan.", None, now,
+                        ),
+                    )
+        return record
 
     def get_finding_scoped(self, finding_id: str, *, organization_id: str) -> FindingRecord:
         with self._pool.connection() as connection:
@@ -166,6 +197,9 @@ class PostgresFindingRepository:
         after: tuple[str, str] | None = None,
         scan_id: str | None = None,
         status: FindingStatus | None = None,
+        severity: str | None = None,
+        cwe_id: str | None = None,
+        asset: str | None = None,
     ) -> tuple[tuple[FindingRecord, ...], bool]:
         clauses = ["organization_id = %s"]
         parameters: list[object] = [organization_id]
@@ -175,6 +209,15 @@ class PostgresFindingRepository:
         if status is not None:
             clauses.append("status = %s")
             parameters.append(status.value)
+        if severity is not None:
+            clauses.append("severity = %s")
+            parameters.append(severity)
+        if cwe_id is not None:
+            clauses.append("cwe_id = %s")
+            parameters.append(cwe_id)
+        if asset is not None:
+            clauses.append("asset = %s")
+            parameters.append(asset)
         if after is not None:
             clauses.append("(last_seen_at < %s OR (last_seen_at = %s AND finding_id::text < %s))")
             parameters.extend((after[0], after[0], after[1]))
@@ -193,16 +236,30 @@ class PostgresFindingRepository:
         return tuple(self._record_from_row(row) for row in rows[:limit]), has_more
 
     def update_status(
-        self, finding_id: str, *, organization_id: str, new_status: FindingStatus, now: datetime
+        self,
+        finding_id: str,
+        *,
+        organization_id: str,
+        new_status: FindingStatus,
+        now: datetime,
+        reason: str | None = None,
+        changed_by: str | None = None,
     ) -> FindingRecord:
         with self._pool.connection() as connection:
             row = connection.execute(
-                f"SELECT status FROM findings WHERE finding_id = %s AND organization_id = %s",  # noqa: S608
+                "SELECT status FROM findings WHERE finding_id = %s AND organization_id = %s",
                 (finding_id, organization_id),
             ).fetchone()
             if row is None:
                 raise FindingStoreError("finding_not_found", "Finding was not found.")
-            assert_valid_transition(FindingStatus(row[0]), new_status)
+            current_status = FindingStatus(row[0])
+            if new_status is current_status:
+                # Requirement 9: idempotent where appropriate.
+                current = connection.execute(
+                    f"SELECT {_COLUMNS} FROM findings WHERE finding_id = %s", (finding_id,)  # noqa: S608
+                ).fetchone()
+                return self._record_from_row(current)
+            assert_valid_transition(current_status, new_status)
             updated = connection.execute(
                 f"""
                 UPDATE findings SET status = %s
@@ -211,7 +268,51 @@ class PostgresFindingRepository:
                 """,  # noqa: S608
                 (new_status.value, finding_id, organization_id),
             ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO finding_events (
+                    event_id, finding_id, organization_id, previous_status,
+                    new_status, reason, changed_by, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    str(uuid4()), finding_id, organization_id, current_status.value,
+                    new_status.value, reason, changed_by, now,
+                ),
+            )
         return self._record_from_row(updated)
+
+    def list_events_scoped(
+        self, finding_id: str, *, organization_id: str
+    ) -> tuple[FindingEventRecord, ...]:
+        with self._pool.connection() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM findings WHERE finding_id = %s AND organization_id = %s",
+                (finding_id, organization_id),
+            ).fetchone()
+            if exists is None:
+                raise FindingStoreError("finding_not_found", "Finding was not found.")
+            rows = connection.execute(
+                """
+                SELECT event_id, finding_id, organization_id, previous_status,
+                       new_status, reason, changed_by, created_at
+                FROM finding_events WHERE finding_id = %s ORDER BY created_at
+                """,
+                (finding_id,),
+            ).fetchall()
+        return tuple(
+            FindingEventRecord(
+                event_id=str(r[0]),
+                finding_id=str(r[1]),
+                organization_id=str(r[2]),
+                previous_status=FindingStatus(r[3]),
+                new_status=FindingStatus(r[4]),
+                reason=r[5],
+                changed_by=str(r[6]) if r[6] else None,
+                created_at=r[7].astimezone(timezone.utc),
+            )
+            for r in rows
+        )
 
 
 __all__ = ["PostgresFindingRepository"]

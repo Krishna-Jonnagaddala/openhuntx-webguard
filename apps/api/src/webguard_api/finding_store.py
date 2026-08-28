@@ -88,6 +88,25 @@ class FindingStoreError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class FindingEventRecord:
+    """One append-only lifecycle transition (Slice 14 requirement 10).
+    Never updated or deleted -- a wrong entry is corrected by appending
+    a new one, never by rewriting this one. ``changed_by`` is a
+    principal ID for an operator-driven transition, or ``None`` for the
+    one scanner-driven transition (``RESOLVED`` -> ``REOPENED`` on
+    re-detection)."""
+
+    event_id: str
+    finding_id: str
+    organization_id: str
+    previous_status: FindingStatus
+    new_status: FindingStatus
+    created_at: datetime
+    reason: str | None = None
+    changed_by: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class FindingRecord:
     finding_id: str
     organization_id: str
@@ -131,6 +150,7 @@ class InMemoryFindingRepository:
         self._lock = threading.Lock()
         self._by_key: dict[tuple[str, str], FindingRecord] = {}
         self._by_id: dict[str, FindingRecord] = {}
+        self._events: list[FindingEventRecord] = []
 
     def record_finding(
         self,
@@ -200,6 +220,19 @@ class InMemoryFindingRepository:
                     check_version=check_version,
                     evidence=evidence,
                 )
+                if new_status is not existing.status:
+                    self._events.append(
+                        FindingEventRecord(
+                            event_id=str(uuid4()),
+                            finding_id=record.finding_id,
+                            organization_id=organization_id,
+                            previous_status=existing.status,
+                            new_status=new_status,
+                            created_at=now,
+                            reason="Re-detected on a subsequent scan.",
+                            changed_by=None,
+                        )
+                    )
             self._by_key[key] = record
             self._by_id[record.finding_id] = record
         return record
@@ -219,6 +252,9 @@ class InMemoryFindingRepository:
         after: tuple[str, str] | None = None,
         scan_id: str | None = None,
         status: FindingStatus | None = None,
+        severity: str | None = None,
+        cwe_id: str | None = None,
+        asset: str | None = None,
     ) -> tuple[tuple[FindingRecord, ...], bool]:
         with self._lock:
             values = [r for r in self._by_id.values() if r.organization_id == organization_id]
@@ -226,6 +262,12 @@ class InMemoryFindingRepository:
             values = [r for r in values if r.scan_id == scan_id]
         if status is not None:
             values = [r for r in values if r.status is status]
+        if severity is not None:
+            values = [r for r in values if r.severity == severity]
+        if cwe_id is not None:
+            values = [r for r in values if r.cwe_id == cwe_id]
+        if asset is not None:
+            values = [r for r in values if r.asset == asset]
         values.sort(key=lambda r: (r.last_seen_at, r.finding_id), reverse=True)
         if after is not None:
             values = [
@@ -243,19 +285,49 @@ class InMemoryFindingRepository:
         organization_id: str,
         new_status: FindingStatus,
         now: datetime,
+        reason: str | None = None,
+        changed_by: str | None = None,
     ) -> FindingRecord:
         with self._lock:
             record = self._by_id.get(finding_id)
             if record is None or record.organization_id != organization_id:
                 raise FindingStoreError("finding_not_found", "Finding was not found.")
+            if new_status is record.status:
+                # Requirement 9: idempotent where appropriate -- a retry
+                # of the identical transition is a no-op success, not a
+                # rejected transition and not a duplicate history entry.
+                return record
             assert_valid_transition(record.status, new_status)
             updated = replace(record, status=new_status)
             self._by_id[finding_id] = updated
             self._by_key[(organization_id, record.fingerprint)] = updated
+            self._events.append(
+                FindingEventRecord(
+                    event_id=str(uuid4()),
+                    finding_id=finding_id,
+                    organization_id=organization_id,
+                    previous_status=record.status,
+                    new_status=new_status,
+                    created_at=now,
+                    reason=reason,
+                    changed_by=changed_by,
+                )
+            )
         return updated
+
+    def list_events_scoped(
+        self, finding_id: str, *, organization_id: str
+    ) -> tuple[FindingEventRecord, ...]:
+        with self._lock:
+            record = self._by_id.get(finding_id)
+            if record is None or record.organization_id != organization_id:
+                raise FindingStoreError("finding_not_found", "Finding was not found.")
+            events = [e for e in self._events if e.finding_id == finding_id]
+        return tuple(sorted(events, key=lambda e: e.created_at))
 
 
 __all__ = [
+    "FindingEventRecord",
     "FindingRecord",
     "FindingStatus",
     "FindingStoreError",

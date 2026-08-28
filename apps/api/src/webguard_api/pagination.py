@@ -304,14 +304,31 @@ class SignedCursorCodec:
         return CursorPosition(ordered_at=ordered_at, resource_id=resource_id)
 
 
+_MAXIMUM_FREE_FORM_FILTER_VALUE_LENGTH = 2048
+_CONTROL_CHARACTERS = frozenset(chr(code) for code in range(0x20)) | {chr(0x7F)}
+
+
 def parse_page_request(
     query: Mapping[str, tuple[str, ...]],
     *,
     allowed_filters: Mapping[str, frozenset[str]],
+    free_form_filters: frozenset[str] = frozenset(),
 ) -> PageRequest:
-    """Validate unique list query parameters and canonicalize filters."""
+    """Validate unique list query parameters and canonicalize filters.
 
-    allowed = {"limit", "cursor", *allowed_filters}
+    ``allowed_filters`` is for closed-enum filters (e.g. ``status``,
+    restricted to a fixed, named set of accepted values).
+    ``free_form_filters`` (Slice 14 requirement 12) is for filters whose
+    legitimate values cannot be enumerated in advance -- a scan ID, a
+    CWE identifier, a target URL -- accepted as any bounded, control-
+    character-free string rather than rejected for not appearing in a
+    hardcoded set. Both go through the identical canonical (key, value)
+    tuple shape, so the signed-cursor binding below treats them
+    identically: any filter, of either kind, changing between the
+    cursor's issuance and its use fails closed exactly the same way.
+    """
+
+    allowed = {"limit", "cursor", *allowed_filters, *free_form_filters}
     unknown = set(query) - allowed
     if unknown:
         raise PaginationError(
@@ -351,6 +368,19 @@ def parse_page_request(
                 f"Query parameter {name!r} has an unsupported value.",
             )
         filters.append((name, value))
+    for name in sorted(free_form_filters):
+        if name not in values:
+            continue
+        value = values.pop(name)
+        if len(value) > _MAXIMUM_FREE_FORM_FILTER_VALUE_LENGTH or any(
+            char in _CONTROL_CHARACTERS for char in value
+        ):
+            raise PaginationError(
+                "page_filter_invalid",
+                f"Query parameter {name!r} has an unsupported value.",
+            )
+        filters.append((name, value))
+    filters.sort(key=lambda item: item[0])
     cursor = values.pop("cursor", None)
     if values:
         raise PaginationError(

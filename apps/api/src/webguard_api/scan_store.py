@@ -125,5 +125,28 @@ class InMemoryScanRepository:
             values = [r for r in self._scans.values() if r.organization_id == organization_id]
         return tuple(sorted(values, key=lambda r: r.created_at, reverse=True))
 
+    def list_scans_scoped_page(
+        self,
+        organization_id: str,
+        *,
+        limit: int,
+        after: tuple[str, str] | None = None,
+        target: str | None = None,
+        status: str | None = None,
+    ) -> tuple[tuple[ScanRecord, ...], bool]:
+        with self._lock:
+            values = [r for r in self._scans.values() if r.organization_id == organization_id]
+        if target is not None:
+            values = [r for r in values if r.target == target]
+        if status is not None:
+            values = [r for r in values if r.status == status]
+        values.sort(key=lambda r: (r.created_at, r.scan_id), reverse=True)
+        if after is not None:
+            values = [
+                r for r in values if (r.created_at.isoformat(), r.scan_id) < (after[0], after[1])
+            ]
+        has_more = len(values) > limit
+        return tuple(values[:limit]), has_more
+
 
 __all__ = ["InMemoryScanRepository", "ScanRecord", "ScanStoreError"]

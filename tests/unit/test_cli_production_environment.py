@@ -44,13 +44,24 @@ class _FakeWorker:
         self.run_forever_called_with = stop_event
 
 
+class _FakeScheduleRunSummary:
+    inspected = 0
+    enqueued = 0
+    blocked = 0
+    raced = 0
+
+
 class _FakeScheduler:
     def __init__(self) -> None:
         self.poll_seconds = 5.0
+        self.batch_size = 100
         self.run_forever_called = False
 
     def run_forever(self, stop_event: object) -> None:
         self.run_forever_called = True
+
+    def run_once(self) -> _FakeScheduleRunSummary:
+        return _FakeScheduleRunSummary()
 
 
 class _FakePool:
@@ -64,6 +75,7 @@ class _FakePool:
 class _FakeProductionComponents:
     def __init__(self) -> None:
         self.worker = _FakeWorker()
+        self.scheduler = _FakeScheduler()
         self.pool = _FakePool()
         self.service = object()
         self.authenticator = object()
@@ -120,17 +132,21 @@ class ProductionEnvironmentSelectionTests(unittest.TestCase):
         production_call.assert_not_called()
         self.assertTrue(fake_worker.run_once_called)
 
-    def test_scheduler_command_production_environment_fails_closed(self) -> None:
-        with patch.object(cli, "_production_components") as production_call, patch.object(
-            cli, "_components"
-        ) as local_call:
+    def test_scheduler_command_production_environment_uses_production_components(self) -> None:
+        fake_config = SimpleNamespace(host="127.0.0.1", port=8765)
+        fake_components = _FakeProductionComponents()
+
+        with patch.object(
+            cli, "_production_components", return_value=(fake_config, fake_components)
+        ) as production_call, patch.object(cli, "_components") as local_call:
             exit_code = cli._scheduler_command(_args("scheduler", environment="production", once=True))
 
-        self.assertEqual(exit_code, cli.EXIT_USAGE)
-        production_call.assert_not_called()
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        production_call.assert_called_once()
         local_call.assert_not_called()
+        self.assertTrue(fake_components.pool.closed, "the PostgreSQL pool must be closed on exit")
 
-    def test_serve_command_production_environment_skips_scheduler_and_closes_pool(self) -> None:
+    def test_serve_command_production_environment_starts_scheduler_and_closes_pool(self) -> None:
         fake_config = SimpleNamespace(host="127.0.0.1", port=8765)
         fake_components = _FakeProductionComponents()
         fake_server = _FakeServer()
@@ -147,6 +163,7 @@ class ProductionEnvironmentSelectionTests(unittest.TestCase):
         local_call.assert_not_called()
         self.assertTrue(fake_server.served)
         self.assertIsNotNone(fake_components.worker.run_forever_called_with)
+        self.assertTrue(fake_components.scheduler.run_forever_called)
         self.assertTrue(fake_components.pool.closed)
 
     def test_serve_command_default_environment_starts_scheduler(self) -> None:

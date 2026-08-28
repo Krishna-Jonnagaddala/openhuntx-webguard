@@ -35,6 +35,7 @@ class ReportRecord:
     report_ref: str
     created_at: datetime
     checksum: str | None = None
+    completed_at: datetime | None = None
 
 
 class InMemoryReportRepository:
@@ -53,6 +54,7 @@ class InMemoryReportRepository:
         state: str = "generated",
         checksum: str | None = None,
         report_id: str | None = None,
+        completed_at: datetime | None = None,
     ) -> ReportRecord:
         record = ReportRecord(
             report_id=str(uuid4()) if report_id is None else report_id,
@@ -63,6 +65,7 @@ class InMemoryReportRepository:
             report_ref=report_ref,
             created_at=now,
             checksum=checksum,
+            completed_at=completed_at,
         )
         with self._lock:
             self._reports[record.report_id] = record
@@ -75,10 +78,25 @@ class InMemoryReportRepository:
             raise ReportStoreError("report_not_found", "Report was not found.")
         return record
 
-    def list_reports_scoped(self, organization_id: str) -> tuple[ReportRecord, ...]:
+    def list_reports_scoped_page(
+        self,
+        organization_id: str,
+        *,
+        limit: int,
+        after: tuple[str, str] | None = None,
+        scan_id: str | None = None,
+    ) -> tuple[tuple[ReportRecord, ...], bool]:
         with self._lock:
             values = [r for r in self._reports.values() if r.organization_id == organization_id]
-        return tuple(sorted(values, key=lambda r: r.created_at, reverse=True))
+        if scan_id is not None:
+            values = [r for r in values if r.scan_id == scan_id]
+        values.sort(key=lambda r: (r.created_at, r.report_id), reverse=True)
+        if after is not None:
+            values = [
+                r for r in values if (r.created_at.isoformat(), r.report_id) < (after[0], after[1])
+            ]
+        has_more = len(values) > limit
+        return tuple(values[:limit]), has_more
 
 
 __all__ = ["InMemoryReportRepository", "ReportRecord", "ReportStoreError"]

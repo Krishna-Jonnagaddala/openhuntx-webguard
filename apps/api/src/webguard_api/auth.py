@@ -33,6 +33,9 @@ class ApiPermission(str, Enum):
     AUTHORIZATION_COMPARISON_READ = "authorization_comparisons.read"
     AUTHORIZATION_COMPARISON_REVOKE = "authorization_comparisons.revoke"
     FINDING_READ = "findings.read"
+    FINDING_UPDATE = "findings.update"
+    REPORT_CREATE = "reports.create"
+    REPORT_READ = "reports.read"
 
 
 _ROLE_PERMISSIONS = {
@@ -61,6 +64,9 @@ _ROLE_PERMISSIONS = {
             ApiPermission.SCHEDULE_UPDATE,
             ApiPermission.PERMIT_READ,
             ApiPermission.FINDING_READ,
+            ApiPermission.FINDING_UPDATE,
+            ApiPermission.REPORT_CREATE,
+            ApiPermission.REPORT_READ,
         }
     ),
     OrganizationRole.VIEWER: frozenset(
@@ -69,6 +75,7 @@ _ROLE_PERMISSIONS = {
             ApiPermission.SCHEDULE_READ,
             ApiPermission.PERMIT_READ,
             ApiPermission.FINDING_READ,
+            ApiPermission.REPORT_READ,
         }
     ),
 }

@@ -144,16 +144,26 @@ def _production_components() -> tuple[ProductionServiceConfig, ProductionCompone
     requirement 1): selected explicitly via `--environment production`
     / `WEBGUARD_ENVIRONMENT=production`, never inferred. `boto3` is
     imported here, at the one call site that actually needs a real AWS
-    KMS client, and nowhere else in this package -- see
+    KMS/Secrets-Manager client, and nowhere else in this package -- see
     `production_startup.py`'s module docstring for why it is not a
-    package-level dependency."""
+    package-level dependency. A Secrets Manager client is constructed
+    only when `secret_provider` was actually configured (Slice 14
+    requirement 1) -- most deployments never use authenticated scanning
+    and should not need AWS Secrets Manager credentials to start."""
 
     config = ProductionServiceConfig.from_environment()
 
     import boto3
 
     kms_client = boto3.client("kms")
-    components = build_production_components(config, kms_client=kms_client)
+    secrets_manager_client = (
+        boto3.client("secretsmanager")
+        if config.secret_provider == "aws_secrets_manager"  # noqa: S105 - a provider-selector enum value, not a credential
+        else None
+    )
+    components = build_production_components(
+        config, kms_client=kms_client, secrets_manager_client=secrets_manager_client
+    )
     return config, components
 
 
@@ -507,40 +517,42 @@ def _worker_command(args: argparse.Namespace) -> int:
 
 def _scheduler_command(args: argparse.Namespace) -> int:
     environment = _resolve_environment(args)
+    pool = None
     if environment is Environment.PRODUCTION:
+        _, components = _production_components()
+        scheduler = components.scheduler
+        pool = components.pool
+    else:
+        config = _config(args)
+        _, _, _, _, scheduler, _, _ = _components(config)
+    try:
+        if args.once:
+            summary = scheduler.run_once()
+            print(
+                "Schedule pass: "
+                f"inspected={summary.inspected}, enqueued={summary.enqueued}, "
+                f"blocked={summary.blocked}, raced={summary.raced}."
+            )
+            return EXIT_SUCCESS
+        stop_event = threading.Event()
+
+        def request_stop(_signum: int, _frame: object) -> None:
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGTERM, request_stop)
         print(
-            "Recurring-schedule execution is not wired to PostgreSQL "
-            "in this release: POSTGRES_REPOSITORY_READY, "
-            "LIVE_RUNTIME_WIRING_DEFERRED (Slice 13). Run the scheduler "
-            "against a non-production environment instead.",
-            file=sys.stderr,
+            "WebGuard scheduler started "
+            f"(environment={environment.value}): "
+            f"poll={scheduler.poll_seconds:g}s; batch={scheduler.batch_size}."
         )
-        return EXIT_USAGE
-    config = _config(args)
-    _, _, _, _, scheduler, _, _ = _components(config)
-    if args.once:
-        summary = scheduler.run_once()
-        print(
-            "Schedule pass: "
-            f"inspected={summary.inspected}, enqueued={summary.enqueued}, "
-            f"blocked={summary.blocked}, raced={summary.raced}."
-        )
+        print("Press Ctrl+C to stop.")
+        scheduler.run_forever(stop_event)
+        print("WebGuard scheduler stopped.")
         return EXIT_SUCCESS
-    stop_event = threading.Event()
-
-    def request_stop(_signum: int, _frame: object) -> None:
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, request_stop)
-    signal.signal(signal.SIGTERM, request_stop)
-    print(
-        "WebGuard scheduler started: "
-        f"poll={scheduler.poll_seconds:g}s; batch={scheduler.batch_size}."
-    )
-    print("Press Ctrl+C to stop.")
-    scheduler.run_forever(stop_event)
-    print("WebGuard scheduler stopped.")
-    return EXIT_SUCCESS
+    finally:
+        if pool is not None:
+            pool.close()
 
 
 def _serve_command(args: argparse.Namespace) -> int:
@@ -551,16 +563,16 @@ def _serve_command(args: argparse.Namespace) -> int:
         # Requirement 1: production selection is explicit
         # (--environment / WEBGUARD_ENVIRONMENT), never inferred, and
         # fails closed via ProductionServiceConfig.from_environment()
-        # if required settings are missing. Requirement 5/11: schedules
-        # are POSTGRES_REPOSITORY_READY but LIVE_RUNTIME_WIRING_DEFERRED
-        # this slice, so no scheduler thread is started in production --
-        # running one against SQLite while claiming production would be
-        # the silent, dishonest fallback this project explicitly rejects.
+        # if required settings are missing. Slice 14 requirement 3:
+        # schedule materialization is now live against PostgreSQL, so
+        # production starts a real scheduler thread here, the same way
+        # local/lab mode always has.
         production_config, components = _production_components()
         host, port = production_config.host, production_config.port
         maximum_request_bytes = DEFAULT_API_MAXIMUM_REQUEST_BYTES
         service = components.service
         worker = components.worker
+        scheduler = components.scheduler
         authenticator = components.authenticator
         limiter = components.rate_limiter
         pool = components.pool

@@ -1,19 +1,18 @@
 """PostgreSQL-backed authentication-context metadata repository (Slice
-13 requirement 9).
-
-Status: POSTGRES_REPOSITORY_READY, LIVE_RUNTIME_WIRING_DEFERRED.
+13 requirement 9; live-wired into the production runtime in Slice 14
+requirement 1).
 
 Metadata only -- this class has no ``get_secret`` method and no
 parameter anywhere that accepts raw credential material (password,
-bearer token, API secret, session cookie). ``create()`` takes an
-optional ``secret_reference_id`` -- a pointer to wherever the actual
-secret will eventually live (a future KMS/secrets-manager key name) --
-never the secret itself. No such production secret store exists yet;
-every call in this codebase today passes ``secret_reference_id=None``,
-and that is the honest, correct state until one is built (see this
-slice's audit doc). The in-memory ``AuthenticationContextRepository``
-(``authentication_contexts.py``) remains the only place actual secret
-material is ever held, unchanged and untouched by this class.
+bearer token, API secret, session cookie), and never will. ``create()``
+takes an optional ``secret_reference_id`` -- a pointer to wherever the
+actual secret lives -- never the secret itself. Resolving that
+reference into real ``AuthenticationMaterial`` is ``secret_provider.py``'s
+job, not this class's; see that module for the production
+(``SecretsManagerSecretProvider``) and local (``LocalSecretProvider``)
+implementations. The in-memory ``AuthenticationContextRepository``
+(``authentication_contexts.py``) remains the local/dev/test/lab
+backend, unchanged and untouched by this class.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ from .postgres_pool import WebGuardPostgresPool
 
 _COLUMNS = (
     "authentication_context_id, organization_id, target, authorization_id, "
-    "identity_label, method, created_at, expires_at, revoked_at"
+    "identity_label, method, created_at, expires_at, revoked_at, secret_reference_id"
 )
 
 
@@ -44,6 +43,7 @@ class PostgresAuthenticationContextRepository:
         (
             context_id, organization_id, target, authorization_id,
             identity_label, method, created_at, expires_at, revoked_at,
+            secret_reference_id,
         ) = row
         return AuthenticationContextRecord(
             authentication_context_id=str(context_id),
@@ -55,6 +55,7 @@ class PostgresAuthenticationContextRepository:
             created_at=created_at.astimezone(timezone.utc),
             expires_at=expires_at.astimezone(timezone.utc),
             revoked_at=revoked_at.astimezone(timezone.utc) if revoked_at else None,
+            secret_reference_id=secret_reference_id,
         )
 
     def create(
