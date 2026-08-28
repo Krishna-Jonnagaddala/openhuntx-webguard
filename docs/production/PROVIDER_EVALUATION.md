@@ -70,6 +70,8 @@ A comparative evaluation of realistic infrastructure providers against the requi
 
 **Recommendation**: AWS KMS for the TrustScan permit signing key specifically (this is exactly the "KMS/HSM-backed key custody, versions, rotation, revocation" requirement `docs/THREAT_MODEL.md` already states) — this is the single highest-priority infrastructure item given the current local-file signing key is the weakest link in the permit-integrity chain today.
 
+**Slice 12 correction**: this recommendation needs one caveat this table did not previously carry — **AWS KMS has no Ed25519 `KeySpec`** (only RSA and NIST/SECG elliptic curves), so "AWS KMS for the TrustScan permit signing key" necessarily means an algorithm change (Ed25519 → ECDSA_SHA_256), not a like-for-like custody upgrade of the existing Ed25519 key. `apps/api/src/webguard_api/signing.py`'s `KmsSigningProvider` is built against this reality honestly (targets `ECDSA_SHA_256`, never claims Ed25519 compatibility) but is not wired in as the active signer — an actual algorithm migration is a separate, explicit decision this evaluation does not make. If genuine HSM-backed Ed25519 custody (not just KMS custody of *some* algorithm) is the actual requirement, **AWS CloudHSM** is the correct recommendation instead of KMS: it is a general-purpose HSM reachable via PKCS#11 and does support Ed25519, at the cost of materially higher operational complexity (CloudHSM requires cluster management KMS does not) than the KMS recommendation above assumed.
+
 ## Observability
 
 | Provider | Security | UK/EU regions | Price | Scalability | Ops burden | Lock-in | Backup/restore | Compliance |

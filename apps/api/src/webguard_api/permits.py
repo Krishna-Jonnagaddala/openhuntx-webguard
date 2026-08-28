@@ -3,13 +3,8 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from webguard_contracts import (
     OwnedTargetAuthorization,
@@ -19,6 +14,8 @@ from webguard_contracts import (
     TrustScanPermitClaims,
     TrustScanSafetyReceiptClaims,
 )
+
+from .signing import LocalDevelopmentSigner, SigningKeyRegistry, SigningProviderError
 
 
 class TrustScanPermitError(ValueError):
@@ -95,97 +92,109 @@ class PersistedTrustScanPermit:
 
 
 class TrustScanSigner:
-    """Ed25519 signer and verifier for locally issued TrustScan permits."""
+    """Signer and verifier for locally issued TrustScan permits and
+    safety receipts, over a provider-neutral ``SigningKeyRegistry``
+    (Slice 12 requirements 2-3).
+
+    The default constructor (``TrustScanSigner(private_key_bytes)``)
+    is unchanged from every prior slice -- it builds a
+    ``LocalDevelopmentSigner`` from a raw 32-byte Ed25519 key exactly
+    as before, so every existing call site across the CLI, service,
+    scheduler, and test suite keeps working with zero changes. Use
+    ``TrustScanSigner.from_registry`` to back this with a
+    ``KmsSigningProvider`` or any other ``SigningProvider`` instead.
+
+    Verification now resolves by the key ID carried in the signed
+    object (``permit.signing_key_id`` / ``receipt.signing_key_id``)
+    against the registry's known keys, rather than only accepting the
+    currently active key -- this is what makes key rotation possible:
+    a permit signed under a since-retired key still verifies (until it
+    naturally expires), while a disabled key is rejected
+    unconditionally. See ``webguard_api.signing`` for the full
+    lifecycle model.
+    """
 
     def __init__(self, private_key_bytes: bytes) -> None:
-        if not isinstance(private_key_bytes, bytes) or len(private_key_bytes) != 32:
-            raise TrustScanPermitError(
-                "trustscan_signing_key_invalid",
-                "TrustScan Ed25519 private key must contain exactly 32 bytes.",
-            )
         try:
-            self._private_key = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
-        except ValueError as exc:
-            raise TrustScanPermitError(
-                "trustscan_signing_key_invalid",
-                "TrustScan Ed25519 private key is invalid.",
-            ) from exc
-        self._public_bytes = self._private_key.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
-        self.key_id = f"sha256:{hashlib.sha256(self._public_bytes).hexdigest()}"
+            provider = LocalDevelopmentSigner(private_key_bytes)
+        except SigningProviderError as exc:
+            raise TrustScanPermitError(exc.code, exc.message) from exc
+        self._registry = SigningKeyRegistry(provider)
+        self.key_id = provider.key_id
+
+    @classmethod
+    def from_registry(cls, registry: SigningKeyRegistry) -> "TrustScanSigner":
+        instance = cls.__new__(cls)
+        instance._registry = registry
+        instance.key_id = registry.active.key_id
+        return instance
 
     def sign(self, claims: TrustScanPermitClaims) -> SignedTrustScanPermit:
-        signature = self._private_key.sign(claims.signing_bytes)
+        signature = self._registry.active.sign(claims.signing_bytes)
         return SignedTrustScanPermit(
             claims=claims,
-            signing_key_id=self.key_id,
+            signing_key_id=self._registry.active.key_id,
             signature=_b64url_encode(signature),
         )
 
     def verify(self, permit: SignedTrustScanPermit) -> None:
-        if permit.signing_key_id != self.key_id:
-            raise TrustScanPermitError(
-                "trustscan_permit_signing_key_mismatch",
-                "TrustScan permit was not signed by the active service key.",
-            )
         signature = _b64url_decode_canonical(permit.signature)
-        if len(signature) != 64:
-            raise TrustScanPermitError(
-                "trustscan_permit_signature_invalid",
-                "TrustScan permit Ed25519 signature must contain exactly 64 bytes.",
-            )
         try:
-            self._private_key.public_key().verify(signature, permit.claims.signing_bytes)
-        except InvalidSignature as exc:
-            raise TrustScanPermitError(
-                "trustscan_permit_signature_invalid",
-                "TrustScan permit signature verification failed.",
-            ) from exc
+            self._registry.verify_by_key_id(
+                permit.signing_key_id, permit.claims.signing_bytes, signature
+            )
+        except SigningProviderError as exc:
+            code = (
+                "trustscan_permit_signing_key_mismatch"
+                if exc.code in ("trustscan_signing_key_unknown", "trustscan_signing_key_disabled")
+                else "trustscan_permit_signature_invalid"
+            )
+            message = (
+                "TrustScan permit was not signed by a trusted service key."
+                if code == "trustscan_permit_signing_key_mismatch"
+                else "TrustScan permit signature verification failed."
+            )
+            raise TrustScanPermitError(code, message) from exc
 
     def sign_safety_receipt(
         self, claims: TrustScanSafetyReceiptClaims
     ) -> SignedTrustScanSafetyReceipt:
-        signature = self._private_key.sign(claims.signing_bytes)
+        signature = self._registry.active.sign(claims.signing_bytes)
         return SignedTrustScanSafetyReceipt(
             claims=claims,
-            signing_key_id=self.key_id,
+            signing_key_id=self._registry.active.key_id,
             signature=_b64url_encode(signature),
         )
 
     def verify_safety_receipt(
         self, receipt: SignedTrustScanSafetyReceipt
     ) -> None:
-        if receipt.signing_key_id != self.key_id:
-            raise TrustScanPermitError(
-                "trustscan_safety_receipt_signing_key_mismatch",
-                "TrustScan safety receipt was not signed by the active service key.",
-            )
         signature = _b64url_decode_canonical(receipt.signature)
-        if len(signature) != 64:
-            raise TrustScanPermitError(
-                "trustscan_safety_receipt_signature_invalid",
-                "TrustScan safety receipt Ed25519 signature must contain exactly 64 bytes.",
-            )
         try:
-            self._private_key.public_key().verify(
-                signature, receipt.claims.signing_bytes
+            self._registry.verify_by_key_id(
+                receipt.signing_key_id, receipt.claims.signing_bytes, signature
             )
-        except InvalidSignature as exc:
-            raise TrustScanPermitError(
-                "trustscan_safety_receipt_signature_invalid",
-                "TrustScan safety receipt signature verification failed.",
-            ) from exc
+        except SigningProviderError as exc:
+            code = (
+                "trustscan_safety_receipt_signing_key_mismatch"
+                if exc.code in ("trustscan_signing_key_unknown", "trustscan_signing_key_disabled")
+                else "trustscan_safety_receipt_signature_invalid"
+            )
+            message = (
+                "TrustScan safety receipt was not signed by a trusted service key."
+                if code == "trustscan_safety_receipt_signing_key_mismatch"
+                else "TrustScan safety receipt signature verification failed."
+            )
+            raise TrustScanPermitError(code, message) from exc
 
     def verification_key_document(self) -> dict[str, str]:
-        return {
-            "type": "trustscan_verification_key",
-            "algorithm": "Ed25519",
-            "key_id": self.key_id,
-            "encoding": "base64url-raw",
-            "public_key": _b64url_encode(self._public_bytes),
-        }
+        for document in self._registry.verification_key_documents():
+            if document["key_id"] == self._registry.active.key_id:
+                return document
+        raise AssertionError("active key missing from its own registry")  # unreachable
+
+    def verification_key_documents(self) -> list[dict[str, str]]:
+        return self._registry.verification_key_documents()
 
 
 def validate_permit_scope(

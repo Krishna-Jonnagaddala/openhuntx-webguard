@@ -58,3 +58,14 @@ var/webguard-api/
 
 # Local WebGuard runtime state
 /var/
+
+# Terraform state and local overrides -- never committed, may contain
+# resource attribute values that should not enter Git history even
+# when they are not, in this configuration's case, credentials.
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/*.tfvars
+infra/terraform/*.tfvars.json
+infra/terraform/.terraform.lock.hcl
+infra/terraform/crash.log

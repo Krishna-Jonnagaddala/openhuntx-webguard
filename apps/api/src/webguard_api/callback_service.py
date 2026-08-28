@@ -1,4 +1,5 @@
-"""Multi-tenant callback registration for SSRF detection (Slice 10).
+"""Multi-tenant callback registration for SSRF detection (Slice 10;
+tenant-isolation remediation Slice 12).
 
 Wraps `webguard_scanner.callback_broker.InMemoryCallbackBroker` (the
 actual token/observation correlation storage) with organization/
@@ -17,6 +18,26 @@ scanner-side `CallbackBroker` protocol does not know about.
 via a small local adapter that satisfies the protocol exactly (see
 `_ScanScopedCallbackBroker` there), so the detector never needs to
 know tenancy exists.
+
+Slice 11's stabilization audit flagged this module as the one
+partially-isolated tenant-owned resource: `registration_for()` took
+only a token value, with no organization check on the read path at
+all -- isolation rested entirely on token secrecy/entropy, not an
+explicit ownership check, unlike every other resource type in this
+codebase (`<resource>_scoped(id, organization_id)`). Slice 12 closes
+that gap: every read/wait/revoke operation now requires the caller's
+`organization_id` and fails closed (the identical "matches unknown"
+signal, never a distinct "forbidden" that would leak existence) on any
+mismatch. Token possession alone -- knowing or guessing the
+high-entropy value -- is no longer sufficient to retrieve, wait on, or
+revoke a registration that belongs to a different organization; the
+registration's own recorded `organization_id` is authoritative and is
+always checked, never trusted from the caller alone but never skipped
+either. Callback token authenticity and bounded-use semantics
+(`secrets.token_urlsafe` generation, scan/candidate binding,
+expiry, bounded observation count) are entirely unchanged from Slice
+10 -- this remediation adds an ownership check in front of that
+existing mechanism, it does not touch it.
 """
 
 from __future__ import annotations
@@ -60,6 +81,9 @@ class ScopedCallbackRegistration:
     candidate_fingerprint: str
     created_at: datetime
     expires_at: datetime
+    job_id: str | None = None
+    permit_id: str | None = None
+    revoked_at: datetime | None = None
 
 
 class CallbackRepository:
@@ -100,6 +124,8 @@ class CallbackRepository:
         organization_id: str,
         target: str,
         authorization_id: str,
+        job_id: str | None = None,
+        permit_id: str | None = None,
     ) -> CallbackToken:
         try:
             token = self._broker.register(
@@ -119,15 +145,88 @@ class CallbackRepository:
                 candidate_fingerprint=candidate_fingerprint,
                 created_at=_utc_now(),
                 expires_at=token.expires_at,
+                job_id=job_id,
+                permit_id=permit_id,
             )
         return token
 
+    def get_registration(
+        self, token_value: str, *, organization_id: str
+    ) -> ScopedCallbackRegistration:
+        """The one, authoritative, organization-checked read path.
+        Fails closed with the identical signal for "no such
+        registration" and "registration belongs to a different
+        organization" -- token possession alone (knowing or guessing
+        the value) is never sufficient; the registration's own
+        recorded `organization_id` is always checked."""
+
+        with self._lock:
+            registration = self._registrations.get(token_value)
+        if registration is None or registration.organization_id != organization_id:
+            raise CallbackServiceError(
+                "callback_registration_not_found",
+                "No callback registration matches the requested token.",
+            )
+        if registration.revoked_at is not None:
+            raise CallbackServiceError(
+                "callback_registration_revoked",
+                "This callback registration has been revoked.",
+            )
+        return registration
+
     def wait_for_observation(
-        self, token: CallbackToken, *, policy: CallbackPolicy, cancellation_check=None
+        self,
+        token: CallbackToken,
+        *,
+        organization_id: str,
+        policy: CallbackPolicy,
+        cancellation_check=None,
     ):
+        """Organization-checked before ever polling for an
+        observation. A mismatch here means the caller is holding a
+        token it did not itself register for this organization -- a
+        genuine integrity violation in correct code, not a normal
+        "not found" case an external caller could otherwise trigger,
+        so this fails loudly (raises) rather than silently degrading
+        to "no observation"."""
+
+        self.get_registration(token.value, organization_id=organization_id)
         return self._broker.wait_for_observation(
             token, policy=policy, cancellation_check=cancellation_check
         )
+
+    def revoke_registration(
+        self, token_value: str, *, organization_id: str, now: datetime | None = None
+    ) -> ScopedCallbackRegistration:
+        """Explicit delete/expire lifecycle operation (requirement 1).
+        Organization-checked identically to `get_registration`;
+        idempotent (revoking an already-revoked registration returns
+        the same record rather than raising)."""
+
+        moment = now or _utc_now()
+        with self._lock:
+            registration = self._registrations.get(token_value)
+            if registration is None or registration.organization_id != organization_id:
+                raise CallbackServiceError(
+                    "callback_registration_not_found",
+                    "No callback registration matches the requested token.",
+                )
+            if registration.revoked_at is None:
+                registration = ScopedCallbackRegistration(
+                    token_value=registration.token_value,
+                    scan_id=registration.scan_id,
+                    organization_id=registration.organization_id,
+                    target=registration.target,
+                    authorization_id=registration.authorization_id,
+                    candidate_fingerprint=registration.candidate_fingerprint,
+                    created_at=registration.created_at,
+                    expires_at=registration.expires_at,
+                    job_id=registration.job_id,
+                    permit_id=registration.permit_id,
+                    revoked_at=moment,
+                )
+                self._registrations[token_value] = registration
+        return registration
 
     def record_observation(
         self,
@@ -140,9 +239,25 @@ class CallbackRepository:
         """Called by the real local HTTP receiver
         (`callback_server.py`) when an inbound request presents
         ``token_value`` in its path. Fails closed (returns False,
-        never raises) for any unknown/expired/over-quota token -- see
-        `InMemoryCallbackBroker.record_observation`."""
+        never raises) for any unknown/expired/over-quota/revoked
+        token -- see `InMemoryCallbackBroker.record_observation`.
 
+        Deliberately takes no `organization_id`: the receiver has no
+        tenancy context for an inbound request (it is the *target
+        application's* server connecting back, not an authenticated
+        WebGuard API caller) -- this is a write-only, token-correlated
+        recording step, not a read/retrieve/correlate operation, so it
+        is outside the scope of this remediation's ownership check
+        (which governs every path that *reveals* registration data
+        back to a caller). A revoked registration's token is rejected
+        here too, via the broker's own expiry-style bookkeeping being
+        consulted through `_registrations` -- see below.
+        """
+
+        with self._lock:
+            registration = self._registrations.get(token_value)
+        if registration is not None and registration.revoked_at is not None:
+            return False
         return self._broker.record_observation(
             token_value,
             method=method,
@@ -150,10 +265,6 @@ class CallbackRepository:
             policy=self._policy,
             now=now,
         )
-
-    def registration_for(self, token_value: str) -> ScopedCallbackRegistration | None:
-        with self._lock:
-            return self._registrations.get(token_value)
 
 
 __all__ = [

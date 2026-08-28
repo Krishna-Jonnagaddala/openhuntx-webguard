@@ -11,6 +11,8 @@ dependencies = [
     "openhuntx-webguard-contracts==0.1.0",
     "openhuntx-webguard-scanner==0.1.0",
     "cryptography==50.0.0",
+    "psycopg[binary]==3.2.10",
+    "psycopg-pool==3.2.6",
 ]
 
 [project.scripts]

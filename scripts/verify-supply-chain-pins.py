@@ -17,6 +17,10 @@ EXPECTED = {
     "cffi": "2.1.0",
     "pycparser": "3.0",
     "ruff": "0.16.2",
+    "psycopg": "3.2.10",
+    "psycopg-binary": "3.2.10",
+    "psycopg-pool": "3.2.6",
+    "typing-extensions": "4.15.0",
 }
 
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -80,7 +84,16 @@ if set(bootstrap) != {"pip"} or bootstrap["pip"][0] != EXPECTED["pip"]:
     fail("bootstrap lock does not contain only the reviewed pip version")
 
 locked = parse_locked("requirements-ci.lock")
-expected_runtime = {"setuptools", "cryptography", "cffi", "pycparser"}
+expected_runtime = {
+    "setuptools",
+    "cryptography",
+    "cffi",
+    "pycparser",
+    "psycopg",
+    "psycopg-binary",
+    "psycopg-pool",
+    "typing-extensions",
+}
 if set(locked) != expected_runtime:
     fail(f"runtime lock package set changed: {sorted(locked)}")
 for name in expected_runtime:
@@ -114,6 +127,10 @@ with (ROOT / "apps/api/pyproject.toml").open("rb") as handle:
     api = tomllib.load(handle)
 if f"cryptography=={EXPECTED['cryptography']}" not in api["project"]["dependencies"]:
     fail("API cryptography dependency is not exactly pinned")
+if f"psycopg[binary]=={EXPECTED['psycopg']}" not in api["project"]["dependencies"]:
+    fail("API psycopg dependency is not exactly pinned")
+if f"psycopg-pool=={EXPECTED['psycopg-pool']}" not in api["project"]["dependencies"]:
+    fail("API psycopg-pool dependency is not exactly pinned")
 if "version" in api["project"]:
     fail("API pyproject must not define a second static version authority")
 if api["project"].get("dynamic") != ["version"]:

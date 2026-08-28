@@ -95,7 +95,7 @@ class HttpApiTests(unittest.TestCase):
             principal_id=VIEWER_ID,
             token_id=VIEWER_TOKEN_ID,
         )
-        service = WebGuardJobService(
+        self.service = WebGuardJobService(
             store=store,
             authorizations=AuthorizationRepository(auth_dir),
             identity=identity,
@@ -104,7 +104,7 @@ class HttpApiTests(unittest.TestCase):
         self.server = create_server(
             "127.0.0.1",
             0,
-            service,
+            self.service,
             authenticator=ApiTokenAuthenticator(identity),
             rate_limiter=FixedWindowRateLimiter(requests=100, window_seconds=60),
             maximum_request_bytes=1024,
@@ -155,6 +155,30 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(payload, {"status": "ok"})
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertIn("X-Request-ID", headers)
+
+    def test_health_alias_endpoint_is_public(self) -> None:
+        status, _, payload = self.request("GET", "/health", token=None)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"status": "ok"})
+
+    def test_ready_endpoint_is_public_and_ready_by_default(self) -> None:
+        status, _, payload = self.request("GET", "/ready", token=None)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"status": "ready", "reason": "ready"})
+
+    def test_ready_endpoint_reflects_a_failing_dependency_check(self) -> None:
+        original = self.service.readiness_check
+        self.service.readiness_check = lambda: (_ for _ in ()).throw(
+            RuntimeError("simulated dependency outage")
+        )
+        try:
+            status, _, payload = self.request("GET", "/ready", token=None)
+        finally:
+            self.service.readiness_check = original
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["status"], "not_ready")
+        self.assertEqual(payload["reason"], "dependency_unavailable")
+        self.assertNotIn("simulated dependency outage", json.dumps(payload))
 
     def test_trustscan_verification_key_is_public(self) -> None:
         status, _, payload = self.request(

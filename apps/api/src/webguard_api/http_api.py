@@ -342,9 +342,30 @@ def build_handler(
             request_id = str(uuid4())
             try:
                 path, query = self._request_target()
-                if path == "/healthz":
+                if path in ("/healthz", "/health"):
+                    # Liveness only (requirement 14): must not fail
+                    # merely because a transient dependency (database,
+                    # signing provider) is unavailable -- that is
+                    # exactly what `/ready` is for. This process being
+                    # able to answer at all is the only thing checked
+                    # here, by design. `/healthz` is kept for existing
+                    # callers; `/health` is the Slice 12 requirement's
+                    # own name for the identical check.
                     self._require_empty_query(query)
                     self._send_json(200, {"status": "ok"}, request_id=request_id)
+                    return
+                if path == "/ready":
+                    # Safe-to-serve (requirement 14): actually checks
+                    # the configured persistence dependency. Reports
+                    # only a boolean and a fixed reason code -- never a
+                    # host, port, connection string, or schema detail.
+                    self._require_empty_query(query)
+                    ready, reason = service.readiness()
+                    self._send_json(
+                        200 if ready else 503,
+                        {"status": "ready" if ready else "not_ready", "reason": reason},
+                        request_id=request_id,
+                    )
                     return
                 if path == "/v1/trustscan/verification-key":
                     self._require_empty_query(query)

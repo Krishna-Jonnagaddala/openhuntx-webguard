@@ -18,6 +18,8 @@ The current system is a local, single-host engineering foundation:
 
 The current architecture is not approved as a directly internet-exposed SaaS control plane.
 
+**Slice 12 addition**: a parallel, opt-in production persistence and signing path now exists alongside the local baseline above, not in place of it. `ProductionServiceConfig` (`apps/api/src/webguard_api/production_config.py`) is a separate, fail-closed configuration type that requires PostgreSQL and KMS-backed signing to be explicitly configured — it never silently activates from a missing setting, and the local SQLite/in-memory/local-development-signing baseline described in this section remains the default and the only thing `ServiceConfig` (the pre-existing local config type) can produce. See §7 and §8 below, and `docs/audit/production-platform-phase1-postgres-kms-tenancy.md` for the full slice.
+
 ## 3. Repository components
 
 ### `packages/contracts/python`
@@ -433,6 +435,18 @@ The current SQLite database contains:
 
 The database is owner-only (`0600`). There is currently no application-layer database encryption or external KMS/HSM boundary. That limitation is explicitly tracked for production architecture.
 
+### Production persistence (PostgreSQL, Slice 12)
+
+A production PostgreSQL schema and a defensible subset of repository implementations now exist alongside the SQLite baseline above — SQLite is not being removed or deprecated by this addition (`docs/audit/production-platform-phase1-postgres-kms-tenancy.md` explains the scoping). Concretely:
+
+- **Full schema, all entities** (`infra/postgres/migrations/`): organizations, principals, memberships (a new append-only role-assignment history not present in SQLite), API tokens, organization-authorization assignments, security audit events, targets/assets, target-verification metadata, callback registrations/observations, and — schema-only, no repository yet — jobs, schedules, scan records, findings, reports, authentication contexts, authorization-comparison plans, and crawl checkpoints.
+- **Repository implementations with contract tests proven against both backends** (`postgres_identity.py`, `postgres_targets.py`, `postgres_callback_service.py`, `targets.py`): organizations/principals/tokens/authorizations/audit-events, targets, and callback registrations. Every one of these satisfies the same `Protocol` (`repository_contracts.py`) as its SQLite/in-memory counterpart.
+- **Connection pooling** (`postgres_pool.py`): `psycopg_pool`-backed, with a normalized failure taxonomy (`db_errors.py`) translating raw driver exceptions — never a connection string or SQL text reaches a caller.
+- **Migrations** (`scripts/run-postgres-migrations.py`): a hand-rolled, checksum-verified runner over numbered `.sql` files, matching this project's existing no-ORM convention (raw `sqlite3` elsewhere; raw `psycopg` here, not SQLAlchemy/Alembic).
+- **Deferred repositories** (jobs, schedules, scan records, findings, reports, authentication contexts, comparison plans): schema exists; Python repository classes are explicitly next-platform-slice work, not attempted this slice.
+
+None of this is wired into `webguard-api serve`'s default startup — the local SQLite/in-memory baseline remains what actually runs today. Wiring `ProductionServiceConfig` into the service's real startup path is future work.
+
 ## 8. Cryptographic uses
 
 ### API tokens
@@ -450,6 +464,8 @@ Opaque cursors are HMAC-SHA256 signed, expiring, and bound to organisation, reso
 ### TrustScan permits and Safety Receipts
 
 Both use Ed25519. A public verification-key document can be retrieved without authentication. The private seed currently resides in the owner-only SQLite service-secret store.
+
+**Signing abstraction (Slice 12)**: `TrustScanSigner` (`permits.py`) now delegates raw sign/verify operations to a provider-neutral `SigningKeyRegistry` (`signing.py`) rather than holding an Ed25519 key directly — `LocalDevelopmentSigner` (unchanged Ed25519 behavior, the only provider actually wired in today) and `KmsSigningProvider` (AWS KMS-backed, `ECDSA_SHA_256`, built and unit-tested against a duck-typed KMS client but not wired as the active signer) both satisfy the same narrow `SigningProvider` protocol (`sign`, public-key material, key ID, algorithm). Verification now resolves by key ID against a registry of active/retired/disabled keys, enabling rotation that the pre-Slice-12 single-key design could not support. **AWS KMS has no Ed25519 KeySpec** — `KmsSigningProvider` targets `ECDSA_SHA_256` as its own honestly-labeled algorithm and never claims Ed25519 compatibility; an actual algorithm migration remains a separate, explicit, not-yet-made decision (see `signing.py`'s module docstring and `docs/audit/production-platform-phase1-postgres-kms-tenancy.md`).
 
 ## 9. Network safety model
 

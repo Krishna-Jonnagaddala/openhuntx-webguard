@@ -100,11 +100,22 @@ class WebGuardJobService:
         trustscan_signer: TrustScanSigner | None = None,
         authentication_contexts: AuthenticationContextRepository | None = None,
         authorization_comparison_plans: AuthorizationComparisonPlanRepository | None = None,
+        readiness_check: Callable[[], None] | None = None,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
         self.identity = identity
         self.clock = clock
+        # Slice 12 requirement 14: a cheap, dependency-specific probe
+        # `/ready` invokes. Defaults to a no-op, matching the honest
+        # behavior of the pre-Slice-12 default deployment (a local
+        # SQLite file has no separate "reachability" concern beyond the
+        # process itself being up). A production caller wires this to
+        # `WebGuardPostgresPool.check_connectivity` (or any other
+        # backend's own equivalent) so readiness reflects the actual
+        # configured persistence layer, not a hardcoded assumption
+        # about which one is in use.
+        self.readiness_check = readiness_check if readiness_check is not None else (lambda: None)
         # Optional and defaulted so every pre-Slice-7 constructor call
         # site is unaffected. A caller that needs authentication contexts
         # shared across a service and its worker/executor must pass one
@@ -291,6 +302,20 @@ class WebGuardJobService:
         """Return the public Ed25519 verification key; never expose the private seed."""
 
         return self.trustscan_signer.verification_key_document()
+
+    def readiness(self) -> tuple[bool, str]:
+        """Safe-to-serve check (requirement 14): runs the configured
+        `readiness_check` and reports only a boolean and a fixed,
+        reviewed reason string on failure -- never the underlying
+        exception's message, which could name a host, port, or schema
+        detail (requirement 14: do not expose infrastructure
+        topology)."""
+
+        try:
+            self.readiness_check()
+        except Exception:  # noqa: BLE001 - deliberately generic, see docstring
+            return False, "dependency_unavailable"
+        return True, "ready"
 
     def _permit_record(
         self, context: AuthContext, permit_id: str

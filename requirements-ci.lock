@@ -22,3 +22,24 @@ cffi==2.1.0 \
 
 pycparser==3.0 \
     --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+
+# C1-002 (Slice 12) -- PostgreSQL driver for the production persistence
+# layer. psycopg's core wheel is pure Python (one hash); psycopg-binary
+# bundles a compiled libpq per platform/interpreter, covering the same
+# reviewed Linux x86_64 Python 3.11/3.12/3.13/3.14 matrix and macOS
+# ARM64 Python 3.14 developer path as every other pin in this file.
+psycopg==3.2.10 \
+    --hash=sha256:ab5caf09a9ec42e314a21f5216dbcceac528e0e05142e42eea83a3b28b320ac3
+
+psycopg-binary==3.2.10 \
+    --hash=sha256:1b29285474e3339d0840e1b5079fdb0481914108f92ec62de0c87ae333c60b24 \
+    --hash=sha256:14bcbcac0cab465d88b2581e43ec01af4b01c9833e663f1352e05cb41be19e44 \
+    --hash=sha256:a92ff1c2cd79b3966d6a87e26ceb222ecd5581b5ae4b58961f126af806a861ed \
+    --hash=sha256:0c2b95e83fda70ed2b0b4fadd8538572e4a4d987b721823981862d1ab56cc760 \
+    --hash=sha256:810f65b9ef1fe9dddb5c05937884ea9563aaf4e1a2c3d138205231ed5f439511
+
+psycopg-pool==3.2.6 \
+    --hash=sha256:5887318a9f6af906d041a0b1dc1c60f8f0dda8340c2572b74e10907b51ed5da7
+
+typing-extensions==4.15.0 \
+    --hash=sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548

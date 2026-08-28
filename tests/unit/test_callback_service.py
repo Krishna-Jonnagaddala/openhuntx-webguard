@@ -4,6 +4,13 @@ recording, tenancy metadata, DNS/spoofing-independent correlation (the
 receiver trusts only the path token, never Host or source address),
 and the redirect-response scenario (confirmation happens on arrival,
 never depends on what the receiver's own response contains).
+
+`CallbackTenantIsolationTests` (Slice 12) proves the tenant-isolation
+remediation: every read/wait/revoke path requires and checks the
+caller's `organization_id`, and a cross-organization caller holding a
+genuine, valid token gets the identical "not found" signal a
+completely unknown token would produce -- token possession alone is
+never sufficient.
 """
 
 from __future__ import annotations
@@ -13,7 +20,7 @@ import urllib.error
 import urllib.request
 
 from webguard_api.callback_server import CallbackHttpReceiver
-from webguard_api.callback_service import CallbackRepository
+from webguard_api.callback_service import CallbackRepository, CallbackServiceError
 from webguard_scanner.callback_broker import CallbackPolicy
 
 
@@ -43,6 +50,7 @@ class CallbackHttpReceiverTests(unittest.TestCase):
 
             observation, within_primary, cancelled = repository.wait_for_observation(
                 token,
+                organization_id="org-1",
                 policy=CallbackPolicy(maximum_wait_seconds=1.0, grace_seconds=0.2),
             )
             self.assertIsNotNone(observation)
@@ -62,7 +70,9 @@ class CallbackHttpReceiverTests(unittest.TestCase):
                 target="https://target.example/",
                 authorization_id="auth-9",
             )
-            registration = repository.registration_for(token.value)
+            registration = repository.get_registration(
+                token.value, organization_id="org-9"
+            )
             self.assertIsNotNone(registration)
             self.assertEqual(registration.organization_id, "org-9")
             self.assertEqual(registration.target, "https://target.example/")
@@ -90,6 +100,7 @@ class CallbackHttpReceiverTests(unittest.TestCase):
 
             observation, within_primary, _cancelled = repository.wait_for_observation(
                 token,
+                organization_id="org-1",
                 policy=CallbackPolicy(maximum_wait_seconds=1.0, grace_seconds=0.2),
             )
             self.assertIsNotNone(observation)
@@ -138,6 +149,7 @@ class CallbackHttpReceiverTests(unittest.TestCase):
 
             observation, within_primary, _cancelled = repository.wait_for_observation(
                 token,
+                organization_id="org-1",
                 policy=CallbackPolicy(maximum_wait_seconds=1.0, grace_seconds=0.2),
             )
             self.assertIsNotNone(observation)
@@ -159,12 +171,132 @@ class CallbackHttpReceiverTests(unittest.TestCase):
             urllib.request.urlopen(request, timeout=3)
             observation, _within, _cancelled = repository.wait_for_observation(
                 token,
+                organization_id="org-1",
                 policy=CallbackPolicy(maximum_wait_seconds=1.0, grace_seconds=0.2),
             )
             self.assertIsNotNone(observation)
             self.assertEqual(observation.method, "POST")
         finally:
             receiver.stop()
+
+
+class CallbackTenantIsolationTests(unittest.TestCase):
+    """Slice 12 requirement 1: register / retrieve / observe /
+    correlate / expire / delete must all fail closed across an
+    organization boundary, with the identical signal a genuinely
+    unknown token produces -- never a distinct "forbidden" that would
+    confirm the token's existence to an attacker/other tenant."""
+
+    def test_cross_tenant_get_registration_fails_closed_like_unknown_token(
+        self,
+    ) -> None:
+        repository = CallbackRepository(base_url="http://127.0.0.1:0/")
+        token = repository.register(
+            scan_id="scan-a",
+            candidate_fingerprint="c-a",
+            organization_id="org-a",
+            target="https://a.example/",
+            authorization_id="auth-a",
+        )
+
+        with self.assertRaises(CallbackServiceError) as owner_mismatch:
+            repository.get_registration(token.value, organization_id="org-b")
+        with self.assertRaises(CallbackServiceError) as unknown_token:
+            repository.get_registration("not-a-real-token", organization_id="org-b")
+
+        self.assertEqual(owner_mismatch.exception.code, "callback_registration_not_found")
+        self.assertEqual(unknown_token.exception.code, "callback_registration_not_found")
+        self.assertEqual(
+            owner_mismatch.exception.message, unknown_token.exception.message
+        )
+
+        # The genuine owner can still retrieve it -- proving the
+        # rejection above was tenancy-specific, not a general break.
+        registration = repository.get_registration(token.value, organization_id="org-a")
+        self.assertEqual(registration.organization_id, "org-a")
+
+    def test_cross_tenant_wait_for_observation_fails_closed(self) -> None:
+        repository = CallbackRepository(base_url="http://127.0.0.1:0/")
+        token = repository.register(
+            scan_id="scan-a",
+            candidate_fingerprint="c-a",
+            organization_id="org-a",
+            target="https://a.example/",
+            authorization_id="auth-a",
+        )
+
+        with self.assertRaises(CallbackServiceError) as exc:
+            repository.wait_for_observation(
+                token,
+                organization_id="org-b",
+                policy=CallbackPolicy(maximum_wait_seconds=0.1, grace_seconds=0.05),
+            )
+        self.assertEqual(exc.exception.code, "callback_registration_not_found")
+
+    def test_cross_tenant_revoke_fails_closed_and_does_not_revoke(self) -> None:
+        repository = CallbackRepository(base_url="http://127.0.0.1:0/")
+        token = repository.register(
+            scan_id="scan-a",
+            candidate_fingerprint="c-a",
+            organization_id="org-a",
+            target="https://a.example/",
+            authorization_id="auth-a",
+        )
+
+        with self.assertRaises(CallbackServiceError) as exc:
+            repository.revoke_registration(token.value, organization_id="org-b")
+        self.assertEqual(exc.exception.code, "callback_registration_not_found")
+
+        # The registration must be untouched by the failed cross-tenant
+        # attempt -- the genuine owner can still read it, unrevoked.
+        registration = repository.get_registration(token.value, organization_id="org-a")
+        self.assertIsNone(registration.revoked_at)
+
+    def test_owner_revoke_then_get_fails_closed_identically_to_unknown(self) -> None:
+        repository = CallbackRepository(base_url="http://127.0.0.1:0/")
+        token = repository.register(
+            scan_id="scan-a",
+            candidate_fingerprint="c-a",
+            organization_id="org-a",
+            target="https://a.example/",
+            authorization_id="auth-a",
+        )
+
+        revoked = repository.revoke_registration(token.value, organization_id="org-a")
+        self.assertIsNotNone(revoked.revoked_at)
+
+        with self.assertRaises(CallbackServiceError) as exc:
+            repository.get_registration(token.value, organization_id="org-a")
+        self.assertEqual(exc.exception.code, "callback_registration_revoked")
+
+    def test_revoke_is_idempotent_for_the_genuine_owner(self) -> None:
+        repository = CallbackRepository(base_url="http://127.0.0.1:0/")
+        token = repository.register(
+            scan_id="scan-a",
+            candidate_fingerprint="c-a",
+            organization_id="org-a",
+            target="https://a.example/",
+            authorization_id="auth-a",
+        )
+
+        first = repository.revoke_registration(token.value, organization_id="org-a")
+        second = repository.revoke_registration(token.value, organization_id="org-a")
+        self.assertEqual(first.revoked_at, second.revoked_at)
+
+    def test_register_records_job_and_permit_identifiers(self) -> None:
+        repository = CallbackRepository(base_url="http://127.0.0.1:0/")
+        token = repository.register(
+            scan_id="scan-a",
+            candidate_fingerprint="c-a",
+            organization_id="org-a",
+            target="https://a.example/",
+            authorization_id="auth-a",
+            job_id="job-a",
+            permit_id="permit-a",
+        )
+        registration = repository.get_registration(token.value, organization_id="org-a")
+        self.assertEqual(registration.job_id, "job-a")
+        self.assertEqual(registration.permit_id, "permit-a")
 
 
 if __name__ == "__main__":

@@ -757,11 +757,15 @@ class _ScanScopedCallbackBroker:
         organization_id: str,
         target: str,
         authorization_id: str,
+        job_id: str | None = None,
+        permit_id: str | None = None,
     ) -> None:
         self._repository = repository
         self._organization_id = organization_id
         self._target = target
         self._authorization_id = authorization_id
+        self._job_id = job_id
+        self._permit_id = permit_id
 
     def register(self, *, scan_id: str, candidate_fingerprint: str) -> CallbackToken:
         try:
@@ -771,13 +775,18 @@ class _ScanScopedCallbackBroker:
                 organization_id=self._organization_id,
                 target=self._target,
                 authorization_id=self._authorization_id,
+                job_id=self._job_id,
+                permit_id=self._permit_id,
             )
         except CallbackServiceError as exc:
             raise CallbackBrokerError(exc.code, exc.message) from exc
 
     def wait_for_observation(self, token, *, policy, cancellation_check=None):
         return self._repository.wait_for_observation(
-            token, policy=policy, cancellation_check=cancellation_check
+            token,
+            organization_id=self._organization_id,
+            policy=policy,
+            cancellation_check=cancellation_check,
         )
 
 
@@ -797,6 +806,7 @@ def _apply_ssrf_callback_detection(
     fetch_policy: FetchPolicy,
     safety: TrustScanRuntimeSafetyEngine,
     cancellation_token: CrawlCancellationToken,
+    job_id: str | None = None,
 ) -> WebGuardReport:
     """Run the SSRF-callback detector and merge findings into the
     report.
@@ -885,6 +895,8 @@ def _apply_ssrf_callback_detection(
         organization_id=organization_id,
         target=target.normalised_url,
         authorization_id=authorization_id,
+        job_id=job_id,
+        permit_id=permit_id,
     )
 
     try:
@@ -1311,6 +1323,7 @@ class ScanJobExecutor:
                 fetch_policy=fetch_policy,
                 safety=safety,
                 cancellation_token=token,
+                job_id=record.job_id,
             )
         except TrustScanRuntimeSafetyError as exc:
             receipt = safety.signed_receipt(termination_reason="safety_blocked")
