@@ -110,6 +110,23 @@ from .active_detector_registry import (
     ACTIVE_DETECTOR_REGISTRY,
     KNOWN_ACTIVE_DETECTOR_IDS,
 )
+from .callback_broker import (
+    CallbackBroker,
+    CallbackBrokerError,
+    CallbackObservation,
+    CallbackPolicy,
+    CallbackToken,
+    InMemoryCallbackBroker,
+)
+from .ssrf_callback_detector import (
+    SSRF_PARAMETER_NAME_HINTS,
+    SsrfDetectionOutcome,
+    SsrfDetectorRunResult,
+    SsrfProbeRecord,
+    is_ssrf_candidate_parameter,
+    run_ssrf_callback_detector,
+    select_ssrf_candidates,
+)
 from .authentication import (
     MAXIMUM_BEARER_TOKEN_BYTES,
     MAXIMUM_COOKIES,
@@ -306,6 +323,19 @@ __all__ = [
     "ActiveDetectionError",
     "ActiveDetectionPolicy",
     "AnalyzerOutputError",
+    "CallbackBroker",
+    "CallbackBrokerError",
+    "CallbackObservation",
+    "CallbackPolicy",
+    "CallbackToken",
+    "InMemoryCallbackBroker",
+    "SSRF_PARAMETER_NAME_HINTS",
+    "SsrfDetectionOutcome",
+    "SsrfDetectorRunResult",
+    "SsrfProbeRecord",
+    "is_ssrf_candidate_parameter",
+    "run_ssrf_callback_detector",
+    "select_ssrf_candidates",
     "BeforeRequestHook",
     "AfterRequestHook",
     "AnalyzerPipelineResult",

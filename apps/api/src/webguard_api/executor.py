@@ -55,12 +55,14 @@ from webguard_scanner import (
     fetch_same_origin_page,
     run_authenticated_resource_discovery_crawl,
     run_idor_authorization_detector,
+    run_ssrf_callback_detector,
     to_request_templates,
     validate_owned_target_preflight,
     validate_target_url,
     run_passive_crawl_scan,
     run_passive_header_scan,
 )
+from webguard_scanner.callback_broker import CallbackBrokerError, CallbackToken
 
 from .authentication_contexts import (
     AuthenticationContextError,
@@ -70,6 +72,7 @@ from .authorization_comparison import (
     AuthorizationComparisonError,
     AuthorizationComparisonPlanRepository,
 )
+from .callback_service import CallbackRepository, CallbackServiceError
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .safety import TrustScanRuntimeSafetyEngine, TrustScanRuntimeSafetyError
@@ -737,6 +740,176 @@ def _apply_authorization_comparison(
     )
 
 
+class _ScanScopedCallbackBroker:
+    """Thin per-scan adapter satisfying the scanner's `CallbackBroker`
+    protocol exactly (`register`/`wait_for_observation`, nothing more)
+    -- binds this one scan's organization/target/authorization once,
+    via closure, so the detector never needs to know tenancy exists.
+    Translates the API-layer `CallbackServiceError` back into the
+    scanner-layer `CallbackBrokerError` the detector already knows how
+    to catch per-candidate, rather than letting a leaked API-layer
+    exception type cross that boundary."""
+
+    def __init__(
+        self,
+        repository: CallbackRepository,
+        *,
+        organization_id: str,
+        target: str,
+        authorization_id: str,
+    ) -> None:
+        self._repository = repository
+        self._organization_id = organization_id
+        self._target = target
+        self._authorization_id = authorization_id
+
+    def register(self, *, scan_id: str, candidate_fingerprint: str) -> CallbackToken:
+        try:
+            return self._repository.register(
+                scan_id=scan_id,
+                candidate_fingerprint=candidate_fingerprint,
+                organization_id=self._organization_id,
+                target=self._target,
+                authorization_id=self._authorization_id,
+            )
+        except CallbackServiceError as exc:
+            raise CallbackBrokerError(exc.code, exc.message) from exc
+
+    def wait_for_observation(self, token, *, policy, cancellation_check=None):
+        return self._repository.wait_for_observation(
+            token, policy=policy, cancellation_check=cancellation_check
+        )
+
+
+def _apply_ssrf_callback_detection(
+    report: WebGuardReport,
+    *,
+    target: ValidatedTarget,
+    active_checks: tuple[str, ...],
+    scan_id: str,
+    organization_id: str,
+    authorization_id: str,
+    permit_id: str,
+    permit_fingerprint: str,
+    authentication_context_id: str | None,
+    authentication_contexts: AuthenticationContextRepository,
+    callback_repository: CallbackRepository,
+    fetch_policy: FetchPolicy,
+    safety: TrustScanRuntimeSafetyEngine,
+    cancellation_token: CrawlCancellationToken,
+) -> WebGuardReport:
+    """Run the SSRF-callback detector and merge findings into the
+    report.
+
+    Fails closed by construction: if ``active.ssrf.callback`` is not in
+    ``active_checks``, this returns ``report`` completely unchanged --
+    an XSS-only, SQLi-only, or IDOR-only permit never authorizes this
+    detector, exactly as requirement 1 requires (there is no shared
+    "any active check" gate here beyond the identical
+    ``PERMIT_ISSUE_ACTIVE`` RBAC gate every active check already uses
+    at issuance time).
+
+    Single-page scans only this slice, mirroring the same, already-
+    documented precedent as Slice 8/9's comparison-style detectors: a
+    crawled page's findings must be attributable to that one page's own
+    URL, and SSRF candidate discovery here is not yet threaded through
+    crawl-mode's per-page restriction.
+    """
+
+    if "active.ssrf.callback" not in active_checks:
+        return report
+
+    if hasattr(report, "pages"):
+        return report
+
+    if report.status not in _ACTIVE_DETECTION_ELIGIBLE_STATUSES:
+        return report
+
+    def cancellation_check() -> bool:
+        return cancellation_token.is_cancelled
+
+    if cancellation_check():
+        return report
+
+    authentication_material = None
+    if authentication_context_id is not None:
+        try:
+            authentication_contexts.require_bound(
+                authentication_context_id,
+                organization_id=organization_id,
+                target=target.normalised_url,
+                authorization_id=authorization_id,
+                now=safety.clock(),
+            )
+            authentication_material = authentication_contexts.get_secret(
+                authentication_context_id
+            )
+        except AuthenticationContextError as exc:
+            raise TrustScanRuntimeSafetyError(exc.code, exc.message) from exc
+
+    response = fetch_same_origin_page(
+        target,
+        target.normalised_url,
+        policy=ActiveDetectionPolicy(fetch_policy=fetch_policy),
+        before_request=safety.before_request,
+        after_request=safety.after_request,
+        authentication_material=authentication_material,
+    )
+    if response is None:
+        return report
+
+    surface = discover_page_attack_surface(
+        target, target.normalised_url, response.body, budget=AttackSurfaceBudget()
+    )
+    allow_post = "POST" in fetch_policy.allowed_methods
+    allow_json = allow_post
+    candidates = to_request_templates(
+        surface, allow_post=allow_post, allow_json=allow_json
+    )
+    if not candidates:
+        return report
+    candidates = candidates[:MAXIMUM_DISCOVERED_CANDIDATES]
+
+    context = ActiveDetectionContext(
+        scan_id=scan_id,
+        authorization_id=authorization_id,
+        permit_id=permit_id,
+        permit_fingerprint=permit_fingerprint,
+    )
+    policy = ActiveDetectionPolicy(
+        fetch_policy=fetch_policy,
+        maximum_probe_requests=MAXIMUM_DISCOVERED_CANDIDATES,
+    )
+    broker = _ScanScopedCallbackBroker(
+        callback_repository,
+        organization_id=organization_id,
+        target=target.normalised_url,
+        authorization_id=authorization_id,
+    )
+
+    try:
+        result = run_ssrf_callback_detector(
+            target,
+            candidates,
+            context,
+            callback_broker=broker,
+            policy=policy,
+            callback_policy=callback_repository.policy,
+            before_request=safety.before_request,
+            after_request=safety.after_request,
+            authentication_material=authentication_material,
+            cancellation_check=cancellation_check,
+        )
+    except ActiveDetectionError:
+        return report
+
+    if not result.findings:
+        return report
+    return dataclasses_replace(
+        report, findings=report.findings + tuple(result.findings)
+    )
+
+
 class ScanJobExecutor:
     """Execute one validated, server-authorized passive scanner job."""
 
@@ -756,6 +929,7 @@ class ScanJobExecutor:
         ) = None,
         authentication_contexts: AuthenticationContextRepository | None = None,
         authorization_comparison_plans: AuthorizationComparisonPlanRepository | None = None,
+        callback_repository: CallbackRepository | None = None,
     ) -> None:
         self.authorizations = authorizations
         self.store = store
@@ -783,6 +957,18 @@ class ScanJobExecutor:
             authorization_comparison_plans
             if authorization_comparison_plans is not None
             else AuthorizationComparisonPlanRepository()
+        )
+        # Same rationale, Slice 10. A default, receiver-less repository
+        # is a safe fallback: without a real callback receiver actually
+        # running and pointed at it, every SSRF probe simply times out
+        # and correctly reports NOT_VULNERABLE rather than crashing --
+        # a caller that wants genuine SSRF confirmation must construct
+        # a `CallbackHttpReceiver` against this same repository
+        # instance and pass it here.
+        self.callback_repository = (
+            callback_repository
+            if callback_repository is not None
+            else CallbackRepository(base_url="http://127.0.0.1:0/")
         )
 
     def _policies(self, authorization, permit, mode: ScanJobMode):
@@ -1106,6 +1292,22 @@ class ScanJobExecutor:
                 comparison_plan_id=permit.permit.claims.authorization_comparison_plan_id,
                 authorization_comparison_plans=self.authorization_comparison_plans,
                 authentication_contexts=self.authentication_contexts,
+                fetch_policy=fetch_policy,
+                safety=safety,
+                cancellation_token=token,
+            )
+            report = _apply_ssrf_callback_detection(
+                report,
+                target=target,
+                active_checks=permit.permit.claims.active_checks,
+                scan_id=scan_id,
+                organization_id=scope[0],
+                authorization_id=record.request.authorization_id,
+                permit_id=permit.permit.claims.permit_id,
+                permit_fingerprint=permit.permit.fingerprint,
+                authentication_context_id=permit.permit.claims.authentication_context_id,
+                authentication_contexts=self.authentication_contexts,
+                callback_repository=self.callback_repository,
                 fetch_policy=fetch_policy,
                 safety=safety,
                 cancellation_token=token,

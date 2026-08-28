@@ -130,7 +130,7 @@ class ActiveChecksPermitControlTests(unittest.TestCase):
         with self.assertRaises(ApiServiceError) as caught:
             self.issue(
                 payload=permit_body(
-                    active_checks=["active.ssrf.callback"]
+                    active_checks=["active.nonexistent.detector"]
                 )
             )
         self.assertEqual(

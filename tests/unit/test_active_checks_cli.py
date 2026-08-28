@@ -213,7 +213,7 @@ class ActiveChecksCliTests(unittest.TestCase):
     def test_unknown_active_check_fails_closed(self) -> None:
         args = self._base_permit_args(self.owner_token) + [
             "--active-check",
-            "active.ssrf.callback",
+            "active.nonexistent.detector",
         ]
         errors = io.StringIO()
         with redirect_stderr(errors):

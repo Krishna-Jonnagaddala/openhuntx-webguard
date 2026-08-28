@@ -78,16 +78,28 @@ def _endpoint_template(resource: AuthorizationResource) -> str:
     """A structural key identifying "the same logical endpoint, for any
     identifier value" -- the templated path with this resource's own
     identifier value removed, so two resources for the same endpoint
-    shape but different concrete objects produce the same template."""
+    shape but different concrete objects produce the same template.
+
+    The identifier is matched as a *whole path segment*, searched from
+    the end of the path backward, never as an arbitrary substring of
+    the URL -- a naive substring replacement would (and, before this
+    fix, once did) incorrectly match a numeric identifier value that
+    happens to also appear inside the hostname/IP address or port
+    (e.g. identifier "12" spuriously matching inside "127.0.0.1"),
+    silently breaking eligibility matching for any endpoint where that
+    coincidence occurs.
+    """
 
     parsed = urlsplit(resource.endpoint)
-    canonical = f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
-    if (
-        resource.identifier_location is IdentifierLocation.PATH
-        and resource.identifier_value
-        and resource.identifier_value in canonical
-    ):
-        canonical = canonical.replace(resource.identifier_value, "{identifier}", 1)
+    path = parsed.path or "/"
+    if resource.identifier_location is IdentifierLocation.PATH and resource.identifier_value:
+        segments = path.split("/")
+        for index in range(len(segments) - 1, -1, -1):
+            if segments[index] == resource.identifier_value:
+                segments[index] = "{identifier}"
+                break
+        path = "/".join(segments)
+    canonical = f"{parsed.scheme}://{parsed.netloc}{path}"
     return "|".join(
         (
             canonical,

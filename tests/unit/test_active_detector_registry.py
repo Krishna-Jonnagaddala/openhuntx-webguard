@@ -9,7 +9,10 @@ import unittest
 
 from webguard_contracts import KNOWN_TRUSTSCAN_ACTIVE_CHECKS
 from webguard_scanner import ACTIVE_DETECTOR_REGISTRY, KNOWN_ACTIVE_DETECTOR_IDS
-from webguard_scanner.active_detector_registry import COMPARISON_ACTIVE_CHECK_IDS
+from webguard_scanner.active_detector_registry import (
+    CALLBACK_ACTIVE_CHECK_IDS,
+    COMPARISON_ACTIVE_CHECK_IDS,
+)
 
 
 class ActiveDetectorRegistryConsistencyTests(unittest.TestCase):
@@ -29,11 +32,21 @@ class ActiveDetectorRegistryConsistencyTests(unittest.TestCase):
         never neither, never both."""
 
         self.assertEqual(
-            set(ACTIVE_DETECTOR_REGISTRY) | COMPARISON_ACTIVE_CHECK_IDS,
+            set(ACTIVE_DETECTOR_REGISTRY)
+            | COMPARISON_ACTIVE_CHECK_IDS
+            | CALLBACK_ACTIVE_CHECK_IDS,
             KNOWN_ACTIVE_DETECTOR_IDS,
         )
         self.assertEqual(
             set(ACTIVE_DETECTOR_REGISTRY) & COMPARISON_ACTIVE_CHECK_IDS,
+            set(),
+        )
+        self.assertEqual(
+            set(ACTIVE_DETECTOR_REGISTRY) & CALLBACK_ACTIVE_CHECK_IDS,
+            set(),
+        )
+        self.assertEqual(
+            COMPARISON_ACTIVE_CHECK_IDS & CALLBACK_ACTIVE_CHECK_IDS,
             set(),
         )
 

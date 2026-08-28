@@ -49,7 +49,7 @@ Scanner-side security logic including:
 - checkpoint/resume logic;
 - owned-target preflight enforcement;
 - runtime hooks used by the TrustScan safety engine; and
-- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`), the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`), the request-template/mutation layer between them (`request_template.py`), the authentication-context/session-application layer that lets any of these run against an authenticated surface (`authentication.py`, `login_workflow.py`), the multi-identity authorization-comparison engine (`authorization_resource.py`, `idor_authorization_detector.py`) that IDOR/BOLA detection is built on, and the authenticated crawl/resource-discovery layer (`authorization_crawl.py`, `authorization_resource_discovery.py`, `resource_graph.py`) that turns legitimate authenticated observation into resource pairs for that engine — see `docs/audit/active-detection-phase1-xss.md` through `phase9-authenticated-resource-discovery.md`.
+- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`, `ssrf_callback_detector.py`), the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`), the request-template/mutation layer between them (`request_template.py`), the authentication-context/session-application layer that lets any of these run against an authenticated surface (`authentication.py`, `login_workflow.py`), the multi-identity authorization-comparison engine (`authorization_resource.py`, `idor_authorization_detector.py`) that IDOR/BOLA detection is built on, the authenticated crawl/resource-discovery layer (`authorization_crawl.py`, `authorization_resource_discovery.py`, `resource_graph.py`) that turns legitimate authenticated observation into resource pairs for that engine, and the controlled-callback protocol (`callback_broker.py`) SSRF detection is built on — see `docs/audit/active-detection-phase1-xss.md` through `phase10-ssrf-callback.md`.
 
 Active-detection data flow, current as of Slice 7 (single-identity detectors — XSS, SQLi):
 
@@ -189,6 +189,56 @@ same TrustScan budget and rate limits. See
 for the full eligibility rules, false-positive controls, and the Juice
 Shop discovery validation.
 
+#### Controlled SSRF detection & callback infrastructure, added Slice 10
+
+SSRF (`active.ssrf.callback`, CWE-918) is architecturally distinct from
+every prior detector in this project: confirmation depends on
+something *receiving* a connection the target's own server makes, not
+on anything WebGuard's own client observes in a response. This adds a
+new component role — a receiver, not a client — that intentionally sits
+outside the request/response cycle every other detector operates
+within.
+
+```
+CallbackToken/CallbackObservation/CallbackPolicy/CallbackBroker (callback_broker.py, scanner)
+   |  protocol only -- register()/wait_for_observation(), zero apps/api dependency
+   v
+InMemoryCallbackBroker (scanner)         CallbackRepository (callback_service.py, apps/api)
+   |  self-contained default                |  multi-tenant wrapper: org/target/authorization
+   |  (webguard scan CLI, tests)             |  metadata per registration, one shared broker
+   v                                          v
+run_ssrf_callback_detector()             _ScanScopedCallbackBroker (executor.py)
+   |  RequestTemplate + mutate() (Slice 6,     |  binds one scan's tenancy via closure,
+   |  unmodified) -> issue_templated_request    |  satisfies the scanner's protocol exactly
+   |  with the callback URL as the probe value
+   v
+CallbackHttpReceiver (callback_server.py, apps/api)
+   |  a real, separately-startable ThreadingHTTPServer -- not embedded
+   |  in the detector -- accepting /<scan_id>/<token> and recording an
+   |  observation keyed ONLY on the token (never Host header, never
+   |  source address)
+   v
+CONFIRMED (observed in the primary wait window) / PROBABLE (grace
+window only) / NOT_VULNERABLE / INCONCLUSIVE / ERROR
+   -> NormalizedFinding (CWE-918 + OWASP A10:2021, only for CONFIRMED/PROBABLE)
+```
+
+The only destination this detector ever hands to a probe is a callback
+URL a `CallbackBroker.register()` call itself produced -- there is no
+code path that falls back to, or accepts, an internal address
+(127.0.0.1, RFC1918, cloud metadata) to "prove" SSRF, and this
+detector's own safety boundary is completely independent of
+`scope_validator.py`/`safe_http.py`, which continue to govern
+WebGuard's own outbound *client* requests to the target unchanged.
+Tokens are `secrets.token_urlsafe`-generated, scan-bound,
+candidate-bound, time-limited, and bounded-use; correlation is
+token-only, never DNS/Host-dependent, which is what makes it robust to
+DNS rebinding or callback-host spoofing by construction rather than by
+policy. See
+`docs/audit/active-detection-phase10-ssrf-callback.md` for the full
+confirmation model, false-positive controls, and documented (not yet
+built) production callback-service requirements.
+
 ### `apps/api`
 
 The local control-plane foundation including:
@@ -205,7 +255,8 @@ The local control-plane foundation including:
 - TrustScan Safety Receipt persistence;
 - active-detector orchestration (`executor.py`'s `_apply_active_detection`), which runs the same authorized-detector loop against every candidate the scanner's attack-surface discovery finds, regardless of which interface (CLI or API) requested the scan; and
 - authentication-context metadata/secret storage (`authentication_contexts.py`) for authenticated scanning — deliberately in-memory only this slice, not SQLite (see its module docstring and `docs/audit/active-detection-phase7-authenticated-scanning.md` for why), so it does not yet persist across separate CLI/worker process invocations; and
-- authorization-comparison plan storage (`authorization_comparison.py`) for IDOR/BOLA scanning — a reference-only record (two authentication-context IDs plus an explicit resource scope, never a secret itself), in-memory only for the same reason as authentication-context storage, so it shares the same cross-process persistence limitation.
+- authorization-comparison plan storage (`authorization_comparison.py`) for IDOR/BOLA scanning — a reference-only record (two authentication-context IDs plus an explicit resource scope, never a secret itself), in-memory only for the same reason as authentication-context storage, so it shares the same cross-process persistence limitation; and
+- callback registration/receiver infrastructure (`callback_service.py`, `callback_server.py`) for SSRF scanning — a multi-tenant, in-memory correlation store (tokens, not secrets) plus a real, independently-startable local HTTP receiver; not wired into `webguard-api serve`'s default startup this slice, and not yet backed by a public hostname or persistent storage (see `docs/audit/active-detection-phase10-ssrf-callback.md`'s documented production requirements).
 
 ### `infra/compose`
 

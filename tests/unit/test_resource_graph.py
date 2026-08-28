@@ -144,6 +144,26 @@ class EligibilityTests(unittest.TestCase):
         b = resource(identity="user-b", identifier_value="SAME-ID")
         self.assertFalse(is_eligible_for_comparison(a, b))
 
+    def test_numeric_identifier_coinciding_with_a_digit_in_the_host_is_still_eligible(
+        self,
+    ) -> None:
+        # Regression: a naive substring replacement in the endpoint-
+        # template computation once matched identifier "12" against the
+        # "12" inside the host "127.0.0.1" instead of the trailing path
+        # segment, silently breaking eligibility. The identifier must
+        # only ever be matched as a whole path segment.
+        a = resource(
+            identity="user-a",
+            identifier_value="11",
+            endpoint="http://127.0.0.1:3000/rest/basket/11",
+        )
+        b = resource(
+            identity="user-b",
+            identifier_value="12",
+            endpoint="http://127.0.0.1:3000/rest/basket/12",
+        )
+        self.assertTrue(is_eligible_for_comparison(a, b))
+
 
 class ResourceGraphTests(unittest.TestCase):
     def test_add_resources_only_accepts_matching_identity_label(self) -> None:

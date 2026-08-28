@@ -21,6 +21,14 @@ executed through its own dedicated orchestration path
 (``executor._apply_authorization_comparison``), never through the
 generic loop. ``COMPARISON_ACTIVE_CHECK_IDS`` exists so that split is
 explicit and tested, not an accidental omission.
+
+``active.ssrf.callback`` (Slice 10) is excluded from
+``ACTIVE_DETECTOR_REGISTRY`` for the identical reason: it requires a
+``CallbackBroker`` dependency and a bounded, asynchronous "wait for an
+out-of-band callback" step that does not fit the generic synchronous
+calling convention either. It is tracked in its own
+``CALLBACK_ACTIVE_CHECK_IDS`` set and executed through
+``executor._apply_ssrf_callback_detection``.
 """
 
 from __future__ import annotations
@@ -34,11 +42,17 @@ ACTIVE_DETECTOR_REGISTRY = {
 }
 
 COMPARISON_ACTIVE_CHECK_IDS = frozenset({"active.authorization.idor"})
+CALLBACK_ACTIVE_CHECK_IDS = frozenset({"active.ssrf.callback"})
 
-KNOWN_ACTIVE_DETECTOR_IDS = frozenset(ACTIVE_DETECTOR_REGISTRY) | COMPARISON_ACTIVE_CHECK_IDS
+KNOWN_ACTIVE_DETECTOR_IDS = (
+    frozenset(ACTIVE_DETECTOR_REGISTRY)
+    | COMPARISON_ACTIVE_CHECK_IDS
+    | CALLBACK_ACTIVE_CHECK_IDS
+)
 
 __all__ = [
     "ACTIVE_DETECTOR_REGISTRY",
+    "CALLBACK_ACTIVE_CHECK_IDS",
     "COMPARISON_ACTIVE_CHECK_IDS",
     "KNOWN_ACTIVE_DETECTOR_IDS",
 ]

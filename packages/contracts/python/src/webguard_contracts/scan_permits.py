@@ -45,6 +45,7 @@ TRUSTSCAN_PROHIBITED_OPERATIONS = (
 KNOWN_TRUSTSCAN_ACTIVE_CHECKS = (
     "active.authorization.idor",
     "active.sqli.error",
+    "active.ssrf.callback",
     "active.xss.reflected",
 )
 
