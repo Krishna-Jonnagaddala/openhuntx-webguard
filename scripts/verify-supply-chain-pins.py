@@ -162,7 +162,7 @@ if f"actions/setup-python@{SETUP_PYTHON_SHA}" not in workflow:
     fail("actions/setup-python is not pinned to the reviewed immutable SHA")
 if re.search(r"uses:\s+actions/(?:checkout|setup-python)@v", workflow):
     fail("a moving GitHub Action major-version tag remains in CI")
-if workflow.count(f"runs-on: {EXPECTED_RUNNER}") != 3:
+if workflow.count(f"runs-on: {EXPECTED_RUNNER}") != 4:
     fail("CI runner count or reviewed Ubuntu runner pin changed")
 if "runs-on: ubuntu-latest" in workflow:
     fail("CI still uses the moving ubuntu-latest runner label")

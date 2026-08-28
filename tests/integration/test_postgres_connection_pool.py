@@ -15,14 +15,21 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 RUN_INTEGRATION = os.environ.get("WEBGUARD_RUN_INTEGRATION") == "1"
-POSTGRES_TEST_DSN = os.environ.get(
-    "WEBGUARD_POSTGRES_TEST_DSN",
-    "postgresql://webguard:webguard_dev_only_not_for_production@127.0.0.1:5433/webguard",
-)
+# No hardcoded default DSN: WEBGUARD_RUN_INTEGRATION=1 alone is not
+# sufficient to run these -- the CI job that sets it also runs the
+# Juice Shop lab tests, which need no PostgreSQL at all, so treating
+# that flag as "a Postgres instance exists" produced a real CI failure
+# (a 5-second pool-timeout error, not a clean skip) the first time this
+# suite ran in a job with no Postgres service container. Requiring the
+# DSN to be explicitly set is also more honest than a hardcoded
+# fallback that might silently point at the wrong instance.
+POSTGRES_TEST_DSN = os.environ.get("WEBGUARD_POSTGRES_TEST_DSN")
+RUN_POSTGRES_TESTS = RUN_INTEGRATION and bool(POSTGRES_TEST_DSN)
 
 
 @unittest.skipUnless(
-    RUN_INTEGRATION, "Set WEBGUARD_RUN_INTEGRATION=1 to run this PostgreSQL integration test."
+    RUN_POSTGRES_TESTS,
+    "Set WEBGUARD_RUN_INTEGRATION=1 and WEBGUARD_POSTGRES_TEST_DSN to run this PostgreSQL integration test.",
 )
 class PostgresConnectionPoolTests(unittest.TestCase):
     def setUp(self) -> None:

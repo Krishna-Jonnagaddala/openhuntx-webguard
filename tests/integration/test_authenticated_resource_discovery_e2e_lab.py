@@ -543,7 +543,18 @@ class AuthenticatedResourceDiscoveryEndToEndLabTests(unittest.TestCase):
                             "confirm_authorization": authorization_id,
                             "permitted_modes": ["single_page"],
                             "allowed_http_methods": ["GET", "HEAD"],
-                            "not_before": (now + timedelta(milliseconds=500))
+                            # Computed fresh here, not from the outer
+                            # `now` captured before this test's earlier
+                            # real HTTP round-trips (login, discovery
+                            # context setup) -- on a loaded CI runner
+                            # those alone can exceed a small fixed
+                            # buffer measured from a stale timestamp,
+                            # making not_before arrive already in the
+                            # past and get rejected by the server's
+                            # (correct) anti-backdating check.
+                            "not_before": (
+                                datetime.now(timezone.utc) + timedelta(milliseconds=500)
+                            )
                             .isoformat(timespec="microseconds")
                             .replace("+00:00", "Z"),
                             "expires_at": (now + timedelta(days=7))

@@ -30,6 +30,12 @@ python -m unittest discover \
   -p 'test_*.py' \
   -v
 
+echo "Running repository contract tests (SQLite/in-memory backends always run here; PostgreSQL backends skip unless WEBGUARD_POSTGRES_TEST_DSN is set)..."
+python -m unittest discover \
+  -s tests/contract \
+  -p 'test_*.py' \
+  -v
+
 echo "Confirming integration tests remain opt-in..."
 python -m unittest discover \
   -s tests/integration \

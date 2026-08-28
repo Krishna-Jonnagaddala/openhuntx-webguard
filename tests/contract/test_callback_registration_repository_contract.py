@@ -18,10 +18,10 @@ from uuid import uuid4
 from webguard_api.callback_service import CallbackRepository, CallbackServiceError
 
 RUN_INTEGRATION = os.environ.get("WEBGUARD_RUN_INTEGRATION") == "1"
-POSTGRES_TEST_DSN = os.environ.get(
-    "WEBGUARD_POSTGRES_TEST_DSN",
-    "postgresql://webguard:webguard_dev_only_not_for_production@127.0.0.1:5433/webguard",
-)
+# No hardcoded default DSN -- see test_postgres_connection_pool.py's
+# comment on this exact env-var pair.
+POSTGRES_TEST_DSN = os.environ.get("WEBGUARD_POSTGRES_TEST_DSN")
+RUN_POSTGRES_TESTS = RUN_INTEGRATION and bool(POSTGRES_TEST_DSN)
 
 
 def _token_value(registered) -> str:
@@ -136,7 +136,8 @@ class InMemoryCallbackRegistrationRepositoryContractTests(
 
 
 @unittest.skipUnless(
-    RUN_INTEGRATION, "Set WEBGUARD_RUN_INTEGRATION=1 to run this PostgreSQL contract test."
+    RUN_POSTGRES_TESTS,
+    "Set WEBGUARD_RUN_INTEGRATION=1 and WEBGUARD_POSTGRES_TEST_DSN to run this PostgreSQL contract test.",
 )
 class PostgresCallbackRegistrationRepositoryContractTests(
     CallbackRegistrationRepositoryContractMixin, unittest.TestCase
