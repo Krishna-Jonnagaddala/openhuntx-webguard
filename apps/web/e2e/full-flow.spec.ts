@@ -1,26 +1,47 @@
 import { expect, test } from "@playwright/test";
 
 /**
- * Slice 15 requirement 28: the full product flow driven through the
- * real browser UI, against the real production-mode API + PostgreSQL
- * + worker started by `global-setup.ts`. Every step below is the same
- * click/type a human operator would perform -- nothing here reaches
- * around the UI to poke the API directly.
+ * Slice 15 requirement 28 (rewritten for Slice 16 requirement 24): the
+ * full product flow driven through the real browser UI, against the
+ * real production-mode API + PostgreSQL + worker started by
+ * `global-setup.ts`. Every step below is the same click/type a human
+ * operator would perform -- nothing here reaches around the UI to
+ * poke the API directly.
+ *
+ * The account itself is bootstrapped out-of-band by the harness (a
+ * real password credential + a verified email, set up the same way
+ * an admin-provisioned account would be) rather than registered
+ * on-screen, since registration is already covered by its own
+ * dedicated backend/unit coverage -- but sign-in, session
+ * establishment, and sign-out below all go through the real login
+ * form and real HttpOnly session cookie. The old "paste your API
+ * token into the login screen" mechanism this spec used through
+ * Slice 15 no longer exists in the product at all.
  */
 
 const TOKEN = process.env.WEBGUARD_E2E_TOKEN;
+const OWNER_EMAIL = process.env.WEBGUARD_E2E_OWNER_EMAIL;
+const OWNER_PASSWORD = process.env.WEBGUARD_E2E_OWNER_PASSWORD;
 const TARGET_URL = process.env.WEBGUARD_E2E_TARGET_URL;
 
 test.beforeAll(() => {
-  if (!TOKEN || !TARGET_URL) {
-    throw new Error("global-setup did not publish WEBGUARD_E2E_TOKEN/WEBGUARD_E2E_TARGET_URL");
+  if (!TOKEN || !OWNER_EMAIL || !OWNER_PASSWORD || !TARGET_URL) {
+    throw new Error(
+      "global-setup did not publish WEBGUARD_E2E_TOKEN/WEBGUARD_E2E_OWNER_EMAIL/" +
+        "WEBGUARD_E2E_OWNER_PASSWORD/WEBGUARD_E2E_TARGET_URL",
+    );
   }
 });
 
-test("full customer platform flow: sign in, add asset, verify, scan, findings, report", async ({ page }) => {
-  // -- sign in --
+test("full customer platform flow: sign in, add asset, verify, scan, findings, report, sign out", async ({
+  page,
+}) => {
+  // -- sign in with a real email/password account, establishing a
+  // real server-side browser session (HttpOnly cookie) -- not a
+  // pasted bearer token --
   await page.goto("/login");
-  await page.getByLabel("API token").fill(TOKEN!);
+  await page.getByLabel("Email").fill(OWNER_EMAIL!);
+  await page.getByLabel("Password").fill(OWNER_PASSWORD!);
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
 
@@ -95,4 +116,17 @@ test("full customer platform flow: sign in, add asset, verify, scan, findings, r
   // page) --
   await page.goto("/reports");
   await expect(page.getByRole("heading", { name: "Reports" })).toBeVisible();
+
+  // -- sign out through the real UI: this revokes the session
+  // server-side (not just a client-side state clear), so the browser
+  // session cookie stops authenticating anything afterward --
+  await page.getByRole("button", { name: "Dev Owner", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Sign out" }).click();
+  await expect(page).toHaveURL(/\/login/);
+
+  // -- a protected page is inaccessible after logout: the SPA's
+  // route guard redirects back to /login rather than rendering
+  // authenticated content from stale client state --
+  await page.goto("/assets");
+  await expect(page).toHaveURL(/\/login/);
 });

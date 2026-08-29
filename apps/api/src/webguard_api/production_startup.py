@@ -43,7 +43,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .artifact_store import ObjectStorageArtifactStore
-from .auth import ApiTokenAuthenticator
+from .auth import ApiTokenAuthenticator, BrowserSessionAuthenticator
+from .auth_rate_limit import PostgresAuthRateLimiter
 from .authorizations import AuthorizationRepository
 from .callback_service import CallbackRepository
 from .config import (
@@ -56,6 +57,7 @@ from .config import (
     DEFAULT_WORKER_POLL_SECONDS,
 )
 from .executor import ScanJobExecutor
+from .mail import LoggingMailProvider
 from .pagination import SignedCursorCodec
 from .postgres_authentication_contexts import PostgresAuthenticationContextRepository
 from .postgres_authorization_comparison import PostgresAuthorizationComparisonPlanRepository
@@ -66,6 +68,7 @@ from .postgres_jobs import PostgresJobRepository
 from .postgres_pool import WebGuardPostgresPool
 from .postgres_reports import PostgresReportRepository
 from .postgres_scans import PostgresScanRepository
+from .postgres_sessions import PostgresSessionRepository
 from .postgres_target_verification import PostgresTargetVerificationRepository
 from .postgres_targets import PostgresTargetRepository
 from .production_config import ProductionServiceConfig
@@ -102,6 +105,7 @@ class ProductionComponents:
     worker: ScanJobWorker
     scheduler: ScanScheduleCoordinator
     authenticator: ApiTokenAuthenticator
+    session_authenticator: BrowserSessionAuthenticator
     rate_limiter: FixedWindowRateLimiter
 
     def readiness_check(self) -> None:
@@ -133,6 +137,21 @@ def build_production_components(
     authorization_comparison_plans = PostgresAuthorizationComparisonPlanRepository(pool)
     reports = PostgresReportRepository(pool)
     authorizations = AuthorizationRepository(Path(config.authorization_directory))
+    sessions = PostgresSessionRepository(pool)
+    # Slice 16 requirement 12: a real, distributed-safe counter (see
+    # auth_rate_limit.py's own docstring on why Postgres is sufficient
+    # here) shared by every auth-adjacent route's bucket key -- login,
+    # registration, password reset, email verification, invitation
+    # acceptance each get their own bucket key prefix, so one purpose
+    # being hammered never exhausts another's quota, but all share one
+    # threshold rather than needing a separately-tuned limiter per
+    # route.
+    auth_rate_limiter = PostgresAuthRateLimiter(pool, max_attempts=10, window_seconds=900)
+    # Requirement 26: no production transactional-email integration
+    # exists yet -- deliberately. Production writes verification/
+    # reset/invitation links to its own log instead of a real inbox
+    # until a real provider is wired up in the infrastructure phase.
+    mail_provider = LoggingMailProvider()
 
     signing_provider = KmsSigningProvider(kms_client, key_id=config.kms_key_id)
     registry = SigningKeyRegistry(signing_provider)
@@ -176,6 +195,9 @@ def build_production_components(
         authorization_comparison_plans=authorization_comparison_plans,
         targets=targets,
         target_verifications=target_verifications,
+        sessions=sessions,
+        mail_provider=mail_provider,
+        auth_rate_limiter=auth_rate_limiter,
     )
     executor = ScanJobExecutor(
         authorizations=authorizations,
@@ -209,6 +231,7 @@ def build_production_components(
         batch_size=DEFAULT_SCHEDULER_BATCH_SIZE,
     )
     authenticator = ApiTokenAuthenticator(identity)
+    session_authenticator = BrowserSessionAuthenticator(identity, sessions)
     rate_limiter = FixedWindowRateLimiter(requests=120, window_seconds=60)
 
     return ProductionComponents(
@@ -230,6 +253,7 @@ def build_production_components(
         worker=worker,
         scheduler=scheduler,
         authenticator=authenticator,
+        session_authenticator=session_authenticator,
         rate_limiter=rate_limiter,
     )
 

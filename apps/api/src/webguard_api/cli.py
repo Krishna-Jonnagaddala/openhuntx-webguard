@@ -16,7 +16,7 @@ from uuid import uuid4
 from webguard_contracts import OrganizationRole, PrincipalType
 
 from . import __version__
-from .auth import ApiTokenAuthenticator, AuthenticationError
+from .auth import ApiTokenAuthenticator, AuthenticationError, BrowserSessionAuthenticator
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .config import (
     DEFAULT_API_HOST,
@@ -574,11 +574,13 @@ def _serve_command(args: argparse.Namespace) -> int:
         worker = components.worker
         scheduler = components.scheduler
         authenticator = components.authenticator
+        session_authenticator = components.session_authenticator
         limiter = components.rate_limiter
         pool = components.pool
     else:
         config = _config(args)
-        _, _, service, worker, scheduler, authenticator, limiter = _components(config)
+        _, identity, service, worker, scheduler, authenticator, limiter = _components(config)
+        session_authenticator = BrowserSessionAuthenticator(identity, service.sessions)
         host, port = config.host, config.port
         maximum_request_bytes = config.maximum_request_bytes
     stop_event = threading.Event()
@@ -603,14 +605,26 @@ def _serve_command(args: argparse.Namespace) -> int:
         for origin in os.environ.get("WEBGUARD_WEB_ALLOWED_ORIGINS", "").split(",")
         if origin.strip()
     )
+    # Slice 16: secure by default -- an operator must explicitly opt
+    # out for plain-HTTP local/dev use (a browser will not store or
+    # return a Secure cookie over plain HTTP at all, so getting this
+    # wrong in dev doesn't fail insecurely, it just breaks login).
+    # HSTS is readiness, not enforcement (see build_handler's
+    # docstring): off by default, since this process itself only ever
+    # binds to loopback.
+    secure_cookies = os.environ.get("WEBGUARD_SECURE_COOKIES", "true").strip().lower() != "false"
+    hsts_enabled = os.environ.get("WEBGUARD_HSTS_ENABLED", "false").strip().lower() == "true"
     server = create_server(
         host,
         port,
         service,
         authenticator=authenticator,
+        session_authenticator=session_authenticator,
         rate_limiter=limiter,
         maximum_request_bytes=maximum_request_bytes,
         allowed_origins=allowed_origins,
+        secure_cookies=secure_cookies,
+        hsts_enabled=hsts_enabled,
     )
 
     def request_stop(_signum: int, _frame: object) -> None:

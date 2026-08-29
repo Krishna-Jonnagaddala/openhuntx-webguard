@@ -21,6 +21,8 @@ EXPECTED = {
     "psycopg-binary": "3.2.10",
     "psycopg-pool": "3.2.6",
     "typing-extensions": "4.15.0",
+    "argon2-cffi": "25.1.0",
+    "argon2-cffi-bindings": "26.1.0",
 }
 
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -93,6 +95,8 @@ expected_runtime = {
     "psycopg-binary",
     "psycopg-pool",
     "typing-extensions",
+    "argon2-cffi",
+    "argon2-cffi-bindings",
 }
 if set(locked) != expected_runtime:
     fail(f"runtime lock package set changed: {sorted(locked)}")
@@ -131,6 +135,8 @@ if f"psycopg[binary]=={EXPECTED['psycopg']}" not in api["project"]["dependencies
     fail("API psycopg dependency is not exactly pinned")
 if f"psycopg-pool=={EXPECTED['psycopg-pool']}" not in api["project"]["dependencies"]:
     fail("API psycopg-pool dependency is not exactly pinned")
+if f"argon2-cffi=={EXPECTED['argon2-cffi']}" not in api["project"]["dependencies"]:
+    fail("API argon2-cffi dependency is not exactly pinned")
 if "version" in api["project"]:
     fail("API pyproject must not define a second static version authority")
 if api["project"].get("dynamic") != ["version"]:

@@ -263,10 +263,11 @@ class CustomerPlatformApiTests(unittest.TestCase):
 
     def test_owner_can_invite_update_and_remove_a_member(self) -> None:
         status, _, invited = self.json_request(
-            "POST", "/v1/team/invitations", {"display_name": "New Analyst", "role": "analyst"}
+            "POST", "/v1/team/invitations",
+            {"display_name": "New Analyst", "role": "analyst", "email": "new.analyst@example.com"},
         )
         self.assertEqual(status, 201, invited)
-        self.assertTrue(invited["initial_token"])
+        self.assertEqual(invited["email"], "new.analyst@example.com")
         member_id = invited["principal_id"]
 
         status, _, listing = self.json_request("GET", "/v1/team")
@@ -289,12 +290,22 @@ class CustomerPlatformApiTests(unittest.TestCase):
 
     def test_non_owner_cannot_grant_owner_role(self) -> None:
         status, _, invited = self.json_request(
-            "POST", "/v1/team/invitations", {"display_name": "Future Admin", "role": "administrator"}
+            "POST", "/v1/team/invitations",
+            {"display_name": "Future Admin", "role": "administrator", "email": "future.admin@example.com"},
         )
         self.assertEqual(status, 201, invited)
-        admin_token = invited["initial_token"]
+        # Slice 16: invitation no longer issues a bearer token directly
+        # (it issues a mailed invitation token instead) -- an API token
+        # for the invited administrator is created the same way any
+        # other out-of-band API token would be, matching this file's
+        # own established "provision a second principal/token directly"
+        # pattern used elsewhere in this suite (test_assets_are_tenant_scoped).
+        admin_token = self.service.identity.create_token(
+            invited["principal_id"], label="test-admin", now=NOW
+        ).token
         status, _, invited2 = self.json_request(
-            "POST", "/v1/team/invitations", {"display_name": "Nobody Yet", "role": "viewer"},
+            "POST", "/v1/team/invitations",
+            {"display_name": "Nobody Yet", "role": "viewer", "email": "nobody.yet@example.com"},
             headers={"Authorization": f"Bearer {admin_token}"}, token=None,
         )
         self.assertEqual(status, 201, invited2)

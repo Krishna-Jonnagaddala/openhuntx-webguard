@@ -32,10 +32,15 @@ from webguard_contracts import (
 from .db_errors import DatabaseIntegrityError
 from .identity import (
     DEFAULT_TOKEN_VALIDITY_DAYS,
+    IDENTITY_TOKEN_PREFIX,
     MAXIMUM_TOKEN_VALIDITY_DAYS,
     IdentityStoreError,
+    IdentityTokenPurpose,
+    IdentityTokenRecord,
     IssuedApiToken,
+    IssuedIdentityToken,
     _hash_secret,
+    _parse_prefixed_secret,
     _token_parts,
     _verify_secret,
 )
@@ -101,6 +106,11 @@ class PostgresIdentityRepository:
             created_at=row[3].astimezone(timezone.utc),
         )
 
+    _PRINCIPAL_COLUMNS = (
+        "principal_id, organization_id, display_name, principal_type, role, active, created_at, "
+        "email, email_verified_at, last_login_at"
+    )
+
     def create_principal(
         self,
         organization_id: str,
@@ -110,6 +120,7 @@ class PostgresIdentityRepository:
         role: OrganizationRole,
         now: datetime,
         principal_id: str | None = None,
+        email: str | None = None,
     ) -> Principal:
         organization = self.get_organization(organization_id)
         if organization.status is not OrganizationStatus.ACTIVE:
@@ -122,6 +133,7 @@ class PostgresIdentityRepository:
             role=role,
             active=True,
             created_at=now,
+            email=email,
         )
         try:
             with self._pool.connection() as connection:
@@ -129,8 +141,8 @@ class PostgresIdentityRepository:
                     connection.execute(
                         """
                         INSERT INTO principals
-                            (principal_id, organization_id, display_name, principal_type, role, active, created_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            (principal_id, organization_id, display_name, principal_type, role, active, created_at, email)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             value.principal_id,
@@ -140,6 +152,7 @@ class PostgresIdentityRepository:
                             value.role.value,
                             True,
                             value.created_at,
+                            value.email,
                         ),
                     )
                     connection.execute(
@@ -158,6 +171,11 @@ class PostgresIdentityRepository:
                         ),
                     )
         except DatabaseIntegrityError as exc:
+            if value.email is not None:
+                raise IdentityStoreError(
+                    "principal_email_conflict",
+                    "An account with that email address already exists.",
+                ) from exc
             raise IdentityStoreError(
                 "principal_conflict", "Principal already exists."
             ) from exc
@@ -166,15 +184,20 @@ class PostgresIdentityRepository:
     def get_principal(self, principal_id: str) -> Principal:
         with self._pool.connection() as connection:
             row = connection.execute(
-                """
-                SELECT principal_id, organization_id, display_name, principal_type, role, active, created_at
-                FROM principals WHERE principal_id = %s
-                """,
+                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals WHERE principal_id = %s",  # noqa: S608
                 (principal_id,),
             ).fetchone()
         if row is None:
             raise IdentityStoreError("principal_not_found", "Principal was not found.")
         return self._principal_from_row(row)
+
+    def get_principal_by_email(self, email: str) -> Principal | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals WHERE email = %s",  # noqa: S608
+                (email.strip().casefold(),),
+            ).fetchone()
+        return None if row is None else self._principal_from_row(row)
 
     @staticmethod
     def _principal_from_row(row: tuple) -> Principal:
@@ -186,6 +209,9 @@ class PostgresIdentityRepository:
             role=OrganizationRole(row[4]),
             active=bool(row[5]),
             created_at=row[6].astimezone(timezone.utc),
+            email=row[7],
+            email_verified_at=row[8].astimezone(timezone.utc) if row[8] else None,
+            last_login_at=row[9].astimezone(timezone.utc) if row[9] else None,
         )
 
     def get_principal_scoped(self, principal_id: str, *, organization_id: str) -> Principal:
@@ -197,10 +223,7 @@ class PostgresIdentityRepository:
     def list_principals(self, organization_id: str) -> tuple[Principal, ...]:
         with self._pool.connection() as connection:
             rows = connection.execute(
-                """
-                SELECT principal_id, organization_id, display_name, principal_type, role, active, created_at
-                FROM principals WHERE organization_id = %s ORDER BY created_at
-                """,
+                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals WHERE organization_id = %s ORDER BY created_at",  # noqa: S608
                 (organization_id,),
             ).fetchall()
         return tuple(self._principal_from_row(row) for row in rows)
@@ -221,6 +244,9 @@ class PostgresIdentityRepository:
             role=role,
             active=principal.active,
             created_at=principal.created_at,
+            email=principal.email,
+            email_verified_at=principal.email_verified_at,
+            last_login_at=principal.last_login_at,
         )
 
     def set_principal_active(
@@ -239,7 +265,146 @@ class PostgresIdentityRepository:
             role=principal.role,
             active=active,
             created_at=principal.created_at,
+            email=principal.email,
+            email_verified_at=principal.email_verified_at,
+            last_login_at=principal.last_login_at,
         )
+
+    def set_principal_email_verified(self, principal_id: str, *, now: datetime) -> Principal:
+        principal = self.get_principal(principal_id)
+        with self._pool.connection() as connection:
+            connection.execute(
+                "UPDATE principals SET email_verified_at = %s WHERE principal_id = %s",
+                (now, principal_id),
+            )
+        return Principal(
+            principal_id=principal.principal_id,
+            organization_id=principal.organization_id,
+            display_name=principal.display_name,
+            principal_type=principal.principal_type,
+            role=principal.role,
+            active=principal.active,
+            created_at=principal.created_at,
+            email=principal.email,
+            email_verified_at=now,
+            last_login_at=principal.last_login_at,
+        )
+
+    def touch_last_login(self, principal_id: str, *, now: datetime) -> None:
+        with self._pool.connection() as connection:
+            connection.execute(
+                "UPDATE principals SET last_login_at = %s WHERE principal_id = %s",
+                (now, principal_id),
+            )
+
+    def set_password_hash(self, principal_id: str, *, algorithm: str, password_hash: str, now: datetime) -> None:
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO password_credentials (principal_id, algorithm, password_hash, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (principal_id) DO UPDATE SET
+                    algorithm = EXCLUDED.algorithm,
+                    password_hash = EXCLUDED.password_hash,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (principal_id, algorithm, password_hash, now, now),
+            )
+
+    def get_password_hash(self, principal_id: str) -> str | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "SELECT password_hash FROM password_credentials WHERE principal_id = %s",
+                (principal_id,),
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def create_identity_token(
+        self,
+        principal_id: str,
+        organization_id: str,
+        *,
+        purpose: IdentityTokenPurpose,
+        ttl: timedelta,
+        now: datetime,
+    ) -> IssuedIdentityToken:
+        token_id = str(uuid4())
+        secret = secrets.token_urlsafe(32)
+        raw = f"{IDENTITY_TOKEN_PREFIX}_{token_id}_{secret}"
+        expires_at = now + ttl
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO identity_tokens
+                    (token_id, principal_id, organization_id, purpose, secret_hash, created_at, expires_at, used_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NULL)
+                """,
+                (token_id, principal_id, organization_id, purpose.value, _hash_secret(secret), now, expires_at),
+            )
+        record = IdentityTokenRecord(
+            token_id=token_id,
+            principal_id=principal_id,
+            organization_id=organization_id,
+            purpose=purpose,
+            created_at=now,
+            expires_at=expires_at,
+        )
+        return IssuedIdentityToken(record=record, token=raw)
+
+    def consume_identity_token(
+        self, token: object, *, purpose: IdentityTokenPurpose, now: datetime
+    ) -> IdentityTokenRecord:
+        token_id, secret = _parse_prefixed_secret(
+            token, prefix=IDENTITY_TOKEN_PREFIX, error_code="identity_token_invalid"
+        )
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT token_id, principal_id, organization_id, purpose, secret_hash,
+                       created_at, expires_at, used_at
+                FROM identity_tokens WHERE token_id = %s
+                """,
+                (token_id,),
+            ).fetchone()
+            if row is None or not _verify_secret(secret, row[4]):
+                raise IdentityStoreError("identity_token_invalid", "Token is invalid.")
+            if row[3] != purpose.value:
+                raise IdentityStoreError("identity_token_invalid", "Token is invalid.")
+            if row[7] is not None:
+                raise IdentityStoreError("identity_token_used", "Token has already been used.")
+            expires_at = row[6].astimezone(timezone.utc)
+            if now.astimezone(timezone.utc) >= expires_at:
+                raise IdentityStoreError("identity_token_expired", "Token has expired.")
+            connection.execute(
+                "UPDATE identity_tokens SET used_at = %s WHERE token_id = %s",
+                (now, token_id),
+            )
+        return IdentityTokenRecord(
+            token_id=str(row[0]),
+            principal_id=str(row[1]),
+            organization_id=str(row[2]),
+            purpose=IdentityTokenPurpose(row[3]),
+            created_at=row[5].astimezone(timezone.utc),
+            expires_at=expires_at,
+            used_at=now,
+        )
+
+    def invalidate_identity_tokens(
+        self, principal_id: str, *, purpose: IdentityTokenPurpose, now: datetime
+    ) -> None:
+        """Mark every still-usable token of this purpose for this
+        principal as used, without needing its secret -- used when a new
+        token supersedes an older, still-pending one (e.g. requesting a
+        second password reset invalidates the first)."""
+
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                UPDATE identity_tokens SET used_at = %s
+                WHERE principal_id = %s AND purpose = %s AND used_at IS NULL
+                """,
+                (now, principal_id, purpose.value),
+            )
 
     def list_tokens_for_principal(self, principal_id: str) -> tuple[ApiTokenMetadata, ...]:
         with self._pool.connection() as connection:
@@ -385,10 +550,7 @@ class PostgresIdentityRepository:
             if now.astimezone(timezone.utc) >= metadata.expires_at:
                 raise IdentityStoreError("api_token_expired", "API token has expired.")
             principal_row = connection.execute(
-                """
-                SELECT principal_id, organization_id, display_name, principal_type, role, active, created_at
-                FROM principals WHERE principal_id = %s
-                """,
+                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals WHERE principal_id = %s",  # noqa: S608
                 (metadata.principal_id,),
             ).fetchone()
             organization_row = connection.execute(

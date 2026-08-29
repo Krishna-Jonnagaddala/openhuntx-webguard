@@ -8,16 +8,21 @@ import re
 import time
 from datetime import datetime, timezone
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Type
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
-from .auth import ApiTokenAuthenticator, AuthContext, AuthenticationError
+from .auth import ApiTokenAuthenticator, AuthContext, AuthenticationError, BrowserSessionAuthenticator
 from .identity import TOKEN_PREFIX
 from .pagination import PaginationError, parse_page_request
 from .rate_limit import FixedWindowRateLimiter, RateLimitDecision, RateLimitError
 from .service import ApiServiceError, WebGuardJobService
+
+SESSION_COOKIE_NAME = "wg_session"  # noqa: S105
+CSRF_COOKIE_NAME = "wg_csrf"  # noqa: S105
+CSRF_HEADER_NAME = "X-CSRF-Token"  # noqa: S105
 
 
 _JOB_PATH = re.compile(r"^/v1/jobs/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
@@ -68,7 +73,7 @@ def _json_bytes(value: object) -> bytes:
 
 
 _CORS_ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS"
-_CORS_ALLOWED_HEADERS = "Authorization, Content-Type, Idempotency-Key, TrustScan-Permit"
+_CORS_ALLOWED_HEADERS = "Authorization, Content-Type, Idempotency-Key, TrustScan-Permit, X-CSRF-Token"
 
 
 def build_handler(
@@ -80,6 +85,9 @@ def build_handler(
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     epoch_clock: Callable[[], float] = time.time,
     allowed_origins: frozenset[str] = frozenset(),
+    session_authenticator: BrowserSessionAuthenticator | None = None,
+    secure_cookies: bool = True,
+    hsts_enabled: bool = False,
 ) -> Type[BaseHTTPRequestHandler]:
     """Create a request handler bound to authenticated service dependencies.
 
@@ -91,6 +99,21 @@ def build_handler(
     support, since credentials-bearing requests (the ``Authorization``
     bearer header) must never be paired with ``Access-Control-Allow-
     Origin: *``.
+
+    ``session_authenticator`` (Slice 16) enables cookie-based browser
+    sessions alongside the existing Bearer API tokens -- ``None``
+    (the default) preserves every pre-Slice-16 caller's behavior
+    exactly, since no code path can present a session cookie this
+    handler will accept. ``secure_cookies`` should be true whenever
+    the API is reachable over HTTPS (directly or through a reverse
+    proxy) and false only for plain-HTTP local/dev use, where a
+    browser will not store or return a ``Secure`` cookie at all --
+    getting this wrong in dev doesn't fail insecurely, it just breaks
+    login. ``hsts_enabled`` is readiness, not enforcement: this
+    process itself only ever binds to loopback (see ``create_server``),
+    so a real deployment's TLS-terminating reverse proxy is expected
+    to set `Strict-Transport-Security` too; this lets it be present
+    end-to-end once that proxy exists.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -105,7 +128,77 @@ def build_handler(
             origin = self.headers.get("Origin")
             if not origin or origin not in allowed_origins:
                 return {}
-            return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+            # Credentialed (cookie-carrying) cross-origin requests
+            # require this alongside a specific, non-wildcard Allow-
+            # Origin -- both are already true here, since
+            # `allowed_origins` never contains "*" (see build_handler's
+            # docstring) and this only ever echoes a matched origin.
+            return {
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Credentials": "true",
+                "Vary": "Origin",
+            }
+
+        def _security_headers(self) -> dict[str, str]:
+            headers = {
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "no-referrer",
+                # A JSON/bytes-only API: it never needs to load a
+                # script, style, image, or frame from anywhere,
+                # including itself -- 'none' is not an approximation
+                # of the right policy here, it is the right policy.
+                "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+                "Permissions-Policy": (
+                    "geolocation=(), camera=(), microphone=(), payment=(), usb=(), "
+                    "interest-cohort=()"
+                ),
+            }
+            if hsts_enabled:
+                headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+            return headers
+
+        def _parse_cookies(self) -> SimpleCookie:
+            jar: SimpleCookie = SimpleCookie()
+            header_values = self.headers.get_all("Cookie") or []
+            for value in header_values:
+                try:
+                    jar.load(value)
+                except Exception:  # noqa: BLE001, S112 - a malformed cookie header must fail closed, not crash
+                    continue
+            return jar
+
+        def _session_cookie_value(self) -> str | None:
+            jar = self._parse_cookies()
+            morsel = jar.get(SESSION_COOKIE_NAME)
+            return morsel.value if morsel is not None else None
+
+        def _csrf_header_value(self) -> str | None:
+            values = self.headers.get_all(CSRF_HEADER_NAME) or []
+            return values[0] if len(values) == 1 and values[0] else None
+
+        def _set_cookie(
+            self, name: str, value: str, *, http_only: bool, max_age_seconds: int
+        ) -> str:
+            attributes = [f"{name}={value}", "Path=/", f"Max-Age={max_age_seconds}", "SameSite=Lax"]
+            if http_only:
+                attributes.append("HttpOnly")
+            if secure_cookies:
+                attributes.append("Secure")
+            return "; ".join(attributes)
+
+        def _session_set_cookies(self, issued) -> list[str]:
+            max_age = int((issued.record.absolute_expires_at - issued.record.issued_at).total_seconds())
+            return [
+                self._set_cookie(SESSION_COOKIE_NAME, issued.session_token, http_only=True, max_age_seconds=max_age),
+                self._set_cookie(CSRF_COOKIE_NAME, issued.csrf_token, http_only=False, max_age_seconds=max_age),
+            ]
+
+        def _clear_session_cookies(self) -> list[str]:
+            return [
+                self._set_cookie(SESSION_COOKIE_NAME, "", http_only=True, max_age_seconds=0),
+                self._set_cookie(CSRF_COOKIE_NAME, "", http_only=False, max_age_seconds=0),
+            ]
 
         def _send_json(
             self,
@@ -114,21 +207,24 @@ def build_handler(
             *,
             request_id: str,
             extra_headers: dict[str, str] | None = None,
+            set_cookies: list[str] | None = None,
         ) -> None:
             body = _json_bytes(payload)
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Referrer-Policy", "no-referrer")
+            for name, value in self._security_headers().items():
+                self.send_header(name, value)
             self.send_header("X-Request-ID", request_id)
             for name, value in self._cors_headers().items():
                 self.send_header(name, value)
             if extra_headers:
                 for name, value in extra_headers.items():
                     self.send_header(name, value)
+            if set_cookies:
+                for cookie in set_cookies:
+                    self.send_header("Set-Cookie", cookie)
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
@@ -139,6 +235,7 @@ def build_handler(
             self.send_response(204)
             if origin and origin in allowed_origins:
                 self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Credentials", "true")
                 self.send_header("Vary", "Origin")
                 self.send_header("Access-Control-Allow-Methods", _CORS_ALLOWED_METHODS)
                 self.send_header("Access-Control-Allow-Headers", _CORS_ALLOWED_HEADERS)
@@ -339,11 +436,35 @@ def build_handler(
                 f"{self.client_address[0]}"
             )
 
-        def _authenticate(self) -> tuple[AuthContext, RateLimitDecision]:
+        def _authenticate(self, *, require_csrf: bool = False) -> tuple[AuthContext, RateLimitDecision]:
+            now_epoch = epoch_clock()
+            session_token = (
+                self._session_cookie_value() if session_authenticator is not None else None
+            )
+
+            if session_token is not None:
+                # A distinct failure bucket from the Bearer-token one
+                # below -- a browser session cookie and an API token
+                # are different credential spaces and must not share
+                # (or let one exhaust) the other's quota.
+                failure_key = f"auth-failure-session-peer:{self.client_address[0]}"
+                rate_limiter.check(failure_key, now_epoch=now_epoch)
+                try:
+                    context = session_authenticator.authenticate(
+                        session_token,
+                        now=clock(),
+                        csrf_header=self._csrf_header_value(),
+                        require_csrf=require_csrf,
+                    )
+                except AuthenticationError:
+                    raise
+                rate_limiter.release(failure_key, now_epoch=now_epoch)
+                decision = rate_limiter.check(context.token_id, now_epoch=now_epoch)
+                return context, decision
+
             authorization_headers = (
                 self.headers.get_all("Authorization") or []
             )
-            now_epoch = epoch_clock()
 
             failure_key = self._authentication_failure_key(
                 authorization_headers
@@ -375,6 +496,11 @@ def build_handler(
             )
 
             # Preserve the existing authenticated per-token quota.
+            # require_csrf is a no-op for this path by design
+            # (requirement 7): a request authenticated with an
+            # Authorization header is never subject to browser CSRF
+            # semantics -- it carries no ambient credential a
+            # cross-site request could ride along with.
             decision = rate_limiter.check(
                 context.token_id,
                 now_epoch=now_epoch,
@@ -442,11 +568,18 @@ def build_handler(
                     self.send_header("Content-Length", str(len(content)))
                     self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                     self.send_header("Cache-Control", "no-store")
+                    for name, value in self._security_headers().items():
+                        self.send_header(name, value)
                     self.send_header("X-Request-ID", request_id)
                     for name, value in self._cors_headers().items():
                         self.send_header(name, value)
                     self.end_headers()
                     self.wfile.write(content)
+                    return
+                if path == "/v1/auth/session":
+                    self._require_empty_query(query)
+                    payload = service.get_session_info(context, request_id=request_id)
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
                     return
                 if path == "/v1/dashboard/summary":
                     self._require_empty_query(query)
@@ -636,12 +769,139 @@ def build_handler(
             ) as exc:
                 self._error(exc, request_id=request_id)
 
+        def _unauthenticated_json_body(self, error_code: str) -> dict:
+            raw_body = self._read_json_body()
+            try:
+                body = json.loads(raw_body)
+            except json.JSONDecodeError as exc:
+                raise ApiTransportError(error_code, "Request body must be valid JSON.", status=400) from exc
+            if not isinstance(body, dict):
+                raise ApiTransportError(error_code, "Request body must be a JSON object.", status=400)
+            return body
+
+        def _user_agent(self) -> str | None:
+            values = self.headers.get_all("User-Agent") or []
+            return values[0][:512] if values else None
+
         def do_POST(self) -> None:  # noqa: N802
             request_id = str(uuid4())
             try:
                 path, query = self._request_target()
                 self._require_empty_query(query)
-                context, decision = self._authenticate()
+
+                # -- unauthenticated browser-auth routes (Slice 16): the
+                # request body's own token/credential is the authority
+                # here, not a prior session or API token. Each is its
+                # own IP-scoped rate-limit bucket inside service.py. --
+                if path == "/v1/auth/register":
+                    body = self._unauthenticated_json_body("register_body_invalid")
+                    context, issued = service.register_account(
+                        body, request_id=request_id, user_agent=self._user_agent(),
+                        ip_address=self.client_address[0],
+                    )
+                    self._send_json(
+                        201, context.to_public_dict(), request_id=request_id,
+                        set_cookies=self._session_set_cookies(issued),
+                    )
+                    return
+                if path == "/v1/auth/login":
+                    body = self._unauthenticated_json_body("login_body_invalid")
+                    context, issued = service.login(
+                        body, request_id=request_id, user_agent=self._user_agent(),
+                        ip_address=self.client_address[0],
+                    )
+                    self._send_json(
+                        200, context.to_public_dict(), request_id=request_id,
+                        set_cookies=self._session_set_cookies(issued),
+                    )
+                    return
+                if path == "/v1/auth/password/reset/request":
+                    body = self._unauthenticated_json_body("password_reset_body_invalid")
+                    payload = service.request_password_reset(
+                        body, request_id=request_id, ip_address=self.client_address[0]
+                    )
+                    self._send_json(200, payload, request_id=request_id)
+                    return
+                if path == "/v1/auth/password/reset/confirm":
+                    body = self._unauthenticated_json_body("password_reset_confirm_body_invalid")
+                    payload = service.confirm_password_reset(
+                        body, request_id=request_id, ip_address=self.client_address[0]
+                    )
+                    self._send_json(200, payload, request_id=request_id)
+                    return
+                if path == "/v1/auth/email/verify/confirm":
+                    body = self._unauthenticated_json_body("email_verification_body_invalid")
+                    payload = service.confirm_email_verification(
+                        body, request_id=request_id, ip_address=self.client_address[0]
+                    )
+                    self._send_json(200, payload, request_id=request_id)
+                    return
+                if path == "/v1/auth/invitations/accept":
+                    body = self._unauthenticated_json_body("invitation_accept_body_invalid")
+                    context, issued = service.accept_invitation(
+                        body, request_id=request_id, user_agent=self._user_agent(),
+                        ip_address=self.client_address[0],
+                    )
+                    self._send_json(
+                        200, context.to_public_dict(), request_id=request_id,
+                        set_cookies=self._session_set_cookies(issued),
+                    )
+                    return
+
+                context, decision = self._authenticate(require_csrf=True)
+
+                # -- authenticated browser-auth routes --
+                if path == "/v1/auth/logout":
+                    lengths = self.headers.get_all("Content-Length") or []
+                    if lengths and any(value != "0" for value in lengths):
+                        raise ApiTransportError("logout_body_not_allowed", "Logout cannot contain a body.", status=400)
+                    service.logout(context, request_id=request_id)
+                    self._send_json(
+                        200, {"status": "signed_out"}, request_id=request_id,
+                        extra_headers=self._rate_headers(decision), set_cookies=self._clear_session_cookies(),
+                    )
+                    return
+                if path == "/v1/auth/logout-all":
+                    lengths = self.headers.get_all("Content-Length") or []
+                    if lengths and any(value != "0" for value in lengths):
+                        raise ApiTransportError(
+                            "logout_all_body_not_allowed", "Logout-all cannot contain a body.", status=400
+                        )
+                    payload = service.logout_all_sessions(context, request_id=request_id)
+                    self._send_json(
+                        200, payload, request_id=request_id, extra_headers=self._rate_headers(decision),
+                        set_cookies=self._clear_session_cookies(),
+                    )
+                    return
+                if path == "/v1/auth/password/change":
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "password_change_body_invalid", "Request body must be valid JSON.", status=400
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "password_change_body_invalid", "Request body must be a JSON object.", status=400
+                        )
+                    service.change_password(context, body, request_id=request_id)
+                    self._send_json(
+                        200, {"status": "password_changed"}, request_id=request_id,
+                        extra_headers=self._rate_headers(decision),
+                    )
+                    return
+                if path == "/v1/auth/email/verify/request":
+                    lengths = self.headers.get_all("Content-Length") or []
+                    if lengths and any(value != "0" for value in lengths):
+                        raise ApiTransportError(
+                            "email_verify_request_body_not_allowed",
+                            "This route cannot contain a body.", status=400,
+                        )
+                    payload = service.request_email_verification(context, request_id=request_id)
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
+                    return
+
                 if path == "/v1/assets":
                     raw_body = self._read_json_body()
                     try:
@@ -998,7 +1258,7 @@ def build_handler(
             try:
                 path, query = self._request_target()
                 self._require_empty_query(query)
-                context, decision = self._authenticate()
+                context, decision = self._authenticate(require_csrf=True)
                 asset_match = _ASSET_PATH.fullmatch(path)
                 if asset_match:
                     raw_body = self._read_json_body()
@@ -1044,7 +1304,7 @@ def build_handler(
             try:
                 path, query = self._request_target()
                 self._require_empty_query(query)
-                context, decision = self._authenticate()
+                context, decision = self._authenticate(require_csrf=True)
                 lengths = self.headers.get_all("Content-Length") or []
                 if lengths and any(value != "0" for value in lengths):
                     raise ApiTransportError(
@@ -1082,6 +1342,9 @@ def create_server(
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     epoch_clock: Callable[[], float] = time.time,
     allowed_origins: frozenset[str] = frozenset(),
+    session_authenticator: BrowserSessionAuthenticator | None = None,
+    secure_cookies: bool = True,
+    hsts_enabled: bool = False,
 ) -> ThreadingHTTPServer:
     """Bind the authenticated local HTTP transport."""
 
@@ -1105,6 +1368,9 @@ def create_server(
         clock=clock,
         epoch_clock=epoch_clock,
         allowed_origins=allowed_origins,
+        session_authenticator=session_authenticator,
+        secure_cookies=secure_cookies,
+        hsts_enabled=hsts_enabled,
     )
     server = ThreadingHTTPServer((address.compressed, port), handler)
     server.daemon_threads = True

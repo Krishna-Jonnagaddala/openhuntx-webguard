@@ -42,9 +42,11 @@ def main() -> int:
         print(f"  Base URL:          {stack.base_url}")
         print(f"  Organization ID:   {stack.organization_id}")
         print(f"  Owner principal:   {stack.owner_principal_id}")
-        print(f"  Owner API token:   {stack.owner_token}")
+        print(f"  Owner email:       {stack.owner_email}")
+        print(f"  Owner password:    {stack.owner_password}")
+        print(f"  Owner API token:   {stack.owner_token} (for CLI/API automation, not browser login)")
         print()
-        print("Paste the token above into the WebGuard web app's sign-in screen.")
+        print("Sign in at the WebGuard web app's login screen with the email/password above.")
         print(f"Point the frontend at this API with VITE_WEBGUARD_API_BASE_URL={stack.base_url}")
         print("Press Ctrl+C to stop.")
         try:

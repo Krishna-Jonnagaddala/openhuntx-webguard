@@ -1,21 +1,22 @@
 import { useState, type FormEvent } from "react";
-import { Button, Card, ErrorState, LoadingState, PageHeader, Table, Td, Th } from "../components/ui/primitives";
+import { Button, Card, ErrorState, LoadingState, PageHeader, StatusBadge, Table, Td, Th } from "../components/ui/primitives";
 import { useInviteMember, useRemoveMember, useTeam, useUpdateMemberRole } from "../hooks/queries";
 import { ApiError } from "../lib/api";
 import { useAuth } from "../lib/auth";
 
 const ROLES = ["owner", "administrator", "analyst", "viewer"];
 
-function InviteForm({ onClose, onIssued }: { onClose: () => void; onIssued: (token: string) => void }) {
+function InviteForm({ onClose, onSent }: { onClose: () => void; onSent: (email: string) => void }) {
   const [displayName, setDisplayName] = useState("");
+  const [email, setEmail] = useState("");
   const [role, setRole] = useState("viewer");
   const invite = useInviteMember();
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     try {
-      const member = await invite.mutateAsync({ display_name: displayName.trim(), role });
-      if (member.initial_token) onIssued(member.initial_token);
+      await invite.mutateAsync({ display_name: displayName.trim(), email: email.trim(), role });
+      onSent(email.trim());
       onClose();
     } catch {
       // surfaced below
@@ -25,7 +26,7 @@ function InviteForm({ onClose, onIssued }: { onClose: () => void; onIssued: (tok
   return (
     <Card className="mb-4 p-4">
       <form onSubmit={handleSubmit}>
-        <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="mb-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
           <div>
             <label htmlFor="invite-name" className="mb-1 block text-sm font-medium text-[var(--color-text-primary)]">
               Name
@@ -35,6 +36,19 @@ function InviteForm({ onClose, onIssued }: { onClose: () => void; onIssued: (tok
               required
               value={displayName}
               onChange={(event) => setDisplayName(event.target.value)}
+              className="w-full rounded-md border border-[var(--color-border-strong)] bg-[var(--color-canvas)] px-3 py-2 text-sm text-[var(--color-text-primary)]"
+            />
+          </div>
+          <div>
+            <label htmlFor="invite-email" className="mb-1 block text-sm font-medium text-[var(--color-text-primary)]">
+              Email
+            </label>
+            <input
+              id="invite-email"
+              type="email"
+              required
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
               className="w-full rounded-md border border-[var(--color-border-strong)] bg-[var(--color-canvas)] px-3 py-2 text-sm text-[var(--color-text-primary)]"
             />
           </div>
@@ -63,7 +77,7 @@ function InviteForm({ onClose, onIssued }: { onClose: () => void; onIssued: (tok
         ) : null}
         <div className="flex gap-2">
           <Button type="submit" variant="primary" disabled={invite.isPending}>
-            {invite.isPending ? "Inviting…" : "Send invitation"}
+            {invite.isPending ? "Sending invitation…" : "Send invitation"}
           </Button>
           <Button type="button" variant="ghost" onClick={onClose}>
             Cancel
@@ -80,8 +94,7 @@ export function TeamPage() {
   const updateRole = useUpdateMemberRole();
   const removeMember = useRemoveMember();
   const [showInvite, setShowInvite] = useState(false);
-  const [issuedToken, setIssuedToken] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [sentTo, setSentTo] = useState<string | null>(null);
 
   const canManage = session?.role === "owner" || session?.role === "administrator";
 
@@ -99,32 +112,19 @@ export function TeamPage() {
         }
       />
 
-      {issuedToken ? (
+      {sentTo ? (
         <Card className="mb-4 border-[var(--color-accent)]/50 p-4">
-          <p className="mb-2 text-sm font-medium text-[var(--color-text-primary)]">
-            Invitation created. This token is shown once — copy it now and relay it to your new team member securely.
+          <p className="text-sm text-[var(--color-text-primary)]">
+            An invitation email was sent to <span className="font-medium">{sentTo}</span>. They can accept it to set
+            their own password and sign in.
           </p>
-          <div className="mb-2 flex items-center gap-2">
-            <code className="flex-1 overflow-x-auto rounded bg-[var(--color-surface-raised)] px-2 py-1.5 text-xs text-[var(--color-text-primary)]">
-              {issuedToken}
-            </code>
-            <Button
-              variant="secondary"
-              onClick={async () => {
-                await navigator.clipboard.writeText(issuedToken);
-                setCopied(true);
-              }}
-            >
-              {copied ? "Copied" : "Copy"}
-            </Button>
-          </div>
-          <Button variant="ghost" onClick={() => { setIssuedToken(null); setCopied(false); }}>
-            I've saved this token, dismiss
+          <Button variant="ghost" className="mt-2" onClick={() => setSentTo(null)}>
+            Dismiss
           </Button>
         </Card>
       ) : null}
 
-      {showInvite ? <InviteForm onClose={() => setShowInvite(false)} onIssued={setIssuedToken} /> : null}
+      {showInvite ? <InviteForm onClose={() => setShowInvite(false)} onSent={setSentTo} /> : null}
 
       {isLoading ? <LoadingState label="Loading team…" /> : null}
       {error ? <ErrorState message={error instanceof ApiError ? error.message : "Unable to load the team."} /> : null}
@@ -133,6 +133,7 @@ export function TeamPage() {
           <thead>
             <tr>
               <Th>Name</Th>
+              <Th>Email</Th>
               <Th>Role</Th>
               <Th>Status</Th>
               <Th>
@@ -142,12 +143,20 @@ export function TeamPage() {
           </thead>
           <tbody>
             {data.members.map((member) => {
-              const isSelf = member.principal_id === session?.principalId;
+              const isSelf = member.principal_id === session?.principal_id;
               return (
                 <tr key={member.principal_id} className="hover:bg-[var(--color-surface-hover)]">
                   <Td>
                     {member.display_name}
                     {isSelf ? <span className="ml-1 text-xs text-[var(--color-text-tertiary)]">(you)</span> : null}
+                  </Td>
+                  <Td className="text-[var(--color-text-secondary)]">
+                    {member.email ?? "—"}
+                    {member.email && !member.email_verified_at ? (
+                      <span className="ml-1">
+                        <StatusBadge status="pending" />
+                      </span>
+                    ) : null}
                   </Td>
                   <Td>
                     {canManage && !isSelf ? (

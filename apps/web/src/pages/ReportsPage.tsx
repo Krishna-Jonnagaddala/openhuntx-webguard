@@ -1,12 +1,14 @@
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, Table, Td, Th } from "../components/ui/primitives";
 import { useReports } from "../hooks/queries";
 import { API_BASE_URL, ApiError, reportsApi } from "../lib/api";
-import { loadSession } from "../lib/auth-storage";
 
 async function downloadReport(reportId: string) {
-  const session = loadSession();
+  // Session-cookie auth (Slice 16): the browser attaches the HttpOnly
+  // session cookie automatically -- there is no token in JS-reachable
+  // storage to attach a header from. A GET never needs the CSRF header
+  // either (see api.ts's request()).
   const response = await fetch(`${API_BASE_URL}${reportsApi.downloadUrl(reportId)}`, {
-    headers: session ? { Authorization: `Bearer ${session.token}` } : {},
+    credentials: "include",
   });
   if (!response.ok) {
     window.alert("Unable to download this report.");

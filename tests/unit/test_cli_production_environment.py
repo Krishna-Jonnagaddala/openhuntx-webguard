@@ -79,6 +79,7 @@ class _FakeProductionComponents:
         self.pool = _FakePool()
         self.service = object()
         self.authenticator = object()
+        self.session_authenticator = object()
         self.rate_limiter = object()
 
 
@@ -174,10 +175,11 @@ class ProductionEnvironmentSelectionTests(unittest.TestCase):
             host="127.0.0.1", port=0, maximum_request_bytes=8192
         )
 
+        fake_service = SimpleNamespace(sessions=object())
         with patch.object(cli, "_config", return_value=fake_local_config), patch.object(
             cli,
             "_components",
-            return_value=(None, None, object(), fake_worker, fake_scheduler, object(), object()),
+            return_value=(None, None, fake_service, fake_worker, fake_scheduler, object(), object()),
         ) as local_call, patch.object(cli, "_production_components") as production_call, patch.object(
             cli, "create_server", return_value=fake_server
         ), patch.object(cli.signal, "signal"):

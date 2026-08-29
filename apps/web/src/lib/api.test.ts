@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api, ApiError, UNAUTHORIZED_EVENT } from "./api";
-import { clearSession, saveSession } from "./auth-storage";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -9,36 +8,59 @@ function jsonResponse(status: number, body: unknown): Response {
   });
 }
 
+function clearCookies() {
+  for (const cookie of document.cookie.split(";")) {
+    const name = cookie.split("=")[0]?.trim();
+    if (name) document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`;
+  }
+}
+
 describe("api request layer (contract)", () => {
   beforeEach(() => {
-    clearSession();
+    clearCookies();
     vi.stubGlobal("fetch", vi.fn());
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    clearCookies();
   });
 
-  it("attaches no Authorization header when signed out", async () => {
+  it("always sends credentials so the HttpOnly session cookie is included", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(200, { ok: true }));
+    await api.get("/v1/dashboard/summary");
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    expect(init?.credentials).toBe("include");
+  });
+
+  it("never attaches an Authorization header -- there is no token in JS-reachable storage", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(200, { ok: true }));
     await api.get("/v1/dashboard/summary");
     const [, init] = vi.mocked(fetch).mock.calls[0];
     expect((init?.headers as Record<string, string>).Authorization).toBeUndefined();
   });
 
-  it("attaches a Bearer Authorization header from the stored session", async () => {
-    saveSession({
-      token: "wgt_test-token",
-      organizationId: "org-1",
-      organizationName: "Org",
-      principalId: "p-1",
-      principalName: "Person",
-      role: "owner",
-    });
+  it("attaches the CSRF header on a state-changing request when the CSRF cookie is present", async () => {
+    document.cookie = "wg_csrf=csrf-token-value";
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(201, { ok: true }));
+    await api.post("/v1/assets", { url: "https://example.com/" });
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    expect((init?.headers as Record<string, string>)["X-CSRF-Token"]).toBe("csrf-token-value");
+  });
+
+  it("does not attach a CSRF header on a GET request even when the CSRF cookie is present", async () => {
+    document.cookie = "wg_csrf=csrf-token-value";
     vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(200, { ok: true }));
     await api.get("/v1/dashboard/summary");
     const [, init] = vi.mocked(fetch).mock.calls[0];
-    expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer wgt_test-token");
+    expect((init?.headers as Record<string, string>)["X-CSRF-Token"]).toBeUndefined();
+  });
+
+  it("omits the CSRF header on a state-changing request when signed out (no CSRF cookie yet)", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(200, { ok: true }));
+    await api.post("/v1/auth/login", { email: "a@example.com", password: "whatever password" });
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    expect((init?.headers as Record<string, string>)["X-CSRF-Token"]).toBeUndefined();
   });
 
   it("builds a query string from provided params, skipping undefined and empty values", async () => {
@@ -86,6 +108,7 @@ describe("api request layer (contract)", () => {
   });
 
   it("sends a JSON content-type header only when a body is present", async () => {
+    document.cookie = "wg_csrf=csrf-token-value";
     vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(200, { ok: true }));
     await api.post("/v1/assets", { url: "https://example.com/" });
     const [, init] = vi.mocked(fetch).mock.calls[0];

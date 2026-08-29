@@ -3,6 +3,7 @@ import {
   apiKeysApi,
   assetsApi,
   auditApi,
+  authApi,
   dashboardApi,
   findingsApi,
   jobsApi,
@@ -13,6 +14,24 @@ import {
   settingsApi,
   teamApi,
 } from "../lib/api";
+
+export function useChangePassword() {
+  return useMutation({
+    mutationFn: (body: { current_password: string; new_password: string }) => authApi.changePassword(body),
+  });
+}
+
+export function useSignOutAllSessions() {
+  return useMutation({ mutationFn: authApi.logoutAll });
+}
+
+export function useRequestEmailVerification() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: authApi.requestEmailVerification,
+    onSuccess: () => client.invalidateQueries({ queryKey: ["settings"] }),
+  });
+}
 
 export function useDashboardSummary() {
   return useQuery({ queryKey: ["dashboard-summary"], queryFn: dashboardApi.summary, refetchInterval: 15_000 });
@@ -85,7 +104,7 @@ export function useIssuePermitAndSubmitJob() {
   return useMutation({
     mutationFn: async (params: { target: string; authorizationId: string; mode: "single_page" | "crawl" }) => {
       const permit = await permitsApi.issue(params);
-      await new Promise((resolve) => setTimeout(resolve, 2000)); // permit not_before buffer (see permitsApi.issue)
+      await new Promise((resolve) => setTimeout(resolve, 4000)); // permit not_before buffer (see permitsApi.issue)
       const job = await jobsApi.submit({
         target: params.target,
         authorizationId: params.authorizationId,
@@ -162,7 +181,7 @@ export function useCreateSchedule() {
       intervalSeconds: number;
     }) => {
       const permit = await permitsApi.issue(params);
-      await new Promise((resolve) => setTimeout(resolve, 2000)); // permit not_before buffer (see permitsApi.issue)
+      await new Promise((resolve) => setTimeout(resolve, 4000)); // permit not_before buffer (see permitsApi.issue)
       return schedulesApi.create({ ...params, permitId: permit.permit.claims.permit_id });
     },
     onSuccess: () => client.invalidateQueries({ queryKey: ["schedules"] }),

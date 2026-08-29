@@ -10,9 +10,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * API (real PostgreSQL, real KMS-shaped Ed25519/ECDSA signing, real
  * worker) plus a controlled HTTPS fixture asset, via
  * `tests/integration/webguard_e2e_server.py`. Its readiness line
- * (base URL, bootstrapped owner token, fixture target URL) is
- * published into `process.env` for the spec files to read -- the spec
- * itself never constructs its own backend state.
+ * (base URL, bootstrapped owner email/password for a real browser
+ * login, an owner API token, fixture target URL) is published into
+ * `process.env` for the spec files to read -- the spec itself never
+ * constructs its own backend state.
  */
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
@@ -36,35 +37,42 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   const stderrChunks: string[] = [];
   child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk.toString()));
 
-  const ready = await new Promise<{ base_url: string; token: string; target_url: string; organization_id: string }>(
-    (resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error(`Timed out waiting for the E2E API server. Stderr so far:\n${stderrChunks.join("")}`));
-      }, 30_000);
+  const ready = await new Promise<{
+    base_url: string;
+    token: string;
+    owner_email: string;
+    owner_password: string;
+    target_url: string;
+    organization_id: string;
+  }>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error(`Timed out waiting for the E2E API server. Stderr so far:\n${stderrChunks.join("")}`));
+    }, 30_000);
 
-      const rl = createInterface({ input: child!.stdout });
-      rl.on("line", (line) => {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("{")) return;
-        try {
-          const payload = JSON.parse(trimmed);
-          clearTimeout(timeout);
-          rl.close();
-          resolve(payload);
-        } catch {
-          // not the readiness line; keep waiting
-        }
-      });
-
-      child!.on("exit", (code) => {
+    const rl = createInterface({ input: child!.stdout });
+    rl.on("line", (line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("{")) return;
+      try {
+        const payload = JSON.parse(trimmed);
         clearTimeout(timeout);
-        reject(new Error(`E2E API server exited early (code ${code}). Stderr:\n${stderrChunks.join("")}`));
-      });
-    },
-  );
+        rl.close();
+        resolve(payload);
+      } catch {
+        // not the readiness line; keep waiting
+      }
+    });
+
+    child!.on("exit", (code) => {
+      clearTimeout(timeout);
+      reject(new Error(`E2E API server exited early (code ${code}). Stderr:\n${stderrChunks.join("")}`));
+    });
+  });
 
   process.env.WEBGUARD_E2E_BASE_URL = ready.base_url;
   process.env.WEBGUARD_E2E_TOKEN = ready.token;
+  process.env.WEBGUARD_E2E_OWNER_EMAIL = ready.owner_email;
+  process.env.WEBGUARD_E2E_OWNER_PASSWORD = ready.owner_password;
   process.env.WEBGUARD_E2E_TARGET_URL = ready.target_url;
   process.env.VITE_API_BASE_URL = ready.base_url;
 

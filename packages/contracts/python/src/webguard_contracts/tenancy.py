@@ -20,8 +20,14 @@ MAXIMUM_PRINCIPAL_NAME_LENGTH = 120
 MAXIMUM_TOKEN_LABEL_LENGTH = 120
 MAXIMUM_AUDIT_ACTION_LENGTH = 128
 MAXIMUM_AUDIT_RESOURCE_LENGTH = 128
+MAXIMUM_EMAIL_LENGTH = 254
 
 _IDENTIFIER = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
+# Deliberately conservative, not full RFC 5322: a login identifier only
+# needs to reject obvious garbage, not accept every technically-legal
+# address. Local part and domain each non-empty, no whitespace/control
+# characters (already excluded by _text), domain has at least one dot.
+_EMAIL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
 class OrganizationStatus(str, Enum):
@@ -95,6 +101,15 @@ def _text(value: object, field: str, maximum: int) -> str:
     return cleaned
 
 
+def _email(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise TenancyContractError("tenancy_email_invalid", f"{field} must be text.")
+    cleaned = value.strip().casefold()
+    if not cleaned or len(cleaned) > MAXIMUM_EMAIL_LENGTH or not _EMAIL.fullmatch(cleaned):
+        raise TenancyContractError("tenancy_email_invalid", f"{field} must be a valid email address.")
+    return cleaned
+
+
 def _identifier(value: object, field: str, maximum: int = 128) -> str:
     cleaned = _text(value, field, maximum).lower()
     if not _IDENTIFIER.fullmatch(cleaned):
@@ -156,6 +171,14 @@ class Principal:
     role: OrganizationRole
     active: bool
     created_at: datetime
+    # Slice 16: browser-user identity fields. Optional/None for
+    # principals that predate this slice or that never authenticate as
+    # a browser user (service accounts, CLI-bootstrapped owners that
+    # only ever use an API token) -- a principal is not required to
+    # have a login identity to remain a valid API-token principal.
+    email: str | None = None
+    email_verified_at: datetime | None = None
+    last_login_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "principal_id", _uuid(self.principal_id, "principal_id"))
@@ -176,6 +199,14 @@ class Principal:
         if not isinstance(self.active, bool):
             raise TenancyContractError("principal_active_invalid", "active must be boolean.")
         object.__setattr__(self, "created_at", _datetime(self.created_at, "created_at"))
+        if self.email is not None:
+            object.__setattr__(self, "email", _email(self.email, "email"))
+        if self.email_verified_at is not None:
+            object.__setattr__(
+                self, "email_verified_at", _datetime(self.email_verified_at, "email_verified_at")
+            )
+        if self.last_login_at is not None:
+            object.__setattr__(self, "last_login_at", _datetime(self.last_login_at, "last_login_at"))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -188,6 +219,9 @@ class Principal:
             "role": self.role.value,
             "active": self.active,
             "created_at": _timestamp(self.created_at),
+            "email": self.email,
+            "email_verified_at": None if self.email_verified_at is None else _timestamp(self.email_verified_at),
+            "last_login_at": None if self.last_login_at is None else _timestamp(self.last_login_at),
         }
 
 
@@ -300,6 +334,7 @@ __all__ = [
     "CURRENT_TENANCY_SCHEMA_VERSION",
     "MAXIMUM_AUDIT_ACTION_LENGTH",
     "MAXIMUM_AUDIT_RESOURCE_LENGTH",
+    "MAXIMUM_EMAIL_LENGTH",
     "MAXIMUM_ORGANIZATION_NAME_LENGTH",
     "MAXIMUM_PRINCIPAL_NAME_LENGTH",
     "MAXIMUM_TOKEN_LABEL_LENGTH",

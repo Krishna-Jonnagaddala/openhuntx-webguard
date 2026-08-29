@@ -40,6 +40,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from webguard_contracts import OrganizationRole, PrincipalType
 from webguard_api.http_api import create_server
+from webguard_api.passwords import hash_password
 from webguard_api.production_config import ProductionServiceConfig
 from webguard_api.production_startup import ProductionComponents, build_production_components
 
@@ -67,6 +68,9 @@ class FakeKmsClient:
         return {"KeyId": KeyId, "PublicKey": public_bytes}
 
 
+DEFAULT_OWNER_PASSWORD = "dev-harness-owner-password-123"  # noqa: S105 - a disposable local test fixture credential
+
+
 @dataclass(frozen=True)
 class RunningStack:
     host: str
@@ -74,6 +78,8 @@ class RunningStack:
     organization_id: str
     owner_principal_id: str
     owner_token: str
+    owner_email: str
+    owner_password: str
     components: ProductionComponents
     authorization_directory: Path
 
@@ -89,11 +95,16 @@ def run_production_stack(
     port: int = 0,
     organization_name: str | None = None,
     owner_display_name: str = "Dev Owner",
+    owner_email: str | None = None,
+    owner_password: str = DEFAULT_OWNER_PASSWORD,
     allowed_origins: frozenset[str] = frozenset({"http://localhost:5173", "http://127.0.0.1:5173"}),
 ) -> Iterator[RunningStack]:
     """Start a real production-mode WebGuard API + worker against
-    `postgres_dsn`, with one bootstrapped organization/owner/token,
-    and tear it down on exit."""
+    `postgres_dsn`, with one bootstrapped organization/owner, and tear
+    it down on exit. The owner gets both an API bearer token (for
+    direct API testing/automation) and a real password credential (so
+    the browser E2E suite can log in through the actual UI -- Slice 16
+    requirement 24 -- rather than pasting a token)."""
 
     with TemporaryDirectory() as directory:
         root = Path(directory)
@@ -119,6 +130,13 @@ def run_production_stack(
         try:
             now = datetime.now(timezone.utc)
             resolved_name = organization_name or f"WebGuard Dev Org {secrets.token_hex(4)}"
+            # Email has a real, global unique constraint (one login
+            # identity per address) -- unlike the pre-Slice-16 fields
+            # here, a fixed default would collide the second time this
+            # harness runs against a persistent (not freshly recreated)
+            # database, exactly like the organization name already
+            # avoids by suffixing itself.
+            resolved_email = owner_email or f"owner-{secrets.token_hex(4)}@webguard-dev.invalid"
             organization = components.identity.create_organization(resolved_name, now=now)
             owner = components.identity.create_principal(
                 organization.organization_id,
@@ -126,17 +144,24 @@ def run_production_stack(
                 principal_type=PrincipalType.USER,
                 role=OrganizationRole.OWNER,
                 now=now,
+                email=resolved_email,
             )
             issued_token = components.identity.create_token(owner.principal_id, label="dev-bootstrap", now=now)
+            components.identity.set_password_hash(
+                owner.principal_id, algorithm="argon2id", password_hash=hash_password(owner_password), now=now
+            )
+            components.identity.set_principal_email_verified(owner.principal_id, now=now)
 
             server = create_server(
                 "127.0.0.1",
                 port,
                 components.service,
                 authenticator=components.authenticator,
+                session_authenticator=components.session_authenticator,
                 rate_limiter=components.rate_limiter,
                 maximum_request_bytes=8192,
                 allowed_origins=allowed_origins,
+                secure_cookies=False,
             )
             stop = threading.Event()
             worker_thread = threading.Thread(target=components.worker.run_forever, args=(stop,), daemon=True)
@@ -151,6 +176,8 @@ def run_production_stack(
                     organization_id=organization.organization_id,
                     owner_principal_id=owner.principal_id,
                     owner_token=issued_token.token,
+                    owner_email=resolved_email,
+                    owner_password=owner_password,
                     components=components,
                     authorization_directory=auth_dir,
                 )

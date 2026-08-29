@@ -13,6 +13,7 @@ dependencies = [
     "cryptography==50.0.0",
     "psycopg[binary]==3.2.10",
     "psycopg-pool==3.2.6",
+    "argon2-cffi==25.1.0",
 ]
 
 [project.scripts]

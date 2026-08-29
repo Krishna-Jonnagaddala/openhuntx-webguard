@@ -8,8 +8,10 @@ import hmac
 import os
 import secrets
 import sqlite3
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from uuid import uuid4
 
@@ -26,7 +28,7 @@ from webguard_contracts import (
 )
 
 
-IDENTITY_SCHEMA_VERSION = 1
+IDENTITY_SCHEMA_VERSION = 2
 DEFAULT_TOKEN_VALIDITY_DAYS = 90
 MAXIMUM_TOKEN_VALIDITY_DAYS = 366
 TOKEN_PREFIX = "wgt"  # noqa: S105
@@ -34,6 +36,22 @@ _SCRYPT_N = 2**14
 _SCRYPT_R = 8
 _SCRYPT_P = 1
 _SCRYPT_DKLEN = 32
+
+# Slice 16: identity tokens (email verification / password reset /
+# invitation) share one lifecycle shape -- high-entropy, hashed at
+# rest, single-purpose, expiry-bounded, single-use, principal/org
+# bound -- so they share one table with a `purpose` discriminator
+# rather than three near-identical ones.
+class IdentityTokenPurpose(str, Enum):
+    EMAIL_VERIFICATION = "email_verification"
+    PASSWORD_RESET = "password_reset"  # noqa: S105 - a token purpose label, not a credential
+    INVITATION = "invitation"
+
+
+EMAIL_VERIFICATION_TOKEN_TTL = timedelta(hours=24)
+PASSWORD_RESET_TOKEN_TTL = timedelta(hours=1)
+INVITATION_TOKEN_TTL = timedelta(days=7)
+IDENTITY_TOKEN_PREFIX = "wgi"  # noqa: S105
 
 
 class IdentityStoreError(ValueError):
@@ -50,6 +68,31 @@ class IssuedApiToken:
     """One-time API token result; the raw token is never persisted."""
 
     metadata: ApiTokenMetadata
+    token: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityTokenRecord:
+    """Metadata for an email-verification / password-reset / invitation
+    token. The raw token is never persisted -- only its hash -- and is
+    returned exactly once, by whichever method just issued it."""
+
+    token_id: str
+    principal_id: str
+    organization_id: str
+    purpose: IdentityTokenPurpose
+    created_at: datetime
+    expires_at: datetime
+    used_at: datetime | None = None
+
+    @property
+    def is_usable(self) -> bool:
+        return self.used_at is None
+
+
+@dataclass(frozen=True, slots=True)
+class IssuedIdentityToken:
+    record: IdentityTokenRecord
     token: str = field(repr=False)
 
 
@@ -126,6 +169,25 @@ def _token_parts(token: object) -> tuple[str, str]:
     return metadata.token_id, parts[2]
 
 
+def _parse_prefixed_secret(token: object, *, prefix: str, error_code: str) -> tuple[str, str]:
+    """Generic ``{prefix}_{uuid}_{secret}`` parser shared by identity
+    tokens and browser sessions (API tokens keep their own historical
+    `_token_parts`, unchanged)."""
+
+    if not isinstance(token, str):
+        raise IdentityStoreError(error_code, "Token is invalid.")
+    parts = token.split("_", 2)
+    if len(parts) != 3 or parts[0] != prefix or not parts[2]:
+        raise IdentityStoreError(error_code, "Token is invalid.")
+    try:
+        canonical = str(uuid.UUID(parts[1]))
+    except (ValueError, AttributeError) as exc:
+        raise IdentityStoreError(error_code, "Token is invalid.") from exc
+    if canonical != parts[1]:
+        raise IdentityStoreError(error_code, "Token is invalid.")
+    return canonical, parts[2]
+
+
 def _persisted_boolean(value: object) -> bool:
     if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
         raise IdentityStoreError(
@@ -171,6 +233,9 @@ class IdentityStore:
                 "api_tokens",
                 "organization_authorizations",
                 "security_audit_events",
+                "password_credentials",
+                "identity_tokens",
+                "browser_sessions",
             }
 
             rows = connection.execute(
@@ -305,6 +370,9 @@ class IdentityStore:
                 role TEXT NOT NULL,
                 active INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
+                email TEXT UNIQUE,
+                email_verified_at TEXT,
+                last_login_at TEXT,
                 FOREIGN KEY (organization_id)
                     REFERENCES organizations(
                         organization_id
@@ -320,6 +388,84 @@ class IdentityStore:
                 organization_id,
                 active,
                 role
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE password_credentials (
+                principal_id TEXT PRIMARY KEY,
+                algorithm TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (principal_id)
+                    REFERENCES principals(principal_id)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE identity_tokens (
+                token_id TEXT PRIMARY KEY,
+                principal_id TEXT NOT NULL,
+                organization_id TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                secret_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
+                FOREIGN KEY (principal_id)
+                    REFERENCES principals(principal_id),
+                FOREIGN KEY (organization_id)
+                    REFERENCES organizations(organization_id)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX idx_identity_tokens_principal
+            ON identity_tokens(
+                principal_id,
+                purpose,
+                used_at
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE browser_sessions (
+                session_id TEXT PRIMARY KEY,
+                principal_id TEXT NOT NULL,
+                organization_id TEXT NOT NULL,
+                secret_hash TEXT NOT NULL,
+                csrf_hash TEXT NOT NULL,
+                assurance_level TEXT NOT NULL,
+                issued_at TEXT NOT NULL,
+                idle_expires_at TEXT NOT NULL,
+                absolute_expires_at TEXT NOT NULL,
+                last_used_at TEXT,
+                revoked_at TEXT,
+                user_agent TEXT,
+                ip_address TEXT,
+                FOREIGN KEY (principal_id)
+                    REFERENCES principals(principal_id),
+                FOREIGN KEY (organization_id)
+                    REFERENCES organizations(organization_id)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX idx_browser_sessions_principal
+            ON browser_sessions(
+                principal_id,
+                revoked_at
             )
             """
         )
@@ -403,11 +549,16 @@ class IdentityStore:
                 FOREIGN KEY (principal_id)
                     REFERENCES principals(
                         principal_id
-                    ),
-                FOREIGN KEY (token_id)
-                    REFERENCES api_tokens(
-                        token_id
                     )
+                -- Slice 16: token_id is no longer always an api_tokens
+                -- row -- it is a browser_sessions.session_id for
+                -- session-authenticated actions, or a fresh, otherwise-
+                -- unused UUID for the handful of identity events that
+                -- happen before a session exists or after one has
+                -- already been consumed (see
+                -- WebGuardJobService._audit_identity_event). A foreign
+                -- key naming one specific credential table is no longer
+                -- a correct constraint for this column.
             )
             """
         )
@@ -458,6 +609,9 @@ class IdentityStore:
                 "role",
                 "active",
                 "created_at",
+                "email",
+                "email_verified_at",
+                "last_login_at",
             },
             "api_tokens": {
                 "token_id",
@@ -489,6 +643,38 @@ class IdentityStore:
                 "occurred_at",
                 "detail_code",
             },
+            "password_credentials": {
+                "principal_id",
+                "algorithm",
+                "password_hash",
+                "created_at",
+                "updated_at",
+            },
+            "identity_tokens": {
+                "token_id",
+                "principal_id",
+                "organization_id",
+                "purpose",
+                "secret_hash",
+                "created_at",
+                "expires_at",
+                "used_at",
+            },
+            "browser_sessions": {
+                "session_id",
+                "principal_id",
+                "organization_id",
+                "secret_hash",
+                "csrf_hash",
+                "assurance_level",
+                "issued_at",
+                "idle_expires_at",
+                "absolute_expires_at",
+                "last_used_at",
+                "revoked_at",
+                "user_agent",
+                "ip_address",
+            },
         }
 
         for table_name, expected in required_columns.items():
@@ -518,6 +704,8 @@ class IdentityStore:
             "idx_principals_organization",
             "idx_api_tokens_principal",
             "idx_security_audit_org_time",
+            "idx_identity_tokens_principal",
+            "idx_browser_sessions_principal",
         }
 
         rows = connection.execute(
@@ -615,6 +803,13 @@ class IdentityStore:
                 ),
                 active=_persisted_boolean(row["active"]),
                 created_at=created_at,
+                email=row["email"],
+                email_verified_at=IdentityStore._persisted_timestamp(
+                    row["email_verified_at"], required=False
+                ),
+                last_login_at=IdentityStore._persisted_timestamp(
+                    row["last_login_at"], required=False
+                ),
             )
 
         except IdentityStoreError:
@@ -737,6 +932,7 @@ class IdentityStore:
         role: OrganizationRole,
         now: datetime,
         principal_id: str | None = None,
+        email: str | None = None,
     ) -> Principal:
         organization = self.get_organization(organization_id)
         if organization.status is not OrganizationStatus.ACTIVE:
@@ -749,11 +945,12 @@ class IdentityStore:
             role=role,
             active=True,
             created_at=now,
+            email=email,
         )
         connection = self._connect()
         try:
             connection.execute(
-                "INSERT INTO principals VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO principals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     value.principal_id,
                     value.organization_id,
@@ -762,9 +959,17 @@ class IdentityStore:
                     value.role.value,
                     1,
                     _timestamp(value.created_at),
+                    value.email,
+                    None,
+                    None,
                 ),
             )
         except sqlite3.IntegrityError as exc:
+            if value.email is not None:
+                raise IdentityStoreError(
+                    "principal_email_conflict",
+                    "An account with that email address already exists.",
+                ) from exc
             raise IdentityStoreError(
                 "principal_conflict",
                 "Principal already exists.",
@@ -831,6 +1036,9 @@ class IdentityStore:
             role=role,
             active=principal.active,
             created_at=principal.created_at,
+            email=principal.email,
+            email_verified_at=principal.email_verified_at,
+            last_login_at=principal.last_login_at,
         )
 
     def set_principal_active(
@@ -857,7 +1065,201 @@ class IdentityStore:
             role=principal.role,
             active=active,
             created_at=principal.created_at,
+            email=principal.email,
+            email_verified_at=principal.email_verified_at,
+            last_login_at=principal.last_login_at,
         )
+
+    def get_principal_by_email(self, email: str) -> Principal | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM principals WHERE email = ?", (email.strip().casefold(),)
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else self._principal(row)
+
+    def set_principal_email_verified(self, principal_id: str, *, now: datetime) -> Principal:
+        principal = self.get_principal(principal_id)
+        connection = self._connect()
+        try:
+            connection.execute(
+                "UPDATE principals SET email_verified_at = ? WHERE principal_id = ?",
+                (_timestamp(now), principal_id),
+            )
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "principal_email_verify_failed", "Unable to record email verification."
+            ) from exc
+        finally:
+            connection.close()
+        return Principal(
+            principal_id=principal.principal_id,
+            organization_id=principal.organization_id,
+            display_name=principal.display_name,
+            principal_type=principal.principal_type,
+            role=principal.role,
+            active=principal.active,
+            created_at=principal.created_at,
+            email=principal.email,
+            email_verified_at=now,
+            last_login_at=principal.last_login_at,
+        )
+
+    def touch_last_login(self, principal_id: str, *, now: datetime) -> None:
+        connection = self._connect()
+        try:
+            connection.execute(
+                "UPDATE principals SET last_login_at = ? WHERE principal_id = ?",
+                (_timestamp(now), principal_id),
+            )
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "principal_login_touch_failed", "Unable to record the login timestamp."
+            ) from exc
+        finally:
+            connection.close()
+
+    def set_password_hash(self, principal_id: str, *, algorithm: str, password_hash: str, now: datetime) -> None:
+        connection = self._connect()
+        try:
+            connection.execute(
+                """
+                INSERT INTO password_credentials (principal_id, algorithm, password_hash, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(principal_id) DO UPDATE SET
+                    algorithm = excluded.algorithm,
+                    password_hash = excluded.password_hash,
+                    updated_at = excluded.updated_at
+                """,
+                (principal_id, algorithm, password_hash, _timestamp(now), _timestamp(now)),
+            )
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "password_credential_write_failed", "Unable to persist the password credential."
+            ) from exc
+        finally:
+            connection.close()
+
+    def get_password_hash(self, principal_id: str) -> str | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT password_hash FROM password_credentials WHERE principal_id = ?",
+                (principal_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        return None if row is None else row["password_hash"]
+
+    def create_identity_token(
+        self,
+        principal_id: str,
+        organization_id: str,
+        *,
+        purpose: IdentityTokenPurpose,
+        ttl: timedelta,
+        now: datetime,
+    ) -> IssuedIdentityToken:
+        token_id = str(uuid4())
+        secret = secrets.token_urlsafe(32)
+        raw = f"{IDENTITY_TOKEN_PREFIX}_{token_id}_{secret}"
+        expires_at = now + ttl
+        connection = self._connect()
+        try:
+            connection.execute(
+                """
+                INSERT INTO identity_tokens
+                    (token_id, principal_id, organization_id, purpose, secret_hash, created_at, expires_at, used_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    token_id,
+                    principal_id,
+                    organization_id,
+                    purpose.value,
+                    _hash_secret(secret),
+                    _timestamp(now),
+                    _timestamp(expires_at),
+                ),
+            )
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "identity_token_create_failed", "Unable to persist the identity token."
+            ) from exc
+        finally:
+            connection.close()
+        record = IdentityTokenRecord(
+            token_id=token_id,
+            principal_id=principal_id,
+            organization_id=organization_id,
+            purpose=purpose,
+            created_at=now,
+            expires_at=expires_at,
+        )
+        return IssuedIdentityToken(record=record, token=raw)
+
+    def consume_identity_token(
+        self, token: object, *, purpose: IdentityTokenPurpose, now: datetime
+    ) -> IdentityTokenRecord:
+        token_id, secret = _parse_prefixed_secret(
+            token, prefix=IDENTITY_TOKEN_PREFIX, error_code="identity_token_invalid"
+        )
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM identity_tokens WHERE token_id = ?", (token_id,)
+            ).fetchone()
+            if row is None or not _verify_secret(secret, row["secret_hash"]):
+                raise IdentityStoreError("identity_token_invalid", "Token is invalid.")
+            if row["purpose"] != purpose.value:
+                raise IdentityStoreError("identity_token_invalid", "Token is invalid.")
+            if row["used_at"] is not None:
+                raise IdentityStoreError("identity_token_used", "Token has already been used.")
+            expires_at = _parse_timestamp(row["expires_at"])
+            if now.astimezone(timezone.utc) >= expires_at:
+                raise IdentityStoreError("identity_token_expired", "Token has expired.")
+            connection.execute(
+                "UPDATE identity_tokens SET used_at = ? WHERE token_id = ?",
+                (_timestamp(now), token_id),
+            )
+        except IdentityStoreError:
+            raise
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "identity_token_consume_failed", "Unable to consume the identity token."
+            ) from exc
+        finally:
+            connection.close()
+        return IdentityTokenRecord(
+            token_id=str(row["token_id"]),
+            principal_id=str(row["principal_id"]),
+            organization_id=str(row["organization_id"]),
+            purpose=IdentityTokenPurpose(row["purpose"]),
+            created_at=_parse_timestamp(row["created_at"]),
+            expires_at=expires_at,
+            used_at=now,
+        )
+
+    def invalidate_identity_tokens(
+        self, principal_id: str, *, purpose: IdentityTokenPurpose, now: datetime
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute(
+                """
+                UPDATE identity_tokens SET used_at = ?
+                WHERE principal_id = ? AND purpose = ? AND used_at IS NULL
+                """,
+                (_timestamp(now), principal_id, purpose.value),
+            )
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "identity_token_invalidate_failed", "Unable to invalidate prior identity tokens."
+            ) from exc
+        finally:
+            connection.close()
 
     def list_tokens_for_principal(self, principal_id: str) -> tuple[ApiTokenMetadata, ...]:
         connection = self._connect()

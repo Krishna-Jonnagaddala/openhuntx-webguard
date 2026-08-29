@@ -44,7 +44,15 @@ from .authorization_comparison import (
 )
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .finding_store import FindingStatus, FindingStoreError
-from .identity import IdentityStoreError
+from .identity import (
+    EMAIL_VERIFICATION_TOKEN_TTL,
+    INVITATION_TOKEN_TTL,
+    PASSWORD_RESET_TOKEN_TTL,
+    IdentityStoreError,
+    IdentityTokenPurpose,
+)
+from .passwords import PasswordPolicyError, hash_password, needs_rehash, validate_password_policy, verify_password
+from .rate_limit import RateLimitError
 from .report_store import ReportStoreError
 from .scan_store import ScanStoreError
 from .target_verification import TargetVerificationError, VerificationMethod, check_well_known_token
@@ -116,6 +124,11 @@ class WebGuardJobService:
         artifact_store=None,
         targets=None,
         target_verifications=None,
+        sessions=None,
+        mail_provider=None,
+        auth_rate_limiter=None,
+        session_idle_timeout: timedelta | None = None,
+        session_absolute_timeout: timedelta | None = None,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
@@ -209,6 +222,21 @@ class WebGuardJobService:
             )
         except (JobStoreError, TrustScanPermitError) as exc:
             raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        # Slice 16: browser identity/session layer, same optional/
+        # defaulted pattern as every repository above.
+        from .sessions import DEFAULT_ABSOLUTE_TIMEOUT, DEFAULT_IDLE_TIMEOUT, InMemorySessionRepository
+        from .mail import LoggingMailProvider
+        from .auth_rate_limit import InMemoryAuthRateLimiter
+
+        self.sessions = sessions if sessions is not None else InMemorySessionRepository()
+        self.mail_provider = mail_provider if mail_provider is not None else LoggingMailProvider()
+        self.auth_rate_limiter = (
+            auth_rate_limiter
+            if auth_rate_limiter is not None
+            else InMemoryAuthRateLimiter(max_attempts=10, window_seconds=900)
+        )
+        self.session_idle_timeout = session_idle_timeout or DEFAULT_IDLE_TIMEOUT
+        self.session_absolute_timeout = session_absolute_timeout or DEFAULT_ABSOLUTE_TIMEOUT
 
     def _audit(
         self,
@@ -2046,6 +2074,427 @@ class WebGuardJobService:
         )
         return context.to_public_dict()
 
+    # -- Browser authentication (Slice 16) --------------------------------
+    # Sessions, passwords, and identity tokens resolve into the exact
+    # same AuthContext/ApiPermission model an API token does (see
+    # auth.py's BrowserSessionAuthenticator) -- there is no separate,
+    # frontend-only permission model here (requirement 15).
+
+    def _audit_identity_event(
+        self,
+        *,
+        organization_id: str,
+        principal_id: str,
+        request_id: str,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+        outcome: AuditOutcome,
+        detail_code: str | None = None,
+    ) -> None:
+        """Same shape as `_audit`, for the handful of identity events
+        that happen before a session exists (registration, a login
+        failure against a real account, a password-reset/email-
+        verification confirmation) or after one has already been
+        consumed. `token_id` is a fresh, unused UUID in these cases --
+        there is no real credential to attribute the event to, and the
+        audit contract requires a canonical UUID there regardless."""
+
+        try:
+            self.identity.record_audit_event(
+                SecurityAuditEvent(
+                    event_id=str(uuid4()),
+                    request_id=request_id,
+                    organization_id=organization_id,
+                    principal_id=principal_id,
+                    token_id=str(uuid4()),
+                    action=action,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    outcome=outcome,
+                    occurred_at=self.clock(),
+                    detail_code=detail_code,
+                )
+            )
+        except IdentityStoreError as exc:
+            raise ApiServiceError(
+                "audit_persistence_failed", "The security audit event could not be persisted.", status=500
+            ) from exc
+
+    def _issue_session_context(self, principal, organization, issued) -> AuthContext:
+        return AuthContext(
+            organization_id=organization.organization_id,
+            organization_name=organization.name,
+            principal_id=principal.principal_id,
+            principal_name=principal.display_name,
+            role=principal.role,
+            token_id=issued.record.session_id,
+            auth_method="browser_session",
+        )
+
+    def register_account(
+        self, body: dict, *, request_id: str, user_agent: str | None, ip_address: str | None
+    ) -> tuple[AuthContext, object]:
+        """Self-service signup (requirement 9): creates a new
+        organization and its owner in one step. There is no "join an
+        existing organization by email domain" flow -- joining an
+        existing organization only ever happens through an explicit
+        owner/administrator invitation (`invite_team_member` /
+        `accept_invitation`), never by guessing or matching on email
+        domain, which would let an attacker join any organization that
+        shares their own employer's domain."""
+
+        if not isinstance(body, dict):
+            raise ApiServiceError("register_body_invalid", "Request body must be a JSON object.", status=400)
+        organization_name = body.get("organization_name")
+        display_name = body.get("display_name")
+        email = body.get("email")
+        password = body.get("password")
+        if not isinstance(organization_name, str) or not organization_name.strip():
+            raise ApiServiceError("register_body_invalid", "organization_name is required.", status=400)
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise ApiServiceError("register_body_invalid", "display_name is required.", status=400)
+        if not isinstance(email, str) or not email.strip():
+            raise ApiServiceError("register_body_invalid", "email is required.", status=400)
+        try:
+            validate_password_policy(password)
+        except PasswordPolicyError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+
+        now = self.clock()
+        try:
+            self.auth_rate_limiter.check_and_record(f"register:{ip_address}", now=now)
+        except RateLimitError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=429) from exc
+        if self.identity.get_principal_by_email(email.strip()) is not None:
+            raise ApiServiceError(
+                "register_email_in_use", "An account with that email address already exists.", status=409
+            )
+        try:
+            organization = self.identity.create_organization(organization_name.strip(), now=now)
+            principal = self.identity.create_principal(
+                organization.organization_id, display_name.strip(),
+                principal_type=PrincipalType.USER, role=OrganizationRole.OWNER, now=now,
+                email=email.strip(),
+            )
+        except IdentityStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        self.identity.set_password_hash(
+            principal.principal_id, algorithm="argon2id", password_hash=hash_password(password), now=now
+        )
+        verification = self.identity.create_identity_token(
+            principal.principal_id, organization.organization_id,
+            purpose=IdentityTokenPurpose.EMAIL_VERIFICATION, ttl=EMAIL_VERIFICATION_TOKEN_TTL, now=now,
+        )
+        self.mail_provider.send(
+            to=principal.email,
+            subject="Verify your WebGuard email address",
+            body=f"Confirm your email address with this one-time token: {verification.token}",
+            category="email_verification",
+        )
+        issued = self.sessions.create_session(
+            principal.principal_id, organization.organization_id, now=now,
+            idle_ttl=self.session_idle_timeout, absolute_ttl=self.session_absolute_timeout,
+            user_agent=user_agent, ip_address=ip_address,
+        )
+        self.identity.touch_last_login(principal.principal_id, now=now)
+        context = self._issue_session_context(principal, organization, issued)
+        self._audit(
+            context, request_id=request_id, action="auth.register", resource_type="principal",
+            resource_id=principal.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return context, issued
+
+    def login(
+        self, body: dict, *, request_id: str, user_agent: str | None, ip_address: str | None
+    ) -> tuple[AuthContext, object]:
+        if not isinstance(body, dict) or not isinstance(body.get("email"), str) or not isinstance(
+            body.get("password"), str
+        ):
+            raise ApiServiceError("login_body_invalid", "email and password are required.", status=400)
+        email = body["email"].strip()
+        password = body["password"]
+        now = self.clock()
+        try:
+            self.auth_rate_limiter.check_and_record(f"login:{ip_address}:{email.casefold()}", now=now)
+        except RateLimitError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=429) from exc
+
+        generic_failure = ApiServiceError("invalid_credentials", "Invalid email or password.", status=401)
+        principal = self.identity.get_principal_by_email(email)
+        if principal is None:
+            # No real account to scope an audit event to -- see
+            # `_audit_identity_event`'s docstring on why this is the
+            # one login-failure shape this codebase's audit contract
+            # cannot represent, and requirement 11's own anti-
+            # enumeration principle means the response must not differ
+            # from every other failure mode anyway.
+            raise generic_failure
+        stored_hash = self.identity.get_password_hash(principal.principal_id)
+        if (
+            stored_hash is None
+            or not principal.active
+            or not verify_password(password, stored_hash)
+        ):
+            self._audit_identity_event(
+                organization_id=principal.organization_id, principal_id=principal.principal_id,
+                request_id=request_id, action="auth.login", resource_type="principal",
+                resource_id=principal.principal_id, outcome=AuditOutcome.FAILED, detail_code="invalid-credentials",
+            )
+            raise generic_failure
+        if needs_rehash(stored_hash):
+            self.identity.set_password_hash(
+                principal.principal_id, algorithm="argon2id", password_hash=hash_password(password), now=now
+            )
+        organization = self.identity.get_organization(principal.organization_id)
+        issued = self.sessions.create_session(
+            principal.principal_id, organization.organization_id, now=now,
+            idle_ttl=self.session_idle_timeout, absolute_ttl=self.session_absolute_timeout,
+            user_agent=user_agent, ip_address=ip_address,
+        )
+        self.identity.touch_last_login(principal.principal_id, now=now)
+        context = self._issue_session_context(principal, organization, issued)
+        self._audit(
+            context, request_id=request_id, action="auth.login", resource_type="principal",
+            resource_id=principal.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return context, issued
+
+    def logout(self, context: AuthContext, *, request_id: str) -> None:
+        self.sessions.revoke_session(context.token_id, now=self.clock())
+        self._audit(
+            context, request_id=request_id, action="auth.logout", resource_type="session",
+            resource_id=context.token_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+
+    def logout_all_sessions(self, context: AuthContext, *, request_id: str) -> dict:
+        count = self.sessions.revoke_all_sessions_for_principal(context.principal_id, now=self.clock())
+        self._audit(
+            context, request_id=request_id, action="auth.logout_all", resource_type="principal",
+            resource_id=context.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {"revoked_count": count}
+
+    def get_session_info(self, context: AuthContext, *, request_id: str) -> dict:
+        payload = context.to_public_dict()
+        if context.auth_method == "browser_session":
+            session = self.sessions.get_session(context.token_id)
+            if session is not None:
+                payload["session"] = session.to_public_dict()
+        self._audit(
+            context, request_id=request_id, action="auth.session.read", resource_type="principal",
+            resource_id=context.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return payload
+
+    def change_password(self, context: AuthContext, body: dict, *, request_id: str) -> None:
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("current_password"), str)
+            or not isinstance(body.get("new_password"), str)
+        ):
+            raise ApiServiceError(
+                "password_change_body_invalid", "current_password and new_password are required.", status=400
+            )
+        stored_hash = self.identity.get_password_hash(context.principal_id)
+        if stored_hash is None or not verify_password(body["current_password"], stored_hash):
+            self._audit(
+                context, request_id=request_id, action="auth.password_change", resource_type="principal",
+                resource_id=context.principal_id, outcome=AuditOutcome.FAILED, detail_code="current-password-incorrect",
+            )
+            raise ApiServiceError("current_password_incorrect", "Current password is incorrect.", status=401)
+        try:
+            validate_password_policy(body["new_password"])
+        except PasswordPolicyError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        now = self.clock()
+        self.identity.set_password_hash(
+            context.principal_id, algorithm="argon2id", password_hash=hash_password(body["new_password"]), now=now
+        )
+        except_session = context.token_id if context.auth_method == "browser_session" else None
+        self.sessions.revoke_all_sessions_for_principal(
+            context.principal_id, now=now, except_session_id=except_session
+        )
+        self._audit(
+            context, request_id=request_id, action="auth.password_change", resource_type="principal",
+            resource_id=context.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+
+    def request_password_reset(self, body: dict, *, request_id: str, ip_address: str | None) -> dict:
+        """Requirement 11: the response is identical whether or not the
+        email matches a real account -- an attacker must not be able to
+        enumerate registered accounts through this endpoint."""
+
+        if not isinstance(body, dict) or not isinstance(body.get("email"), str) or not body["email"].strip():
+            raise ApiServiceError("password_reset_body_invalid", "email is required.", status=400)
+        email = body["email"].strip()
+        now = self.clock()
+        try:
+            self.auth_rate_limiter.check_and_record(f"password_reset:{ip_address}:{email.casefold()}", now=now)
+        except RateLimitError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=429) from exc
+        generic_response = {
+            "message": "If an account with that email address exists, a password reset link has been sent."
+        }
+        principal = self.identity.get_principal_by_email(email)
+        if principal is None or not principal.active:
+            return generic_response
+        self.identity.invalidate_identity_tokens(
+            principal.principal_id, purpose=IdentityTokenPurpose.PASSWORD_RESET, now=now
+        )
+        issued = self.identity.create_identity_token(
+            principal.principal_id, principal.organization_id,
+            purpose=IdentityTokenPurpose.PASSWORD_RESET, ttl=PASSWORD_RESET_TOKEN_TTL, now=now,
+        )
+        self.mail_provider.send(
+            to=principal.email,
+            subject="Reset your WebGuard password",
+            body=f"Reset your password with this one-time token (expires in 1 hour): {issued.token}",
+            category="password_reset",
+        )
+        self._audit_identity_event(
+            organization_id=principal.organization_id, principal_id=principal.principal_id,
+            request_id=request_id, action="auth.password_reset_requested", resource_type="principal",
+            resource_id=principal.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return generic_response
+
+    def confirm_password_reset(self, body: dict, *, request_id: str, ip_address: str | None) -> dict:
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("token"), str)
+            or not isinstance(body.get("new_password"), str)
+        ):
+            raise ApiServiceError(
+                "password_reset_confirm_body_invalid", "token and new_password are required.", status=400
+            )
+        try:
+            validate_password_policy(body["new_password"])
+        except PasswordPolicyError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        now = self.clock()
+        try:
+            self.auth_rate_limiter.check_and_record(f"password_reset_confirm:{ip_address}", now=now)
+        except RateLimitError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=429) from exc
+        try:
+            record = self.identity.consume_identity_token(
+                body["token"], purpose=IdentityTokenPurpose.PASSWORD_RESET, now=now
+            )
+        except IdentityStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        self.identity.set_password_hash(
+            record.principal_id, algorithm="argon2id", password_hash=hash_password(body["new_password"]), now=now
+        )
+        self.sessions.revoke_all_sessions_for_principal(record.principal_id, now=now)
+        self._audit_identity_event(
+            organization_id=record.organization_id, principal_id=record.principal_id,
+            request_id=request_id, action="auth.password_reset_completed", resource_type="principal",
+            resource_id=record.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {"message": "Password has been reset. Sign in with your new password."}
+
+    def request_email_verification(self, context: AuthContext, *, request_id: str) -> dict:
+        now = self.clock()
+        try:
+            self.auth_rate_limiter.check_and_record(f"email_verify:{context.principal_id}", now=now)
+        except RateLimitError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=429) from exc
+        principal = self.identity.get_principal(context.principal_id)
+        if principal.email is None:
+            raise ApiServiceError("no_email_on_file", "This account has no email address on file.", status=400)
+        if principal.email_verified_at is not None:
+            return {"message": "Email address is already verified."}
+        self.identity.invalidate_identity_tokens(
+            principal.principal_id, purpose=IdentityTokenPurpose.EMAIL_VERIFICATION, now=now
+        )
+        issued = self.identity.create_identity_token(
+            principal.principal_id, context.organization_id,
+            purpose=IdentityTokenPurpose.EMAIL_VERIFICATION, ttl=EMAIL_VERIFICATION_TOKEN_TTL, now=now,
+        )
+        self.mail_provider.send(
+            to=principal.email,
+            subject="Verify your WebGuard email address",
+            body=f"Confirm your email address with this one-time token: {issued.token}",
+            category="email_verification",
+        )
+        self._audit(
+            context, request_id=request_id, action="auth.email_verification_requested", resource_type="principal",
+            resource_id=context.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {"message": "Verification email sent."}
+
+    def confirm_email_verification(self, body: dict, *, request_id: str, ip_address: str | None) -> dict:
+        if not isinstance(body, dict) or not isinstance(body.get("token"), str):
+            raise ApiServiceError("email_verification_body_invalid", "token is required.", status=400)
+        now = self.clock()
+        try:
+            self.auth_rate_limiter.check_and_record(f"email_verify_confirm:{ip_address}", now=now)
+        except RateLimitError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=429) from exc
+        try:
+            record = self.identity.consume_identity_token(
+                body["token"], purpose=IdentityTokenPurpose.EMAIL_VERIFICATION, now=now
+            )
+        except IdentityStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        self.identity.set_principal_email_verified(record.principal_id, now=now)
+        self._audit_identity_event(
+            organization_id=record.organization_id, principal_id=record.principal_id,
+            request_id=request_id, action="auth.email_verified", resource_type="principal",
+            resource_id=record.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {"message": "Email address verified."}
+
+    def accept_invitation(
+        self, body: dict, *, request_id: str, user_agent: str | None, ip_address: str | None
+    ) -> tuple[AuthContext, object]:
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("token"), str)
+            or not isinstance(body.get("password"), str)
+        ):
+            raise ApiServiceError(
+                "invitation_accept_body_invalid", "token and password are required.", status=400
+            )
+        try:
+            validate_password_policy(body["password"])
+        except PasswordPolicyError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        now = self.clock()
+        try:
+            self.auth_rate_limiter.check_and_record(f"invitation_accept:{ip_address}", now=now)
+        except RateLimitError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=429) from exc
+        try:
+            record = self.identity.consume_identity_token(
+                body["token"], purpose=IdentityTokenPurpose.INVITATION, now=now
+            )
+        except IdentityStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        self.identity.set_password_hash(
+            record.principal_id, algorithm="argon2id", password_hash=hash_password(body["password"]), now=now
+        )
+        # Accepting an emailed invitation link is itself proof of
+        # control of that mailbox -- a second, separate verification
+        # round-trip would confirm nothing a working invitation flow
+        # has not already confirmed.
+        self.identity.set_principal_email_verified(record.principal_id, now=now)
+        principal = self.identity.get_principal(record.principal_id)
+        organization = self.identity.get_organization(record.organization_id)
+        issued = self.sessions.create_session(
+            principal.principal_id, organization.organization_id, now=now,
+            idle_ttl=self.session_idle_timeout, absolute_ttl=self.session_absolute_timeout,
+            user_agent=user_agent, ip_address=ip_address,
+        )
+        self.identity.touch_last_login(principal.principal_id, now=now)
+        context = self._issue_session_context(principal, organization, issued)
+        self._audit(
+            context, request_id=request_id, action="auth.invitation_accepted", resource_type="principal",
+            resource_id=principal.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return context, issued
+
     def audit_events(
         self,
         context: AuthContext,
@@ -2415,6 +2864,11 @@ class WebGuardJobService:
 
     @staticmethod
     def _principal_public_dict(principal) -> dict[str, object]:
+        def _ts(value):
+            return None if value is None else value.astimezone(timezone.utc).isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z")
+
         return {
             "principal_id": principal.principal_id,
             "organization_id": principal.organization_id,
@@ -2422,9 +2876,10 @@ class WebGuardJobService:
             "principal_type": principal.principal_type.value,
             "role": principal.role.value,
             "active": principal.active,
-            "created_at": principal.created_at.astimezone(timezone.utc)
-            .isoformat(timespec="microseconds")
-            .replace("+00:00", "Z"),
+            "created_at": _ts(principal.created_at),
+            "email": principal.email,
+            "email_verified_at": _ts(principal.email_verified_at),
+            "last_login_at": _ts(principal.last_login_at),
         }
 
     def list_team(self, context: AuthContext, *, request_id: str) -> dict:
@@ -2440,11 +2895,16 @@ class WebGuardJobService:
         return {"members": [self._principal_public_dict(m) for m in members]}
 
     def invite_team_member(self, context: AuthContext, body: dict, *, request_id: str) -> dict:
-        """No email-based invitation flow exists (requirement 29: no
-        production email this slice). This creates the principal and an
-        initial API token directly -- the inviter is responsible for
-        relaying the returned raw token to the invitee out-of-band,
-        exactly as CLI bootstrap already requires today."""
+        """Slice 16 revision: Slice 15 issued an initial API bearer
+        token directly here, because no email infrastructure existed to
+        deliver anything else. That reason is gone -- this slice builds
+        the mail-provider/identity-token layer requirement 26 asks for
+        -- so this now creates the principal (no password credential
+        yet) and issues a single-use, expiry-bounded invitation token
+        via the mail provider instead. The invitee sets their own
+        password when they accept it (`accept_invitation`); an API
+        bearer token remains available afterward through the ordinary
+        self-service `/v1/api-keys` route, unrelated to invitation."""
 
         self._require(
             context, ApiPermission.TEAM_MANAGE, request_id=request_id,
@@ -2452,6 +2912,8 @@ class WebGuardJobService:
         )
         if not isinstance(body, dict) or not isinstance(body.get("display_name"), str) or not body["display_name"].strip():
             raise ApiServiceError("team_invite_body_invalid", "display_name is required.", status=400)
+        if not isinstance(body.get("email"), str) or not body["email"].strip():
+            raise ApiServiceError("team_invite_body_invalid", "email is required.", status=400)
         try:
             role = OrganizationRole(body.get("role", "viewer"))
         except ValueError as exc:
@@ -2469,17 +2931,29 @@ class WebGuardJobService:
             principal = self.identity.create_principal(
                 context.organization_id, body["display_name"].strip(),
                 principal_type=PrincipalType.USER, role=role, now=now,
+                email=body["email"].strip(),
             )
-            issued = self.identity.create_token(principal.principal_id, label="initial-invitation", now=now)
         except IdentityStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        issued = self.identity.create_identity_token(
+            principal.principal_id, context.organization_id,
+            purpose=IdentityTokenPurpose.INVITATION, ttl=INVITATION_TOKEN_TTL, now=now,
+        )
+        self.mail_provider.send(
+            to=principal.email,
+            subject="You've been invited to WebGuard",
+            body=(
+                f"{context.principal_name} invited you to join their WebGuard organization "
+                f"as {role.value}. Accept your invitation with this one-time token "
+                f"(expires in {INVITATION_TOKEN_TTL.days} days): {issued.token}"
+            ),
+            category="invitation",
+        )
         self._audit(
             context, request_id=request_id, action="team.invite", resource_type="principal",
             resource_id=principal.principal_id, outcome=AuditOutcome.SUCCEEDED,
         )
-        payload = self._principal_public_dict(principal)
-        payload["initial_token"] = issued.token
-        return payload
+        return self._principal_public_dict(principal)
 
     def update_team_member(self, context: AuthContext, principal_id: str, body: dict, *, request_id: str) -> dict:
         self._require(
@@ -2515,6 +2989,14 @@ class WebGuardJobService:
             )
         except IdentityStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        # Requirement 5: rotate/revoke at privilege-change boundaries.
+        # There is no "current session of the principal whose role
+        # changed" to rotate in place from the admin's own request --
+        # the admin is a different principal -- so the equivalent,
+        # correct action is revoking the target's existing sessions:
+        # their next authenticated request re-resolves the new role
+        # from a fresh session rather than a stale, already-issued one.
+        self.sessions.revoke_all_sessions_for_principal(principal_id, now=self.clock())
         self._audit(
             context, request_id=request_id, action="team.update", resource_type="principal",
             resource_id=principal_id, outcome=AuditOutcome.SUCCEEDED,
@@ -2549,6 +3031,7 @@ class WebGuardJobService:
             )
         except IdentityStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        self.sessions.revoke_all_sessions_for_principal(principal_id, now=self.clock())
         self._audit(
             context, request_id=request_id, action="team.remove", resource_type="principal",
             resource_id=principal_id, outcome=AuditOutcome.SUCCEEDED,

@@ -1,15 +1,20 @@
-"""Bearer-token authentication and role-based authorization."""
+"""Bearer-token and browser-session authentication, and role-based
+authorization shared identically by both (Slice 16 requirement 15:
+a browser session resolves into the exact same ``AuthContext`` /
+``ApiPermission`` model an API token does -- there is no separate
+frontend permission model)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 
 from webguard_contracts import OrganizationRole
 
 from .identity import IdentityStoreError
 from .repository_contracts import IdentityRepository
+from .sessions import DEFAULT_IDLE_TIMEOUT
 
 
 class ApiPermission(str, Enum):
@@ -108,6 +113,13 @@ class AuthContext:
     principal_name: str
     role: OrganizationRole
     token_id: str
+    # Slice 16: which credential kind authenticated this request. Every
+    # other field above is identical regardless -- RBAC resolution
+    # (`permits`/`require`) does not look at this at all. It exists
+    # only for the two places that legitimately must behave
+    # differently by transport: the CSRF gate (browser sessions only)
+    # and audit logging (records which kind of credential acted).
+    auth_method: str = "api_token"
 
     def permits(self, permission: ApiPermission) -> bool:
         return permission in _ROLE_PERMISSIONS[self.role]
@@ -128,6 +140,7 @@ class AuthContext:
             "principal_name": self.principal_name,
             "role": self.role.value,
             "token_id": self.token_id,
+            "auth_method": self.auth_method,
         }
 
 
@@ -164,9 +177,66 @@ class ApiTokenAuthenticator:
         )
 
 
+class BrowserSessionAuthenticator:
+    """Authenticate exactly one browser session cookie against the
+    session store, resolving into the identical ``AuthContext`` shape
+    ``ApiTokenAuthenticator`` produces -- same RBAC, same
+    ``_require``/``_audit`` call sites in ``service.py``, no parallel
+    permission model for browser users (Slice 16 requirement 15)."""
+
+    def __init__(self, identity: IdentityRepository, sessions) -> None:  # noqa: ANN001 - see repository_contracts
+        self.identity = identity
+        self.sessions = sessions
+
+    def authenticate(
+        self,
+        session_token: object,
+        *,
+        now: datetime,
+        csrf_header: str | None = None,
+        require_csrf: bool = False,
+        idle_ttl: timedelta = DEFAULT_IDLE_TIMEOUT,
+    ) -> AuthContext:
+        try:
+            session = self.sessions.authenticate_session(
+                session_token,
+                now=now,
+                idle_ttl=idle_ttl,
+                csrf_header=csrf_header,
+                require_csrf=require_csrf,
+            )
+        except IdentityStoreError as exc:
+            # A missing/wrong CSRF token means the session itself is
+            # genuinely valid -- the caller is simply forbidden from
+            # this specific request without also proving it, which is
+            # a 403 (authenticated but not permitted), not a 401
+            # (not authenticated at all).
+            status = 403 if exc.code == "csrf_token_invalid" else 401
+            raise AuthenticationError(exc.code, exc.message, status=status) from exc
+        try:
+            principal = self.identity.get_principal(session.principal_id)
+            organization = self.identity.get_organization(session.organization_id)
+        except IdentityStoreError as exc:
+            raise AuthenticationError(exc.code, exc.message) from exc
+        if not principal.active:
+            raise AuthenticationError("principal_disabled", "Principal is disabled.")
+        if organization.status.value != "active":
+            raise AuthenticationError("organization_disabled", "Organization is disabled.")
+        return AuthContext(
+            organization_id=organization.organization_id,
+            organization_name=organization.name,
+            principal_id=principal.principal_id,
+            principal_name=principal.display_name,
+            role=principal.role,
+            token_id=session.session_id,
+            auth_method="browser_session",
+        )
+
+
 __all__ = [
     "ApiPermission",
     "ApiTokenAuthenticator",
     "AuthContext",
     "AuthenticationError",
+    "BrowserSessionAuthenticator",
 ]

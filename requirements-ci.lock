@@ -43,3 +43,15 @@ psycopg-pool==3.2.6 \
 
 typing-extensions==4.15.0 \
     --hash=sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548
+
+# C1-003 (Slice 16) -- Argon2id password hashing for native browser-user
+# credentials. argon2-cffi's own wheel is pure Python (one hash);
+# argon2-cffi-bindings is a stable-ABI (abi3) compiled wheel, so the same
+# two platform wheels (Linux x86_64, macOS ARM64) cover the entire
+# reviewed Python 3.11/3.12/3.13/3.14 matrix without a per-version build.
+argon2-cffi==25.1.0 \
+    --hash=sha256:fdc8b074db390fccb6eb4a3604ae7231f219aa669a2652e0f20e16ba513d5741
+
+argon2-cffi-bindings==26.1.0 \
+    --hash=sha256:27f1821903e2ceadcb88ec2b45ef190897b7682449c772f4d9b53e42c520cf29 \
+    --hash=sha256:21ca0396fe5ec995dd54431c32698189666f9224810acfa752e50d2bd94d9df2

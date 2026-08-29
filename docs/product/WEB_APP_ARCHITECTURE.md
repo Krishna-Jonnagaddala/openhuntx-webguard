@@ -41,30 +41,37 @@ No state-management library, no CSS-in-JS runtime, no component library was
 added. The app is small enough that TanStack Query plus local component
 state covers every real need.
 
-## 3. Authentication model
+## 3. Authentication model (rewritten in Slice 16)
 
-The API has no browser session or cookie layer — only Bearer API tokens,
-issued via CLI bootstrap or `POST /v1/api-keys`. There is no password to
-authenticate with. Given that, "login" here means: paste an existing API
-token, and the app validates it once against `GET /v1/me` before persisting
-anything (`src/lib/auth.tsx`). This is not a placeholder for a future real
-login — it is the honest frontend adaptation of the API's actual auth
-model, matching the brief's own anticipation of this exact scenario
-("if full customer browser-auth infrastructure does not yet exist, build a
-functional frontend shell... rather than inventing insecure browser
-authentication").
+The web app now authenticates with a real, server-side browser session —
+not a pasted API token. `POST /v1/auth/login` sets an `HttpOnly` `wg_session`
+cookie (the frontend never reads, stores, or even sees the raw session
+credential) plus a separate, non-`HttpOnly` `wg_csrf` cookie used only to
+echo an `X-CSRF-Token` header back on state-changing requests. Every
+`fetch` call in `src/lib/api.ts` sets `credentials: "include"`, so the
+browser attaches `wg_session` automatically; there is nothing for this
+codebase to store in `sessionStorage`/`localStorage`/`IndexedDB` at all —
+`src/lib/auth-storage.ts` (Slice 15's interim sessionStorage-token module)
+was deleted outright, not deprecated.
 
-The validated token is stored in `sessionStorage`, not `localStorage` (see
-`src/lib/auth-storage.ts`'s docstring and §7 of
-`docs/audit/customer-platform-phase1.md` for the full tradeoff). A global
-`webguard:unauthorized` event, dispatched by `src/lib/api.ts` on any 401,
-clears the session and returns the user to `/login` — this is the only
-place session state is cleared other than an explicit sign-out.
+`src/lib/auth.tsx`'s `AuthProvider` derives all session state from
+`GET /v1/auth/session` (never from browser storage): `refresh()` calls it
+on mount, `login()`/`register()`/`acceptInvitation()` each call their own
+`/v1/auth/...` endpoint and adopt its response directly. The existing
+global `webguard:unauthorized` event (dispatched by `api.ts` on any 401)
+still clears local state, but is now guarded so a session that was never
+established (the very first, expected 401 on a fresh visit) does not
+surface a spurious "you were signed out" message — only a 401 that
+invalidates an *already-established* session does.
 
-There is no password reset or email-based flow (no email infrastructure
-exists — see requirement 29's "no production email" constraint); team
-invitation issues an initial token directly instead (§10a of the API
-contract doc).
+Full lifecycle — registration, login/logout/logout-everywhere, password
+change/reset, email verification, and invitation acceptance — is now real
+and documented in `docs/product/CUSTOMER_AUTH_ARCHITECTURE.md` (product
+model) and `docs/security/BROWSER_SESSION_SECURITY.md` (session/CSRF/
+cookie security design). API-token paste-based login no longer exists
+anywhere in the product; the old `GET /v1/me` Bearer-token path remains
+available unchanged for CLI/API clients, and the web app's own
+self-service API-key management (Slice 15) is unaffected.
 
 ## 4. Application shell and routing
 
@@ -119,16 +126,25 @@ more than its authorization allows is rejected outright, so the UI's
 default must never assume a larger authorization than a real one might
 carry.
 
-## 7. CORS
+## 7. CORS (credentials added in Slice 16)
 
-The API previously had no browser caller and sent no CORS headers.
-`apps/api/src/webguard_api/http_api.py` now accepts an explicit
+`apps/api/src/webguard_api/http_api.py` accepts an explicit
 `allowed_origins` allowlist (`build_handler`/`create_server`), answers
 `OPTIONS` preflights, and echoes `Access-Control-Allow-Origin` only for a
-listed origin — no wildcard, since `Authorization` is a real credential
-header. `cli.py`'s `serve` command reads `WEBGUARD_WEB_ALLOWED_ORIGINS`
-(comma-separated); nothing is allowed by default, so a production
-deployment must opt an origin in explicitly.
+listed origin — no wildcard, since both `Authorization` and the new
+`wg_session` cookie are real credentials. `cli.py`'s `serve` command reads
+`WEBGUARD_WEB_ALLOWED_ORIGINS` (comma-separated); nothing is allowed by
+default, so a production deployment must opt an origin in explicitly.
+
+Slice 16 added `Access-Control-Allow-Credentials: true` to both the actual
+response and the `OPTIONS` preflight — required for `fetch(..., {credentials:
+"include"})` to work cross-origin at all, and only ever paired with a
+reflected, allowlisted origin (never `*`). See
+`docs/security/BROWSER_SESSION_SECURITY.md` §3 for the full cross-origin
+threat model, including why a denied origin's preflight response omits
+these headers entirely rather than rejecting with an error status (the
+browser itself is what enforces the block; the server's job is only to
+withhold permission).
 
 ## 8. Real-backend testing infrastructure
 

@@ -87,7 +87,7 @@ export function AppShell() {
         <div className="flex items-center gap-4">
           {session ? (
             <span className="hidden text-sm text-[var(--color-text-secondary)] sm:inline">
-              {session.organizationName}
+              {session.organization_name}
             </span>
           ) : null}
           <button
@@ -118,9 +118,9 @@ export function AppShell() {
                 aria-hidden="true"
                 className="flex h-6 w-6 items-center justify-center rounded-full bg-[var(--color-accent-muted)] text-xs font-semibold text-[var(--color-accent)]"
               >
-                {session?.principalName?.[0]?.toUpperCase() ?? "?"}
+                {session?.principal_name?.[0]?.toUpperCase() ?? "?"}
               </span>
-              <span className="hidden sm:inline">{session?.principalName}</span>
+              <span className="hidden sm:inline">{session?.principal_name}</span>
             </button>
             {menuOpen ? (
               <div

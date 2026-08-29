@@ -1,5 +1,3 @@
-import { loadSession } from "./auth-storage";
-
 export const API_BASE_URL =
   (import.meta.env.VITE_API_BASE_URL as string | undefined) ??
   "http://127.0.0.1:8765";
@@ -37,6 +35,19 @@ function buildQuery(params?: Record<string, string | number | undefined>): strin
   return query ? `?${query}` : "";
 }
 
+const CSRF_COOKIE_NAME = "wg_csrf";
+const CSRF_HEADER_NAME = "X-CSRF-Token";
+const STATE_CHANGING_METHODS = new Set(["POST", "PATCH", "DELETE", "PUT"]);
+
+/** The CSRF token lives in a deliberately non-HttpOnly cookie (see
+ * docs/security/BROWSER_SESSION_SECURITY.md) precisely so this can
+ * read it and echo it back as a header -- the session cookie itself
+ * is never read here, and never could be (HttpOnly). */
+function readCsrfCookie(): string | null {
+  const match = document.cookie.match(new RegExp(`(?:^|; )${CSRF_COOKIE_NAME}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -47,14 +58,20 @@ async function request<T>(
     extraHeaders?: Record<string, string>;
   } = {},
 ): Promise<T> {
-  const session = loadSession();
   const headers: Record<string, string> = { ...options.extraHeaders };
-  if (session) headers.Authorization = `Bearer ${session.token}`;
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  if (STATE_CHANGING_METHODS.has(method)) {
+    const csrf = readCsrfCookie();
+    if (csrf) headers[CSRF_HEADER_NAME] = csrf;
+  }
 
   const response = await fetch(`${API_BASE_URL}${path}${buildQuery(options.query)}`, {
     method,
     headers,
+    // Session auth is an HttpOnly cookie (Slice 16) -- there is no
+    // token in JS-reachable storage to attach as a header. This is
+    // what makes the browser actually send and receive it.
+    credentials: "include",
     body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
   });
 
@@ -97,13 +114,29 @@ export const api = {
 
 // -- Domain types (mirrors docs/product/WEB_APP_API_CONTRACT_V1.md) ------
 
-export interface MeResponse {
+export interface SessionMetadata {
+  session_id: string;
+  assurance_level: string;
+  issued_at: string;
+  idle_expires_at: string;
+  absolute_expires_at: string;
+  last_used_at: string | null;
+}
+
+export interface SessionResponse {
   organization_id: string;
   organization_name: string;
   principal_id: string;
   principal_name: string;
   role: "owner" | "administrator" | "analyst" | "viewer";
+  auth_method: "browser_session" | "api_token";
+  token_id: string;
+  session?: SessionMetadata;
 }
+
+/** @deprecated use SessionResponse -- kept as an alias so any lingering
+ * reference to the old /v1/me response shape still type-checks. */
+export type MeResponse = SessionResponse;
 
 export interface DashboardSummary {
   total_assets: number;
@@ -258,7 +291,9 @@ export interface TeamMember {
   role: "owner" | "administrator" | "analyst" | "viewer";
   active: boolean;
   created_at: string;
-  initial_token?: string;
+  email: string | null;
+  email_verified_at: string | null;
+  last_login_at: string | null;
 }
 
 export interface ApiKeyRecord {
@@ -296,7 +331,27 @@ export interface PagePayload {
 // -- Resource calls --------------------------------------------------------
 
 export const meApi = {
-  get: () => api.get<MeResponse>("/v1/me"),
+  get: () => api.get<SessionResponse>("/v1/me"),
+};
+
+export const authApi = {
+  register: (body: { organization_name: string; display_name: string; email: string; password: string }) =>
+    api.post<SessionResponse>("/v1/auth/register", body),
+  login: (body: { email: string; password: string }) => api.post<SessionResponse>("/v1/auth/login", body),
+  logout: () => api.postNoBody<{ status: string }>("/v1/auth/logout"),
+  logoutAll: () => api.postNoBody<{ revoked_count: number }>("/v1/auth/logout-all"),
+  session: () => api.get<SessionResponse>("/v1/auth/session"),
+  changePassword: (body: { current_password: string; new_password: string }) =>
+    api.post<{ status: string }>("/v1/auth/password/change", body),
+  requestPasswordReset: (email: string) =>
+    api.post<{ message: string }>("/v1/auth/password/reset/request", { email }),
+  confirmPasswordReset: (body: { token: string; new_password: string }) =>
+    api.post<{ message: string }>("/v1/auth/password/reset/confirm", body),
+  requestEmailVerification: () => api.postNoBody<{ message: string }>("/v1/auth/email/verify/request"),
+  confirmEmailVerification: (token: string) =>
+    api.post<{ message: string }>("/v1/auth/email/verify/confirm", { token }),
+  acceptInvitation: (body: { token: string; password: string }) =>
+    api.post<SessionResponse>("/v1/auth/invitations/accept", body),
 };
 
 export const dashboardApi = {
@@ -347,12 +402,14 @@ export const permitsApi = {
   issue: (params: { target: string; authorizationId: string; mode: "single_page" | "crawl" }) => {
     const now = new Date();
     // Must be far enough ahead to still be in the future once the
-    // request actually reaches the server (real network/render
-    // latency can eat a few hundred ms), and comfortably under the
-    // caller's post-issue wait (see useIssuePermitAndSubmitJob /
-    // useCreateSchedule's buffer) or the job submission arrives
-    // before the permit's own not_before and is rejected as "pending".
-    const notBefore = new Date(now.getTime() + 1000);
+    // request actually reaches the server -- real network/render
+    // latency, plus session-cookie auth's per-request DB touch and
+    // CSRF verification, can eat well over a second under load -- and
+    // comfortably under the caller's post-issue wait (see
+    // useIssuePermitAndSubmitJob / useCreateSchedule's buffer) or the
+    // job submission arrives before the permit's own not_before and
+    // is rejected as "pending".
+    const notBefore = new Date(now.getTime() + 3000);
     const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
     return api.post<PermitRecord>("/v1/permits", {
       target: params.target,
@@ -460,7 +517,7 @@ export const reportsApi = {
 
 export const teamApi = {
   list: () => api.get<{ members: TeamMember[] }>("/v1/team"),
-  invite: (body: { display_name: string; role: string }) =>
+  invite: (body: { display_name: string; email: string; role: string }) =>
     api.post<TeamMember>("/v1/team/invitations", body),
   updateRole: (id: string, role: string) => api.patch<TeamMember>(`/v1/team/${id}`, { role }),
   remove: (id: string) => api.del<TeamMember>(`/v1/team/${id}`),

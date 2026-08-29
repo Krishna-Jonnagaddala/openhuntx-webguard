@@ -3,9 +3,11 @@
 E2E suite (Slice 15 requirement 28).
 
 Started as a subprocess by `apps/web/e2e/global-setup.ts`. Prints one
-JSON line to stdout once ready (base URL, owner token, and the
-controlled fixture's target URL for the browser test to add as an
-asset), then blocks until SIGTERM.
+JSON line to stdout once ready (base URL, owner email/password for a
+real browser login -- Slice 16 requirement 24 retired the old
+paste-a-bearer-token login -- plus an owner API token for any
+API-only assertions, and the controlled fixture's target URL for the
+browser test to add as an asset), then blocks until SIGTERM.
 
 Reuses `webguard_production_harness.run_production_stack` -- the same
 real-Postgres, real-KMS-shaped-signing, real-HTTP-server startup
@@ -252,6 +254,8 @@ def main() -> int:
         ready = {
             "base_url": stack.base_url,
             "token": stack.owner_token,
+            "owner_email": stack.owner_email,
+            "owner_password": stack.owner_password,
             "target_url": target_url,
             "organization_id": stack.organization_id,
         }

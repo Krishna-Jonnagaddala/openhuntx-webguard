@@ -10,7 +10,50 @@ This is **not a frontend design document.** It is the contract the WebGuard web 
 - `EXPERIMENTAL` — implemented and tested, but the shape may still change based on real frontend usage (most of what shipped this slice: findings lifecycle, reports, scans-as-a-resource).
 - `INTERNAL` — exists for the platform's own use (audit, health/readiness) and is not intended as a primary UI data source, though a UI may still read it.
 
-All endpoints below require `Authorization: Bearer <token>` unless marked public. All are tenant-scoped to the authenticated token's organization; cross-organization access fails closed as 404 (see `docs/ARCHITECTURE.md` Boundary B). All list endpoints share one pagination/filtering contract (§9).
+All endpoints below require `Authorization: Bearer <token>` **or** an authenticated `wg_session` browser cookie (§0) unless marked public. All are tenant-scoped to the authenticated caller's organization; cross-organization access fails closed as 404 (see `docs/ARCHITECTURE.md` Boundary B). All list endpoints share one pagination/filtering contract (§9).
+
+## 0. Authentication — `STABLE_V1` (new in Slice 16)
+
+Two independent, always-available authenticator paths, both resolving into the identical RBAC `AuthContext` (see `docs/security/BROWSER_SESSION_SECURITY.md` §1 for the full design rationale — there is exactly one authorization model, never a separate "browser" permission set):
+
+- **`Authorization: Bearer <token>`** — unchanged from Slice 12, for CLI/API/automation clients. Never subject to CSRF checks (§0d).
+- **`wg_session` cookie** (`HttpOnly`, `Secure` in production, `SameSite=Lax`) — for the web app. The raw cookie value is never readable by JavaScript and never appears in a JSON response body.
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v1/auth/register` | Public. Body: `{"organization_name", "display_name", "email", "password"}`. Creates a new organization + `owner` principal + password credential, issues an email-verification token (§0c), and establishes a session immediately (auto-login — no separate post-registration login step). 409 on a duplicate email. Rate-limited by IP. |
+| `POST` | `/v1/auth/login` | Public. Body: `{"email", "password"}`. Returns the same session shape as `GET /v1/auth/session` and sets the session/CSRF cookies. **Identical generic 401 (`invalid_credentials`)** whether the email does not exist or the password is wrong — no account-enumeration signal. Rate-limited per `email+IP`. |
+| `POST` | `/v1/auth/logout` | Revokes the current session only. |
+| `POST` | `/v1/auth/logout-all` | Revokes every session for the calling principal, including the current one ("sign out everywhere"). |
+| `GET` | `/v1/auth/session` | The session-aware replacement for `GET /v1/me` (still available, unchanged, for Bearer clients). Fields: `organization_id`, `organization_name`, `principal_id`, `principal_name`, `role`, `auth_method` (`"api_token"` \| `"browser_session"`), `token_id` (the session ID for browser sessions — never a secret), and, only when `auth_method == "browser_session"`, a nested `session` object (`session_id`, `assurance_level`, `issued_at`, `idle_expires_at`, `absolute_expires_at`, `last_used_at`) — no secret or hash ever appears here either. |
+
+### 0a. Password lifecycle
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v1/auth/password/change` | Authenticated. Body: `{"current_password", "new_password"}`. Revokes every **other** session for the caller (keeps the session used to make the change) — a role/credential-strength change is a session-rotation boundary. |
+| `POST` | `/v1/auth/password/reset/request` | Public. Body: `{"email"}`. **Always** returns the same generic message regardless of whether the address matches an account — no enumeration signal, no distinguishable timing-sensitive branch in the response shape. Rate-limited by IP. |
+| `POST` | `/v1/auth/password/reset/confirm` | Public. Body: `{"token", "new_password"}`. Single-use, expiry-bounded (1 hour) token. Revokes **every** session for the account (a password reset is a full "sign out everywhere" boundary, unlike an in-session password change). Rate-limited by IP. |
+
+### 0b. Email verification
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v1/auth/email/verify/request` | Authenticated. Re-sends a verification email (resend). Rate-limited by IP. |
+| `POST` | `/v1/auth/email/verify/confirm` | Public. Body: `{"token"}`. Single-use, expiry-bounded (24 hours). Rate-limited by IP. |
+
+### 0c. Invitations
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v1/team/invitations` | See the revised §10a below — issues a mailed invitation token, not a raw API token. |
+| `POST` | `/v1/auth/invitations/accept` | Public. Body: `{"token", "password"}`. Single-use, expiry-bounded (7 days) token. Sets the invited principal's password, marks their email verified (accepting a mailed link is treated as proof of mailbox control), and establishes a session immediately (auto-login). Rate-limited by IP. |
+
+### 0d. CSRF
+
+Every state-changing (`POST`/`PATCH`/`DELETE`) request authenticated via the `wg_session` cookie must echo the separate, non-`HttpOnly` `wg_csrf` cookie's value back as an `X-CSRF-Token` header, or the request fails with `403 csrf_token_invalid` (distinct from `401`, which means "not authenticated at all"). `GET` requests never require it. A request authenticated via `Authorization: Bearer` is never subject to this check, regardless of whether it happens to also carry a stray session cookie. See `docs/security/BROWSER_SESSION_SECURITY.md` §2 for the full threat model this defends against, including why `SameSite=Lax` alone is not treated as sufficient.
+
+No endpoint in this section ever returns a raw session secret, CSRF secret, password, or reset/verification/invitation token in a JSON body — tokens are delivered exclusively via the mail provider (§0's docs) or, for the session/CSRF pair, exclusively via `Set-Cookie`.
 
 ## 1. Dashboard — `EXPERIMENTAL` (new in Slice 15)
 
@@ -40,16 +83,16 @@ List-response fields: `target_id`, `organization_id`, `url`, `label`, `default_m
 
 Only `method: "well_known_http"` is implemented; DNS TXT verification is a named, deferred gap (see `docs/audit/customer-platform-phase1.md`). **The frontend can never mark an asset verified directly** — `status` only ever becomes `verified` as the return value of a real server-side fetch performed by the `/verification/check` call above. RBAC: `assets.manage` for both routes (starting or checking verification is a management action, not a read).
 
-## 10a. Team — `EXPERIMENTAL` (new in Slice 15)
+## 10a. Team — `EXPERIMENTAL` (new in Slice 15, invitation flow revised in Slice 16)
 
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/v1/team` | Lists every principal in the organization (all roles, including inactive/removed members). |
-| `POST` | `/v1/team/invitations` | Body: `{"display_name": "...", "role": "owner"\|"administrator"\|"analyst"\|"viewer"}`. **No email-based invitation flow exists** (no production email this slice, per the brief's own instruction) — this creates the principal and issues an initial API token directly, returned once as `initial_token`; the inviter relays it out-of-band, exactly as CLI bootstrap already requires. Granting `owner` requires the caller to already be `owner`. |
-| `PATCH` | `/v1/team/{principal_id}` | Body: `{"role": "..."}`. A principal cannot change their own role (self-lockout prevention); granting or revoking `owner` requires the caller to already be `owner`. |
-| `DELETE` | `/v1/team/{principal_id}` | Deactivates (`active: false`) — never a row deletion, matching this API's standing revoke-over-delete convention everywhere else (permits, tokens, authentication contexts). A principal cannot deactivate themselves; removing an `owner` requires the caller to already be `owner`. |
+| `POST` | `/v1/team/invitations` | Body: `{"display_name": "...", "email": "...", "role": "owner"\|"administrator"\|"analyst"\|"viewer"}`. **Revised in Slice 16**: `email` is now required. Creates the principal (no password yet) and sends a real invitation email via the identity-token/mail-provider layer (`docs/product/CUSTOMER_AUTH_ARCHITECTURE.md` §4) — it no longer returns a raw `initial_token` to relay out-of-band. The recipient sets their own password via `POST /v1/auth/invitations/accept` (§0c). Granting `owner` requires the caller to already be `owner`. |
+| `PATCH` | `/v1/team/{principal_id}` | Body: `{"role": "..."}`. A principal cannot change their own role (self-lockout prevention); granting or revoking `owner` requires the caller to already be `owner`. **New in Slice 16**: also revokes every browser session belonging to the target principal, forcing re-authentication under the new role. |
+| `DELETE` | `/v1/team/{principal_id}` | Deactivates (`active: false`) — never a row deletion, matching this API's standing revoke-over-delete convention everywhere else (permits, tokens, authentication contexts). A principal cannot deactivate themselves; removing an `owner` requires the caller to already be `owner`. **New in Slice 16**: also revokes every browser session belonging to the target principal. |
 
-Response fields: `principal_id`, `organization_id`, `display_name`, `principal_type`, `role`, `active`, `created_at` (plus `initial_token` on the invitation response only). RBAC: `team.read` for `GET` (all four roles), `team.manage` for the other three (`owner`/`administrator` only). Role names are the existing domain roles exactly — `owner`, `administrator`, `analyst`, `viewer` — no frontend-only role model.
+Response fields: `principal_id`, `organization_id`, `display_name`, `principal_type`, `role`, `active`, `created_at`, `email` (`string \| null`), `email_verified_at` (`string \| null` — a `null` value is the UI's "pending" signal for an unaccepted invitation), `last_login_at` (`string \| null`). RBAC: `team.read` for `GET` (all four roles), `team.manage` for the other three (`owner`/`administrator` only). Role names are the existing domain roles exactly — `owner`, `administrator`, `analyst`, `viewer` — no frontend-only role model.
 
 ## 10b. API keys — `EXPERIMENTAL` (new in Slice 15)
 
@@ -162,8 +205,8 @@ Every list endpoint above shares one contract:
 
 Fields: `event_id`, `action`, `resource_type`, `resource_id`, `outcome`, `detail_code`, `occurred_at`, `principal_id`, `token_id`, `request_id`. `detail_code` is always a canonical identifier, never free text or a secret-bearing payload — every internal event that could otherwise carry sensitive detail (e.g. a verification check's raw response body) is reduced to a fixed code before being audited. RBAC: `audit.read`.
 
-**Summary for frontend planning (updated Slice 15)**: Scans, Findings (including lifecycle/history), Schedules, Reports (including download), Dashboard, Assets (including ownership verification), Team, API Keys, Settings, and Audit Log all have real, tested API surfaces and can be built against now. Remaining named gaps, none of which block the UI surfaces above: DNS TXT verification (only `.well-known` HTTP is implemented, §2a); no organization-settings write route beyond what §2/§10a already cover; no browser session/cookie authentication layer (see `docs/audit/customer-platform-phase1.md`'s authentication-status section) — the web app authenticates with the same Bearer API tokens this document already describes.
+**Summary for frontend planning (updated Slice 16)**: Authentication (real email/password browser sessions, registration, password reset, email verification, invitation acceptance — §0), Scans, Findings (including lifecycle/history), Schedules, Reports (including download), Dashboard, Assets (including ownership verification), Team, API Keys, Settings, and Audit Log all have real, tested API surfaces and can be built against now. Remaining named gaps, none of which block the UI surfaces above: DNS TXT verification (only `.well-known` HTTP is implemented, §2a); no organization-settings write route beyond what §2/§10a already cover; no true multi-organization support — a principal still belongs to exactly one organization (a deliberate Slice 16 scope decision, see `docs/product/CUSTOMER_AUTH_ARCHITECTURE.md` §6); no production email provider — verification/reset/invitation mail is logged, not delivered (see `docs/audit/customer-platform-phase2-identity-sessions.md`).
 
 ## 11. What this document is not
 
-It does not specify response HTTP headers beyond what §9 states, error-response shapes beyond the existing `{"error": {"code", "message", "request_id"}}` convention used everywhere in this API, or any visual/interaction design. It reflects implemented, tested behavior as of Slice 15 (`docs/audit/customer-platform-phase1.md`) and should be updated in the same slice that changes any endpoint it describes — not left to drift.
+It does not specify response HTTP headers beyond what §9 states, error-response shapes beyond the existing `{"error": {"code", "message", "request_id"}}` convention used everywhere in this API, or any visual/interaction design. It reflects implemented, tested behavior as of Slice 16 (`docs/audit/customer-platform-phase2-identity-sessions.md`) and should be updated in the same slice that changes any endpoint it describes — not left to drift.
