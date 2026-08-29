@@ -36,6 +36,10 @@ class ApiPermission(str, Enum):
     FINDING_UPDATE = "findings.update"
     REPORT_CREATE = "reports.create"
     REPORT_READ = "reports.read"
+    ASSET_READ = "assets.read"
+    ASSET_MANAGE = "assets.manage"
+    TEAM_READ = "team.read"
+    TEAM_MANAGE = "team.manage"
 
 
 _ROLE_PERMISSIONS = {
@@ -67,6 +71,9 @@ _ROLE_PERMISSIONS = {
             ApiPermission.FINDING_UPDATE,
             ApiPermission.REPORT_CREATE,
             ApiPermission.REPORT_READ,
+            ApiPermission.ASSET_READ,
+            ApiPermission.ASSET_MANAGE,
+            ApiPermission.TEAM_READ,
         }
     ),
     OrganizationRole.VIEWER: frozenset(
@@ -76,6 +83,8 @@ _ROLE_PERMISSIONS = {
             ApiPermission.PERMIT_READ,
             ApiPermission.FINDING_READ,
             ApiPermission.REPORT_READ,
+            ApiPermission.ASSET_READ,
+            ApiPermission.TEAM_READ,
         }
     ),
 }

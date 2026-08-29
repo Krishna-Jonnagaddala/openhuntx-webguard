@@ -31,7 +31,13 @@ _FINDING_PATH = re.compile(r"^/v1/findings/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-
 _FINDING_STATUS_PATH = re.compile(r"^/v1/findings/([0-9a-f-]{36})/status$")
 _FINDING_EVENTS_PATH = re.compile(r"^/v1/findings/([0-9a-f-]{36})/events$")
 _REPORT_PATH = re.compile(r"^/v1/reports/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+_REPORT_DOWNLOAD_PATH = re.compile(r"^/v1/reports/([0-9a-f-]{36})/download$")
 _SCAN_PATH = re.compile(r"^/v1/scans/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+_ASSET_PATH = re.compile(r"^/v1/assets/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+_ASSET_VERIFICATION_START_PATH = re.compile(r"^/v1/assets/([0-9a-f-]{36})/verification$")
+_ASSET_VERIFICATION_CHECK_PATH = re.compile(r"^/v1/assets/([0-9a-f-]{36})/verification/check$")
+_TEAM_MEMBER_PATH = re.compile(r"^/v1/team/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+_API_KEY_PATH = re.compile(r"^/v1/api-keys/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _PERMIT_REVOKE_PATH = re.compile(r"^/v1/permits/([0-9a-f-]{36})/revoke$")
 _AUTHENTICATION_CONTEXT_REVOKE_PATH = re.compile(
     r"^/v1/authentication-contexts/([0-9a-f-]{36})/revoke$"
@@ -61,6 +67,10 @@ def _json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
+_CORS_ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS"
+_CORS_ALLOWED_HEADERS = "Authorization, Content-Type, Idempotency-Key, TrustScan-Permit"
+
+
 def build_handler(
     service: WebGuardJobService,
     *,
@@ -69,8 +79,19 @@ def build_handler(
     maximum_request_bytes: int,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     epoch_clock: Callable[[], float] = time.time,
+    allowed_origins: frozenset[str] = frozenset(),
 ) -> Type[BaseHTTPRequestHandler]:
-    """Create a request handler bound to authenticated service dependencies."""
+    """Create a request handler bound to authenticated service dependencies.
+
+    ``allowed_origins`` is an explicit allowlist for browser CORS
+    (Slice 15: the WebGuard web app is a pure SPA calling this API
+    directly from the browser, so cross-origin requests are now a
+    real, not hypothetical, transport concern). Empty by default --
+    an operator must opt a specific origin in; there is no wildcard
+    support, since credentials-bearing requests (the ``Authorization``
+    bearer header) must never be paired with ``Access-Control-Allow-
+    Origin: *``.
+    """
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "OpenHuntX-WebGuard-API"
@@ -79,6 +100,12 @@ def build_handler(
 
         def log_message(self, _format: str, *_args: object) -> None:
             return
+
+        def _cors_headers(self) -> dict[str, str]:
+            origin = self.headers.get("Origin")
+            if not origin or origin not in allowed_origins:
+                return {}
+            return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
 
         def _send_json(
             self,
@@ -97,12 +124,28 @@ def build_handler(
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("X-Request-ID", request_id)
+            for name, value in self._cors_headers().items():
+                self.send_header(name, value)
             if extra_headers:
                 for name, value in extra_headers.items():
                     self.send_header(name, value)
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
+            self.close_connection = True
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            origin = self.headers.get("Origin")
+            self.send_response(204)
+            if origin and origin in allowed_origins:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Vary", "Origin")
+                self.send_header("Access-Control-Allow-Methods", _CORS_ALLOWED_METHODS)
+                self.send_header("Access-Control-Allow-Headers", _CORS_ALLOWED_HEADERS)
+                self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
             self.close_connection = True
 
         def _error(
@@ -384,6 +427,52 @@ def build_handler(
                     )
                     return
                 context, decision = self._authenticate()
+                download_match = _REPORT_DOWNLOAD_PATH.fullmatch(path)
+                if download_match:
+                    # Requirement 7: never exposes a filesystem path --
+                    # a raw byte stream, tenant-checked, resolved through
+                    # ArtifactStore. Not sent through _send_json, which
+                    # always wraps a JSON body.
+                    self._require_empty_query(query)
+                    content, content_type, filename = service.download_report(
+                        context, download_match.group(1), request_id=request_id
+                    )
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(content)))
+                    self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Request-ID", request_id)
+                    for name, value in self._cors_headers().items():
+                        self.send_header(name, value)
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
+                if path == "/v1/dashboard/summary":
+                    self._require_empty_query(query)
+                    payload = service.dashboard_summary(context, request_id=request_id)
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
+                    return
+                if path == "/v1/team":
+                    self._require_empty_query(query)
+                    payload = service.list_team(context, request_id=request_id)
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
+                    return
+                if path == "/v1/api-keys":
+                    self._require_empty_query(query)
+                    payload = service.list_api_keys(context, request_id=request_id)
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
+                    return
+                if path == "/v1/settings":
+                    self._require_empty_query(query)
+                    payload = service.get_settings(context, request_id=request_id)
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
+                    return
+                if path == "/v1/assets":
+                    page = self._page_request(query, filters={})
+                    payload = service.list_assets(context, page, request_id=request_id)
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
+                    return
                 if path == "/v1/me":
                     self._require_empty_query(query)
                     payload = service.me(context, request_id=request_id)
@@ -482,7 +571,12 @@ def build_handler(
                     finding_match = _FINDING_PATH.fullmatch(path)
                     report_match = _REPORT_PATH.fullmatch(path)
                     scan_match = _SCAN_PATH.fullmatch(path)
-                    if finding_events_match:
+                    asset_match = _ASSET_PATH.fullmatch(path)
+                    if asset_match:
+                        payload = service.get_asset(
+                            context, asset_match.group(1), request_id=request_id
+                        )
+                    elif finding_events_match:
                         payload = service.list_finding_events(
                             context, finding_events_match.group(1), request_id=request_id
                         )
@@ -548,6 +642,89 @@ def build_handler(
                 path, query = self._request_target()
                 self._require_empty_query(query)
                 context, decision = self._authenticate()
+                if path == "/v1/assets":
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "asset_body_invalid", "Request body must be valid JSON.", status=400
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "asset_body_invalid", "Request body must be a JSON object.", status=400
+                        )
+                    payload = service.create_asset(context, body, request_id=request_id)
+                    self._send_json(
+                        201, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
+                    )
+                    return
+                asset_verification_start_match = _ASSET_VERIFICATION_START_PATH.fullmatch(path)
+                if asset_verification_start_match:
+                    lengths = self.headers.get_all("Content-Length") or []
+                    if lengths and any(value != "0" for value in lengths):
+                        raise ApiTransportError(
+                            "asset_verification_body_not_allowed",
+                            "Verification-start requests cannot contain a body.",
+                            status=400,
+                        )
+                    payload = service.start_asset_verification(
+                        context, asset_verification_start_match.group(1), request_id=request_id
+                    )
+                    self._send_json(
+                        201, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
+                    )
+                    return
+                asset_verification_check_match = _ASSET_VERIFICATION_CHECK_PATH.fullmatch(path)
+                if asset_verification_check_match:
+                    lengths = self.headers.get_all("Content-Length") or []
+                    if lengths and any(value != "0" for value in lengths):
+                        raise ApiTransportError(
+                            "asset_verification_body_not_allowed",
+                            "Verification-check requests cannot contain a body.",
+                            status=400,
+                        )
+                    payload = service.check_asset_verification(
+                        context, asset_verification_check_match.group(1), request_id=request_id
+                    )
+                    self._send_json(
+                        200, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
+                    )
+                    return
+                if path == "/v1/team/invitations":
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "team_invite_body_invalid", "Request body must be valid JSON.", status=400
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "team_invite_body_invalid", "Request body must be a JSON object.", status=400
+                        )
+                    payload = service.invite_team_member(context, body, request_id=request_id)
+                    self._send_json(
+                        201, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
+                    )
+                    return
+                if path == "/v1/api-keys":
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "api_key_body_invalid", "Request body must be valid JSON.", status=400
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "api_key_body_invalid", "Request body must be a JSON object.", status=400
+                        )
+                    payload = service.create_api_key(context, body, request_id=request_id)
+                    self._send_json(
+                        201, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
+                    )
+                    return
                 if path == "/v1/permits":
                     payload = service.issue_permit(
                         context,
@@ -816,8 +993,80 @@ def build_handler(
                 request_id=request_id,
             )
 
-        do_DELETE = do_PUT
-        do_PATCH = do_PUT
+        def do_PATCH(self) -> None:  # noqa: N802
+            request_id = str(uuid4())
+            try:
+                path, query = self._request_target()
+                self._require_empty_query(query)
+                context, decision = self._authenticate()
+                asset_match = _ASSET_PATH.fullmatch(path)
+                if asset_match:
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "asset_body_invalid", "Request body must be valid JSON.", status=400
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "asset_body_invalid", "Request body must be a JSON object.", status=400
+                        )
+                    payload = service.update_asset(context, asset_match.group(1), body, request_id=request_id)
+                    self._send_json(
+                        200, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
+                    )
+                    return
+                team_match = _TEAM_MEMBER_PATH.fullmatch(path)
+                if team_match:
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "team_update_body_invalid", "Request body must be valid JSON.", status=400
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "team_update_body_invalid", "Request body must be a JSON object.", status=400
+                        )
+                    payload = service.update_team_member(context, team_match.group(1), body, request_id=request_id)
+                    self._send_json(
+                        200, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
+                    )
+                    return
+                raise ApiTransportError("route_not_found", "API route was not found.", status=404)
+            except (ApiTransportError, ApiServiceError, AuthenticationError, RateLimitError) as exc:
+                self._error(exc, request_id=request_id)
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            request_id = str(uuid4())
+            try:
+                path, query = self._request_target()
+                self._require_empty_query(query)
+                context, decision = self._authenticate()
+                lengths = self.headers.get_all("Content-Length") or []
+                if lengths and any(value != "0" for value in lengths):
+                    raise ApiTransportError(
+                        "delete_body_not_allowed", "Delete requests cannot contain a body.", status=400
+                    )
+                team_match = _TEAM_MEMBER_PATH.fullmatch(path)
+                if team_match:
+                    payload = service.remove_team_member(context, team_match.group(1), request_id=request_id)
+                    self._send_json(
+                        200, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
+                    )
+                    return
+                api_key_match = _API_KEY_PATH.fullmatch(path)
+                if api_key_match:
+                    payload = service.revoke_api_key(context, api_key_match.group(1), request_id=request_id)
+                    self._send_json(
+                        200, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
+                    )
+                    return
+                raise ApiTransportError("route_not_found", "API route was not found.", status=404)
+            except (ApiTransportError, ApiServiceError, AuthenticationError, RateLimitError) as exc:
+                self._error(exc, request_id=request_id)
 
     return Handler
 
@@ -832,6 +1081,7 @@ def create_server(
     maximum_request_bytes: int,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     epoch_clock: Callable[[], float] = time.time,
+    allowed_origins: frozenset[str] = frozenset(),
 ) -> ThreadingHTTPServer:
     """Bind the authenticated local HTTP transport."""
 
@@ -854,6 +1104,7 @@ def create_server(
         maximum_request_bytes=maximum_request_bytes,
         clock=clock,
         epoch_clock=epoch_clock,
+        allowed_origins=allowed_origins,
     )
     server = ThreadingHTTPServer((address.compressed, port), handler)
     server.daemon_threads = True

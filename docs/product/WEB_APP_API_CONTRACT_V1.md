@@ -2,7 +2,7 @@
 
 ## Purpose and scope
 
-This is **not a frontend design document.** It is the contract a future WebGuard dashboard builds against: which `/v1/...` endpoints exist today, what they return, what stability guarantee each carries, and which UI surfaces they support. Nothing here is aspirational — every endpoint listed is implemented and tested as of Slice 14. Where a UI surface the brief names (Dashboard, Assets, Team, API Keys, Settings) has no backing endpoint yet, that is stated plainly as a gap, not papered over.
+This is **not a frontend design document.** It is the contract the WebGuard web app builds against: which `/v1/...` endpoints exist today, what they return, what stability guarantee each carries, and which UI surfaces they support. Nothing here is aspirational — every endpoint listed is implemented and tested. As of Slice 15, every UI surface the brief names has a real backing endpoint except where stated explicitly as a gap (Assets/Team/Settings backends were completed in Slice 15; a small number of narrower gaps remain, named in each section below and in §10's summary).
 
 **Stability markers**, per endpoint or field group:
 
@@ -12,13 +12,68 @@ This is **not a frontend design document.** It is the contract a future WebGuard
 
 All endpoints below require `Authorization: Bearer <token>` unless marked public. All are tenant-scoped to the authenticated token's organization; cross-organization access fails closed as 404 (see `docs/ARCHITECTURE.md` Boundary B). All list endpoints share one pagination/filtering contract (§9).
 
-## 1. Dashboard
+## 1. Dashboard — `EXPERIMENTAL` (new in Slice 15)
 
-**No dedicated dashboard endpoint exists.** A dashboard view is expected to compose from the list endpoints below (`/v1/scans`, `/v1/findings`, `/v1/jobs`) rather than a single aggregate. Building a purpose-specific aggregation/summary endpoint (counts by severity, recent activity feed, etc.) is explicitly **not** in scope for this slice or the next — it is dashboard-shaped work the brief itself defers ("do not begin broad web-dashboard development"). Treat this section as a known gap, not an oversight.
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/v1/dashboard/summary` | Tenant-scoped aggregate. No query parameters. |
 
-## 2. Assets (targets)
+Response fields: `total_assets`, `verified_assets`, `active_scans`, `completed_scans`, `failed_scans`, `findings_by_severity` (object keyed by severity), `findings_by_status` (object keyed by lifecycle status), `recent_scans` (up to 5, same shape as §3's scan object), `recent_high_or_critical_findings` (up to 5, same shape as §5's finding object), `counts_capped_at` (an integer — the underlying scan/finding counts are computed from up to this many most-recent records, not the organization's true lifetime total, to keep the endpoint's cost bounded; a large organization's dashboard reflects its most recent activity accurately but its all-time totals only approximately). **No fabricated risk score** — only real counts, per the brief's own instruction; a defensible risk-scoring model, if one is ever built, would be an additive field here, never a replacement for these counts. RBAC: `jobs.read`.
 
-Target creation/listing exists at the repository layer (`PostgresTargetRepository`/`InMemoryTargetRepository`, live since Slice 13) but **has no HTTP route today.** Targets are currently created only as a side effect of authorization assignment in test/CLI flows. An "Assets" page needs `POST /v1/targets`, `GET /v1/targets`, `GET /v1/targets/{id}` added — real, scoped work for a future slice, not represented in the table below because it does not exist yet.
+## 2. Assets (targets) — `EXPERIMENTAL` (new in Slice 15)
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v1/assets` | Body: `{"url": "...", "label": "<optional>", "default_mode": "single_page"\|"crawl"\|null}`. 409 on a duplicate URL within the organization. |
+| `GET` | `/v1/assets` | Paginated (§9's standard contract). No filters yet. |
+| `GET` | `/v1/assets/{target_id}` | Full detail (see fields below). |
+| `PATCH` | `/v1/assets/{target_id}` | Body may include `label` and/or `default_mode` (either `null` or omitted to leave unchanged vs. omitted entirely — omit a key to leave it untouched, send it explicitly as `null` to clear it). |
+
+List-response fields: `target_id`, `organization_id`, `url`, `label`, `default_mode`, `created_at`, `archived_at`. Detail-response fields add: `verification` (the current `TargetVerificationRecord`, or `null` if never started — see §2a), `authorization` (`{"authorization_id", "issued_at", "expires_at", "state": "active"|"expiring_soon"|"expired"}`, or `null` if no assigned authorization currently covers this exact URL — matched by exact URL string, since targets and authorizations are deliberately separate entities with no foreign key between them), `last_scan` (§3's scan object, or `null`), `finding_counts` (object keyed by severity, computed from up to 100 most-recent findings for this asset — see `finding_count_is_capped`). **Registering an asset never grants scan permission** — the existing authorization/TrustScan boundaries are entirely unchanged and remain the only thing that can actually authorize a scan; `default_mode` only pre-fills what the "Start Scan" workflow offers. RBAC: `assets.read` for the two `GET` routes, `assets.manage` for `POST`/`PATCH`.
+
+### 2a. Ownership verification — `EXPERIMENTAL` (new in Slice 15)
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v1/assets/{target_id}/verification` | Starts (or restarts) verification. No body. Returns `{"verification_id", "method": "well_known_http", "status": "pending", "expires_at", "instructions": {"path": "/.well-known/webguard-verification.txt", "expected_content": "<token>"}}`. The `instructions`/token are returned **only** while status is `pending` and only from this call and the immediately-following detail read before a check runs — never re-derivable afterward. |
+| `POST` | `/v1/assets/{target_id}/verification/check` | No body. The server fetches `{scheme}://{host[:port]}/.well-known/webguard-verification.txt` from the asset's own origin (via the same safe-fetch machinery the scanner itself uses — public-address-only resolution, bounded response) and compares it against the expected token. Returns the updated verification record. 409 if no verification is currently pending. |
+
+Only `method: "well_known_http"` is implemented; DNS TXT verification is a named, deferred gap (see `docs/audit/customer-platform-phase1.md`). **The frontend can never mark an asset verified directly** — `status` only ever becomes `verified` as the return value of a real server-side fetch performed by the `/verification/check` call above. RBAC: `assets.manage` for both routes (starting or checking verification is a management action, not a read).
+
+## 10a. Team — `EXPERIMENTAL` (new in Slice 15)
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/v1/team` | Lists every principal in the organization (all roles, including inactive/removed members). |
+| `POST` | `/v1/team/invitations` | Body: `{"display_name": "...", "role": "owner"\|"administrator"\|"analyst"\|"viewer"}`. **No email-based invitation flow exists** (no production email this slice, per the brief's own instruction) — this creates the principal and issues an initial API token directly, returned once as `initial_token`; the inviter relays it out-of-band, exactly as CLI bootstrap already requires. Granting `owner` requires the caller to already be `owner`. |
+| `PATCH` | `/v1/team/{principal_id}` | Body: `{"role": "..."}`. A principal cannot change their own role (self-lockout prevention); granting or revoking `owner` requires the caller to already be `owner`. |
+| `DELETE` | `/v1/team/{principal_id}` | Deactivates (`active: false`) — never a row deletion, matching this API's standing revoke-over-delete convention everywhere else (permits, tokens, authentication contexts). A principal cannot deactivate themselves; removing an `owner` requires the caller to already be `owner`. |
+
+Response fields: `principal_id`, `organization_id`, `display_name`, `principal_type`, `role`, `active`, `created_at` (plus `initial_token` on the invitation response only). RBAC: `team.read` for `GET` (all four roles), `team.manage` for the other three (`owner`/`administrator` only). Role names are the existing domain roles exactly — `owner`, `administrator`, `analyst`, `viewer` — no frontend-only role model.
+
+## 10b. API keys — `EXPERIMENTAL` (new in Slice 15)
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/v1/api-keys` | Lists the **calling principal's own** tokens only — self-service, no cross-principal visibility, matching how personal-access tokens work in most developer-facing products. No RBAC permission beyond authentication. |
+| `POST` | `/v1/api-keys` | Body: `{"label": "...", "validity_days": <optional int>}`. Returns the metadata plus `token` — the raw bearer token, **returned exactly once**, never retrievable again. Only the scrypt hash is persisted. |
+| `DELETE` | `/v1/api-keys/{token_id}` | Revokes. 404 (not 403) if the token belongs to a different principal — cross-principal existence is not distinguishable from not-found. |
+
+Response fields (excluding the one-time `token`): `token_id`, `label`, `created_at`, `expires_at`, `revoked_at`, `last_used_at`.
+
+## 10c. Settings — `EXPERIMENTAL` (new in Slice 15)
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/v1/settings` | No query parameters. |
+
+Response: `{"organization": {"organization_id", "name", "status", "created_at"}, "account": {<the calling principal's own §10a fields>}}`. **Intentionally minimal** — no notification preferences, scan-defaults, or session-preference storage exists in the backend yet, and this endpoint does not invent placeholder fields for settings that are not real. There is no write route this slice (no genuine settings value is currently mutable beyond what §2/§10a already cover — an asset's `default_mode`, a team member's role).
+
+## 10d. Report download — `EXPERIMENTAL` (new in Slice 15)
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/v1/reports/{report_id}/download` | Not JSON — returns the raw artifact bytes with `Content-Type` matching the report's format and `Content-Disposition: attachment`. Tenant-checked identically to every other report route. Never exposes `report_ref` (an internal artifact reference, never a filesystem path or public URL) — only the bytes it resolves to, through `ArtifactStore`. In production, before object storage exists (Slice 14 §6), this fails closed with 503 (`object_storage_not_implemented`), not a fabricated success. |
 
 ## 3. Scans — `STABLE_V1` for read shape, `EXPERIMENTAL` overall (new this slice)
 
@@ -99,17 +154,16 @@ Every list endpoint above shares one contract:
 - Cursors are HMAC-signed and bound to: the authenticated organization, the resource type, and the exact filter set in effect when issued. Changing the filters, switching organizations (impossible for a single token, but relevant if a cursor is somehow replayed against a different token), or tampering with the cursor all fail closed with a 400, never silently returning a different page.
 - Filters come in two shapes: **enum filters** (`state`, `status`, `severity`, `mode`, `outcome`) validated against a fixed accepted-value set, and **free-form filters** (`target`, `asset`, `scan_id`, `cwe_id`) accepted as any bounded, control-character-free string. Both are bound into the signed cursor identically — a UI does not need to treat them differently when building "next page" requests, only when building the *initial* filter form (enum filters should render as a fixed choice list; free-form filters as free text).
 
-## 10. Team, API keys, audit log, settings
+## 10. Audit log — `STABLE_V1`
 
-| Surface | Status |
-|---|---|
-| **Team / members** | `INTERNAL` only. Principal/membership creation exists at the repository and CLI layer (`identity.create_principal`, `organization principal create`) but has no `/v1/...` HTTP route. A "Team" page needs `POST /v1/principals`, `GET /v1/principals`, and a role-update route added. |
-| **API keys** | `INTERNAL` only, same gap. Token issuance exists via CLI (`webguard-api token create`) and at the repository layer, not via HTTP. A "API Keys" page needs `POST /v1/tokens`, `GET /v1/tokens`, `POST /v1/tokens/{id}/revoke`. |
-| **Audit log** | `STABLE_V1`. `GET /v1/audit-events`, paginated, filter `outcome` (enum: `succeeded`\|`failed`\|`denied`). Fields: `event_id`, `action`, `resource_type`, `resource_id`, `outcome`, `detail_code`, `occurred_at`, `principal_id`, `token_id`, `request_id`. This is the one "settings-adjacent" surface that is fully ready today. |
-| **Settings** (org name, org-level policy, etc.) | No endpoint exists. Organization creation is CLI/repository-only. |
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/v1/audit-events` | Paginated. Filter: `outcome` (enum: `succeeded`\|`failed`\|`denied`). |
 
-**Summary for frontend planning**: Scans, Findings (including lifecycle/history), Schedules, Reports, and Audit Log have real, tested API surfaces today and can be built against now. Dashboard, Assets, Team, API Keys, and Settings have partial or no HTTP surface — building those UI screens requires new, scoped API work first, named explicitly here rather than discovered mid-frontend-build.
+Fields: `event_id`, `action`, `resource_type`, `resource_id`, `outcome`, `detail_code`, `occurred_at`, `principal_id`, `token_id`, `request_id`. `detail_code` is always a canonical identifier, never free text or a secret-bearing payload — every internal event that could otherwise carry sensitive detail (e.g. a verification check's raw response body) is reduced to a fixed code before being audited. RBAC: `audit.read`.
+
+**Summary for frontend planning (updated Slice 15)**: Scans, Findings (including lifecycle/history), Schedules, Reports (including download), Dashboard, Assets (including ownership verification), Team, API Keys, Settings, and Audit Log all have real, tested API surfaces and can be built against now. Remaining named gaps, none of which block the UI surfaces above: DNS TXT verification (only `.well-known` HTTP is implemented, §2a); no organization-settings write route beyond what §2/§10a already cover; no browser session/cookie authentication layer (see `docs/audit/customer-platform-phase1.md`'s authentication-status section) — the web app authenticates with the same Bearer API tokens this document already describes.
 
 ## 11. What this document is not
 
-It does not specify response HTTP headers beyond what §9 states, error-response shapes beyond the existing `{"error": {"code", "message", "request_id"}}` convention used everywhere in this API, or any visual/interaction design. It reflects implemented, tested behavior as of Slice 14 (`docs/audit/production-platform-phase3-runtime-completion.md`) and should be updated in the same slice that changes any endpoint it describes — not left to drift.
+It does not specify response HTTP headers beyond what §9 states, error-response shapes beyond the existing `{"error": {"code", "message", "request_id"}}` convention used everywhere in this API, or any visual/interaction design. It reflects implemented, tested behavior as of Slice 15 (`docs/audit/customer-platform-phase1.md`) and should be updated in the same slice that changes any endpoint it describes — not left to drift.

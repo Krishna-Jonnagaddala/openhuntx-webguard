@@ -188,6 +188,114 @@ class PostgresIdentityRepository:
             created_at=row[6].astimezone(timezone.utc),
         )
 
+    def get_principal_scoped(self, principal_id: str, *, organization_id: str) -> Principal:
+        principal = self.get_principal(principal_id)
+        if principal.organization_id != organization_id:
+            raise IdentityStoreError("principal_not_found", "Principal was not found.")
+        return principal
+
+    def list_principals(self, organization_id: str) -> tuple[Principal, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT principal_id, organization_id, display_name, principal_type, role, active, created_at
+                FROM principals WHERE organization_id = %s ORDER BY created_at
+                """,
+                (organization_id,),
+            ).fetchall()
+        return tuple(self._principal_from_row(row) for row in rows)
+
+    def update_principal_role(
+        self, principal_id: str, *, organization_id: str, role: OrganizationRole, now: datetime
+    ) -> Principal:
+        principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
+        with self._pool.connection() as connection:
+            connection.execute(
+                "UPDATE principals SET role = %s WHERE principal_id = %s", (role.value, principal_id)
+            )
+        return Principal(
+            principal_id=principal.principal_id,
+            organization_id=principal.organization_id,
+            display_name=principal.display_name,
+            principal_type=principal.principal_type,
+            role=role,
+            active=principal.active,
+            created_at=principal.created_at,
+        )
+
+    def set_principal_active(
+        self, principal_id: str, *, organization_id: str, active: bool, now: datetime
+    ) -> Principal:
+        principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
+        with self._pool.connection() as connection:
+            connection.execute(
+                "UPDATE principals SET active = %s WHERE principal_id = %s", (active, principal_id)
+            )
+        return Principal(
+            principal_id=principal.principal_id,
+            organization_id=principal.organization_id,
+            display_name=principal.display_name,
+            principal_type=principal.principal_type,
+            role=principal.role,
+            active=active,
+            created_at=principal.created_at,
+        )
+
+    def list_tokens_for_principal(self, principal_id: str) -> tuple[ApiTokenMetadata, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT token_id, organization_id, principal_id, label,
+                       created_at, expires_at, revoked_at, last_used_at
+                FROM api_tokens WHERE principal_id = %s ORDER BY created_at DESC
+                """,
+                (principal_id,),
+            ).fetchall()
+        return tuple(
+            ApiTokenMetadata(
+                token_id=str(row[0]),
+                organization_id=str(row[1]),
+                principal_id=str(row[2]),
+                label=row[3],
+                created_at=row[4].astimezone(timezone.utc),
+                expires_at=row[5].astimezone(timezone.utc),
+                revoked_at=row[6].astimezone(timezone.utc) if row[6] else None,
+                last_used_at=row[7].astimezone(timezone.utc) if row[7] else None,
+            )
+            for row in rows
+        )
+
+    def revoke_token_owned(self, token_id: str, *, principal_id: str, now: datetime) -> ApiTokenMetadata:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT token_id, organization_id, principal_id, label,
+                       created_at, expires_at, revoked_at, last_used_at
+                FROM api_tokens WHERE token_id = %s
+                """,
+                (token_id,),
+            ).fetchone()
+            if row is None or str(row[2]) != principal_id:
+                raise IdentityStoreError("api_token_not_found", "API token was not found.")
+            revoked_at = row[6]
+            if revoked_at is None:
+                connection.execute(
+                    "UPDATE api_tokens SET revoked_at = %s WHERE token_id = %s", (now, token_id)
+                )
+                revoked_at = now
+            else:
+                revoked_at = revoked_at.astimezone(timezone.utc)
+        return ApiTokenMetadata(
+            token_id=str(row[0]),
+            organization_id=str(row[1]),
+            principal_id=str(row[2]),
+            label=row[3],
+            created_at=row[4].astimezone(timezone.utc),
+            expires_at=row[5].astimezone(timezone.utc),
+            revoked_at=revoked_at,
+            last_used_at=row[7].astimezone(timezone.utc) if row[7] else None,
+        )
+
     def create_token(
         self,
         principal_id: str,
@@ -386,6 +494,14 @@ class PostgresIdentityRepository:
                 (organization_id, authorization_id),
             ).fetchone()
             return row is not None
+
+    def list_assigned_authorization_ids(self, organization_id: str) -> tuple[str, ...]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                "SELECT authorization_id FROM organization_authorizations WHERE organization_id = %s",
+                (organization_id,),
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
 
     def record_audit_event(self, event: SecurityAuditEvent) -> None:
         if not isinstance(event, SecurityAuditEvent):

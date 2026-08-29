@@ -66,6 +66,7 @@ from .postgres_jobs import PostgresJobRepository
 from .postgres_pool import WebGuardPostgresPool
 from .postgres_reports import PostgresReportRepository
 from .postgres_scans import PostgresScanRepository
+from .postgres_target_verification import PostgresTargetVerificationRepository
 from .postgres_targets import PostgresTargetRepository
 from .production_config import ProductionServiceConfig
 from .rate_limit import FixedWindowRateLimiter
@@ -86,6 +87,7 @@ class ProductionComponents:
     pool: WebGuardPostgresPool
     identity: PostgresIdentityRepository
     targets: PostgresTargetRepository
+    target_verifications: PostgresTargetVerificationRepository
     jobs: PostgresJobRepository
     scans: PostgresScanRepository
     findings: PostgresFindingRepository
@@ -122,6 +124,7 @@ def build_production_components(
     )
     identity = PostgresIdentityRepository(pool)
     targets = PostgresTargetRepository(pool)
+    target_verifications = PostgresTargetVerificationRepository(pool)
     jobs = PostgresJobRepository(pool)
     scans = PostgresScanRepository(pool)
     findings = PostgresFindingRepository(pool)
@@ -171,6 +174,8 @@ def build_production_components(
         artifact_store=artifact_store,
         authentication_contexts=authentication_contexts,
         authorization_comparison_plans=authorization_comparison_plans,
+        targets=targets,
+        target_verifications=target_verifications,
     )
     executor = ScanJobExecutor(
         authorizations=authorizations,
@@ -210,6 +215,7 @@ def build_production_components(
         pool=pool,
         identity=identity,
         targets=targets,
+        target_verifications=target_verifications,
         jobs=jobs,
         scans=scans,
         findings=findings,

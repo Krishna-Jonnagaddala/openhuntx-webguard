@@ -598,6 +598,11 @@ def _serve_command(args: argparse.Namespace) -> int:
         if scheduler is not None
         else None
     )
+    allowed_origins = frozenset(
+        origin.strip()
+        for origin in os.environ.get("WEBGUARD_WEB_ALLOWED_ORIGINS", "").split(",")
+        if origin.strip()
+    )
     server = create_server(
         host,
         port,
@@ -605,6 +610,7 @@ def _serve_command(args: argparse.Namespace) -> int:
         authenticator=authenticator,
         rate_limiter=limiter,
         maximum_request_bytes=maximum_request_bytes,
+        allowed_origins=allowed_origins,
     )
 
     def request_stop(_signum: int, _frame: object) -> None:

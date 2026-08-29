@@ -9,6 +9,8 @@ from uuid import uuid4
 
 from webguard_contracts import (
     AuditOutcome,
+    OrganizationRole,
+    PrincipalType,
     ScanJobLoadError,
     ScanJobMode,
     ScanJobRequest,
@@ -45,6 +47,8 @@ from .finding_store import FindingStatus, FindingStoreError
 from .identity import IdentityStoreError
 from .report_store import ReportStoreError
 from .scan_store import ScanStoreError
+from .target_verification import TargetVerificationError, VerificationMethod, check_well_known_token
+from .targets import TargetRepositoryError
 from .pagination import PageRequest, PaginationError, SignedCursorCodec
 from .permits import (
     PersistedTrustScanPermit,
@@ -110,6 +114,8 @@ class WebGuardJobService:
         scan_repository=None,
         report_repository=None,
         artifact_store=None,
+        targets=None,
+        target_verifications=None,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
@@ -148,6 +154,14 @@ class WebGuardJobService:
 
             artifact_store = LocalArtifactStore(Path("scan-results/service"))
         self.artifact_store = artifact_store
+        # Slice 15: assets/verification, same optional/defaulted pattern.
+        from .targets import InMemoryTargetRepository
+        from .target_verification import InMemoryTargetVerificationRepository
+
+        self.targets = targets if targets is not None else InMemoryTargetRepository()
+        self.target_verifications = (
+            target_verifications if target_verifications is not None else InMemoryTargetVerificationRepository()
+        )
         # Slice 12 requirement 14: a cheap, dependency-specific probe
         # `/ready` invokes. Defaults to a no-op, matching the honest
         # behavior of the pre-Slice-12 default deployment (a local
@@ -2081,6 +2095,602 @@ class WebGuardJobService:
             "events": [event.to_dict() for event in events],
             "page": self._page_payload(page.limit, next_cursor),
         }
+
+    # -- Assets (Slice 15 requirement 2) --------------------------------
+
+    _ASSET_MODES = frozenset({"single_page", "crawl"})
+
+    def _find_authorization_for_asset(self, organization_id: str, url: str):
+        """Targets and authorizations are deliberately separate entities
+        (a target is just a URL an org has registered interest in; an
+        authorization is the actual scan-permission grant) -- there is
+        no foreign key between them, matching by URL is the only
+        correct join. Returns ``None`` if no assigned authorization
+        currently covers this exact URL; never invents one."""
+
+        for authorization_id in self.identity.list_assigned_authorization_ids(organization_id):
+            try:
+                authorization = self.authorizations.get(authorization_id)
+            except AuthorizationRepositoryError:
+                continue
+            if authorization.target == url:
+                return authorization
+        return None
+
+    def _asset_public_dict(self, context: AuthContext, target, *, detailed: bool) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "target_id": target.target_id,
+            "organization_id": target.organization_id,
+            "url": target.url,
+            "label": target.label,
+            "default_mode": target.default_mode,
+            "created_at": target.created_at.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "archived_at": None
+            if target.archived_at is None
+            else target.archived_at.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+        }
+        if not detailed:
+            return payload
+        verification = self.target_verifications.get_current(
+            target.target_id, organization_id=context.organization_id
+        )
+        payload["verification"] = None if verification is None else verification.to_public_dict()
+        authorization = self._find_authorization_for_asset(context.organization_id, target.url)
+        if authorization is None:
+            payload["authorization"] = None
+        else:
+            now = self.clock()
+            payload["authorization"] = {
+                "authorization_id": authorization.authorization_id,
+                "issued_at": authorization.issued_at.astimezone(timezone.utc)
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z"),
+                "expires_at": authorization.expires_at.astimezone(timezone.utc)
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z"),
+                "state": (
+                    "expired"
+                    if now >= authorization.expires_at
+                    else "expiring_soon"
+                    if authorization.expires_at - now <= timedelta(days=7)
+                    else "active"
+                ),
+            }
+        try:
+            scans, _ = self.scan_repository.list_scans_scoped_page(
+                context.organization_id, limit=1, target=target.url
+            )
+        except ScanStoreError:
+            scans = ()
+        payload["last_scan"] = self._scan_public_dict(scans[0]) if scans else None
+        try:
+            findings, _ = self.finding_repository.list_findings_scoped_page(
+                context.organization_id, limit=100, asset=target.url
+            )
+        except FindingStoreError:
+            findings = ()
+        counts: dict[str, int] = {}
+        for finding in findings:
+            counts[finding.severity] = counts.get(finding.severity, 0) + 1
+        payload["finding_counts"] = counts
+        payload["finding_count_is_capped"] = len(findings) >= 100
+        return payload
+
+    def create_asset(self, context: AuthContext, body: dict, *, request_id: str) -> dict:
+        self._require(
+            context, ApiPermission.ASSET_MANAGE, request_id=request_id,
+            action="assets.create", resource_type="target", resource_id="pending",
+        )
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str) or not body["url"].strip():
+            raise ApiServiceError("asset_body_invalid", "Request body must include a non-empty url field.", status=400)
+        label = body.get("label")
+        if label is not None and not isinstance(label, str):
+            raise ApiServiceError("asset_label_invalid", "label must be a string.", status=400)
+        default_mode = body.get("default_mode")
+        if default_mode is not None and default_mode not in self._ASSET_MODES:
+            raise ApiServiceError(
+                "asset_default_mode_invalid",
+                f"default_mode must be one of: {', '.join(sorted(self._ASSET_MODES))}.",
+                status=400,
+            )
+        try:
+            record = self.targets.create_target(
+                context.organization_id, body["url"].strip(), created_by=context.principal_id,
+                now=self.clock(), label=label, default_mode=default_mode,
+            )
+        except TargetRepositoryError as exc:
+            status = 409 if exc.code == "target_conflict" else 400
+            self._audit(
+                context, request_id=request_id, action="assets.create", resource_type="target",
+                resource_id="pending", outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        self._audit(
+            context, request_id=request_id, action="assets.create", resource_type="target",
+            resource_id=record.target_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return self._asset_public_dict(context, record, detailed=False)
+
+    def list_assets(self, context: AuthContext, page: PageRequest, *, request_id: str) -> dict:
+        self._require(
+            context, ApiPermission.ASSET_READ, request_id=request_id,
+            action="assets.list", resource_type="organization", resource_id=context.organization_id,
+        )
+        try:
+            records, has_more = self.targets.list_targets_scoped_page(
+                context.organization_id, limit=page.limit,
+                after=self._decode_page(context, page, resource="assets"),
+            )
+        except TargetRepositoryError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=500) from exc
+        next_cursor = None
+        if has_more and records:
+            last = records[-1]
+            next_cursor = self._next_cursor(
+                context, page, resource="assets", ordered_at=last.created_at, resource_id=last.target_id,
+            )
+        self._audit(
+            context, request_id=request_id, action="assets.list", resource_type="organization",
+            resource_id=context.organization_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {
+            "assets": [self._asset_public_dict(context, record, detailed=False) for record in records],
+            "page": self._page_payload(page.limit, next_cursor),
+        }
+
+    def get_asset(self, context: AuthContext, target_id: str, *, request_id: str) -> dict:
+        self._require(
+            context, ApiPermission.ASSET_READ, request_id=request_id,
+            action="assets.get", resource_type="target", resource_id=target_id,
+        )
+        try:
+            record = self.targets.get_target(target_id, organization_id=context.organization_id)
+        except TargetRepositoryError as exc:
+            self._audit(
+                context, request_id=request_id, action="assets.get", resource_type="target",
+                resource_id=target_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        self._audit(
+            context, request_id=request_id, action="assets.get", resource_type="target",
+            resource_id=target_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return self._asset_public_dict(context, record, detailed=True)
+
+    def update_asset(self, context: AuthContext, target_id: str, body: dict, *, request_id: str) -> dict:
+        self._require(
+            context, ApiPermission.ASSET_MANAGE, request_id=request_id,
+            action="assets.update", resource_type="target", resource_id=target_id,
+        )
+        if not isinstance(body, dict):
+            raise ApiServiceError("asset_body_invalid", "Request body must be a JSON object.", status=400)
+        kwargs: dict[str, object] = {}
+        if "label" in body:
+            if body["label"] is not None and not isinstance(body["label"], str):
+                raise ApiServiceError("asset_label_invalid", "label must be a string or null.", status=400)
+            kwargs["label"] = body["label"]
+        if "default_mode" in body:
+            if body["default_mode"] is not None and body["default_mode"] not in self._ASSET_MODES:
+                raise ApiServiceError(
+                    "asset_default_mode_invalid",
+                    f"default_mode must be null or one of: {', '.join(sorted(self._ASSET_MODES))}.",
+                    status=400,
+                )
+            kwargs["default_mode"] = body["default_mode"]
+        try:
+            record = self.targets.update_target(
+                target_id, organization_id=context.organization_id, **kwargs
+            )
+        except TargetRepositoryError as exc:
+            self._audit(
+                context, request_id=request_id, action="assets.update", resource_type="target",
+                resource_id=target_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        self._audit(
+            context, request_id=request_id, action="assets.update", resource_type="target",
+            resource_id=target_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return self._asset_public_dict(context, record, detailed=True)
+
+    def start_asset_verification(self, context: AuthContext, target_id: str, *, request_id: str) -> dict:
+        """Requirement 3: server-generated token only -- the frontend
+        never marks an asset verified; it only ever displays what this
+        returns and later asks for a check."""
+
+        self._require(
+            context, ApiPermission.ASSET_MANAGE, request_id=request_id,
+            action="assets.verification.start", resource_type="target", resource_id=target_id,
+        )
+        try:
+            self.targets.get_target(target_id, organization_id=context.organization_id)
+        except TargetRepositoryError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        record = self.target_verifications.initiate(
+            target_id, organization_id=context.organization_id,
+            method=VerificationMethod.WELL_KNOWN_HTTP, now=self.clock(),
+        )
+        self._audit(
+            context, request_id=request_id, action="assets.verification.start", resource_type="target",
+            resource_id=target_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return record.to_public_dict()
+
+    def check_asset_verification(self, context: AuthContext, target_id: str, *, request_id: str) -> dict:
+        """The only path that can ever set ``status=verified`` -- by
+        performing the real, server-side fetch itself (requirement 3:
+        verification state must come from server-side validation)."""
+
+        self._require(
+            context, ApiPermission.ASSET_MANAGE, request_id=request_id,
+            action="assets.verification.check", resource_type="target", resource_id=target_id,
+        )
+        try:
+            target = self.targets.get_target(target_id, organization_id=context.organization_id)
+        except TargetRepositoryError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        current = self.target_verifications.get_current(target_id, organization_id=context.organization_id)
+        if current is None or current.status.value != "pending":
+            raise ApiServiceError(
+                "target_verification_not_pending",
+                "Start a verification before requesting a check.",
+                status=409,
+            )
+        now = self.clock()
+        if current.expires_at is not None and now >= current.expires_at:
+            matched, detail = False, "verification_token_expired"
+        else:
+            try:
+                token = self.target_verifications.get_pending_token(
+                    current.verification_id, organization_id=context.organization_id
+                )
+            except TargetVerificationError as exc:
+                raise ApiServiceError(exc.code, exc.message, status=409) from exc
+            matched, detail = check_well_known_token(target.url, token)
+        record = self.target_verifications.record_result(
+            current.verification_id, organization_id=context.organization_id,
+            matched=matched, detail=detail, now=now,
+        )
+        self._audit(
+            context, request_id=request_id, action="assets.verification.check", resource_type="target",
+            resource_id=target_id,
+            outcome=AuditOutcome.SUCCEEDED if matched else AuditOutcome.FAILED,
+            detail_code=detail,
+        )
+        return record.to_public_dict()
+
+    # -- Dashboard (Slice 15 requirement 1) -----------------------------
+
+    def dashboard_summary(self, context: AuthContext, *, request_id: str) -> dict:
+        """Real counts only -- no fabricated risk score. If a defensible
+        risk-scoring model exists in the future, it is additive to this
+        payload, never a replacement for the underlying counts."""
+
+        self._require(
+            context, ApiPermission.JOB_READ, request_id=request_id,
+            action="dashboard.summary", resource_type="organization", resource_id=context.organization_id,
+        )
+        organization_id = context.organization_id
+        assets = self.targets.list_targets(organization_id)
+        verified_assets = 0
+        for asset in assets:
+            verification = self.target_verifications.get_current(asset.target_id, organization_id=organization_id)
+            if verification is not None and verification.status.value == "verified":
+                verified_assets += 1
+        scans, _ = self.scan_repository.list_scans_scoped_page(organization_id, limit=100)
+        active_scans = sum(1 for s in scans if s.status in ("running", "queued"))
+        completed_scans = sum(1 for s in scans if s.status == "completed")
+        failed_scans = sum(1 for s in scans if s.status in ("failed", "completed_with_errors"))
+        findings, _ = self.finding_repository.list_findings_scoped_page(organization_id, limit=100)
+        by_severity: dict[str, int] = {}
+        by_status: dict[str, int] = {}
+        recent_high_critical = []
+        for finding in findings:
+            by_severity[finding.severity] = by_severity.get(finding.severity, 0) + 1
+            by_status[finding.status.value] = by_status.get(finding.status.value, 0) + 1
+            if finding.severity in ("high", "critical") and len(recent_high_critical) < 5:
+                recent_high_critical.append(self._finding_public_dict(finding))
+        self._audit(
+            context, request_id=request_id, action="dashboard.summary", resource_type="organization",
+            resource_id=organization_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {
+            "total_assets": len(assets),
+            "verified_assets": verified_assets,
+            "active_scans": active_scans,
+            "completed_scans": completed_scans,
+            "failed_scans": failed_scans,
+            "findings_by_severity": by_severity,
+            "findings_by_status": by_status,
+            "recent_scans": [self._scan_public_dict(s) for s in scans[:5]],
+            "recent_high_or_critical_findings": recent_high_critical,
+            "counts_capped_at": 100,
+        }
+
+    # -- Team (Slice 15 requirement 4) -----------------------------------
+
+    @staticmethod
+    def _principal_public_dict(principal) -> dict[str, object]:
+        return {
+            "principal_id": principal.principal_id,
+            "organization_id": principal.organization_id,
+            "display_name": principal.display_name,
+            "principal_type": principal.principal_type.value,
+            "role": principal.role.value,
+            "active": principal.active,
+            "created_at": principal.created_at.astimezone(timezone.utc)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+        }
+
+    def list_team(self, context: AuthContext, *, request_id: str) -> dict:
+        self._require(
+            context, ApiPermission.TEAM_READ, request_id=request_id,
+            action="team.list", resource_type="organization", resource_id=context.organization_id,
+        )
+        members = self.identity.list_principals(context.organization_id)
+        self._audit(
+            context, request_id=request_id, action="team.list", resource_type="organization",
+            resource_id=context.organization_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {"members": [self._principal_public_dict(m) for m in members]}
+
+    def invite_team_member(self, context: AuthContext, body: dict, *, request_id: str) -> dict:
+        """No email-based invitation flow exists (requirement 29: no
+        production email this slice). This creates the principal and an
+        initial API token directly -- the inviter is responsible for
+        relaying the returned raw token to the invitee out-of-band,
+        exactly as CLI bootstrap already requires today."""
+
+        self._require(
+            context, ApiPermission.TEAM_MANAGE, request_id=request_id,
+            action="team.invite", resource_type="principal", resource_id="pending",
+        )
+        if not isinstance(body, dict) or not isinstance(body.get("display_name"), str) or not body["display_name"].strip():
+            raise ApiServiceError("team_invite_body_invalid", "display_name is required.", status=400)
+        try:
+            role = OrganizationRole(body.get("role", "viewer"))
+        except ValueError as exc:
+            raise ApiServiceError(
+                "team_invite_role_invalid",
+                "role must be one of: " + ", ".join(r.value for r in OrganizationRole),
+                status=400,
+            ) from exc
+        if role is OrganizationRole.OWNER and context.role is not OrganizationRole.OWNER:
+            raise ApiServiceError(
+                "team_owner_role_requires_owner", "Only an owner may grant the owner role.", status=403
+            )
+        now = self.clock()
+        try:
+            principal = self.identity.create_principal(
+                context.organization_id, body["display_name"].strip(),
+                principal_type=PrincipalType.USER, role=role, now=now,
+            )
+            issued = self.identity.create_token(principal.principal_id, label="initial-invitation", now=now)
+        except IdentityStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        self._audit(
+            context, request_id=request_id, action="team.invite", resource_type="principal",
+            resource_id=principal.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        payload = self._principal_public_dict(principal)
+        payload["initial_token"] = issued.token
+        return payload
+
+    def update_team_member(self, context: AuthContext, principal_id: str, body: dict, *, request_id: str) -> dict:
+        self._require(
+            context, ApiPermission.TEAM_MANAGE, request_id=request_id,
+            action="team.update", resource_type="principal", resource_id=principal_id,
+        )
+        if principal_id == context.principal_id:
+            raise ApiServiceError(
+                "team_cannot_modify_self", "Use another owner/administrator account to change your own role.",
+                status=403,
+            )
+        if not isinstance(body, dict) or not isinstance(body.get("role"), str):
+            raise ApiServiceError("team_update_body_invalid", "Request body must include a string role field.", status=400)
+        try:
+            role = OrganizationRole(body["role"])
+        except ValueError as exc:
+            raise ApiServiceError(
+                "team_update_role_invalid",
+                "role must be one of: " + ", ".join(r.value for r in OrganizationRole),
+                status=400,
+            ) from exc
+        try:
+            current = self.identity.get_principal_scoped(principal_id, organization_id=context.organization_id)
+        except IdentityStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        if (role is OrganizationRole.OWNER or current.role is OrganizationRole.OWNER) and context.role is not OrganizationRole.OWNER:
+            raise ApiServiceError(
+                "team_owner_role_requires_owner", "Only an owner may grant or remove the owner role.", status=403
+            )
+        try:
+            updated = self.identity.update_principal_role(
+                principal_id, organization_id=context.organization_id, role=role, now=self.clock()
+            )
+        except IdentityStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        self._audit(
+            context, request_id=request_id, action="team.update", resource_type="principal",
+            resource_id=principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return self._principal_public_dict(updated)
+
+    def remove_team_member(self, context: AuthContext, principal_id: str, *, request_id: str) -> dict:
+        """A "remove" is a deactivation (``active=False``), matching this
+        codebase's standing revoke-over-delete convention -- never a row
+        deletion."""
+
+        self._require(
+            context, ApiPermission.TEAM_MANAGE, request_id=request_id,
+            action="team.remove", resource_type="principal", resource_id=principal_id,
+        )
+        if principal_id == context.principal_id:
+            raise ApiServiceError(
+                "team_cannot_modify_self", "Use another owner/administrator account to remove your own access.",
+                status=403,
+            )
+        try:
+            current = self.identity.get_principal_scoped(principal_id, organization_id=context.organization_id)
+        except IdentityStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        if current.role is OrganizationRole.OWNER and context.role is not OrganizationRole.OWNER:
+            raise ApiServiceError(
+                "team_owner_role_requires_owner", "Only an owner may remove another owner.", status=403
+            )
+        try:
+            updated = self.identity.set_principal_active(
+                principal_id, organization_id=context.organization_id, active=False, now=self.clock()
+            )
+        except IdentityStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        self._audit(
+            context, request_id=request_id, action="team.remove", resource_type="principal",
+            resource_id=principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return self._principal_public_dict(updated)
+
+    # -- API keys (Slice 15 requirement 5) -------------------------------
+    # Self-service by design: every principal manages only their own
+    # tokens, mirroring how personal-access tokens work in most
+    # developer-facing products -- no cross-principal visibility, no new
+    # RBAC decision about who may see or revoke someone else's key.
+
+    @staticmethod
+    def _api_key_public_dict(metadata) -> dict[str, object]:
+        def _ts(value):
+            return None if value is None else value.astimezone(timezone.utc).isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z")
+
+        return {
+            "token_id": metadata.token_id,
+            "label": metadata.label,
+            "created_at": _ts(metadata.created_at),
+            "expires_at": _ts(metadata.expires_at),
+            "revoked_at": _ts(metadata.revoked_at),
+            "last_used_at": _ts(metadata.last_used_at),
+        }
+
+    def list_api_keys(self, context: AuthContext, *, request_id: str) -> dict:
+        tokens = self.identity.list_tokens_for_principal(context.principal_id)
+        self._audit(
+            context, request_id=request_id, action="api_keys.list", resource_type="principal",
+            resource_id=context.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {"api_keys": [self._api_key_public_dict(t) for t in tokens]}
+
+    def create_api_key(self, context: AuthContext, body: dict, *, request_id: str) -> dict:
+        if not isinstance(body, dict) or not isinstance(body.get("label"), str) or not body["label"].strip():
+            raise ApiServiceError("api_key_body_invalid", "label is required.", status=400)
+        validity_days = body.get("validity_days")
+        kwargs = {}
+        if validity_days is not None:
+            if isinstance(validity_days, bool) or not isinstance(validity_days, int):
+                raise ApiServiceError("api_key_validity_invalid", "validity_days must be an integer.", status=400)
+            kwargs["validity_days"] = validity_days
+        try:
+            issued = self.identity.create_token(
+                context.principal_id, label=body["label"].strip(), now=self.clock(), **kwargs
+            )
+        except IdentityStoreError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        self._audit(
+            context, request_id=request_id, action="api_keys.create", resource_type="principal",
+            resource_id=context.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        payload = self._api_key_public_dict(issued.metadata)
+        payload["token"] = issued.token
+        return payload
+
+    def revoke_api_key(self, context: AuthContext, token_id: str, *, request_id: str) -> dict:
+        try:
+            metadata = self.identity.revoke_token_owned(
+                token_id, principal_id=context.principal_id, now=self.clock()
+            )
+        except IdentityStoreError as exc:
+            self._audit(
+                context, request_id=request_id, action="api_keys.revoke", resource_type="principal",
+                resource_id=context.principal_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        self._audit(
+            context, request_id=request_id, action="api_keys.revoke", resource_type="principal",
+            resource_id=context.principal_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return self._api_key_public_dict(metadata)
+
+    # -- Settings (Slice 15 requirement 6) -------------------------------
+
+    def get_settings(self, context: AuthContext, *, request_id: str) -> dict:
+        """Only genuine, currently-backed settings -- an organization's
+        name and this principal's own profile. No notification/session-
+        preference storage exists yet; this deliberately does not
+        invent placeholder fields for a screen that would otherwise be
+        empty (requirement 6)."""
+
+        organization = self.identity.get_organization(context.organization_id)
+        principal = self.identity.get_principal(context.principal_id)
+        self._audit(
+            context, request_id=request_id, action="settings.get", resource_type="organization",
+            resource_id=context.organization_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {
+            "organization": {
+                "organization_id": organization.organization_id,
+                "name": organization.name,
+                "status": organization.status.value,
+                "created_at": organization.created_at.astimezone(timezone.utc)
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z"),
+            },
+            "account": self._principal_public_dict(principal),
+        }
+
+    # -- Report download (Slice 15 requirement 7) ------------------------
+
+    def download_report(self, context: AuthContext, report_id: str, *, request_id: str) -> tuple[bytes, str, str]:
+        """Never exposes ``report_ref`` (an internal artifact reference,
+        never a filesystem path or public URL) to the caller -- only the
+        bytes it resolves to, after a tenant-ownership check, through
+        the same ``ArtifactStore`` abstraction production honestly fails
+        closed on until object storage exists (Slice 14 requirement 6)."""
+
+        self._require(
+            context, ApiPermission.REPORT_READ, request_id=request_id,
+            action="reports.download", resource_type="report", resource_id=report_id,
+        )
+        try:
+            record = self.report_repository.get_report_scoped(report_id, organization_id=context.organization_id)
+        except ReportStoreError as exc:
+            self._audit(
+                context, request_id=request_id, action="reports.download", resource_type="report",
+                resource_id=report_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        from .artifact_store import ArtifactStoreError
+
+        try:
+            content = self.artifact_store.get_reference(record.report_ref)
+        except ArtifactStoreError as exc:
+            status = 503 if exc.code == "object_storage_not_implemented" else 404
+            self._audit(
+                context, request_id=request_id, action="reports.download", resource_type="report",
+                resource_id=report_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        self._audit(
+            context, request_id=request_id, action="reports.download", resource_type="report",
+            resource_id=report_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        content_type = "application/json" if record.format == "json" else "application/octet-stream"
+        filename = f"report-{report_id}.{record.format}"
+        return content, content_type, filename
 
 
 __all__ = ["ApiServiceError", "WebGuardJobService"]

@@ -790,6 +790,120 @@ class IdentityStore:
             raise IdentityStoreError("principal_not_found", "Principal was not found.")
         return self._principal(row)
 
+    def get_principal_scoped(self, principal_id: str, *, organization_id: str) -> Principal:
+        principal = self.get_principal(principal_id)
+        if principal.organization_id != organization_id:
+            raise IdentityStoreError("principal_not_found", "Principal was not found.")
+        return principal
+
+    def list_principals(self, organization_id: str) -> tuple[Principal, ...]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM principals WHERE organization_id = ? ORDER BY created_at",
+                (organization_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(self._principal(row) for row in rows)
+
+    def update_principal_role(
+        self, principal_id: str, *, organization_id: str, role: OrganizationRole, now: datetime
+    ) -> Principal:
+        principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
+        connection = self._connect()
+        try:
+            connection.execute(
+                "UPDATE principals SET role = ? WHERE principal_id = ?",
+                (role.value, principal_id),
+            )
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "principal_role_update_failed", "Unable to update the principal's role."
+            ) from exc
+        finally:
+            connection.close()
+        return Principal(
+            principal_id=principal.principal_id,
+            organization_id=principal.organization_id,
+            display_name=principal.display_name,
+            principal_type=principal.principal_type,
+            role=role,
+            active=principal.active,
+            created_at=principal.created_at,
+        )
+
+    def set_principal_active(
+        self, principal_id: str, *, organization_id: str, active: bool, now: datetime
+    ) -> Principal:
+        principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
+        connection = self._connect()
+        try:
+            connection.execute(
+                "UPDATE principals SET active = ? WHERE principal_id = ?",
+                (1 if active else 0, principal_id),
+            )
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "principal_status_update_failed", "Unable to update the principal's status."
+            ) from exc
+        finally:
+            connection.close()
+        return Principal(
+            principal_id=principal.principal_id,
+            organization_id=principal.organization_id,
+            display_name=principal.display_name,
+            principal_type=principal.principal_type,
+            role=principal.role,
+            active=active,
+            created_at=principal.created_at,
+        )
+
+    def list_tokens_for_principal(self, principal_id: str) -> tuple[ApiTokenMetadata, ...]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM api_tokens WHERE principal_id = ? ORDER BY created_at DESC",
+                (principal_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(self._token_metadata(row) for row in rows)
+
+    def revoke_token_owned(self, token_id: str, *, principal_id: str, now: datetime) -> ApiTokenMetadata:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM api_tokens WHERE token_id = ?", (token_id,)
+            ).fetchone()
+            if row is None or row["principal_id"] != principal_id:
+                raise IdentityStoreError("api_token_not_found", "API token was not found.")
+            metadata = self._token_metadata(row)
+            if metadata.revoked_at is None:
+                connection.execute(
+                    "UPDATE api_tokens SET revoked_at = ? WHERE token_id = ?",
+                    (_timestamp(now), token_id),
+                )
+                metadata = ApiTokenMetadata(
+                    token_id=metadata.token_id,
+                    organization_id=metadata.organization_id,
+                    principal_id=metadata.principal_id,
+                    label=metadata.label,
+                    created_at=metadata.created_at,
+                    expires_at=metadata.expires_at,
+                    revoked_at=now,
+                    last_used_at=metadata.last_used_at,
+                )
+            return metadata
+        except IdentityStoreError:
+            raise
+        except sqlite3.Error as exc:
+            raise IdentityStoreError(
+                "api_token_revoke_failed", "Unable to revoke the API token."
+            ) from exc
+        finally:
+            connection.close()
+
     def create_token(
         self,
         principal_id: str,
@@ -993,6 +1107,17 @@ class IdentityStore:
             return row is not None
         finally:
             connection.close()
+
+    def list_assigned_authorization_ids(self, organization_id: str) -> tuple[str, ...]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT authorization_id FROM organization_authorizations WHERE organization_id = ?",
+                (organization_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return tuple(row["authorization_id"] for row in rows)
 
     def record_audit_event(self, event: SecurityAuditEvent) -> None:
         if not isinstance(event, SecurityAuditEvent):
