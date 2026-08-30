@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import signal
@@ -44,10 +45,19 @@ from .identity import (
 )
 from .production_config import ProductionConfigError, ProductionServiceConfig
 from .production_startup import ProductionComponents, build_production_components
+from .callback_server import CallbackHttpReceiver
+from .postgres_callback_service import PostgresCallbackRegistrationRepository
+from .postgres_pool import WebGuardPostgresPool
 from .rate_limit import FixedWindowRateLimiter
 from .permits import TrustScanSigner
 from .scheduler import ScanScheduleCoordinator
 from .service import ApiServiceError, WebGuardJobService
+from .signing import LocalDevelopmentSigner, SigningKeyRegistry
+from .signing_service import (
+    SigningServiceError,
+    SigningServiceServer,
+    build_cloudhsm_signing_provider_from_env,
+)
 from .store import JobStoreError, ScanJobStore
 from .worker import ScanJobWorker
 
@@ -179,7 +189,12 @@ def _production_components() -> tuple[ProductionServiceConfig, ProductionCompone
 
     import boto3
 
-    kms_client = boto3.client("kms")
+    # Slice 18: only construct a real KMS client when the "kms"
+    # signing path is actually selected -- the "cloudhsm_signing_service"
+    # path never touches AWS KMS at all, it calls the dedicated
+    # TrustScan Signing Service over HTTP instead (no AWS credentials
+    # of any kind needed by this process in that mode).
+    kms_client = boto3.client("kms") if config.signing_provider == "kms" else None
     s3_client = boto3.client("s3", region_name=config.object_storage_region)
     secrets_manager_client = (
         boto3.client("secretsmanager")
@@ -580,6 +595,117 @@ def _scheduler_command(args: argparse.Namespace) -> int:
             pool.close()
 
 
+def _signing_service_command(args: argparse.Namespace) -> int:
+    """Runs the TrustScan Signing Service standalone (Slice 18
+    requirements 1-4) -- never started as part of `webguard-api
+    serve`, mirroring how the worker/scheduler are already
+    independently-run components, and how `CallbackHttpReceiver`
+    (callback_server.py) is already an independently-run component
+    too. `--key-source development` uses an in-process Ed25519 key
+    (matching `LocalDevelopmentSigner` exactly) for local/dev/test use
+    -- this is the mode the browser E2E harness and the manual dev
+    script use. `--key-source cloudhsm` is the production path and
+    requires real PKCS#11 configuration; see
+    `docs/production/TRUSTSCAN_SIGNING_SERVICE.md` for the full
+    operational model, including the explicit statement that this
+    exact code path has not been exercised against real CloudHSM
+    hardware in this repository."""
+
+    bearer_token = os.environ.get("WEBGUARD_SIGNING_SERVICE_BEARER_TOKEN", "").strip()
+    if not bearer_token:
+        print(
+            "ERROR [signing_service_config_missing]: WEBGUARD_SIGNING_SERVICE_BEARER_TOKEN is required.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILURE
+
+    if args.key_source == "development":
+        dev_key_hex = os.environ.get("WEBGUARD_SIGNING_SERVICE_DEV_KEY_HEX")
+        key_bytes = bytes.fromhex(dev_key_hex) if dev_key_hex else bytes(range(32))
+        provider = LocalDevelopmentSigner(key_bytes)
+    else:
+        try:
+            provider = build_cloudhsm_signing_provider_from_env()
+        except SigningServiceError as exc:
+            print(f"ERROR [{exc.code}]: {exc.message}", file=sys.stderr)
+            return EXIT_FAILURE
+
+    registry = SigningKeyRegistry(provider)
+    host = os.environ.get("WEBGUARD_SIGNING_SERVICE_HOST", "127.0.0.1")
+    port = int(os.environ.get("WEBGUARD_SIGNING_SERVICE_PORT", "8766"))
+    server = SigningServiceServer(registry, bearer_token=bearer_token, host=host, port=port)
+    server.start()
+    print(f"TrustScan Signing Service listening on {server.base_url} (key_source={args.key_source}).")
+    print(f"Active key ID: {provider.key_id} (algorithm={provider.algorithm}).")
+    print(
+        "This service must never be reachable from the public Internet -- "
+        "see docs/production/TRUSTSCAN_SIGNING_SERVICE.md."
+    )
+    print("Press Ctrl+C to stop.")
+    stop_event = threading.Event()
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    stop_event.wait()
+    server.stop()
+    print("TrustScan Signing Service stopped.")
+    return EXIT_SUCCESS
+
+
+def _callback_service_command(args: argparse.Namespace) -> int:
+    """Runs the SSRF callback receiver standalone (Slice 18
+    requirement 15) -- independently deployable/scalable from the main
+    WebGuard API/worker, exactly like the worker/scheduler/signing
+    service are already independently-run components. Always backed by
+    `PostgresCallbackRegistrationRepository` (the bounded, tenant-scoped
+    correlation store every environment already shares with the main
+    API) -- there is no separate "callback-service database", only a
+    separate *process* reading and writing the same store. A
+    per-source-IP rate limit (`WEBGUARD_CALLBACK_SERVICE_RATE_LIMIT_REQUESTS`/
+    `_WINDOW_SECONDS`, default 60 requests/60s) protects that store's
+    write capacity if this receiver is ever reachable from the public
+    Internet (`callback.openhuntx.com`) -- see
+    docs/production/CALLBACK_SERVICE_DEPLOYMENT.md."""
+
+    database_url = os.environ.get("WEBGUARD_DATABASE_URL", "").strip()
+    if not database_url:
+        print("ERROR [callback_service_config_missing]: WEBGUARD_DATABASE_URL is required.", file=sys.stderr)
+        return EXIT_FAILURE
+    host = os.environ.get("WEBGUARD_CALLBACK_SERVICE_HOST", "127.0.0.1")
+    port = int(os.environ.get("WEBGUARD_CALLBACK_SERVICE_PORT", "8767"))
+    rate_limit_requests = int(os.environ.get("WEBGUARD_CALLBACK_SERVICE_RATE_LIMIT_REQUESTS", "60"))
+    rate_limit_window = int(os.environ.get("WEBGUARD_CALLBACK_SERVICE_RATE_LIMIT_WINDOW_SECONDS", "60"))
+
+    pool = WebGuardPostgresPool(database_url)
+    try:
+        repository = PostgresCallbackRegistrationRepository(pool)
+        rate_limiter = FixedWindowRateLimiter(requests=rate_limit_requests, window_seconds=rate_limit_window)
+        receiver = CallbackHttpReceiver(repository, host=host, port=port, rate_limiter=rate_limiter)
+        receiver.start()
+        print(f"SSRF callback receiver listening on {receiver.base_url}")
+        print(
+            f"Per-source rate limit: {rate_limit_requests} requests / {rate_limit_window}s. "
+            "See docs/production/CALLBACK_SERVICE_DEPLOYMENT.md."
+        )
+        print("Press Ctrl+C to stop.")
+        stop_event = threading.Event()
+
+        def request_stop(_signum: int, _frame: object) -> None:
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGTERM, request_stop)
+        stop_event.wait()
+        receiver.stop()
+        print("SSRF callback receiver stopped.")
+        return EXIT_SUCCESS
+    finally:
+        pool.close()
+
+
 def _serve_command(args: argparse.Namespace) -> int:
     environment = _resolve_environment(args)
     pool = None
@@ -639,6 +765,16 @@ def _serve_command(args: argparse.Namespace) -> int:
     # binds to loopback.
     secure_cookies = os.environ.get("WEBGUARD_SECURE_COOKIES", "true").strip().lower() != "false"
     hsts_enabled = os.environ.get("WEBGUARD_HSTS_ENABLED", "false").strip().lower() == "true"
+    # Slice 18 requirement 13: empty by default (today's loopback-only
+    # deployment) -- an operator fronting this API with a real reverse
+    # proxy/Cloudflare must explicitly opt its CIDR(s) in before
+    # CF-Connecting-IP/X-Forwarded-For are ever read from a request.
+    # See build_handler's own docstring for the full trust model.
+    trusted_proxy_networks = frozenset(
+        ipaddress.ip_network(cidr.strip(), strict=False)
+        for cidr in os.environ.get("WEBGUARD_TRUSTED_PROXY_CIDRS", "").split(",")
+        if cidr.strip()
+    )
     server = create_server(
         host,
         port,
@@ -650,6 +786,7 @@ def _serve_command(args: argparse.Namespace) -> int:
         allowed_origins=allowed_origins,
         secure_cookies=secure_cookies,
         hsts_enabled=hsts_enabled,
+        trusted_proxy_networks=trusted_proxy_networks,
     )
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -1042,6 +1179,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--environment", choices=environment_choices, default=environment_default, help=environment_help
     )
     scheduler_parser.set_defaults(handler=_scheduler_command)
+
+    signing_service_parser = subparsers.add_parser(
+        "signing-service",
+        help="Run the standalone TrustScan Signing Service (never started as part of `serve`).",
+    )
+    signing_service_parser.add_argument(
+        "--key-source",
+        choices=("development", "cloudhsm"),
+        default="development",
+        help='"development" uses an in-process Ed25519 key (local/dev/test only); '
+        '"cloudhsm" requires real PKCS#11 configuration (production).',
+    )
+    signing_service_parser.set_defaults(handler=_signing_service_command)
+
+    callback_service_parser = subparsers.add_parser(
+        "callback-service",
+        help="Run the standalone SSRF callback receiver (never started as part of `serve`).",
+    )
+    callback_service_parser.set_defaults(handler=_callback_service_command)
     return parser
 
 

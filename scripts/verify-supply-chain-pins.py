@@ -27,6 +27,13 @@ EXPECTED = {
 
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 SETUP_PYTHON_SHA = "ece7cb06caefa5fff74198d8649806c4678c61a1"
+SETUP_NODE_SHA = "820762786026740c76f36085b0efc47a31fe5020"  # v7.0.0
+UPLOAD_ARTIFACT_SHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"  # v7.0.1
+SETUP_TERRAFORM_SHA = "dfe3c3f87815947d99a8997f908cb6525fc44e9e"  # v4.0.1
+TRIVY_VERSION = "0.74.0"
+TRIVY_LINUX_AMD64_SHA256 = (
+    "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
+)
 
 EXPECTED_PYTHON_VERSIONS = ("3.11.15", "3.12.13", "3.13.14", "3.14.6")
 EXPECTED_PYTHON_REQUIRES = ">=3.11,<3.15"
@@ -168,7 +175,11 @@ if f"actions/setup-python@{SETUP_PYTHON_SHA}" not in workflow:
     fail("actions/setup-python is not pinned to the reviewed immutable SHA")
 if re.search(r"uses:\s+actions/(?:checkout|setup-python)@v", workflow):
     fail("a moving GitHub Action major-version tag remains in CI")
-if workflow.count(f"runs-on: {EXPECTED_RUNNER}") != 4:
+# Slice 18 added terraform, frontend, and frontend-e2e to the original
+# four jobs (unit-tests, security-gates, authorised-lab-integration,
+# postgresql-integration) -- a deliberately reviewed count, bumped as
+# part of this change rather than left silently unenforced.
+if workflow.count(f"runs-on: {EXPECTED_RUNNER}") != 7:
     fail("CI runner count or reviewed Ubuntu runner pin changed")
 if "runs-on: ubuntu-latest" in workflow:
     fail("CI still uses the moving ubuntu-latest runner label")
@@ -195,11 +206,21 @@ uses_lines = [
 reviewed_actions = {
     f"actions/checkout@{CHECKOUT_SHA}",
     f"actions/setup-python@{SETUP_PYTHON_SHA}",
+    f"actions/setup-node@{SETUP_NODE_SHA}",
+    f"actions/upload-artifact@{UPLOAD_ARTIFACT_SHA}",
+    f"hashicorp/setup-terraform@{SETUP_TERRAFORM_SHA}",
 }
 for action in uses_lines:
     action_ref = action.split("#", 1)[0].strip()
     if action_ref not in reviewed_actions:
         fail(f"CI uses an unreviewed GitHub Action: {action_ref}")
+
+if "  terraform:" not in workflow:
+    fail("CI terraform validation/IaC scan job is missing")
+if f"trivy_{TRIVY_VERSION}_Linux-64bit.tar.gz" not in workflow:
+    fail("CI does not reference the reviewed Trivy release")
+if TRIVY_LINUX_AMD64_SHA256 not in workflow:
+    fail("CI does not pin the reviewed Trivy release checksum")
 
 if "  security-gates:" not in workflow:
     fail("CI security-gates job is missing")

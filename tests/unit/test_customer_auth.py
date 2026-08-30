@@ -532,6 +532,132 @@ class CustomerAuthTests(unittest.TestCase):
         self.assertNotEqual(session_payload["organization_id"], self.owner_context.organization_id)
 
 
+class SecureCookieAttributesTests(unittest.TestCase):
+    """Slice 18 requirement 12: every pre-existing cookie test in this
+    file (``CustomerAuthTests`` above) deliberately runs with
+    ``secure_cookies=False`` -- the local/dev convenience default -- so
+    none of them ever proved the ``Secure`` attribute is actually
+    present on a production-configured (``secure_cookies=True``, the
+    real value a reverse-proxied HTTPS deployment sets) server. This
+    class is the one place that configuration is exercised, reading the
+    raw ``Set-Cookie`` header strings rather than the name=value-only
+    ``cookies_from`` helper the other tests use, since the attributes
+    under test live in the parts of the header that helper discards."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        auth_dir = root / "authorizations"
+        write_authorization(auth_dir)
+        store = ScanJobStore(root / "jobs.sqlite3")
+        identity, self.owner_context, self.owner_token = create_identity_fixture(store.path)
+        self.sessions = InMemorySessionRepository()
+        self.mail = InMemoryMailProvider()
+        self.service = WebGuardJobService(
+            store=store,
+            authorizations=AuthorizationRepository(auth_dir),
+            identity=identity,
+            clock=lambda: NOW,
+            artifact_store=LocalArtifactStore(root / "artifacts"),
+            sessions=self.sessions,
+            mail_provider=self.mail,
+            auth_rate_limiter=InMemoryAuthRateLimiter(max_attempts=5, window_seconds=900),
+        )
+        self.server = create_server(
+            "127.0.0.1", 0, self.service,
+            authenticator=ApiTokenAuthenticator(identity),
+            session_authenticator=BrowserSessionAuthenticator(identity, self.sessions),
+            rate_limiter=FixedWindowRateLimiter(requests=500, window_seconds=60),
+            maximum_request_bytes=8192,
+            clock=lambda: NOW,
+            epoch_clock=lambda: 1000.0,
+            # The one thing this class exists to flip relative to every
+            # other test in this file -- a real HTTPS-behind-Cloudflare
+            # deployment (see docs/production/PUBLIC_EDGE_SECURITY.md).
+            secure_cookies=True,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.host, self.port = self.server.server_address[:2]
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def raw_set_cookie_headers(self) -> dict[str, str]:
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=3)
+        connection.request(
+            "POST",
+            "/v1/auth/register",
+            body=json.dumps(
+                {
+                    "organization_name": "Secure Cookie Org",
+                    "display_name": "Ada",
+                    "email": "secure-cookie@x.example",
+                    "password": "a genuinely long password 123",
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.status, 201)
+        raw = {}
+        for name, value in response.getheaders():
+            if name.lower() == "set-cookie":
+                cookie_name = value.split("=", 1)[0]
+                raw[cookie_name] = value
+        connection.close()
+        return raw
+
+    def test_session_cookie_is_secure_httponly_samesite_lax_path_root(self) -> None:
+        cookies = self.raw_set_cookie_headers()
+        session_cookie = cookies["wg_session"]
+        self.assertIn("Secure", session_cookie)
+        self.assertIn("HttpOnly", session_cookie)
+        self.assertIn("SameSite=Lax", session_cookie)
+        self.assertIn("Path=/", session_cookie)
+
+    def test_csrf_cookie_is_secure_samesite_lax_but_not_httponly(self) -> None:
+        # The CSRF cookie must remain readable by the page's own script
+        # (the double-submit pattern requires it), so HttpOnly is
+        # deliberately absent here even though every other attribute
+        # matches the session cookie -- this asserts that distinction
+        # holds under the real production cookie configuration, not
+        # only the dev-default one every other test in this file uses.
+        cookies = self.raw_set_cookie_headers()
+        csrf_cookie = cookies["wg_csrf"]
+        self.assertIn("Secure", csrf_cookie)
+        self.assertIn("SameSite=Lax", csrf_cookie)
+        self.assertIn("Path=/", csrf_cookie)
+        self.assertNotIn("HttpOnly", csrf_cookie)
+
+    def test_logout_clears_cookies_and_still_marks_them_secure(self) -> None:
+        cookies = self.raw_set_cookie_headers()
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=3)
+        connection.request(
+            "POST",
+            "/v1/auth/logout",
+            headers={
+                "Cookie": f"wg_session={cookies['wg_session'].split(';', 1)[0].split('=', 1)[1]}",
+                "X-CSRF-Token": cookies["wg_csrf"].split(";", 1)[0].split("=", 1)[1],
+            },
+        )
+        response = connection.getresponse()
+        response.read()
+        cleared = {}
+        for name, value in response.getheaders():
+            if name.lower() == "set-cookie":
+                cleared[value.split("=", 1)[0]] = value
+        connection.close()
+        self.assertIn("Secure", cleared["wg_session"])
+        self.assertIn("Max-Age=0", cleared["wg_session"])
+        self.assertIn("Secure", cleared["wg_csrf"])
+        self.assertIn("Max-Age=0", cleared["wg_csrf"])
+
+
 class CorsCrossOriginPolicyTests(unittest.TestCase):
     """Requirement 19/25: a real browser only lets a page's own script
     read a cross-origin response (or send one with a custom header,

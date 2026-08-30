@@ -45,6 +45,96 @@ resource "aws_s3_bucket" "artifacts" {
   }
 }
 
+# Slice 18 Terraform security review (requirement 17, Trivy AWS-0089):
+# a separate destination bucket, per AWS's own recommendation (a bucket
+# should not log to itself). Holds only access-log records -- no
+# report/artifact content ever lands here -- so it needs none of the
+# artifacts bucket's own SSE-KMS/versioning/retention machinery; SSE-S3
+# (the bucket default) and a short expiry are enough for what is purely
+# an operational audit trail.
+resource "aws_s3_bucket" "artifacts_access_logs" {
+  bucket = "webguard-${var.environment_name}-artifacts-access-logs"
+
+  tags = {
+    Name        = "webguard-${var.environment_name}-artifacts-access-logs"
+    Environment = var.environment_name
+    ManagedBy   = "terraform"
+    Purpose     = "s3-server-access-logs"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "artifacts_access_logs" {
+  bucket = aws_s3_bucket.artifacts_access_logs.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "artifacts_access_logs" {
+  bucket = aws_s3_bucket.artifacts_access_logs.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "artifacts_access_logs" {
+  bucket = aws_s3_bucket.artifacts_access_logs.id
+
+  rule {
+    id     = "expire-access-logs"
+    status = "Enabled"
+
+    filter {}
+
+    expiration {
+      days = 90
+    }
+  }
+}
+
+# Grants the S3 log-delivery service principal write access to this
+# bucket only -- the modern (policy-based, not ACL-based) mechanism for
+# S3 server access logging, which works even with
+# block_public_acls/ignore_public_acls fully enabled above.
+# `aws:SourceArn`/`aws:SourceAccount` scope this grant to log deliveries
+# that actually originate from the artifacts bucket in this account,
+# not an arbitrary bucket anywhere.
+data "aws_iam_policy_document" "artifacts_access_logs_delivery" {
+  statement {
+    sid       = "S3ServerAccessLogsDelivery"
+    effect    = "Allow"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.artifacts_access_logs.arn}/*"]
+    principals {
+      type        = "Service"
+      identifiers = ["logging.s3.amazonaws.com"]
+    }
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = [aws_s3_bucket.artifacts.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "artifacts_access_logs" {
+  bucket = aws_s3_bucket.artifacts_access_logs.id
+  policy = data.aws_iam_policy_document.artifacts_access_logs_delivery.json
+}
+
+resource "aws_s3_bucket_logging" "artifacts" {
+  bucket        = aws_s3_bucket.artifacts.id
+  target_bucket = aws_s3_bucket.artifacts_access_logs.id
+  target_prefix = "artifacts-access-logs/"
+}
+
 # Versioning is defense in depth against the "arbitrary overwrite"
 # concern requirement 9 names -- object keys are always server-
 # generated (see artifact_store.py's own docstring) so an overwrite
@@ -184,52 +274,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
   }
 }
 
-# Least-privilege access policy for whatever compute identity actually
-# runs the API/worker (an ECS task role, in the stack
-# docs/production/PROVIDER_EVALUATION.md recommends -- not provisioned
-# here, matching this directory's existing "no compute" scope). Scoped
-# to exactly the four S3 actions ObjectStorageArtifactStore calls, this
-# bucket only, plus the KMS actions needed to use its specific
-# encryption key -- never a wildcard resource, never access to any
-# other bucket or key.
-data "aws_iam_policy_document" "artifact_storage_access" {
-  statement {
-    sid    = "ArtifactObjectAccess"
-    effect = "Allow"
-    actions = [
-      "s3:PutObject",
-      "s3:GetObject",
-      "s3:DeleteObject",
-    ]
-    resources = ["${aws_s3_bucket.artifacts.arn}/*"]
-  }
-
-  statement {
-    sid       = "ArtifactBucketMetadataAccess"
-    effect    = "Allow"
-    actions   = ["s3:ListBucket"]
-    resources = [aws_s3_bucket.artifacts.arn]
-  }
-
-  statement {
-    sid    = "ArtifactEncryptionKeyAccess"
-    effect = "Allow"
-    actions = [
-      "kms:Decrypt",
-      "kms:GenerateDataKey",
-    ]
-    resources = [aws_kms_key.artifact_storage_encryption.arn]
-  }
-}
-
-resource "aws_iam_policy" "artifact_storage_access" {
-  name        = "webguard-${var.environment_name}-artifact-storage-access"
-  description = "Least-privilege S3/KMS access for the WebGuard API/worker's ObjectStorageArtifactStore -- attach to the compute role that runs them."
-  policy      = data.aws_iam_policy_document.artifact_storage_access.json
-
-  tags = {
-    Name        = "webguard-${var.environment_name}-artifact-storage-access"
-    Environment = var.environment_name
-    ManagedBy   = "terraform"
-  }
-}
+# Slice 18 requirement 18 split the single undifferentiated
+# artifact-storage policy this file used to define here into separate,
+# read-vs-write, per-responsibility policies -- see iam.tf. Reusing one
+# policy for both the API (which only ever reads a generated report
+# back for download -- service.py's `artifact_store.get_reference()`)
+# and the worker (which is the only process that ever writes one --
+# executor.py's `artifact_store.put()`) would grant each process
+# permissions the other has no legitimate reason to hold; iam.tf keeps
+# that distinction real rather than asserting it only in documentation.

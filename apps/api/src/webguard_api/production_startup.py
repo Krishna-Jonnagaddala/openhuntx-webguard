@@ -79,7 +79,8 @@ from .rate_limit import FixedWindowRateLimiter
 from .scheduler import ScanScheduleCoordinator
 from .secret_provider import SecretsManagerClientProtocol, SecretsManagerSecretProvider
 from .service import WebGuardJobService
-from .signing import KmsSigningProvider, SigningKeyRegistry
+from .signing import KmsSigningProvider, SigningKeyRegistry, SigningServiceClient
+from .signing_service import SigningServiceHttpClient
 from .permits import TrustScanSigner
 from .worker import ScanJobWorker
 
@@ -118,13 +119,15 @@ class ProductionComponents:
 def build_production_components(
     config: ProductionServiceConfig,
     *,
-    kms_client,
+    kms_client=None,
     s3_client: S3ClientProtocol,
     secrets_manager_client: SecretsManagerClientProtocol | None = None,
     mail_transport: PostmarkClientProtocol | None = None,
 ) -> ProductionComponents:
     if config.environment != "production":
         raise ValueError("build_production_components requires a production config.")
+    if config.signing_provider == "kms" and kms_client is None:
+        raise ValueError("kms_client is required when signing_provider is kms.")
 
     pool = WebGuardPostgresPool(
         config.database_url,
@@ -168,7 +171,24 @@ def build_production_components(
         from_address=config.mail_from_address,
     )
 
-    signing_provider = KmsSigningProvider(kms_client, key_id=config.kms_key_id)
+    # Slice 18: TrustScan production signing. "kms" (ECDSA_SHA_256,
+    # unchanged since Slice 12) and "cloudhsm_signing_service"
+    # (Ed25519, preserving the existing permit/receipt format
+    # entirely -- docs/production/TRUSTSCAN_PRODUCTION_SIGNING.md's
+    # Option A) are the only two accepted values
+    # (ProductionServiceConfig fails closed on anything else). The
+    # CloudHSM path never touches CloudHSM or a PKCS#11 binding from
+    # this process -- it calls the dedicated, narrow-interface
+    # TrustScan Signing Service over HTTP
+    # (docs/production/TRUSTSCAN_SIGNING_SERVICE.md); only that
+    # separate service process ever holds HSM credentials.
+    if config.signing_provider == "kms":
+        signing_provider = KmsSigningProvider(kms_client, key_id=config.kms_key_id)
+    else:
+        signing_service_transport = SigningServiceHttpClient(
+            base_url=config.signing_service_url, bearer_token=config.signing_service_bearer_token
+        )
+        signing_provider = SigningServiceClient(signing_service_transport)
     registry = SigningKeyRegistry(signing_provider)
     trustscan_signer = TrustScanSigner.from_registry(registry)
     cursor_codec = SignedCursorCodec(config.cursor_signing_key_bytes)

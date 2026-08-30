@@ -195,6 +195,7 @@ def run_production_stack(
     allowed_origins: frozenset[str] = frozenset({"http://localhost:5173", "http://127.0.0.1:5173"}),
     web_app_base_url: str = "http://127.0.0.1:5173",
     mail_sink_path: Path | None = None,
+    signing_mode: str = "kms",
 ) -> Iterator[RunningStack]:
     """Start a real production-mode WebGuard API + worker against
     `postgres_dsn`, with one bootstrapped organization/owner, and tear
@@ -205,7 +206,17 @@ def run_production_stack(
     storage and mail are both real production code (`ObjectStorageArtifactStore`,
     `ProductionMailProvider`) running against `FakeS3Client`/
     `FakePostmarkTransport` -- only the AWS/Postmark network boundary
-    is substituted, exactly like KMS already was."""
+    is substituted, exactly like KMS already was.
+
+    Slice 18: ``signing_mode="cloudhsm_signing_service"`` starts a
+    real, separate ``SigningServiceServer`` (real HTTP, real Ed25519
+    signing -- backed by ``LocalDevelopmentSigner``, an honest dev-mode
+    stand-in for a real HSM-backed key, never claimed as CloudHSM
+    validation) and points the main stack's ``SigningServiceClient`` at
+    it over real HTTP, proving the whole
+    permit-request -> signing-service -> signed-permit -> worker-verifies
+    chain end to end against real production component assembly. The
+    default, ``"kms"``, is unchanged from every prior slice."""
 
     with TemporaryDirectory() as directory:
         root = Path(directory)
@@ -214,13 +225,32 @@ def run_production_stack(
         auth_dir.mkdir(parents=True, exist_ok=True)
         artifacts.mkdir(parents=True, exist_ok=True)
 
+        signing_service_server = None
+        signing_kwargs: dict[str, object]
+        if signing_mode == "cloudhsm_signing_service":
+            from webguard_api.signing import LocalDevelopmentSigner, SigningKeyRegistry
+            from webguard_api.signing_service import SigningServiceServer
+
+            signing_service_token = f"signing-service-{secrets.token_hex(16)}"  # noqa: S105
+            signing_service_registry = SigningKeyRegistry(LocalDevelopmentSigner(bytes(range(32))))
+            signing_service_server = SigningServiceServer(
+                signing_service_registry, bearer_token=signing_service_token, host="127.0.0.1", port=0
+            )
+            signing_service_server.start()
+            signing_kwargs = dict(
+                signing_provider="cloudhsm_signing_service",
+                kms_key_id="",
+                signing_service_url=signing_service_server.base_url,
+                signing_service_bearer_token=signing_service_token,
+            )
+        else:
+            signing_kwargs = dict(signing_provider="kms", kms_key_id="fake-kms-key-dev")
+
         config = ProductionServiceConfig(
             environment="production",
             service_identity="web-dev-1",
             database_backend="postgresql",
             database_url=postgres_dsn,
-            signing_provider="kms",
-            kms_key_id="fake-kms-key-dev",
             callback_service_hostname="callback.dev.invalid",
             migration_mode="pre_applied",
             authorization_directory=str(auth_dir),
@@ -234,11 +264,15 @@ def run_production_stack(
             object_storage_bucket="webguard-dev-fake-bucket",
             object_storage_region="eu-west-2",
             object_storage_kms_key_id="fake-kms-key-dev-s3",
+            **signing_kwargs,
         )
         s3_client = FakeS3Client()
         mail_transport = FakePostmarkTransport(sink_path=mail_sink_path)
         components = build_production_components(
-            config, kms_client=FakeKmsClient(), s3_client=s3_client, mail_transport=mail_transport
+            config,
+            kms_client=(FakeKmsClient() if signing_mode != "cloudhsm_signing_service" else None),
+            s3_client=s3_client,
+            mail_transport=mail_transport,
         )
         try:
             now = datetime.now(timezone.utc)
@@ -304,3 +338,5 @@ def run_production_stack(
                 server.server_close()
         finally:
             components.pool.close()
+            if signing_service_server is not None:
+                signing_service_server.stop()

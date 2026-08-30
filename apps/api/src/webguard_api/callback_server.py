@@ -31,14 +31,33 @@ solely to prove that a target application's own downstream redirect
 handling (or lack of it) has no bearing on whether WebGuard already
 recorded the observation -- confirmation happens the moment the
 request arrives, never after any further round trip.
+
+Slice 18 requirement 15: a per-source-IP request-rate bound
+(``FixedWindowRateLimiter``, the same limiter class the main API
+already uses) protects the correlation store from unbounded writes if
+this receiver is ever reachable from the public Internet
+(``callback.openhuntx.com``) -- a rate-limited request still receives
+the identical generic response every other request gets, it is simply
+never recorded, so the wire-visible behavior an external observer sees
+is unchanged either way (no oracle for "was I rate-limited"). This is
+independent of, and does not affect, the main WebGuard API/worker's
+own capacity -- this receiver has always been its own separate,
+independently-run `ThreadingHTTPServer` process/thread pool (see this
+module's own pre-Slice-18 docstring above), so unbounded callback
+traffic could never actually consume API/worker resources directly;
+the rate limit exists to protect this receiver's own correlation-store
+writes specifically.
 """
 
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Protocol
+
+from .rate_limit import FixedWindowRateLimiter, RateLimitError
 
 
 class _ObservationSink(Protocol):
@@ -58,7 +77,10 @@ def _utc_now() -> datetime:
 
 
 def _make_handler(
-    repository: _ObservationSink, *, respond_with_redirect: bool
+    repository: _ObservationSink,
+    *,
+    respond_with_redirect: bool,
+    rate_limiter: FixedWindowRateLimiter | None,
 ) -> type[BaseHTTPRequestHandler]:
     class _CallbackHandler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:  # noqa: D401
@@ -71,9 +93,19 @@ def _make_handler(
             # logging, never trusted as an authority signal by itself.
             segments = [segment for segment in self.path.split("/") if segment]
             token_value = segments[-1] if segments else ""
-            repository.record_observation(
-                token_value, method=self.command, now=_utc_now()
-            )
+            within_limit = True
+            if rate_limiter is not None:
+                try:
+                    rate_limiter.check(self.client_address[0], now_epoch=time.time())
+                except RateLimitError:
+                    within_limit = False
+            if within_limit:
+                repository.record_observation(token_value, method=self.command, now=_utc_now())
+            # A rate-limited request is deliberately never recorded,
+            # but still receives the identical generic response every
+            # other request gets (see module docstring) -- a
+            # throttled caller must not be able to distinguish
+            # "throttled" from "recorded" from the response alone.
             if respond_with_redirect:
                 self.send_response(302)
                 self.send_header("Location", "/redirected")
@@ -114,8 +146,11 @@ class CallbackHttpReceiver:
         host: str = "127.0.0.1",
         port: int = 0,
         respond_with_redirect: bool = False,
+        rate_limiter: FixedWindowRateLimiter | None = None,
     ) -> None:
-        handler = _make_handler(repository, respond_with_redirect=respond_with_redirect)
+        handler = _make_handler(
+            repository, respond_with_redirect=respond_with_redirect, rate_limiter=rate_limiter
+        )
         self._server = ThreadingHTTPServer((host, port), handler)
         self._thread: threading.Thread | None = None
 

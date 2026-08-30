@@ -129,6 +129,14 @@ class ProductionServiceConfig:
     # constrained to one accepted value for the same typo-safety reason
     # `signing_provider` is.
     secret_provider: str | None = None
+    # Slice 18: required only when `signing_provider` is
+    # "cloudhsm_signing_service" -- optional/defaulted (like
+    # `secret_provider` above) so every "kms"-signing deployment is
+    # unaffected. `kms_key_id` remains present but unvalidated in this
+    # branch (there is no KMS key to require); see
+    # docs/production/TRUSTSCAN_SIGNING_SERVICE.md.
+    signing_service_url: str | None = None
+    signing_service_bearer_token: str | None = None
 
     def __post_init__(self) -> None:
         if self.environment != "production":
@@ -151,16 +159,31 @@ class ProductionServiceConfig:
                 "production_config_missing",
                 "database_url is required for a production deployment.",
             )
-        if self.signing_provider != "kms":
+        if self.signing_provider not in ("kms", "cloudhsm_signing_service"):
             raise ProductionConfigError(
                 "production_config_signing_provider_invalid",
-                'signing_provider must be exactly "kms" in production.',
+                'signing_provider must be "kms" or "cloudhsm_signing_service" in production.',
             )
-        if not self.kms_key_id.strip():
+        if self.signing_provider == "kms" and not self.kms_key_id.strip():
             raise ProductionConfigError(
                 "production_config_missing",
                 "kms_key_id is required when signing_provider is kms.",
             )
+        if self.signing_provider == "cloudhsm_signing_service":
+            if not (self.signing_service_url or "").strip() or not (
+                self.signing_service_url or ""
+            ).startswith(("http://", "https://")):
+                raise ProductionConfigError(
+                    "production_config_invalid",
+                    "signing_service_url must be an absolute http(s) URL when signing_provider "
+                    "is cloudhsm_signing_service.",
+                )
+            if not (self.signing_service_bearer_token or "").strip():
+                raise ProductionConfigError(
+                    "production_config_missing",
+                    "signing_service_bearer_token is required when signing_provider is "
+                    "cloudhsm_signing_service.",
+                )
         if not self.callback_service_hostname.strip():
             raise ProductionConfigError(
                 "production_config_missing",
@@ -328,6 +351,8 @@ class ProductionServiceConfig:
             database_pool_minimum=pool_minimum,
             database_pool_maximum=pool_maximum,
             secret_provider=os.environ.get("WEBGUARD_SECRET_PROVIDER") or None,
+            signing_service_url=os.environ.get("WEBGUARD_SIGNING_SERVICE_URL") or None,
+            signing_service_bearer_token=os.environ.get("WEBGUARD_SIGNING_SERVICE_BEARER_TOKEN") or None,
         )
 
 

@@ -107,6 +107,28 @@ variable "object_storage_retention_days" {
   }
 }
 
+variable "signing_provider" {
+  description = "Which TrustScanSigner backend the API and worker are deployed against -- must match WEBGUARD_SIGNING_PROVIDER in the application's own environment configuration (production_config.py). Controls whether the API/worker IAM policies in iam.tf include kms:Sign/kms:GetPublicKey on the TrustScan signing key at all: under \"cloudhsm_signing_service\" (this slice's recommended v1 direction), neither process touches the signing key by any AWS API whatsoever -- they only hold a bearer token for the dedicated signing service (requirement 2). Under \"kms\", each process still constructs its own KmsSigningProvider directly (see production_startup.py) and therefore still needs this narrowly-scoped grant -- a named architectural gap, not an oversight; see docs/production/TRUSTSCAN_SIGNING_SERVICE.md."
+  type        = string
+  default     = "cloudhsm_signing_service"
+
+  validation {
+    condition     = contains(["kms", "cloudhsm_signing_service"], var.signing_provider)
+    error_message = "signing_provider must be \"kms\" or \"cloudhsm_signing_service\" -- the same two values production_config.py accepts."
+  }
+}
+
+variable "cloudhsm_hsm_type" {
+  description = "CloudHSM v2 HSM type. hsm2m.medium is the current generation at the time this configuration was written -- confirm against AWS's own CloudHSM documentation before applying, since AWS periodically introduces newer generations."
+  type        = string
+  default     = "hsm2m.medium"
+}
+
+variable "signing_service_security_group_id" {
+  description = "Security group ID of the compute that runs the TrustScan Signing Service (webguard-api signing-service). The CloudHSM cluster's auto-created security group only permits inbound CloudHSM client traffic from this security group -- never from the API or worker security groups (requirement 2). No default -- this configuration provisions no compute (see README.md), exactly like application_security_group_id above."
+  type        = string
+}
+
 variable "object_storage_transition_days" {
   description = "How long a report/evidence artifact object stays in S3 Standard before transitioning to Standard-IA (cheaper, still immediately readable). Must be less than object_storage_retention_days."
   type        = number
@@ -116,4 +138,94 @@ variable "object_storage_transition_days" {
     condition     = var.object_storage_transition_days >= 1
     error_message = "object_storage_transition_days must be at least 1."
   }
+}
+
+# --- Public edge (Cloudflare) -- Slice 18 requirements 5-9 ---
+#
+# None of these have a default that assumes openhuntx.com is actually
+# on Cloudflare yet (requirement 5: "do not assume these DNS names
+# exist unless verified"). An operator who has actually registered the
+# domain and created a Cloudflare account supplies real values for all
+# of these before ever running `terraform plan` against cloudflare.tf.
+
+variable "cloudflare_account_id" {
+  description = "The Cloudflare account ID that will own the openhuntx.com zone. No default (like application_security_group_id above) -- an operator supplies this only once a real Cloudflare account exists."
+  type        = string
+}
+
+variable "root_domain" {
+  description = "The root domain name fronted by Cloudflare. WebGuard's three public hostnames (app./api./callback.) are subdomains of this."
+  type        = string
+  default     = "openhuntx.com"
+}
+
+variable "origin_web_hostname" {
+  description = "The real, non-public origin hostname the app.<root_domain> DNS record proxies to (e.g. an internal load balancer's DNS name). No default -- no such origin exists yet in this configuration (it provisions no compute; see README.md)."
+  type        = string
+}
+
+variable "origin_api_hostname" {
+  description = "The real, non-public origin hostname the api.<root_domain> DNS record proxies to. No default -- see origin_web_hostname."
+  type        = string
+}
+
+variable "origin_callback_hostname" {
+  description = "The real, non-public origin hostname the callback.<root_domain> DNS record proxies to. Deliberately a distinct origin from origin_api_hostname -- requirement 15 requires the callback receiver to be independently deployable/scalable from the main API. No default -- see origin_web_hostname."
+  type        = string
+}
+
+variable "cloudflare_security_level" {
+  description = "Cloudflare zone security_level (off/essentially_off/low/medium/high/under_attack). \"medium\" is Cloudflare's own recommended default and is not aggressive enough to challenge normal WebGuard API/browser traffic -- requirement 8 explicitly warns against enabling aggressive rules that break WebGuard workflows."
+  type        = string
+  default     = "medium"
+
+  validation {
+    condition     = contains(["off", "essentially_off", "low", "medium", "high", "under_attack"], var.cloudflare_security_level)
+    error_message = "cloudflare_security_level must be one of: off, essentially_off, low, medium, high, under_attack."
+  }
+}
+
+variable "cloudflare_edge_rate_limit_login_requests_per_minute" {
+  description = "Edge-level (Cloudflare) request cap for /v1/auth/login per client IP per minute -- a coarse, complementary outer bound in front of the application's own InMemoryAuthRateLimiter (requirement 10: edge and application limits should complement, not contradict). Deliberately looser than the application's own limit so the application layer, which has the actual per-account lockout logic, is always what actually decides an auth-abuse response; the edge rule exists only to blunt a volumetric flood before it reaches the origin at all."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.cloudflare_edge_rate_limit_login_requests_per_minute >= 1
+    error_message = "cloudflare_edge_rate_limit_login_requests_per_minute must be at least 1."
+  }
+}
+
+variable "cloudflare_edge_rate_limit_asset_verification_requests_per_minute" {
+  description = "Edge-level request cap for /v1/assets/*/verification* per client IP per minute -- same complementary-outer-bound rationale as the login limit above."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.cloudflare_edge_rate_limit_asset_verification_requests_per_minute >= 1
+    error_message = "cloudflare_edge_rate_limit_asset_verification_requests_per_minute must be at least 1."
+  }
+}
+
+variable "cloudflare_edge_rate_limit_report_requests_per_minute" {
+  description = "Edge-level request cap for /v1/reports* per client IP per minute -- same complementary-outer-bound rationale as the login limit above."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.cloudflare_edge_rate_limit_report_requests_per_minute >= 1
+    error_message = "cloudflare_edge_rate_limit_report_requests_per_minute must be at least 1."
+  }
+}
+
+variable "cloudflare_managed_ruleset_id" {
+  description = "Cloudflare's own \"Cloudflare Managed Ruleset\" ID. This is a stable, publicly documented ID (the same for every Cloudflare account/zone -- see Cloudflare's own WAF managed-rules documentation and Terraform examples), not an account-specific secret. Left overridable in case Cloudflare ever changes it."
+  type        = string
+  default     = "efb7b8c949ac4650a09736fc376e9aee"
+}
+
+variable "cloudflare_owasp_ruleset_id" {
+  description = "Cloudflare's own \"Cloudflare OWASP Core Ruleset\" ID -- same stable-and-public nature as cloudflare_managed_ruleset_id above."
+  type        = string
+  default     = "4814384a9e5d4991b9815dcfc25d2f1f"
 }

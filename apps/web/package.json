@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
+    "pretest": "rm -rf node_modules/.vite node_modules/.vite-temp",
     "test": "vitest run",
     "test:watch": "vitest",
     "e2e": "playwright test"

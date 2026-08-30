@@ -281,3 +281,219 @@ jobs:
           docker compose \
             -f infra/compose/compose.postgres.yml \
             down --volumes --remove-orphans
+
+  terraform:
+    name: Terraform validation and IaC security scan
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.16.0"
+          terraform_wrapper: false
+
+      - name: Terraform fmt check
+        working-directory: infra/terraform
+        run: terraform fmt -check -diff
+
+      - name: Terraform init (no backend -- this configuration is never applied in CI)
+        working-directory: infra/terraform
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        working-directory: infra/terraform
+        run: terraform validate
+
+      # Trivy replaced tfsec (archived upstream in favour of Trivy's own
+      # `config` scanner) as this slice's IaC security scanner
+      # (requirement 17). Installed from a SHA-256-verified release
+      # tarball rather than a third-party GitHub Action, matching
+      # ADR 0028's own "SHA-256-verified" pattern for downloaded
+      # artifacts (the same approach already used for the pip bootstrap
+      # wheel) rather than adding a new Action implementation to the
+      # trusted allowlist for a single scan step.
+      - name: Install Trivy (SHA-256 verified)
+        run: |
+          set -euo pipefail
+          curl -sSL -o trivy.tar.gz \
+            https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz
+          echo "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a  trivy.tar.gz" | sha256sum -c -
+          tar -xzf trivy.tar.gz trivy
+          sudo mv trivy /usr/local/bin/trivy
+          rm trivy.tar.gz
+
+      - name: Trivy IaC security scan
+        working-directory: infra/terraform
+        run: trivy config --exit-code 1 --severity LOW,MEDIUM,HIGH,CRITICAL .
+
+  frontend:
+    name: Frontend build, lint, and unit tests
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      # Slice 18: a stale Vite dependency-optimization cache
+      # (node_modules/.vite, node_modules/.vite-temp) left behind by an
+      # interrupted previous run can make every Vitest worker hang
+      # indefinitely waiting to start -- root-caused during this
+      # slice. A fresh `npm ci` checkout never has this directory, but
+      # the `pretest` script (package.json) clears it defensively on
+      # every invocation of `npm test`, so this is deterministic
+      # regardless of what ran here before.
+      - name: Type-check and build
+        working-directory: apps/web
+        run: npm run build
+
+      - name: Lint
+        working-directory: apps/web
+        run: npm run lint
+
+      - name: Run unit/component tests
+        working-directory: apps/web
+        run: npm test
+
+  frontend-e2e:
+    name: Frontend browser E2E (Playwright)
+    needs:
+      - unit-tests
+      - security-gates
+      - frontend
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13.14"
+          pip-version: "26.2.1"
+          cache: pip
+          cache-dependency-path: |
+            requirements-bootstrap.lock
+            requirements-ci.lock
+            requirements-dev.txt
+            packages/contracts/python/pyproject.toml
+            workers/scanner/pyproject.toml
+            apps/api/pyproject.toml
+
+      - name: Install hash-locked dependencies and project packages
+        run: ./scripts/install-locked-dependencies.sh
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: apps/web
+        run: npx playwright install --with-deps chromium
+
+      - name: Start isolated PostgreSQL
+        run: |
+          docker compose \
+            -f infra/compose/compose.postgres.yml \
+            up -d
+
+      - name: Wait for PostgreSQL health
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          container_id="$(
+            docker compose \
+              -f infra/compose/compose.postgres.yml \
+              ps -q postgres
+          )"
+
+          if [[ -z "$container_id" ]]; then
+            echo "PostgreSQL container was not created."
+            exit 1
+          fi
+
+          for attempt in $(seq 1 60); do
+            status="$(
+              docker inspect \
+                --format '{{.State.Health.Status}}' \
+                "$container_id" \
+                2>/dev/null \
+                || true
+            )"
+
+            echo "Health attempt ${attempt}: ${status:-unknown}"
+
+            if [[ "$status" == "healthy" ]]; then
+              exit 0
+            fi
+
+            if [[ "$status" == "unhealthy" ]]; then
+              docker compose \
+                -f infra/compose/compose.postgres.yml \
+                logs --tail=100 postgres
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          docker compose \
+            -f infra/compose/compose.postgres.yml \
+            logs --tail=100 postgres
+
+          echo "PostgreSQL did not become healthy in time."
+          exit 1
+
+      - name: Apply PostgreSQL migrations
+        env:
+          WEBGUARD_DATABASE_URL: "postgresql://webguard:webguard_dev_only_not_for_production@127.0.0.1:5433/webguard"
+        run: python scripts/run-postgres-migrations.py
+
+      - name: Run Playwright E2E suite
+        working-directory: apps/web
+        env:
+          WEBGUARD_POSTGRES_TEST_DSN: "postgresql://webguard:webguard_dev_only_not_for_production@127.0.0.1:5433/webguard"
+          # global-setup.ts defaults to .venv/bin/python3 (the local
+          # dev convention) -- CI installs dependencies directly onto
+          # the runner's own interpreter (install-locked-dependencies.sh),
+          # so it must be told to use that `python3` instead.
+          WEBGUARD_E2E_PYTHON: python3
+        run: npm run e2e
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report
+          path: apps/web/playwright-report/
+          retention-days: 7
+
+      - name: Stop isolated PostgreSQL
+        if: always()
+        run: |
+          docker compose \
+            -f infra/compose/compose.postgres.yml \
+            down --volumes --remove-orphans

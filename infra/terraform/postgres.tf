@@ -54,6 +54,26 @@ resource "aws_db_instance" "webguard" {
   # separate PITR toggle to set.
   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
 
+  # Slice 18 Terraform security review (requirement 17): purely
+  # additive -- this only makes IAM-token authentication *possible* for
+  # a database user later granted the `rds_iam` role; it does not
+  # disable, replace, or weaken manage_master_user_password above, and
+  # no application code or connection string changes as a result of
+  # enabling it. Kept on as a defense-in-depth emergency-access path
+  # (e.g. break-glass access authenticated by IAM rather than a stored
+  # password) that costs nothing to leave available.
+  iam_database_authentication_enabled = true
+
+  # Slice 18 Terraform security review (requirement 17, Trivy AWS-0133):
+  # session-level diagnostic data (active queries, wait events) that
+  # would materially help investigate a suspected compromise or a
+  # runaway query -- not enabled purely for performance tuning.
+  # Encrypted with the same CMK already protecting this instance's
+  # storage, rather than introducing a second key for one database.
+  performance_insights_enabled          = true
+  performance_insights_kms_key_id       = aws_kms_key.rds_storage_encryption.arn
+  performance_insights_retention_period = 7
+
   tags = {
     Name        = "webguard-${var.environment_name}"
     Environment = var.environment_name

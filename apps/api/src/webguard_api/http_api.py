@@ -72,6 +72,14 @@ def _json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _looks_like_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
 _CORS_ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS"
 _CORS_ALLOWED_HEADERS = "Authorization, Content-Type, Idempotency-Key, TrustScan-Permit, X-CSRF-Token"
 
@@ -88,6 +96,9 @@ def build_handler(
     session_authenticator: BrowserSessionAuthenticator | None = None,
     secure_cookies: bool = True,
     hsts_enabled: bool = False,
+    trusted_proxy_networks: frozenset[
+        ipaddress.IPv4Network | ipaddress.IPv6Network
+    ] = frozenset(),
 ) -> Type[BaseHTTPRequestHandler]:
     """Create a request handler bound to authenticated service dependencies.
 
@@ -114,6 +125,29 @@ def build_handler(
     so a real deployment's TLS-terminating reverse proxy is expected
     to set `Strict-Transport-Security` too; this lets it be present
     end-to-end once that proxy exists.
+
+    ``trusted_proxy_networks`` (Slice 18 requirement 13): the set of
+    CIDR networks a forwarding proxy is allowed to connect from.
+    Empty by default (today's loopback-only deployment, matching every
+    pre-Slice-18 caller exactly -- ``CF-Connecting-IP``/
+    ``X-Forwarded-For`` are never read at all). When non-empty, a
+    request whose *direct TCP peer* (``self.client_address[0]``) falls
+    inside one of these networks may supply the real client IP via
+    ``CF-Connecting-IP`` (preferred -- Cloudflare's own header, never a
+    comma-separated chain) or the leftmost entry of
+    ``X-Forwarded-For``; a request from any other peer has these
+    headers ignored entirely and falls back to the raw peer address,
+    exactly as before. This is what makes it safe to trust the header
+    at all: an attacker connecting directly (not through the
+    configured proxy) cannot claim to be a different IP merely by
+    setting a header, since their own direct connection's peer address
+    is never inside the trusted set. This resolved IP is what
+    populates every rate-limit bucket key and every audit event's
+    ``ip_address`` field -- getting this wrong either lets a shared
+    proxy IP silently pool every real client's rate-limit quota
+    together (empty/misconfigured trust) or lets an attacker spoof an
+    arbitrary source IP into abuse-protection and audit logging
+    (over-broad trust).
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -157,6 +191,37 @@ def build_handler(
             if hsts_enabled:
                 headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
             return headers
+
+        def _resolve_client_ip(self) -> str:
+            """See ``build_handler``'s own docstring for the full
+            trust model. Never trusts a forwarding header from a peer
+            outside ``trusted_proxy_networks``."""
+
+            peer = self.client_address[0]
+            if not trusted_proxy_networks:
+                return peer
+            try:
+                peer_address = ipaddress.ip_address(peer)
+            except ValueError:
+                return peer
+            if not any(peer_address in network for network in trusted_proxy_networks):
+                return peer
+            cf_connecting_ip = self.headers.get("CF-Connecting-IP")
+            if cf_connecting_ip and _looks_like_ip(cf_connecting_ip.strip()):
+                return cf_connecting_ip.strip()
+            forwarded_for = self.headers.get("X-Forwarded-For")
+            if forwarded_for:
+                # The leftmost entry is the original client in the
+                # X-Forwarded-For convention. Trusted here only
+                # because the immediate peer was already confirmed to
+                # be a configured trusted proxy above -- this is a
+                # single-trusted-edge model (Cloudflare, or one load
+                # balancer directly in front), not recursive multi-hop
+                # chain validation.
+                candidate = forwarded_for.split(",")[0].strip()
+                if _looks_like_ip(candidate):
+                    return candidate
+            return peer
 
         def _parse_cookies(self) -> SimpleCookie:
             jar: SimpleCookie = SimpleCookie()
@@ -433,7 +498,7 @@ def build_handler(
 
             return (
                 "auth-failure-peer:"
-                f"{self.client_address[0]}"
+                f"{self._resolve_client_ip()}"
             )
 
         def _authenticate(self, *, require_csrf: bool = False) -> tuple[AuthContext, RateLimitDecision]:
@@ -447,7 +512,7 @@ def build_handler(
                 # below -- a browser session cookie and an API token
                 # are different credential spaces and must not share
                 # (or let one exhaust) the other's quota.
-                failure_key = f"auth-failure-session-peer:{self.client_address[0]}"
+                failure_key = f"auth-failure-session-peer:{self._resolve_client_ip()}"
                 rate_limiter.check(failure_key, now_epoch=now_epoch)
                 try:
                     context = session_authenticator.authenticate(
@@ -797,7 +862,7 @@ def build_handler(
                     body = self._unauthenticated_json_body("register_body_invalid")
                     context, issued = service.register_account(
                         body, request_id=request_id, user_agent=self._user_agent(),
-                        ip_address=self.client_address[0],
+                        ip_address=self._resolve_client_ip(),
                     )
                     self._send_json(
                         201, context.to_public_dict(), request_id=request_id,
@@ -808,7 +873,7 @@ def build_handler(
                     body = self._unauthenticated_json_body("login_body_invalid")
                     context, issued = service.login(
                         body, request_id=request_id, user_agent=self._user_agent(),
-                        ip_address=self.client_address[0],
+                        ip_address=self._resolve_client_ip(),
                     )
                     self._send_json(
                         200, context.to_public_dict(), request_id=request_id,
@@ -818,21 +883,21 @@ def build_handler(
                 if path == "/v1/auth/password/reset/request":
                     body = self._unauthenticated_json_body("password_reset_body_invalid")
                     payload = service.request_password_reset(
-                        body, request_id=request_id, ip_address=self.client_address[0]
+                        body, request_id=request_id, ip_address=self._resolve_client_ip()
                     )
                     self._send_json(200, payload, request_id=request_id)
                     return
                 if path == "/v1/auth/password/reset/confirm":
                     body = self._unauthenticated_json_body("password_reset_confirm_body_invalid")
                     payload = service.confirm_password_reset(
-                        body, request_id=request_id, ip_address=self.client_address[0]
+                        body, request_id=request_id, ip_address=self._resolve_client_ip()
                     )
                     self._send_json(200, payload, request_id=request_id)
                     return
                 if path == "/v1/auth/email/verify/confirm":
                     body = self._unauthenticated_json_body("email_verification_body_invalid")
                     payload = service.confirm_email_verification(
-                        body, request_id=request_id, ip_address=self.client_address[0]
+                        body, request_id=request_id, ip_address=self._resolve_client_ip()
                     )
                     self._send_json(200, payload, request_id=request_id)
                     return
@@ -840,7 +905,7 @@ def build_handler(
                     body = self._unauthenticated_json_body("invitation_accept_body_invalid")
                     context, issued = service.accept_invitation(
                         body, request_id=request_id, user_agent=self._user_agent(),
-                        ip_address=self.client_address[0],
+                        ip_address=self._resolve_client_ip(),
                     )
                     self._send_json(
                         200, context.to_public_dict(), request_id=request_id,
@@ -1345,6 +1410,9 @@ def create_server(
     session_authenticator: BrowserSessionAuthenticator | None = None,
     secure_cookies: bool = True,
     hsts_enabled: bool = False,
+    trusted_proxy_networks: frozenset[
+        ipaddress.IPv4Network | ipaddress.IPv6Network
+    ] = frozenset(),
 ) -> ThreadingHTTPServer:
     """Bind the authenticated local HTTP transport."""
 
@@ -1371,6 +1439,7 @@ def create_server(
         session_authenticator=session_authenticator,
         secure_cookies=secure_cookies,
         hsts_enabled=hsts_enabled,
+        trusted_proxy_networks=trusted_proxy_networks,
     )
     server = ThreadingHTTPServer((address.compressed, port), handler)
     server.daemon_threads = True

@@ -28,7 +28,27 @@ output "artifact_storage_kms_key_arn" {
   value       = aws_kms_key.artifact_storage_encryption.arn
 }
 
-output "artifact_storage_access_policy_arn" {
-  description = "ARN of the least-privilege S3/KMS access policy -- attach this to whatever compute role (e.g. an ECS task role) actually runs the API/worker."
-  value       = aws_iam_policy.artifact_storage_access.arn
+output "api_service_access_policy_arn" {
+  description = "ARN of the API role's least-privilege policy (read-only artifact access, plus TrustScan permit-signing key use when signing_provider = \"kms\") -- attach to whatever compute role runs `webguard-api serve`."
+  value       = aws_iam_policy.api_service_access.arn
+}
+
+output "worker_service_access_policy_arn" {
+  description = "ARN of the worker role's least-privilege policy (write-only artifact access, plus TrustScan signing key use when signing_provider = \"kms\") -- attach to whatever compute role runs `webguard-api worker`."
+  value       = aws_iam_policy.worker_service_access.arn
+}
+
+output "cloudhsm_cluster_id" {
+  description = "CloudHSM v2 cluster ID -- needed for the manual activation ceremony documented in cloudhsm.tf (initialize-cluster, crypto user creation) before the TrustScan Signing Service can use it."
+  value       = aws_cloudhsm_v2_cluster.trustscan_signing.cluster_id
+}
+
+output "cloudflare_zone_id" {
+  description = "Cloudflare zone ID for openhuntx.com -- needed by any future Cloudflare resource added outside this configuration."
+  value       = cloudflare_zone.openhuntx.id
+}
+
+output "cloudflare_zone_name_servers" {
+  description = "The Cloudflare-assigned nameservers for openhuntx.com. An operator updates the domain registrar's NS records to these values to actually activate the zone -- Terraform cannot do this step, since it happens at the registrar, not Cloudflare."
+  value       = cloudflare_zone.openhuntx.name_servers
 }

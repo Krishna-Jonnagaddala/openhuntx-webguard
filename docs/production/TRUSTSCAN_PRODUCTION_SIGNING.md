@@ -2,7 +2,7 @@
 
 ## Status
 
-This is a **production-launch blocker**. It does not block continued local/lab platform development, and it is not resolved by this document — it is *decided* by this document, so that the actual work (provisioning real key custody) is a scoped, reviewed follow-up rather than an open question discovered during a launch readiness review.
+**Decided (this document) and implemented (Slice 18) — not deployed.** This document's Option A recommendation is now real code: `CloudHsmSigningProvider`, a dedicated `TrustScan Signing Service`, and `infra/terraform/cloudhsm.tf` all exist, are unit- and integration-tested, and preserve the exact Ed25519 contract described below with zero schema change. See `docs/production/TRUSTSCAN_SIGNING_SERVICE.md` for the full implementation, key-lifecycle operation, and — stated precisely there — exactly what has and has not been proven (no CloudHSM cluster has been provisioned, and the PKCS#11 adapter has never run against real hardware). The rest of this document is preserved as-written below: it is the decision record, not duplicated in the new document.
 
 ## The problem, precisely
 
@@ -58,7 +58,7 @@ Reasoning:
 2. Option B is dominated by Option A: it costs real engineering effort to build and operate a new service, without reaching the same assurance level. There is no scenario where B is the right choice unless CloudHSM is unconditionally unavailable (e.g. a cost constraint so severe that even a minimal 2-HSM cluster is out of reach) — and even then, Option C should be evaluated before B, since C is cheaper *and* stronger than B.
 3. Option C remains the credible fallback, explicitly not foreclosed: if CloudHSM's operational cost or complexity proves prohibitive after real pricing/procurement conversations, Option C should be picked up as its own dedicated, reviewed, regression-tested slice — not adopted by default now to avoid Option A's cost.
 
-**This decision does not authorize implementation.** Building `CloudHsmSigningProvider`, provisioning a real CloudHSM cluster, and cutting production traffic over to it is scoped, reviewed, follow-up work for a future slice, gated on the same review/regression discipline every other production cryptographic change in this project has required.
+**Slice 18 update**: `CloudHsmSigningProvider` and the dedicated TrustScan Signing Service described above are now built (`docs/production/TRUSTSCAN_SIGNING_SERVICE.md`). What this decision still did not authorize, and what Slice 18 still did not do: provisioning a real CloudHSM cluster or cutting live production traffic over to it. `infra/terraform/cloudhsm.tf` is reviewed, unapplied IaC; the PKCS#11 adapter has never run against real hardware. That remains scoped, reviewed, follow-up work — an infrastructure-provisioning and cutover decision, not a code-review one.
 
 ## What this slice actually changed (recap, for traceability)
 

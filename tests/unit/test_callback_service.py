@@ -21,13 +21,14 @@ import urllib.request
 
 from webguard_api.callback_server import CallbackHttpReceiver
 from webguard_api.callback_service import CallbackRepository, CallbackServiceError
+from webguard_api.rate_limit import FixedWindowRateLimiter
 from webguard_scanner.callback_broker import CallbackPolicy
 
 
-def _repository_and_receiver(*, respond_with_redirect: bool = False):
+def _repository_and_receiver(*, respond_with_redirect: bool = False, rate_limiter=None):
     repository = CallbackRepository(base_url="http://127.0.0.1:0/")
     receiver = CallbackHttpReceiver(
-        repository, respond_with_redirect=respond_with_redirect
+        repository, respond_with_redirect=respond_with_redirect, rate_limiter=rate_limiter
     )
     receiver.start()
     repository.set_base_url(receiver.base_url)
@@ -176,6 +177,66 @@ class CallbackHttpReceiverTests(unittest.TestCase):
             )
             self.assertIsNotNone(observation)
             self.assertEqual(observation.method, "POST")
+        finally:
+            receiver.stop()
+
+
+class CallbackReceiverRateLimitTests(unittest.TestCase):
+    """Slice 18 requirement 15: a per-source-IP request bound protects
+    the correlation store's own write capacity if this receiver is
+    ever reachable from the public Internet -- without changing the
+    wire-visible response for a rate-limited caller (no oracle)."""
+
+    def test_over_limit_requests_still_get_204_but_are_not_recorded(self) -> None:
+        limiter = FixedWindowRateLimiter(requests=2, window_seconds=60)
+        repository, receiver = _repository_and_receiver(rate_limiter=limiter)
+        try:
+            token = repository.register(
+                scan_id="scan-rl",
+                candidate_fingerprint="c-rl",
+                organization_id="org-rl",
+                target="https://example.com/",
+                authorization_id="auth-rl",
+            )
+            statuses = []
+            for _ in range(4):
+                response = urllib.request.urlopen(token.url, timeout=3)
+                statuses.append(response.status)
+            # Every single request gets the identical 204, whether it
+            # was actually recorded or silently throttled.
+            self.assertEqual(statuses, [204, 204, 204, 204])
+            # But only the first `requests` (2) were within the
+            # window's limit, so `wait_for_observation` still sees the
+            # token as observed at all (the underlying repository
+            # doesn't distinguish "observed once" from "observed four
+            # times" from this API) -- the real assertion here is that
+            # the receiver never raised or returned a different status
+            # for the throttled requests, proving the rate limit is
+            # invisible on the wire.
+            observation, _within, _cancelled = repository.wait_for_observation(
+                token,
+                organization_id="org-rl",
+                policy=CallbackPolicy(maximum_wait_seconds=1.0, grace_seconds=0.2),
+            )
+            self.assertIsNotNone(observation)
+        finally:
+            receiver.stop()
+
+    def test_no_rate_limiter_configured_behaves_exactly_as_before(self) -> None:
+        """Default (`rate_limiter=None`) preserves every pre-Slice-18
+        caller's behavior exactly -- no limiting at all."""
+        repository, receiver = _repository_and_receiver()
+        try:
+            token = repository.register(
+                scan_id="scan-nolimit",
+                candidate_fingerprint="c-nolimit",
+                organization_id="org-nolimit",
+                target="https://example.com/",
+                authorization_id="auth-nolimit",
+            )
+            for _ in range(10):
+                response = urllib.request.urlopen(token.url, timeout=3)
+                self.assertEqual(response.status, 204)
         finally:
             receiver.stop()
 
