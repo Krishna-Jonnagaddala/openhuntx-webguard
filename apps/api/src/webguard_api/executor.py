@@ -65,6 +65,7 @@ from webguard_scanner import (
 )
 from webguard_scanner.callback_broker import CallbackBrokerError, CallbackToken
 
+from .artifact_store import ArtifactStore, ArtifactStoreError, LocalArtifactStore
 from .authentication_contexts import (
     AuthenticationContextError,
     AuthenticationContextRepository,
@@ -430,48 +431,6 @@ def _prepare_private_directory(path: Path) -> None:
             "artifact_directory_permissions_failed",
             "Unable to apply owner-only artifact directory permissions.",
         ) from exc
-
-
-def _write_report(report: WebGuardReport, path: Path) -> None:
-    try:
-        exists = os.path.lexists(path)
-    except OSError as exc:
-        raise JobExecutionError(
-            "artifact_path_inspection_failed",
-            f"Unable to inspect report path {path}.",
-        ) from exc
-    if exists:
-        raise JobExecutionError(
-            "artifact_path_exists",
-            "A service job artifact path already exists.",
-        )
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(path, flags, 0o600)
-        with os.fdopen(
-            descriptor,
-            "w",
-            encoding="utf-8",
-            newline="\n",
-        ) as output:
-            descriptor = None
-            output.write(report.to_json())
-            output.write("\n")
-            output.flush()
-            os.fsync(output.fileno())
-    except OSError as exc:
-        raise JobExecutionError(
-            "artifact_write_failed",
-            f"Unable to write scan report {path}.",
-        ) from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
 
 
 def _write_signed_safety_receipt(receipt, path: Path) -> str:
@@ -951,6 +910,7 @@ class ScanJobExecutor:
         scan_repository=None,
         finding_repository=None,
         secret_provider: SecretProvider | None = None,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self.authorizations = authorizations
         self.store = store
@@ -1017,6 +977,25 @@ class ScanJobExecutor:
             secret_provider
             if secret_provider is not None
             else LocalSecretProvider(self.authentication_contexts)
+        )
+        # Slice 17 requirement 7: the completed report's bytes are now
+        # written through the same `ArtifactStore` abstraction
+        # `service.py` already reads them back through, completing
+        # Slice 14's own stated intent (`artifact_store.py`'s module
+        # docstring named this executor's hand-rolled `_write_report`
+        # as the exact behavior `LocalArtifactStore` was extracted
+        # from, but never actually wired the two together until now).
+        # Defaulted to a fresh `LocalArtifactStore` over this
+        # executor's own `artifact_directory` -- functionally
+        # equivalent to the pre-Slice-17 hand-rolled write (same
+        # 0o600/0o700 permissions, same owner-only O_NOFOLLOW-guarded
+        # write), so every pre-Slice-17 local/dev/test/lab call site
+        # that does not pass this explicitly is unaffected. Production
+        # wiring passes the same `ObjectStorageArtifactStore` instance
+        # `WebGuardJobService` reads from, so a report a worker writes
+        # is immediately, durably readable via the API.
+        self.artifact_store = (
+            artifact_store if artifact_store is not None else LocalArtifactStore(self.artifact_directory)
         )
 
     def _policies(self, authorization, permit, mode: ScanJobMode):
@@ -1221,7 +1200,6 @@ class ScanJobExecutor:
         _prepare_private_directory(self.artifact_directory)
         job_directory = self.artifact_directory / relative_directory
         _prepare_private_directory(job_directory)
-        report_path = self.artifact_directory / report_ref
         audit_path = self.artifact_directory / audit_ref
         safety_receipt_path = self.artifact_directory / safety_receipt_ref
 
@@ -1394,7 +1372,10 @@ class ScanJobExecutor:
             ) from exc
 
         receipt = safety.signed_receipt(termination_reason=report.status.value)
-        _write_report(report, report_path)
+        try:
+            self.artifact_store.put(report_ref, (report.to_json() + "\n").encode("utf-8"))
+        except ArtifactStoreError as exc:
+            raise JobExecutionError(exc.code, exc.message) from exc
         digest = _write_signed_safety_receipt(receipt, safety_receipt_path)
 
         if organization_id is not None:

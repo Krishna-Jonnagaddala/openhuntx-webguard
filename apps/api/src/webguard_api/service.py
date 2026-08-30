@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 from uuid import uuid4
+
+_logger = logging.getLogger("webguard_api.service")
 
 from webguard_contracts import (
     AuditOutcome,
@@ -129,6 +132,7 @@ class WebGuardJobService:
         auth_rate_limiter=None,
         session_idle_timeout: timedelta | None = None,
         session_absolute_timeout: timedelta | None = None,
+        web_app_base_url: str = "http://127.0.0.1:5173",
     ) -> None:
         self.store = store
         self.authorizations = authorizations
@@ -225,11 +229,11 @@ class WebGuardJobService:
         # Slice 16: browser identity/session layer, same optional/
         # defaulted pattern as every repository above.
         from .sessions import DEFAULT_ABSOLUTE_TIMEOUT, DEFAULT_IDLE_TIMEOUT, InMemorySessionRepository
-        from .mail import LoggingMailProvider
+        from .mail import DevelopmentMailProvider
         from .auth_rate_limit import InMemoryAuthRateLimiter
 
         self.sessions = sessions if sessions is not None else InMemorySessionRepository()
-        self.mail_provider = mail_provider if mail_provider is not None else LoggingMailProvider()
+        self.mail_provider = mail_provider if mail_provider is not None else DevelopmentMailProvider()
         self.auth_rate_limiter = (
             auth_rate_limiter
             if auth_rate_limiter is not None
@@ -237,6 +241,38 @@ class WebGuardJobService:
         )
         self.session_idle_timeout = session_idle_timeout or DEFAULT_IDLE_TIMEOUT
         self.session_absolute_timeout = session_absolute_timeout or DEFAULT_ABSOLUTE_TIMEOUT
+        # Slice 17 requirement 1: verification/reset/invitation emails
+        # now contain a real clickable link into the SPA, not a bare
+        # token -- this is the SPA's own public origin the link is
+        # built against. Defaulted to the local Vite dev port so every
+        # pre-Slice-17 local/test call site is unaffected; production
+        # wiring passes the real deployed frontend origin explicitly
+        # (`ProductionServiceConfig.web_app_base_url`, fail-closed).
+        self._web_app_base_url = web_app_base_url.rstrip("/")
+
+    def _send_mail_best_effort(self, *, to: str, subject: str, body: str, category: str) -> None:
+        """A delivery failure never fails the caller's own operation --
+        the account/token this email refers to was already durably
+        created before this is called, and blowing up the whole
+        request over a downstream mail-provider hiccup would be worse
+        than a customer occasionally needing "resend verification"
+        (requirement 6). Critically, this also preserves requirement 4
+        (anti-enumeration): `request_password_reset`'s response is
+        identical whether the account exists, whether the send
+        succeeds, or whether it fails -- a delivery failure must never
+        become a second, distinguishable response shape. Only the
+        failure *category* (never the vendor's own response text) is
+        logged, matching requirement 20's "no vendor leakage" applied
+        to server-side telemetry as well as the customer-facing API."""
+        from .mail import MailDeliveryError
+
+        try:
+            self.mail_provider.send(to=to, subject=subject, body=body, category=category)
+        except MailDeliveryError as exc:
+            _logger.warning(
+                "mail delivery failed, continuing without it: category=%s failure_category=%s code=%s",
+                category, exc.category, exc.code,
+            )
 
     def _audit(
         self,
@@ -2186,10 +2222,13 @@ class WebGuardJobService:
             principal.principal_id, organization.organization_id,
             purpose=IdentityTokenPurpose.EMAIL_VERIFICATION, ttl=EMAIL_VERIFICATION_TOKEN_TTL, now=now,
         )
-        self.mail_provider.send(
+        self._send_mail_best_effort(
             to=principal.email,
             subject="Verify your WebGuard email address",
-            body=f"Confirm your email address with this one-time token: {verification.token}",
+            body=(
+                "Confirm your email address by opening this link:\n"
+                f"{self._web_app_base_url}/verify-email?token={verification.token}"
+            ),
             category="email_verification",
         )
         issued = self.sessions.create_session(
@@ -2315,6 +2354,17 @@ class WebGuardJobService:
         self.sessions.revoke_all_sessions_for_principal(
             context.principal_id, now=now, except_session_id=except_session
         )
+        principal = self.identity.get_principal(context.principal_id)
+        if principal.email:
+            self._send_mail_best_effort(
+                to=principal.email,
+                subject="Your WebGuard password was changed",
+                body=(
+                    "Your password was just changed. If this wasn't you, reset your "
+                    f"password immediately: {self._web_app_base_url}/forgot-password"
+                ),
+                category="password_changed",
+            )
         self._audit(
             context, request_id=request_id, action="auth.password_change", resource_type="principal",
             resource_id=context.principal_id, outcome=AuditOutcome.SUCCEEDED,
@@ -2346,10 +2396,13 @@ class WebGuardJobService:
             principal.principal_id, principal.organization_id,
             purpose=IdentityTokenPurpose.PASSWORD_RESET, ttl=PASSWORD_RESET_TOKEN_TTL, now=now,
         )
-        self.mail_provider.send(
+        self._send_mail_best_effort(
             to=principal.email,
             subject="Reset your WebGuard password",
-            body=f"Reset your password with this one-time token (expires in 1 hour): {issued.token}",
+            body=(
+                "Reset your password (this link expires in 1 hour):\n"
+                f"{self._web_app_base_url}/reset-password?token={issued.token}"
+            ),
             category="password_reset",
         )
         self._audit_identity_event(
@@ -2387,6 +2440,17 @@ class WebGuardJobService:
             record.principal_id, algorithm="argon2id", password_hash=hash_password(body["new_password"]), now=now
         )
         self.sessions.revoke_all_sessions_for_principal(record.principal_id, now=now)
+        principal = self.identity.get_principal(record.principal_id)
+        if principal.email:
+            self._send_mail_best_effort(
+                to=principal.email,
+                subject="Your WebGuard password was reset",
+                body=(
+                    "Your password was just reset and every active session was signed "
+                    "out. If this wasn't you, contact your organization's WebGuard owner."
+                ),
+                category="password_changed",
+            )
         self._audit_identity_event(
             organization_id=record.organization_id, principal_id=record.principal_id,
             request_id=request_id, action="auth.password_reset_completed", resource_type="principal",
@@ -2412,10 +2476,13 @@ class WebGuardJobService:
             principal.principal_id, context.organization_id,
             purpose=IdentityTokenPurpose.EMAIL_VERIFICATION, ttl=EMAIL_VERIFICATION_TOKEN_TTL, now=now,
         )
-        self.mail_provider.send(
+        self._send_mail_best_effort(
             to=principal.email,
             subject="Verify your WebGuard email address",
-            body=f"Confirm your email address with this one-time token: {issued.token}",
+            body=(
+                "Confirm your email address by opening this link:\n"
+                f"{self._web_app_base_url}/verify-email?token={issued.token}"
+            ),
             category="email_verification",
         )
         self._audit(
@@ -2939,13 +3006,14 @@ class WebGuardJobService:
             principal.principal_id, context.organization_id,
             purpose=IdentityTokenPurpose.INVITATION, ttl=INVITATION_TOKEN_TTL, now=now,
         )
-        self.mail_provider.send(
+        self._send_mail_best_effort(
             to=principal.email,
             subject="You've been invited to WebGuard",
             body=(
                 f"{context.principal_name} invited you to join their WebGuard organization "
-                f"as {role.value}. Accept your invitation with this one-time token "
-                f"(expires in {INVITATION_TOKEN_TTL.days} days): {issued.token}"
+                f"as {role.value}. Accept your invitation (expires in {INVITATION_TOKEN_TTL.days} "
+                f"days) by opening this link:\n"
+                f"{self._web_app_base_url}/accept-invitation?token={issued.token}"
             ),
             category="invitation",
         )
@@ -3139,10 +3207,14 @@ class WebGuardJobService:
 
     def download_report(self, context: AuthContext, report_id: str, *, request_id: str) -> tuple[bytes, str, str]:
         """Never exposes ``report_ref`` (an internal artifact reference,
-        never a filesystem path or public URL) to the caller -- only the
-        bytes it resolves to, after a tenant-ownership check, through
-        the same ``ArtifactStore`` abstraction production honestly fails
-        closed on until object storage exists (Slice 14 requirement 6)."""
+        never a filesystem path, bucket name, or S3 URL) to the caller
+        -- only the bytes it resolves to, after a tenant-ownership
+        check and an integrity check, through the same ``ArtifactStore``
+        abstraction, real S3-backed in production since Slice 17
+        requirement 7 (`object_storage_not_implemented` no longer
+        occurs; retained in the status mapping below only for an
+        operator who has not yet reconfigured a pre-Slice-17
+        deployment)."""
 
         self._require(
             context, ApiPermission.REPORT_READ, request_id=request_id,
@@ -3161,12 +3233,28 @@ class WebGuardJobService:
         try:
             content = self.artifact_store.get_reference(record.report_ref)
         except ArtifactStoreError as exc:
-            status = 503 if exc.code == "object_storage_not_implemented" else 404
+            status = 404 if exc.code == "artifact_not_found" else 503
             self._audit(
                 context, request_id=request_id, action="reports.download", resource_type="report",
                 resource_id=report_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
             )
             raise ApiServiceError(exc.code, exc.message, status=status) from exc
+        # Slice 17 requirement 14: never serve bytes that don't match
+        # the checksum computed and persisted at report-creation time
+        # (`create_report`, from the artifact's own bytes, never a
+        # client-supplied value) -- a truncated read, a corrupted
+        # object, or a wrong object entirely all fail closed here
+        # rather than silently handing the customer bad report bytes.
+        if record.checksum is not None and hashlib.sha256(content).hexdigest() != record.checksum:
+            self._audit(
+                context, request_id=request_id, action="reports.download", resource_type="report",
+                resource_id=report_id, outcome=AuditOutcome.DENIED, detail_code="report_integrity_check_failed",
+            )
+            raise ApiServiceError(
+                "report_integrity_check_failed",
+                "The report artifact failed integrity verification and cannot be served.",
+                status=500,
+            )
         self._audit(
             context, request_id=request_id, action="reports.download", resource_type="report",
             resource_id=report_id, outcome=AuditOutcome.SUCCEEDED,

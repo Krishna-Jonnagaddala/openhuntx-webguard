@@ -17,3 +17,18 @@ output "trustscan_signing_kms_key_arn" {
   description = "ARN of the TrustScan permit-signing KMS key, for KmsSigningProvider configuration (WEBGUARD_KMS_KEY_ID)."
   value       = aws_kms_key.trustscan_permit_signing.arn
 }
+
+output "artifact_storage_bucket_name" {
+  description = "S3 bucket name for ObjectStorageArtifactStore configuration (WEBGUARD_OBJECT_STORAGE_BUCKET)."
+  value       = aws_s3_bucket.artifacts.id
+}
+
+output "artifact_storage_kms_key_arn" {
+  description = "ARN of the artifact-storage encryption KMS key, for ObjectStorageArtifactStore configuration (WEBGUARD_OBJECT_STORAGE_KMS_KEY_ID)."
+  value       = aws_kms_key.artifact_storage_encryption.arn
+}
+
+output "artifact_storage_access_policy_arn" {
+  description = "ARN of the least-privilege S3/KMS access policy -- attach this to whatever compute role (e.g. an ECS task role) actually runs the API/worker."
+  value       = aws_iam_policy.artifact_storage_access.arn
+}

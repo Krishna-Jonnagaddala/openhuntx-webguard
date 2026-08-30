@@ -16,6 +16,7 @@ from uuid import uuid4
 from webguard_contracts import OrganizationRole, PrincipalType
 
 from . import __version__
+from .artifact_store import LocalArtifactStore
 from .auth import ApiTokenAuthenticator, AuthenticationError, BrowserSessionAuthenticator
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
 from .config import (
@@ -94,6 +95,17 @@ def _components(config: ServiceConfig):
     store, identity = _stores(config)
     authorizations = AuthorizationRepository(config.authorization_directory)
     trustscan_signer = TrustScanSigner(store.trustscan_signing_private_key())
+    # One shared `LocalArtifactStore` over `config.artifact_directory`,
+    # explicitly passed to both -- previously the executor wrote
+    # reports under `config.artifact_directory` (via its own
+    # `artifact_directory` parameter) while the service read them back
+    # through its own separately-defaulted `LocalArtifactStore`
+    # (hardcoded to `scan-results/service`). The two only ever agreed
+    # by coincidence, since that hardcoded default equals
+    # `ServiceConfig.artifact_directory`'s own default -- passing
+    # `--artifacts <anything else>` to `serve`/`run` would have made
+    # every report download silently fail with `artifact_not_found`.
+    artifact_store = LocalArtifactStore(config.artifact_directory)
     executor = ScanJobExecutor(
         authorizations=authorizations,
         store=store,
@@ -103,12 +115,16 @@ def _components(config: ServiceConfig):
         authorization_assignment_checker=(
             identity.authorization_is_assigned
         ),
+        artifact_store=artifact_store,
     )
+    web_app_base_url = os.environ.get("WEBGUARD_WEB_APP_BASE_URL", "http://127.0.0.1:5173")
     service = WebGuardJobService(
         store=store,
         authorizations=authorizations,
         identity=identity,
         trustscan_signer=trustscan_signer,
+        artifact_store=artifact_store,
+        web_app_base_url=web_app_base_url,
     )
     worker = ScanJobWorker(
         store=store,
@@ -144,25 +160,34 @@ def _production_components() -> tuple[ProductionServiceConfig, ProductionCompone
     requirement 1): selected explicitly via `--environment production`
     / `WEBGUARD_ENVIRONMENT=production`, never inferred. `boto3` is
     imported here, at the one call site that actually needs a real AWS
-    KMS/Secrets-Manager client, and nowhere else in this package -- see
-    `production_startup.py`'s module docstring for why it is not a
-    package-level dependency. A Secrets Manager client is constructed
-    only when `secret_provider` was actually configured (Slice 14
-    requirement 1) -- most deployments never use authenticated scanning
-    and should not need AWS Secrets Manager credentials to start."""
+    KMS/Secrets-Manager/S3 client, and nowhere else in this package --
+    see `production_startup.py`'s module docstring for why it is not a
+    package-level dependency (Slice 17 requirement 22: no AWS SDK
+    credential material of any kind is ever embedded in source -- the
+    real `boto3.client(...)` calls below resolve credentials through
+    boto3's own standard chain, i.e. a workload/service identity such
+    as an ECS task role, exactly as `kms_client` already did). A
+    Secrets Manager client is constructed only when `secret_provider`
+    was actually configured (Slice 14 requirement 1) -- most
+    deployments never use authenticated scanning and should not need
+    AWS Secrets Manager credentials to start. The S3 client, unlike
+    Secrets Manager, is unconditional: `ProductionServiceConfig`
+    requires object-storage configuration for every production
+    deployment (Slice 17 requirement 21)."""
 
     config = ProductionServiceConfig.from_environment()
 
     import boto3
 
     kms_client = boto3.client("kms")
+    s3_client = boto3.client("s3", region_name=config.object_storage_region)
     secrets_manager_client = (
         boto3.client("secretsmanager")
         if config.secret_provider == "aws_secrets_manager"  # noqa: S105 - a provider-selector enum value, not a credential
         else None
     )
     components = build_production_components(
-        config, kms_client=kms_client, secrets_manager_client=secrets_manager_client
+        config, kms_client=kms_client, s3_client=s3_client, secrets_manager_client=secrets_manager_client
     )
     return config, components
 

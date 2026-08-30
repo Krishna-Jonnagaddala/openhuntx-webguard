@@ -42,7 +42,9 @@ This document extracts real infrastructure requirements from the scanner archite
 
 ### Object storage
 
-**Required for**: reports/artifacts/safety-receipts once more than one worker host needs to read/write them, or once retention/lifecycle policies (per `docs/ROADMAP.md`'s "Data and regional controls") need enforcing centrally rather than per-filesystem. **Not required for**: the current single-host deployment.
+**Required for**: reports/artifacts/safety-receipts once more than one worker host needs to read/write them, or once retention/lifecycle policies (per `docs/ROADMAP.md`'s "Data and regional controls") need enforcing centrally rather than per-filesystem.
+
+**Slice 17 update**: report storage is now real. `ObjectStorageArtifactStore` (`apps/api/src/webguard_api/artifact_store.py`) is a genuine S3-backed implementation (SSE-KMS encrypted, real retention lifecycle), reached through a duck-typed `S3ClientProtocol` exactly like KMS/Secrets Manager, and `infra/terraform/storage.tf` provisions (unapplied) the bucket/key/IAM policy it needs. See `docs/production/ARTIFACT_STORAGE.md` for the full design. Scope is reports specifically — safety receipts and authorization-audit files remain local-filesystem-only, a deliberate, named gap (`ARTIFACT_STORAGE.md` §5), since this project is still single-host and those files are operator/compliance records, never customer-downloadable.
 
 ### Secret/KMS
 
@@ -66,7 +68,16 @@ This document extracts real infrastructure requirements from the scanner archite
 
 ### Email
 
-**Not built at all.** Needed eventually for account verification, job-completion notifications, and incident communication — no code exists for this today, and it is not a scanner-engine concern (correctly out of scope for this audit's focus).
+**Slice 17 update**: real transactional delivery now exists.
+`ProductionMailProvider` (`apps/api/src/webguard_api/mail.py`) sends
+account verification, password reset, invitation, and password-changed
+notification email through Postmark, reached through a duck-typed
+`PostmarkClientProtocol` (built on the standard library, no vendor SDK
+dependency). See `docs/production/TRANSACTIONAL_EMAIL.md` for the full
+design. Job-completion/scan-result notifications and incident
+communication remain **not built** — the notification model itself
+(what, how often, opt-out) is not yet defined, and this slice's own
+brief explicitly instructed against guessing at it.
 
 ## What NOT to build first
 

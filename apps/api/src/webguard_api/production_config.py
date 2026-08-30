@@ -99,6 +99,20 @@ class ProductionServiceConfig:
     authorization_directory: str
     artifact_directory: str
     cursor_signing_secret: str
+    # Slice 17 requirement 21: production must not silently fall back
+    # to DevelopmentMailProvider/LocalArtifactStore -- every field
+    # below is required (no default), exactly like signing_provider/
+    # kms_key_id above, for the identical reason (a missing or
+    # copied-from-dev value must be a startup failure, never a quiet
+    # downgrade to a weaker backend).
+    mail_provider: str
+    postmark_server_token: str
+    mail_from_address: str
+    web_app_base_url: str
+    object_storage_provider: str
+    object_storage_bucket: str
+    object_storage_region: str
+    object_storage_kms_key_id: str
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     database_pool_minimum: int = DEFAULT_DATABASE_POOL_MINIMUM
@@ -171,6 +185,50 @@ class ProductionServiceConfig:
             raise ProductionConfigError(
                 "production_config_secret_provider_invalid",
                 'secret_provider must be unset or exactly "aws_secrets_manager".',
+            )
+        if self.mail_provider != "postmark":  # noqa: S105 - a provider-selector enum value, not a credential
+            raise ProductionConfigError(
+                "production_config_mail_provider_invalid",
+                'mail_provider must be exactly "postmark" in production.',
+            )
+        if not self.postmark_server_token.strip():
+            raise ProductionConfigError(
+                "production_config_missing",
+                "postmark_server_token is required when mail_provider is postmark.",
+            )
+        if not self.mail_from_address.strip() or "@" not in self.mail_from_address:
+            raise ProductionConfigError(
+                "production_config_invalid",
+                "mail_from_address must be a valid-looking email address.",
+            )
+        if not self.web_app_base_url.strip() or not (
+            self.web_app_base_url.startswith("https://") or self.web_app_base_url.startswith("http://")
+        ):
+            raise ProductionConfigError(
+                "production_config_invalid",
+                "web_app_base_url must be an absolute http(s) URL.",
+            )
+        if self.object_storage_provider != "s3":
+            raise ProductionConfigError(
+                "production_config_object_storage_provider_invalid",
+                'object_storage_provider must be exactly "s3" in production.',
+            )
+        if not self.object_storage_bucket.strip():
+            raise ProductionConfigError(
+                "production_config_missing",
+                "object_storage_bucket is required when object_storage_provider is s3.",
+            )
+        if not self.object_storage_region.strip():
+            raise ProductionConfigError(
+                "production_config_missing",
+                "object_storage_region is required when object_storage_provider is s3.",
+            )
+        if not self.object_storage_kms_key_id.strip():
+            raise ProductionConfigError(
+                "production_config_missing",
+                "object_storage_kms_key_id is required when object_storage_provider is s3 "
+                "(artifacts must be encrypted at rest with a customer-managed key -- see "
+                "docs/production/ARTIFACT_STORAGE.md).",
             )
         try:
             decoded_cursor_secret = base64.urlsafe_b64decode(
@@ -257,6 +315,14 @@ class ProductionServiceConfig:
             authorization_directory=_require_env("WEBGUARD_AUTHORIZATION_DIRECTORY"),
             artifact_directory=_require_env("WEBGUARD_ARTIFACT_DIRECTORY"),
             cursor_signing_secret=_require_env("WEBGUARD_CURSOR_SIGNING_SECRET"),
+            mail_provider=_require_env("WEBGUARD_MAIL_PROVIDER"),
+            postmark_server_token=_require_env("WEBGUARD_POSTMARK_SERVER_TOKEN"),
+            mail_from_address=_require_env("WEBGUARD_MAIL_FROM_ADDRESS"),
+            web_app_base_url=_require_env("WEBGUARD_WEB_APP_BASE_URL"),
+            object_storage_provider=_require_env("WEBGUARD_OBJECT_STORAGE_PROVIDER"),
+            object_storage_bucket=_require_env("WEBGUARD_OBJECT_STORAGE_BUCKET"),
+            object_storage_region=_require_env("WEBGUARD_OBJECT_STORAGE_REGION"),
+            object_storage_kms_key_id=_require_env("WEBGUARD_OBJECT_STORAGE_KMS_KEY_ID"),
             host=os.environ.get("WEBGUARD_HOST", DEFAULT_HOST),
             port=int(os.environ.get("WEBGUARD_PORT", str(DEFAULT_PORT))),
             database_pool_minimum=pool_minimum,

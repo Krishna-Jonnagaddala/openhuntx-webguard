@@ -1,9 +1,14 @@
+import { readFileSync } from "node:fs";
 import { expect, test } from "@playwright/test";
 
 /**
- * Slice 15 requirement 28 (rewritten for Slice 16 requirement 24): the
- * full product flow driven through the real browser UI, against the
- * real production-mode API + PostgreSQL + worker started by
+ * Slice 15 requirement 28 (rewritten for Slice 16 requirement 24, and
+ * again for Slice 17 requirements 15/24 -- the report step now proves
+ * a real download against real, if network-substituted, S3-shaped
+ * object storage, replacing the old expected
+ * "object-storage artifact persistence is not implemented" error):
+ * the full product flow driven through the real browser UI, against
+ * the real production-mode API + PostgreSQL + worker started by
  * `global-setup.ts`. Every step below is the same click/type a human
  * operator would perform -- nothing here reaches around the UI to
  * poke the API directly.
@@ -82,19 +87,14 @@ test("full customer platform flow: sign in, add asset, verify, scan, findings, r
   const findingCount = Number((findingsHeadingText ?? "").match(/\((\d+)\)/)?.[1] ?? "0");
   expect(findingCount).toBeGreaterThan(0);
 
-  // -- request a report for this completed scan. Object-storage
-  // artifact persistence is a known, documented gap (see
-  // docs/audit/customer-platform-phase1.md): this disposable stack
-  // has no S3 provisioned (requirement 29 forbids provisioning one
-  // without separate approval), so the backend honestly refuses
-  // rather than silently treating a local path as durable cloud
-  // storage. The frontend must surface that real error, not paper
-  // over it -- so this assertion is a correctness check on error
-  // handling, not a workaround. --
+  // -- request a report for this completed scan. Slice 17 requirement
+  // 15 completes what Slice 15 could only honestly refuse: the
+  // report's bytes now actually land in the (fake-S3-backed, real
+  // ObjectStorageArtifactStore code path) object store the harness
+  // wires up, so this succeeds for real rather than surfacing
+  // "object-storage artifact persistence is not implemented". --
   await page.getByRole("button", { name: "Request report" }).click();
-  await expect(page.getByText(/object-storage artifact persistence is not implemented/i)).toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(page.getByText(/A report has been requested for this scan/i)).toBeVisible({ timeout: 10_000 });
 
   // -- dashboard reflects the completed scan and its findings --
   await page.goto("/");
@@ -111,11 +111,30 @@ test("full customer platform flow: sign in, add asset, verify, scan, findings, r
   await page.getByRole("button", { name: "Submit" }).click();
   await expect(page.getByText("confirmed", { exact: true }).first()).toBeVisible();
 
-  // -- the reports list itself is real and reachable (report creation
-  // is blocked by the known object-storage gap above, not by this
-  // page) --
+  // -- Slice 17 requirement 15: the customer downloads the real
+  // report and its bytes are validated -- through the actual UI's
+  // download button (a Blob URL + synthetic <a download> click,
+  // Playwright's download interception captures it identically to a
+  // real navigation-triggered download), reading the saved file and
+  // confirming it parses as the real, completed WebGuardReport this
+  // scan actually produced, not an empty placeholder or an error body. --
   await page.goto("/reports");
   await expect(page.getByRole("heading", { name: "Reports" })).toBeVisible();
+  // The reports table lists by scan_id, not target URL -- this test's
+  // scan is the only report that exists at this point in the run.
+  const reportRow = page.getByRole("row").filter({ has: page.getByRole("button", { name: "Download" }) }).first();
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    reportRow.getByRole("button", { name: "Download" }).click(),
+  ]);
+  const downloadedPath = await download.path();
+  expect(downloadedPath).not.toBeNull();
+  const downloadedBytes = readFileSync(downloadedPath!);
+  expect(downloadedBytes.length).toBeGreaterThan(0);
+  const downloadedReport = JSON.parse(downloadedBytes.toString("utf-8"));
+  expect(downloadedReport.target).toBe(TARGET_URL);
+  expect(Array.isArray(downloadedReport.findings)).toBe(true);
+  expect(downloadedReport.findings.length).toBeGreaterThan(0);
 
   // -- sign out through the real UI: this revokes the session
   // server-side (not just a client-side state clear), so the browser

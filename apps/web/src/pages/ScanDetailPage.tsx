@@ -21,11 +21,13 @@ function RequestReportPanel({ scanId }: { scanId: string }) {
   return (
     <div>
       <Button variant="secondary" onClick={() => create.mutate(scanId)} disabled={create.isPending}>
-        {create.isPending ? "Requesting…" : "Request report"}
+        {create.isPending ? "Generating report…" : "Request report"}
       </Button>
       {create.isError ? (
         <p role="alert" className="mt-2 text-sm text-[var(--color-danger)]">
-          {create.error instanceof ApiError ? create.error.message : "Unable to request a report."}
+          {create.error instanceof ApiError
+            ? create.error.message
+            : "We couldn't generate this report. Please try again."}
         </p>
       ) : null}
     </div>

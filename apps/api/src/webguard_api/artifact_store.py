@@ -20,18 +20,23 @@ speculative surface this project's own conventions reject (see
 ``LocalArtifactStore`` is a real, fully-implemented backend -- the
 existing filesystem behavior (`apps/api/src/webguard_api/executor.py`'s
 `_prepare_private_directory`/`_write_report`), reusable now that it has
-a name. ``ObjectStorageArtifactStore`` exists to validate that the
-interface is genuinely implementable by something other than a local
-path -- every method is fully specified and raises a clear, honest
-"not yet implemented" error rather than a stub that silently does
-nothing; per this slice's explicit instruction, this does not include a
-real S3 SDK integration, since nothing in this slice's scope requires
-one to exist yet (no code path in this slice writes to object storage;
-`docs/production/INFRASTRUCTURE_REQUIREMENTS.md`'s object-storage
-section already tracks that as future work). Production must never
-treat a local path as durable cloud storage -- see
-``build_production_components``, which never constructs
-``LocalArtifactStore`` for a production deployment.
+a name.
+
+``ObjectStorageArtifactStore`` (completed in Slice 17 requirement 7) is
+a real S3-backed implementation, reached through ``S3ClientProtocol`` --
+a structural duck-type of the subset of ``boto3``'s S3 client this
+module calls, mirroring ``secret_provider.py``'s
+``SecretsManagerClientProtocol`` and ``signing.py``'s
+``KmsClientProtocol`` exactly. This module never imports ``boto3``
+directly (see ``cli.py``'s ``_production_components()`` for the one
+call site that does, and why); a real ``boto3.client("s3")`` satisfies
+this protocol structurally, and a plain fake satisfies it in tests.
+Every artifact is written with server-side encryption
+(``ServerSideEncryption="aws:kms"``, a specific customer-managed key --
+see ``docs/production/ARTIFACT_STORAGE.md`` §3 for why SSE-KMS was
+chosen over SSE-S3). Production must never treat a local path as
+durable cloud storage -- see ``build_production_components``, which
+never constructs ``LocalArtifactStore`` for a production deployment.
 """
 
 from __future__ import annotations
@@ -148,41 +153,129 @@ class LocalArtifactStore:
         return hashlib.sha256(self.get_reference(reference)).hexdigest()
 
 
+class S3ClientProtocol(Protocol):
+    """Structural shape of the subset of ``boto3``'s S3 client this
+    module calls -- satisfied by a real ``boto3.client("s3")`` without
+    this package importing ``boto3``, and by a plain fake in tests."""
+
+    def put_object(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        Body: bytes,
+        ServerSideEncryption: str,
+        SSEKMSKeyId: str,
+        ContentType: str,
+    ) -> dict: ...
+
+    def get_object(self, *, Bucket: str, Key: str) -> dict: ...
+
+    def head_object(self, *, Bucket: str, Key: str) -> dict: ...
+
+    def delete_object(self, *, Bucket: str, Key: str) -> dict: ...
+
+
+def _s3_error_code(exc: Exception) -> str | None:
+    """Extract ``response["Error"]["Code"]`` from a real (or fake)
+    ``botocore.exceptions.ClientError``-shaped exception without
+    importing ``botocore`` to check ``isinstance`` -- structural, like
+    everything else this module accepts from an injected client."""
+
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return None
+    error = response.get("Error")
+    return error.get("Code") if isinstance(error, dict) else None
+
+
+def _translate_s3_error(exc: Exception, reference: str, *, operation: str) -> ArtifactStoreError:
+    """Never propagates the raw vendor exception text -- only a fixed,
+    already-reviewed message per failure class (requirement 6's "avoid
+    leaking vendor-internal responses directly to users", applied here
+    to storage the same way it applies to mail)."""
+
+    code = _s3_error_code(exc)
+    if code in ("NoSuchKey", "404", "NotFound"):
+        return ArtifactStoreError("artifact_not_found", f"Artifact {reference} was not found.")
+    if code in ("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"):
+        return ArtifactStoreError("artifact_storage_access_denied", "Access to the artifact store was denied.")
+    return ArtifactStoreError(f"artifact_{operation}_failed", f"Unable to {operation} artifact {reference}.")
+
+
 class ObjectStorageArtifactStore:
-    """Interface validation only (Slice 14 requirement 6) -- proves
-    ``ArtifactStore`` is genuinely implementable by a non-filesystem
-    backend without committing to a specific provider, SDK dependency,
-    or credential model this slice does not need to decide. A real
-    implementation (S3, GCS, Azure Blob) is Slice 15 work, once
-    ``docs/production/INFRASTRUCTURE_REQUIREMENTS.md``'s object-storage
-    requirement is actually being built, not merely anticipated."""
+    """Production object-storage backend (Slice 17 requirement 7):
+    AWS S3, reached only through the injected, duck-typed
+    ``S3ClientProtocol`` -- this class never imports or depends on
+    ``boto3`` directly. Every write is server-side encrypted with a
+    specific customer-managed KMS key (SSE-KMS, not the AWS-managed
+    SSE-S3 default -- see ``docs/production/ARTIFACT_STORAGE.md`` §3
+    for the deliberate choice). ``checksum()`` reads the object back
+    and hashes it directly, exactly like ``LocalArtifactStore`` --
+    S3's own ``ETag`` is not a reliable SHA-256 substitute (it is an
+    MD5 only for a single-part, non-KMS-encrypted upload, and this
+    store always uses SSE-KMS).
 
-    def __init__(self, *, bucket: str) -> None:
+    Object keys are never accepted from a caller-controlled filename --
+    every ``reference`` this store ever receives was already
+    constructed server-side (``executor.py``'s
+    ``organizations/<org-id>/jobs/<job-id>/report.json`` scheme, never
+    a customer-supplied string), and ``_reject_unsafe_reference``
+    (shared with ``LocalArtifactStore``) rejects path-traversal/
+    absolute-path shapes identically for both backends."""
+
+    def __init__(self, *, bucket: str, client: S3ClientProtocol, kms_key_id: str) -> None:
         self._bucket = bucket
-
-    @staticmethod
-    def _not_implemented() -> ArtifactStoreError:
-        return ArtifactStoreError(
-            "object_storage_not_implemented",
-            "Object-storage artifact persistence is not implemented yet "
-            "(Slice 15). Production deployments must not treat a local "
-            "path as durable cloud storage in the meantime.",
-        )
+        self._client = client
+        self._kms_key_id = kms_key_id
 
     def put(self, reference: str, data: bytes) -> str:
-        raise self._not_implemented()
+        _reject_unsafe_reference(reference)
+        try:
+            self._client.put_object(
+                Bucket=self._bucket,
+                Key=reference,
+                Body=data,
+                ServerSideEncryption="aws:kms",
+                SSEKMSKeyId=self._kms_key_id,
+                ContentType="application/json",
+            )
+        except Exception as exc:  # noqa: BLE001 - translated into a fixed ArtifactStoreError below
+            raise _translate_s3_error(exc, reference, operation="write") from exc
+        return hashlib.sha256(data).hexdigest()
 
     def get_reference(self, reference: str) -> bytes:
-        raise self._not_implemented()
+        _reject_unsafe_reference(reference)
+        try:
+            response = self._client.get_object(Bucket=self._bucket, Key=reference)
+            return response["Body"].read()
+        except Exception as exc:  # noqa: BLE001 - translated into a fixed ArtifactStoreError below
+            raise _translate_s3_error(exc, reference, operation="read") from exc
 
     def exists(self, reference: str) -> bool:
-        raise self._not_implemented()
+        try:
+            _reject_unsafe_reference(reference)
+            self._client.head_object(Bucket=self._bucket, Key=reference)
+            return True
+        except ArtifactStoreError:
+            return False
+        except Exception as exc:  # noqa: BLE001 - translated below, then narrowed to a bool
+            translated = _translate_s3_error(exc, reference, operation="check")
+            if translated.code == "artifact_not_found":
+                return False
+            raise translated from exc
 
     def delete(self, reference: str) -> None:
-        raise self._not_implemented()
+        _reject_unsafe_reference(reference)
+        try:
+            self._client.delete_object(Bucket=self._bucket, Key=reference)
+        except Exception as exc:  # noqa: BLE001 - translated below; not-found is not an error (see ArtifactStore.delete)
+            translated = _translate_s3_error(exc, reference, operation="delete")
+            if translated.code != "artifact_not_found":
+                raise translated from exc
 
     def checksum(self, reference: str) -> str:
-        raise self._not_implemented()
+        return hashlib.sha256(self.get_reference(reference)).hexdigest()
 
 
 __all__ = [
@@ -190,4 +283,5 @@ __all__ = [
     "ArtifactStoreError",
     "LocalArtifactStore",
     "ObjectStorageArtifactStore",
+    "S3ClientProtocol",
 ]

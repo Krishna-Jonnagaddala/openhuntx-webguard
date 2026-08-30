@@ -1,23 +1,64 @@
-"""Mail provider abstraction (Slice 16 requirement 26).
+"""Mail provider abstraction (Slice 16 requirement 26; production
+delivery completed in Slice 17 requirement 1).
 
-No production transactional-email integration exists yet -- deliberately.
-This module defines the narrow interface a real provider (Postmark, SES,
-...) would implement later, plus two backends usable today: a logging
-sink for local/dev use (an operator running the API locally can read the
-verification/reset link straight off the console) and an in-memory sink
-purpose-built for tests (including the browser E2E suite, which needs to
-read a just-sent link without any real mail transport existing).
+Defines the narrow interface identity-domain code (``service.py``)
+depends on -- ``send(to, subject, body, category)`` and nothing else --
+plus four backends:
+
+- ``DevelopmentMailProvider`` (renamed from Slice 16's
+  ``LoggingMailProvider``) -- writes the message to the application log.
+  Local/dev default only; a real production deployment must configure
+  ``ProductionMailProvider`` explicitly (``production_config.py`` fails
+  closed otherwise). Still logs the full message body, including the
+  one-time token embedded in a verification/reset/invitation link --
+  a local/dev console is not a production log-aggregation exposure
+  surface, matching every other local-vs-production distinction this
+  project already draws.
+- ``InMemoryMailProvider`` -- test-only sink, unchanged from Slice 16.
+- ``ProductionMailProvider`` -- real transactional delivery via
+  Postmark (``docs/production/PROVIDER_EVALUATION.md``'s own
+  recommendation), through an injected ``PostmarkClientProtocol``
+  rather than a vendor SDK import -- mirroring ``secret_provider.py``'s
+  and ``signing.py``'s established duck-typed-client pattern exactly,
+  so ``service.py`` never couples to Postmark (or any vendor) directly.
+  Logs only non-sensitive delivery metadata (category, recipient,
+  provider message ID, outcome) -- **never** the message body or its
+  embedded one-time token (requirement 3's "ensure logs never contain
+  those tokens").
+- ``PostmarkHttpClient`` -- the real HTTPS transport, using only the
+  standard library (``http.client``/``json``), matching this
+  codebase's established outbound-HTTP convention (see
+  ``workers/scanner/src/webguard_scanner/safe_http.py``) rather than
+  adding a new SDK dependency for a single POST-JSON exchange.
+
+Failure classification (requirement 6): every delivery failure is a
+``MailDeliveryError`` carrying a ``category`` -- ``"temporary"``,
+``"permanent"``, ``"configuration"``, ``"rate_limited"``, or
+``"timeout"`` -- classified primarily from the HTTP status code (the
+part of the contract this module trusts completely) and secondarily
+from a small, well-documented set of stable Postmark ``ErrorCode``
+values, never from free-text vendor messages. ``ProductionMailProvider``
+retries exactly once, and only for a ``temporary``/``timeout``
+classification, reusing the identical already-built payload -- the
+one-time token was already embedded in it before this class ever sees
+it, so a transport retry never causes a caller to mint a second one
+(requirement 6's "one-time tokens must not accidentally be regenerated
+on every transport retry"). A vendor's raw response text is logged internally for operator debugging only; it never becomes part of a
+``MailDeliveryError``'s own ``message`` (requirement 20 -- no vendor
+leakage to the customer-facing surface).
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 _logger = logging.getLogger("webguard_api.mail")
 
@@ -35,7 +76,24 @@ class MailProvider(Protocol):
     def send(self, *, to: str, subject: str, body: str, category: str) -> None: ...
 
 
-class LoggingMailProvider:
+class MailDeliveryError(RuntimeError):
+    """A controlled, sanitized mail-delivery failure. ``category`` is
+    one of ``"temporary"``, ``"permanent"``, ``"configuration"``,
+    ``"rate_limited"``, ``"timeout"`` -- callers use it to decide
+    whether the failure is worth surfacing distinctly (e.g. to an
+    admin inviting a teammate) or must be swallowed uniformly (e.g.
+    the anti-enumeration password-reset-request response, which must
+    look identical to callers regardless of whether delivery
+    succeeded)."""
+
+    def __init__(self, code: str, message: str, *, category: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.category = category
+
+
+class DevelopmentMailProvider:
     """Local/dev default: writes the message to the application log
     instead of sending it. An operator running the API locally can read
     a verification/reset/invitation link straight off the console."""
@@ -89,9 +147,187 @@ class InMemoryMailProvider:
         return matches[-1] if matches else None
 
 
+class PostmarkClientProtocol(Protocol):
+    """Structural shape of the one Postmark operation this module
+    calls -- satisfied by a real ``PostmarkHttpClient`` (below) or a
+    plain fake in tests, exactly like ``secret_provider.py``'s
+    ``SecretsManagerClientProtocol`` and ``signing.py``'s
+    ``KmsClientProtocol``."""
+
+    def send_email(self, payload: dict) -> dict:
+        """POST ``payload`` to Postmark's ``/email`` endpoint and
+        return ``{"status_code": int, "body": dict}``. Raises
+        ``MailDeliveryError`` (category ``"timeout"`` or
+        ``"temporary"``) on a transport-level failure -- a real HTTP
+        error response (4xx/5xx) is returned normally, not raised,
+        since classifying it is ``ProductionMailProvider``'s job, not
+        the transport's."""
+        ...
+
+
+class PostmarkHttpClient:
+    """Real HTTPS transport to Postmark's REST API using only the
+    standard library -- no vendor SDK dependency for a single
+    POST-JSON-get-JSON exchange, matching
+    ``webguard_scanner.safe_http``'s own stdlib-only convention."""
+
+    _HOST = "api.postmarkapp.com"
+    _PATH = "/email"
+
+    def __init__(self, *, server_token: str, timeout_seconds: float = 10.0) -> None:
+        self._server_token = server_token
+        self._timeout_seconds = timeout_seconds
+
+    def send_email(self, payload: dict) -> dict:
+        body = json.dumps(payload).encode("utf-8")
+        connection = http.client.HTTPSConnection(self._HOST, timeout=self._timeout_seconds)
+        try:
+            connection.request(
+                "POST",
+                self._PATH,
+                body=body,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "X-Postmark-Server-Token": self._server_token,
+                },
+            )
+            response = connection.getresponse()
+            raw = response.read()
+            status_code = response.status
+        except TimeoutError as exc:
+            raise MailDeliveryError(
+                "mail_transport_timeout", "Timed out contacting the mail provider.", category="timeout"
+            ) from exc
+        except OSError as exc:
+            raise MailDeliveryError(
+                "mail_transport_unreachable", "Unable to reach the mail provider.", category="temporary"
+            ) from exc
+        finally:
+            connection.close()
+        try:
+            parsed = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise MailDeliveryError(
+                "mail_provider_response_invalid",
+                "The mail provider returned an unparseable response.",
+                category="temporary",
+            ) from exc
+        return {"status_code": status_code, "body": parsed if isinstance(parsed, dict) else {}}
+
+
+def _classify_postmark_failure(*, status_code: int | None, error_code: object, vendor_message: object) -> MailDeliveryError:
+    """Classify a non-success Postmark response. Primarily driven by
+    the HTTP status code (a contract this module trusts completely);
+    a small set of stable, long-documented Postmark ``ErrorCode``
+    values refines that further. The raw ``vendor_message`` is never
+    placed on the returned error's own ``.message`` -- callers may log
+    it separately, but nothing here propagates vendor text outward
+    (requirement 20)."""
+
+    if status_code == 429:
+        return MailDeliveryError(
+            "mail_rate_limited", "The mail provider is rate-limiting this account.", category="rate_limited"
+        )
+    if status_code in (401, 403) or error_code == 10:
+        return MailDeliveryError(
+            "mail_provider_misconfigured",
+            "The mail provider rejected the configured credentials.",
+            category="configuration",
+        )
+    if isinstance(status_code, int) and status_code >= 500:
+        return MailDeliveryError(
+            "mail_provider_unavailable", "The mail provider is temporarily unavailable.", category="temporary"
+        )
+    if error_code == 406:
+        return MailDeliveryError(
+            "mail_recipient_inactive",
+            "The recipient address is inactive or has previously bounced.",
+            category="permanent",
+        )
+    if isinstance(status_code, int) and 400 <= status_code < 500:
+        return MailDeliveryError(
+            "mail_rejected", "The mail provider rejected this message.", category="permanent"
+        )
+    return MailDeliveryError(
+        "mail_delivery_failed", "The mail provider returned an unexpected response.", category="temporary"
+    )
+
+
+class ProductionMailProvider:
+    """Postmark-backed transactional email. Domain logic here never
+    touches a vendor SDK -- only ``PostmarkClientProtocol``. Retries
+    exactly once, only for a ``temporary``/``timeout`` classification,
+    with the identical payload (see module docstring)."""
+
+    def __init__(
+        self,
+        client: PostmarkClientProtocol,
+        *,
+        from_address: str,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._client = client
+        self._from_address = from_address
+        self._sleep = sleep
+
+    def send(self, *, to: str, subject: str, body: str, category: str) -> None:
+        payload = {
+            "From": self._from_address,
+            "To": to,
+            "Subject": subject,
+            "TextBody": body,
+            "MessageStream": "outbound",
+            # Postmark's own message-categorization field (shows up in
+            # their dashboard/analytics and any configured webhook) --
+            # a legitimate, vendor-native way to carry the low-
+            # cardinality "template/event type" requirement 5 asks
+            # for, without inventing a WebGuard-specific header.
+            "Tag": category,
+        }
+        attempts = 2
+        last_error: MailDeliveryError | None = None
+        for attempt in range(attempts):
+            try:
+                result = self._client.send_email(payload)
+            except MailDeliveryError as exc:
+                last_error = exc
+                if exc.category in ("temporary", "timeout") and attempt < attempts - 1:
+                    self._sleep(0.5)
+                    continue
+                _logger.warning("mail delivery failed category=%s reason=%s", category, exc.category)
+                raise
+            status_code = result.get("status_code")
+            response_body = result.get("body") or {}
+            error_code = response_body.get("ErrorCode")
+            if status_code == 200 and error_code == 0:
+                _logger.info(
+                    "mail delivered category=%s message_id=%s", category, response_body.get("MessageID")
+                )
+                return
+            classified = _classify_postmark_failure(
+                status_code=status_code, error_code=error_code, vendor_message=response_body.get("Message")
+            )
+            last_error = classified
+            if classified.category in ("temporary", "timeout") and attempt < attempts - 1:
+                _logger.info(
+                    "mail delivery attempt failed, retrying category=%s reason=%s", category, classified.category
+                )
+                self._sleep(0.5)
+                continue
+            _logger.warning("mail delivery failed category=%s reason=%s", category, classified.category)
+            raise classified
+        assert last_error is not None  # pragma: no cover - loop always returns or raises
+        raise last_error
+
+
 __all__ = [
+    "DevelopmentMailProvider",
     "InMemoryMailProvider",
-    "LoggingMailProvider",
+    "MailDeliveryError",
     "MailMessage",
     "MailProvider",
+    "PostmarkClientProtocol",
+    "PostmarkHttpClient",
+    "ProductionMailProvider",
 ]

@@ -380,6 +380,39 @@ class CustomerPlatformApiTests(unittest.TestCase):
         status, _, payload = self.json_request("GET", f"/v1/reports/{report_id}/download", token="viewer")
         self.assertEqual(status, 200)  # viewer has REPORT_READ
 
+    def test_report_download_fails_closed_when_bytes_do_not_match_the_persisted_checksum(self) -> None:
+        """Slice 17 requirement 14: a report artifact that has been
+        corrupted or truncated *after* its checksum was computed and
+        persisted (`create_report`) must never be served -- the
+        download must fail closed with a clear error, not silently
+        hand the customer bytes that no longer match what was
+        checksummed at registration time."""
+
+        scan = self.service.scan_repository.create_scan(
+            organization_id=self.context.organization_id, job_id="77777777-7777-4777-8777-777777777777",
+            target="https://report-integrity.example/", authorization_id="8ae6403f-7832-498c-b37e-c0c87be19ea1",
+            mode="single_page", scanner_version="1.0", now=NOW,
+        )
+        report_path = self.artifact_root / "integrity-report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text('{"status": "completed"}', encoding="utf-8")
+        self.service.scan_repository.complete_scan(
+            scan.scan_id, organization_id=self.context.organization_id, status="completed",
+            report_ref="integrity-report.json", finding_count=0, now=NOW,
+        )
+        status, _, created = self.json_request("POST", "/v1/reports", {"scan_id": scan.scan_id})
+        self.assertEqual(status, 201, created)
+        report_id = created["report_id"]
+
+        # Corrupt the artifact on disk *after* its checksum was
+        # computed and persisted -- exactly the scenario a truncated
+        # write or a bit-flip in storage would produce.
+        report_path.write_text('{"status": "tampered"}', encoding="utf-8")
+
+        status, _, payload = self.json_request("GET", f"/v1/reports/{report_id}/download")
+        self.assertEqual(status, 500, payload)
+        self.assertEqual(payload["error"]["code"], "report_integrity_check_failed")
+
 
 if __name__ == "__main__":
     unittest.main()

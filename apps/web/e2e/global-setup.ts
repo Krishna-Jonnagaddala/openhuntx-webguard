@@ -11,9 +11,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * worker) plus a controlled HTTPS fixture asset, via
  * `tests/integration/webguard_e2e_server.py`. Its readiness line
  * (base URL, bootstrapped owner email/password for a real browser
- * login, an owner API token, fixture target URL) is published into
- * `process.env` for the spec files to read -- the spec itself never
- * constructs its own backend state.
+ * login, an owner API token, fixture target URL, and -- Slice 17 --
+ * a mail-sink JSON Lines file path) is published into `process.env`
+ * for the spec files to read -- the spec itself never constructs its
+ * own backend state. The mail sink lets a spec read the exact
+ * verification/reset/invitation link the real (fake-Postmark-backed)
+ * `ProductionMailProvider` code path just "sent", with no real mail
+ * transport and no new production-reachable endpoint.
  */
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
@@ -44,6 +48,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     owner_password: string;
     target_url: string;
     organization_id: string;
+    mail_sink_path: string;
   }>((resolve, reject) => {
     const timeout = setTimeout(() => {
       reject(new Error(`Timed out waiting for the E2E API server. Stderr so far:\n${stderrChunks.join("")}`));
@@ -74,6 +79,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   process.env.WEBGUARD_E2E_OWNER_EMAIL = ready.owner_email;
   process.env.WEBGUARD_E2E_OWNER_PASSWORD = ready.owner_password;
   process.env.WEBGUARD_E2E_TARGET_URL = ready.target_url;
+  process.env.WEBGUARD_E2E_MAIL_SINK_PATH = ready.mail_sink_path;
   process.env.VITE_API_BASE_URL = ready.base_url;
 
   return async () => {

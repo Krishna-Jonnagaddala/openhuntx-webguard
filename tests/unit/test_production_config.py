@@ -22,6 +22,14 @@ VALID_KWARGS = dict(
     authorization_directory="/var/webguard/authorizations",
     artifact_directory="/var/webguard/artifacts",
     cursor_signing_secret="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+    mail_provider="postmark",
+    postmark_server_token="postmark-server-token-placeholder",  # noqa: S105 - a test fixture value, not a real credential
+    mail_from_address="alerts@webguard.example",
+    web_app_base_url="https://app.webguard.example",
+    object_storage_provider="s3",
+    object_storage_bucket="webguard-production-artifacts",
+    object_storage_region="eu-west-2",
+    object_storage_kms_key_id="arn:aws:kms:eu-west-2:111111111111:key/def-456",
 )
 
 
@@ -97,6 +105,41 @@ class ProductionServiceConfigTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "production_config_invalid")
 
+    def test_wrong_mail_provider_is_rejected(self) -> None:
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "mail_provider": "sendgrid"})
+        self.assertEqual(caught.exception.code, "production_config_mail_provider_invalid")
+
+    def test_missing_postmark_server_token_is_rejected(self) -> None:
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "postmark_server_token": ""})
+        self.assertEqual(caught.exception.code, "production_config_missing")
+
+    def test_invalid_mail_from_address_is_rejected(self) -> None:
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "mail_from_address": "not-an-email"})
+        self.assertEqual(caught.exception.code, "production_config_invalid")
+
+    def test_web_app_base_url_must_be_absolute_http_url(self) -> None:
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "web_app_base_url": "app.webguard.example"})
+        self.assertEqual(caught.exception.code, "production_config_invalid")
+
+    def test_wrong_object_storage_provider_is_rejected(self) -> None:
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "object_storage_provider": "gcs"})
+        self.assertEqual(caught.exception.code, "production_config_object_storage_provider_invalid")
+
+    def test_missing_object_storage_bucket_is_rejected(self) -> None:
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "object_storage_bucket": ""})
+        self.assertEqual(caught.exception.code, "production_config_missing")
+
+    def test_missing_object_storage_kms_key_id_is_rejected(self) -> None:
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "object_storage_kms_key_id": ""})
+        self.assertEqual(caught.exception.code, "production_config_missing")
+
     def test_from_environment_fails_closed_when_variables_are_missing(self) -> None:
         import os
 
@@ -130,6 +173,14 @@ class ProductionServiceConfigTests(unittest.TestCase):
                     "WEBGUARD_AUTHORIZATION_DIRECTORY": "/var/webguard/authorizations",
                     "WEBGUARD_ARTIFACT_DIRECTORY": "/var/webguard/artifacts",
                     "WEBGUARD_CURSOR_SIGNING_SECRET": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+                    "WEBGUARD_MAIL_PROVIDER": "postmark",
+                    "WEBGUARD_POSTMARK_SERVER_TOKEN": "postmark-server-token-placeholder",
+                    "WEBGUARD_MAIL_FROM_ADDRESS": "alerts@webguard.example",
+                    "WEBGUARD_WEB_APP_BASE_URL": "https://app.webguard.example",
+                    "WEBGUARD_OBJECT_STORAGE_PROVIDER": "s3",
+                    "WEBGUARD_OBJECT_STORAGE_BUCKET": "webguard-production-artifacts",
+                    "WEBGUARD_OBJECT_STORAGE_REGION": "eu-west-2",
+                    "WEBGUARD_OBJECT_STORAGE_KMS_KEY_ID": "arn:aws:kms:eu-west-2:111111111111:key/def-456",
                 }
             )
             config = ProductionServiceConfig.from_environment()

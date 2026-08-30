@@ -95,3 +95,25 @@ variable "postgres_deletion_protection" {
   type        = bool
   default     = true
 }
+
+variable "object_storage_retention_days" {
+  description = "How long a report/evidence artifact object is kept before S3 expires it (Slice 17 requirement 13). 400 days is a reasonable default retention window for a security-report product; revisit against a real compliance/data-retention policy before relying on it."
+  type        = number
+  default     = 400
+
+  validation {
+    condition     = var.object_storage_retention_days >= 1
+    error_message = "object_storage_retention_days must be at least 1."
+  }
+}
+
+variable "object_storage_transition_days" {
+  description = "How long a report/evidence artifact object stays in S3 Standard before transitioning to Standard-IA (cheaper, still immediately readable). Must be less than object_storage_retention_days."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.object_storage_transition_days >= 1
+    error_message = "object_storage_transition_days must be at least 1."
+  }
+}

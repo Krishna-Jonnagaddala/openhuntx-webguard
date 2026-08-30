@@ -133,6 +133,56 @@ class ScanJobExecutorTests(unittest.TestCase):
         self.assertNotIn(str(self.artifacts), outcome.report_ref)
 
     @patch("webguard_api.executor.validate_target_url")
+    def test_report_is_written_through_an_injected_artifact_store_not_local_disk(self, validate_mock) -> None:
+        """Slice 17 requirement 7: when a real (non-Local) ArtifactStore
+        is injected -- exactly how production wires ObjectStorageArtifactStore
+        -- the completed report's bytes go through it, not the local
+        filesystem. The audit file and safety receipt are unaffected
+        (still local, unchanged -- this slice's object-storage
+        migration is scoped to reports only)."""
+        validate_mock.return_value = self.validated_target()
+        record = self.running_record(mode=ScanJobMode.SINGLE_PAGE)
+
+        class _FakeArtifactStore:
+            def __init__(self) -> None:
+                self.written: dict[str, bytes] = {}
+
+            def put(self, reference: str, data: bytes) -> str:
+                self.written[reference] = data
+                return "fake-checksum"
+
+            def get_reference(self, reference: str) -> bytes:
+                return self.written[reference]
+
+            def exists(self, reference: str) -> bool:
+                return reference in self.written
+
+            def delete(self, reference: str) -> None:
+                self.written.pop(reference, None)
+
+            def checksum(self, reference: str) -> str:
+                return "fake-checksum"
+
+        fake_store = _FakeArtifactStore()
+        executor = ScanJobExecutor(
+            authorizations=AuthorizationRepository(self.auth_dir),
+            store=self.store,
+            trustscan_signer=self.signer,
+            artifact_directory=self.artifacts,
+            clock=lambda: NOW,
+            single_scanner=lambda target, **kwargs: completed_report(kwargs["scan_id"]),
+            artifact_store=fake_store,
+        )
+        outcome = executor.execute(record)
+        self.assertIn(outcome.report_ref, fake_store.written)
+        report_on_disk = self.artifacts / outcome.report_ref
+        self.assertFalse(report_on_disk.exists(), "the report must not also land on local disk")
+        # The audit file and safety receipt are untouched by this
+        # slice's object-storage migration -- still local, as before.
+        self.assertTrue((self.artifacts / outcome.audit_ref).is_file())
+        self.assertTrue((self.artifacts / outcome.safety_receipt_ref).is_file())
+
+    @patch("webguard_api.executor.validate_target_url")
     def test_runtime_permit_revocation_blocks_next_request_and_writes_receipt(
         self, validate_mock
     ) -> None:

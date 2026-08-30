@@ -107,6 +107,13 @@ class CustomerAuthTests(unittest.TestCase):
     def session_headers(self, jar):
         return {"Cookie": f"wg_session={jar['wg_session']}", "X-CSRF-Token": jar["wg_csrf"]}
 
+    @staticmethod
+    def token_from(message):
+        """Slice 17: mail bodies now embed a clickable
+        `{base_url}/...?token=...` link, not a bare "...: {token}"
+        sentence -- extract the token from the query string."""
+        return message.body.rsplit("token=", 1)[1].strip()
+
     # -- Registration ------------------------------------------------
 
     def test_register_creates_session_and_verification_email(self) -> None:
@@ -408,7 +415,7 @@ class CustomerAuthTests(unittest.TestCase):
         _, jar, _ = self.register("reset2@x.example", password="a genuinely long password 123")
         self.request("POST", "/v1/auth/password/reset/request", {"email": "reset2@x.example"})
         message = self.mail.latest_to("reset2@x.example", category="password_reset")
-        token = message.body.rsplit(": ", 1)[1]
+        token = self.token_from(message)
         status, _, payload = self.request(
             "POST", "/v1/auth/password/reset/confirm", {"token": token, "new_password": "post reset password 123"}
         )
@@ -435,7 +442,7 @@ class CustomerAuthTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
         message = self.mail.latest_to("verify@x.example", category="email_verification")
-        token = message.body.rsplit(": ", 1)[1]
+        token = self.token_from(message)
         status, _, payload = self.request("POST", "/v1/auth/email/verify/confirm", {"token": token})
         self.assertEqual(status, 200, payload)
         status, _, payload = self.request(
@@ -447,7 +454,7 @@ class CustomerAuthTests(unittest.TestCase):
         _, jar, _ = self.register("verifyreplay@x.example")
         self.request("POST", "/v1/auth/email/verify/request", headers=self.session_headers(jar))
         message = self.mail.latest_to("verifyreplay@x.example", category="email_verification")
-        token = message.body.rsplit(": ", 1)[1]
+        token = self.token_from(message)
         self.request("POST", "/v1/auth/email/verify/confirm", {"token": token})
         status, _, payload = self.request("POST", "/v1/auth/email/verify/confirm", {"token": token})
         self.assertEqual(status, 400, payload)
@@ -463,7 +470,7 @@ class CustomerAuthTests(unittest.TestCase):
         self.assertEqual(status, 201, invited)
         message = self.mail.latest_to("invitee@x.example", category="invitation")
         self.assertIsNotNone(message)
-        token = message.body.rsplit(": ", 1)[1]
+        token = self.token_from(message)
         status, headers, payload = self.request(
             "POST", "/v1/auth/invitations/accept", {"token": token, "password": "invitee chosen password 123"}
         )
@@ -486,7 +493,7 @@ class CustomerAuthTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {self.owner_token}"},
         )
         message = self.mail.latest_to("once@x.example", category="invitation")
-        token = message.body.rsplit(": ", 1)[1]
+        token = self.token_from(message)
         self.request("POST", "/v1/auth/invitations/accept", {"token": token, "password": "first accept password 1"})
         status, _, payload = self.request(
             "POST", "/v1/auth/invitations/accept", {"token": token, "password": "second accept password 2"}

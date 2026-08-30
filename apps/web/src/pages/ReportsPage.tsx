@@ -11,7 +11,19 @@ async function downloadReport(reportId: string) {
     credentials: "include",
   });
   if (!response.ok) {
-    window.alert("Unable to download this report.");
+    // The backend's own error message is already sanitized -- it
+    // never contains a vendor's raw response text (e.g. an S3
+    // AccessDenied detail or a Postmark error code) -- so it is safe
+    // to surface directly. Falls back to a generic message if the
+    // body isn't the expected JSON error envelope.
+    let message = "We couldn't download this report. Please try again.";
+    try {
+      const body = await response.json();
+      if (typeof body?.error?.message === "string") message = body.error.message;
+    } catch {
+      // not JSON -- keep the generic message
+    }
+    window.alert(message);
     return;
   }
   const blob = await response.blob();

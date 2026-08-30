@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """Real production-mode WebGuard API server for the Playwright browser
-E2E suite (Slice 15 requirement 28).
+E2E suite (Slice 15 requirement 28; extended in Slice 17 for real
+object storage and email delivery).
 
 Started as a subprocess by `apps/web/e2e/global-setup.ts`. Prints one
 JSON line to stdout once ready (base URL, owner email/password for a
 real browser login -- Slice 16 requirement 24 retired the old
 paste-a-bearer-token login -- plus an owner API token for any
-API-only assertions, and the controlled fixture's target URL for the
-browser test to add as an asset), then blocks until SIGTERM.
+API-only assertions, the controlled fixture's target URL for the
+browser test to add as an asset, and Slice 17's `mail_sink_path` -- a
+JSON Lines file the real `ProductionMailProvider` code path mirrors
+every sent message to via `FakePostmarkTransport`, so the Playwright
+process, running separately, can read a just-sent verification/reset/
+invitation link without any real mail transport or a new production-
+reachable HTTP endpoint), then blocks until SIGTERM.
 
 Reuses `webguard_production_harness.run_production_stack` -- the same
 real-Postgres, real-KMS-shaped-signing, real-HTTP-server startup
-sequence already proven by `test_production_mode_e2e.py` -- plus one
-new piece: a controlled fixture HTTP server that is both (a) a plain
-page with no security headers, so a genuine PASSIVE `single_page` scan
-(the only kind the web app's Start Scan workflow ever requests) trips
-a real `webguard-passive` HTTP-header finding, and (b) able to answer
-its own `.well-known/webguard-verification.txt` with the CURRENT real
-pending token by reading it straight out of the running API's own
+sequence already proven by `test_production_mode_e2e.py`, now also
+real-S3-shaped object storage and real-Postmark-shaped mail delivery
+(Slice 17) -- plus one new piece: a controlled fixture HTTP server that
+is both (a) a plain page with no security headers, so a genuine
+PASSIVE `single_page` scan (the only kind the web app's Start Scan
+workflow ever requests) trips a real `webguard-passive` HTTP-header
+finding, and (b) able to answer its own
+`.well-known/webguard-verification.txt` with the CURRENT real pending
+token by reading it straight out of the running API's own
 `target_verifications` repository -- so ownership verification is
 exercised for real too, with no mocked token comparison.
 
@@ -175,6 +183,13 @@ def main() -> int:
 
     certificate_directory = TemporaryDirectory()
     certificate_path = _generate_self_signed_certificate(Path(certificate_directory.name))
+    # Slice 17: outlives `run_production_stack`'s own internal
+    # TemporaryDirectory (which is cleaned up when that context
+    # manager exits) -- this file needs to be readable by the separate
+    # Playwright/Node process for as long as this server runs.
+    mail_sink_directory = TemporaryDirectory()
+    mail_sink_path = Path(mail_sink_directory.name) / "mail-sink.jsonl"
+    mail_sink_path.touch()
 
     fixture_server = ThreadingHTTPServer(("127.0.0.1", 0), _FixtureHandler)
     tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -223,7 +238,7 @@ def main() -> int:
         side_effect=lambda target: target.resolved_addresses,
     ), patch(
         "webguard_scanner.safe_http.ssl.create_default_context", side_effect=_trusting_tls_context
-    ), run_production_stack(postgres_dsn, port=port) as stack:
+    ), run_production_stack(postgres_dsn, port=port, mail_sink_path=mail_sink_path) as stack:
         _STATE["components"] = stack.components
         _STATE["organization_id"] = stack.organization_id
         _STATE["target_url"] = target_url
@@ -258,6 +273,7 @@ def main() -> int:
             "owner_password": stack.owner_password,
             "target_url": target_url,
             "organization_id": stack.organization_id,
+            "mail_sink_path": str(mail_sink_path),
         }
         print(json.dumps(ready), flush=True)
 
@@ -267,6 +283,7 @@ def main() -> int:
     fixture_server.server_close()
     fixture_thread.join(timeout=5)
     certificate_directory.cleanup()
+    mail_sink_directory.cleanup()
     return 0
 
 

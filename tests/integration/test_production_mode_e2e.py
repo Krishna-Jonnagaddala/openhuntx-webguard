@@ -28,6 +28,7 @@ Requires a real PostgreSQL reachable at `WEBGUARD_POSTGRES_TEST_DSN`
 from __future__ import annotations
 
 import http.client
+import io
 import ipaddress
 import json
 import os
@@ -90,6 +91,54 @@ class _FakeKmsClient:
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
         return {"KeyId": KeyId, "PublicKey": public_bytes}
+
+
+class _FakeS3NotFoundError(Exception):
+    """Structurally matches `botocore.exceptions.ClientError` -- see
+    `webguard_production_harness.py`'s identical fake for the full
+    rationale."""
+
+    def __init__(self) -> None:
+        super().__init__("NoSuchKey")
+        self.response = {"Error": {"Code": "NoSuchKey"}}
+
+
+class _FakeS3Client:
+    """Duck-typed `S3ClientProtocol`, in-memory only -- no AWS
+    credentials, no network call. See `webguard_production_harness.py`'s
+    identical fake for the full rationale (this file predates that
+    harness's extraction and keeps its own local `_Fake*` clients for
+    the same reason `_FakeKmsClient` above is not imported from it)."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+
+    def put_object(self, *, Bucket, Key, Body, ServerSideEncryption, SSEKMSKeyId, ContentType):
+        self.objects[Key] = Body
+        return {}
+
+    def get_object(self, *, Bucket, Key):
+        if Key not in self.objects:
+            raise _FakeS3NotFoundError()
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def head_object(self, *, Bucket, Key):
+        if Key not in self.objects:
+            raise _FakeS3NotFoundError()
+        return {}
+
+    def delete_object(self, *, Bucket, Key):
+        self.objects.pop(Key, None)
+        return {}
+
+
+class _FakePostmarkTransport:
+    """Duck-typed `PostmarkClientProtocol`, in-memory only -- always
+    reports success, so `ProductionMailProvider`'s real logic executes
+    but no network call to Postmark is ever made."""
+
+    def send_email(self, payload: dict) -> dict:
+        return {"status_code": 200, "body": {"ErrorCode": 0, "Message": "OK", "MessageID": "fake-message-id"}}
 
 
 class _ReflectedXssFixtureHandler(BaseHTTPRequestHandler):
@@ -244,8 +293,18 @@ class ProductionModeEndToEndTests(unittest.TestCase):
                 authorization_directory=str(auth_dir),
                 artifact_directory=str(artifacts),
                 cursor_signing_secret=base64.urlsafe_b64encode(secret).decode(),
+                mail_provider="postmark",
+                postmark_server_token="fake-postmark-server-token-e2e",  # noqa: S105 - never reaches a real network call
+                mail_from_address="alerts@webguard-e2e.invalid",
+                web_app_base_url="http://127.0.0.1:5173",
+                object_storage_provider="s3",
+                object_storage_bucket="webguard-e2e-fake-bucket",
+                object_storage_region="eu-west-2",
+                object_storage_kms_key_id="fake-kms-key-e2e-s3",
             )
-            components = build_production_components(config, kms_client=_FakeKmsClient())
+            components = build_production_components(
+                config, kms_client=_FakeKmsClient(), s3_client=_FakeS3Client(), mail_transport=_FakePostmarkTransport()
+            )
             self.addCleanup(components.pool.close)
 
             # -- create organization/principal/token/target directly
@@ -476,8 +535,12 @@ class ProductionModeEndToEndTests(unittest.TestCase):
                 (),
             )
 
-            report_path = artifacts / result_payload["report_ref"]
-            report = load_webguard_report_json(report_path.read_text(encoding="utf-8"))
+            # Slice 17: the report's bytes now live in the (fake-backed)
+            # object store the executor wrote through, not on local
+            # disk -- read it back the same way the real API's
+            # download route does, through `ArtifactStore`.
+            report_bytes = components.service.artifact_store.get_reference(result_payload["report_ref"])
+            report = load_webguard_report_json(report_bytes.decode("utf-8"))
             self.assertTrue(any(f.identity.rule_id.startswith("active.xss.reflected") for f in report.findings))
 
 

@@ -15,14 +15,17 @@ different repository objects rather than writing a parallel API.
 
 Live as of this slice: organizations/principals/memberships, targets,
 authorizations, scans, jobs, findings, audit, schedules, authentication
-contexts, authorization comparison plans, and report *metadata*. Report
-*bodies* remain local-artifact-only in every environment except
-production, where ``ObjectStorageArtifactStore`` is used instead of
-``LocalArtifactStore`` -- deliberately not implemented yet (Slice 15),
-so every report-artifact operation fails closed with
-``object_storage_not_implemented`` in production until object storage
-is real, rather than silently treating a local path as durable cloud
-storage (requirement 5's explicit instruction).
+contexts, authorization comparison plans, and report *metadata*.
+
+Slice 17: report *bodies* are now real, too. ``ObjectStorageArtifactStore``
+(S3-backed, SSE-KMS encrypted) replaces ``LocalArtifactStore`` in
+production, reached through an injected ``s3_client`` -- structurally
+duck-typed, never a ``boto3`` import in this module (see ``cli.py``'s
+``_production_components()``, the one call site that imports it, for
+why). Transactional email is likewise real: ``ProductionMailProvider``
+(Postmark) replaces ``DevelopmentMailProvider`` -- this one needs no
+lazy import at all, since it is built entirely on the standard library
+(``http.client``), not a vendor SDK.
 
 Authenticated-scanning secret resolution goes through
 ``secret_provider.py``'s ``SecretProvider`` abstraction:
@@ -42,7 +45,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .artifact_store import ObjectStorageArtifactStore
+from .artifact_store import ObjectStorageArtifactStore, S3ClientProtocol
 from .auth import ApiTokenAuthenticator, BrowserSessionAuthenticator
 from .auth_rate_limit import PostgresAuthRateLimiter
 from .authorizations import AuthorizationRepository
@@ -57,7 +60,7 @@ from .config import (
     DEFAULT_WORKER_POLL_SECONDS,
 )
 from .executor import ScanJobExecutor
-from .mail import LoggingMailProvider
+from .mail import PostmarkClientProtocol, PostmarkHttpClient, ProductionMailProvider
 from .pagination import SignedCursorCodec
 from .postgres_authentication_contexts import PostgresAuthenticationContextRepository
 from .postgres_authorization_comparison import PostgresAuthorizationComparisonPlanRepository
@@ -116,7 +119,9 @@ def build_production_components(
     config: ProductionServiceConfig,
     *,
     kms_client,
+    s3_client: S3ClientProtocol,
     secrets_manager_client: SecretsManagerClientProtocol | None = None,
+    mail_transport: PostmarkClientProtocol | None = None,
 ) -> ProductionComponents:
     if config.environment != "production":
         raise ValueError("build_production_components requires a production config.")
@@ -147,11 +152,21 @@ def build_production_components(
     # threshold rather than needing a separately-tuned limiter per
     # route.
     auth_rate_limiter = PostgresAuthRateLimiter(pool, max_attempts=10, window_seconds=900)
-    # Requirement 26: no production transactional-email integration
-    # exists yet -- deliberately. Production writes verification/
-    # reset/invitation links to its own log instead of a real inbox
-    # until a real provider is wired up in the infrastructure phase.
-    mail_provider = LoggingMailProvider()
+    # Slice 17 requirement 1: real transactional delivery, always
+    # through `ProductionMailProvider`'s own payload/retry/
+    # classification logic. `mail_transport` is injectable (mirroring
+    # `kms_client`/`s3_client`) purely so a test harness can fake the
+    # actual Postmark network boundary -- e.g. the browser E2E suite's
+    # `webguard_production_harness.py` -- while still exercising the
+    # real production mail-provider code path end to end, not a
+    # separate `InMemoryMailProvider` wholesale substitute. No lazy
+    # import needed for the real default (unlike kms_client/s3_client
+    # below): `PostmarkHttpClient` is built entirely on the standard
+    # library, never a vendor SDK.
+    mail_provider = ProductionMailProvider(
+        mail_transport if mail_transport is not None else PostmarkHttpClient(server_token=config.postmark_server_token),
+        from_address=config.mail_from_address,
+    )
 
     signing_provider = KmsSigningProvider(kms_client, key_id=config.kms_key_id)
     registry = SigningKeyRegistry(signing_provider)
@@ -171,14 +186,16 @@ def build_production_components(
         else None
     )
 
-    # Requirement 5-6: production never treats a local path as durable
-    # cloud storage. `ObjectStorageArtifactStore` is intentionally not
-    # implemented yet (Slice 15) -- every report-artifact operation
-    # fails closed with `object_storage_not_implemented` in production
-    # until it is, rather than silently defaulting to
-    # `LocalArtifactStore` the way every non-production environment
-    # still does (see `service.py`'s own default).
-    artifact_store = ObjectStorageArtifactStore(bucket="production-object-storage-not-yet-implemented")
+    # Slice 17 requirement 7: production never treats a local path as
+    # durable cloud storage. Real S3, SSE-KMS encrypted with a specific
+    # customer-managed key (never the AWS-managed SSE-S3 default -- see
+    # docs/production/ARTIFACT_STORAGE.md §3). This same instance is
+    # passed to both the service (report registration/download reads)
+    # and the executor (report writes) below, so a report a worker
+    # writes is immediately, durably readable via the API.
+    artifact_store = ObjectStorageArtifactStore(
+        bucket=config.object_storage_bucket, client=s3_client, kms_key_id=config.object_storage_kms_key_id
+    )
 
     service = WebGuardJobService(
         store=jobs,
@@ -198,6 +215,7 @@ def build_production_components(
         sessions=sessions,
         mail_provider=mail_provider,
         auth_rate_limiter=auth_rate_limiter,
+        web_app_base_url=config.web_app_base_url,
     )
     executor = ScanJobExecutor(
         authorizations=authorizations,
@@ -212,6 +230,7 @@ def build_production_components(
         authentication_contexts=authentication_contexts,
         authorization_comparison_plans=authorization_comparison_plans,
         secret_provider=secret_provider,
+        artifact_store=artifact_store,
     )
     worker = ScanJobWorker(
         store=jobs,

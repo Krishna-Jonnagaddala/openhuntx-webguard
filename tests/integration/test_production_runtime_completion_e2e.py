@@ -16,6 +16,7 @@ AWS account.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import os
@@ -38,7 +39,6 @@ from webguard_contracts import (
     write_owned_target_authorization_file,
 )
 from webguard_scanner import ValidatedTarget
-from webguard_api.artifact_store import LocalArtifactStore
 from webguard_api.http_api import create_server
 from webguard_api.production_config import ProductionServiceConfig
 from webguard_api.production_startup import build_production_components
@@ -46,6 +46,8 @@ from webguard_api.production_startup import build_production_components
 from tests.integration.test_idor_authorization_e2e_lab import _IdorFixtureHandler, _ORDERS, _TOKENS
 from tests.integration.test_production_mode_e2e import (
     _FakeKmsClient,
+    _FakePostmarkTransport,
+    _FakeS3Client,
     _ReflectedXssFixtureHandler,
     _generate_self_signed_certificate,
 )
@@ -144,10 +146,20 @@ class ProductionRuntimeCompletionEndToEndTests(unittest.TestCase):
             artifact_directory=str(artifacts),
             cursor_signing_secret=base64.urlsafe_b64encode(secret).decode(),
             secret_provider="aws_secrets_manager",
+            mail_provider="postmark",
+            postmark_server_token="fake-postmark-server-token-e2e-phase3",  # noqa: S105 - never reaches a real network call
+            mail_from_address="alerts@webguard-e2e.invalid",
+            web_app_base_url="http://127.0.0.1:5173",
+            object_storage_provider="s3",
+            object_storage_bucket="webguard-e2e-phase3-fake-bucket",
+            object_storage_region="eu-west-2",
+            object_storage_kms_key_id="fake-kms-key-e2e-phase3-s3",
         )
         components = build_production_components(
             config,
             kms_client=_FakeKmsClient(),
+            s3_client=_FakeS3Client(),
+            mail_transport=_FakePostmarkTransport(),
             secrets_manager_client=_FakeSecretsManagerClient(
                 {
                     "prod-e2e-bearer-secret": json.dumps(
@@ -634,13 +646,17 @@ class ProductionRuntimeCompletionEndToEndTests(unittest.TestCase):
             self.assertEqual(reread.state.value, "completed", reread)
 
     def test_production_report_metadata_persists_checksum_and_reference(self) -> None:
-        """Requirement 16: a completed scan -> report requested ->
-        report metadata persisted in PostgreSQL -> checksum/reference
-        available through the API. Uses a local artifact store for this
-        controlled E2E only (explicitly substituted onto the service,
-        never the production default) -- production object storage
-        remains deferred to Slice 15, proven by the second assertion
-        below against the *actual* production default."""
+        """Requirement 16 (Slice 14) + requirement 15 (Slice 17): a
+        completed scan -> report requested -> report metadata persisted
+        in PostgreSQL -> checksum/reference available through the API
+        -> the report is downloaded and its bytes verified against the
+        persisted checksum. Runs against the *actual* production
+        default artifact store (`ObjectStorageArtifactStore`, backed by
+        `_FakeS3Client` -- only the AWS network boundary is
+        substituted, never `webguard_api`'s own production code path;
+        see `test_production_mode_e2e.py`'s `_FakeS3Client` docstring).
+        No `LocalArtifactStore` substitution happens anywhere in this
+        test, unlike before Slice 17 completed object storage."""
 
         config, components, auth_dir = self._build_components()
         organization, owner, token, now = self._bootstrap_org(components)
@@ -658,17 +674,6 @@ class ProductionRuntimeCompletionEndToEndTests(unittest.TestCase):
         fixture_port = fixture_server.server_address[1]
         target = f"https://prod-e2e-fixture.test:{fixture_port}/"
         authorization_id = self._authorize_target(components, auth_dir, organization, owner, target, now, allowed_hosts=("prod-e2e-fixture.test",))
-
-        # Requirement 6: production's real default is object storage,
-        # not yet implemented -- proven directly, before substituting a
-        # local store for the rest of this test.
-        with self.assertRaises(Exception) as captured:
-            components.service.artifact_store.checksum("anything")
-        self.assertEqual(getattr(captured.exception, "code", None), "object_storage_not_implemented")
-
-        local_store = LocalArtifactStore(self._root / "local-artifacts")
-        components.service.artifact_store = local_store
-        components.executor.artifact_directory = self._root / "local-artifacts"
 
         trust_store = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         trust_store.load_verify_locations(cafile=str(cert_path))
@@ -762,6 +767,28 @@ class ProductionRuntimeCompletionEndToEndTests(unittest.TestCase):
                 self.assertEqual(response.status, 200, fetched)
                 self.assertEqual(fetched["checksum"], report_payload["checksum"])
                 self.assertEqual(fetched["scan_id"], scan_id)
+
+                # Slice 17 requirement 15: the report a worker just
+                # wrote through the real (fake-S3-backed)
+                # ObjectStorageArtifactStore is downloadable through
+                # the real HTTP API, and its bytes match the checksum
+                # persisted at registration time -- proving the whole
+                # generate -> store -> register -> download -> verify
+                # pipeline against a real (if network-substituted)
+                # object-storage backend, not a local-disk stand-in.
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "GET", f"/v1/reports/{report_id}/download", headers={"Authorization": f"Bearer {token.token}"}
+                )
+                response = connection.getresponse()
+                downloaded_bytes = response.read()
+                connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    hashlib.sha256(downloaded_bytes).hexdigest(),
+                    report_payload["checksum"],
+                    "downloaded report bytes must match the checksum computed and persisted at registration time",
+                )
             finally:
                 stop.set()
                 server.shutdown()

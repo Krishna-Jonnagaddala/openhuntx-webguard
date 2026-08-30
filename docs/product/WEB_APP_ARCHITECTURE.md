@@ -1,4 +1,4 @@
-# WebGuard Web App Architecture (Slice 15)
+# WebGuard Web App Architecture (Slice 15; updated Slices 16-17)
 
 ## 1. What this is
 
@@ -152,16 +152,33 @@ withhold permission).
 "real-Postgres, no-AWS" startup sequence already proven by
 `test_production_mode_e2e.py` into an importable `run_production_stack()`
 context manager (real HTTP server, real worker thread, one bootstrapped
-organization/owner/token). Two things consume it:
+organization/owner/token). Slice 17 extended the same pattern to object
+storage and email: `FakeS3Client` and `FakePostmarkTransport` fake only
+the AWS/Postmark network boundary, exactly like the existing
+`FakeKmsClient` does for signing -- the real
+`ObjectStorageArtifactStore`/`ProductionMailProvider` code paths run
+unmodified against them, so this harness (and everything built on it)
+proves the actual production wiring, not a substitute. Three things
+consume it:
 
 - `scripts/dev/run_local_webguard_api.py` — a manual dev helper that prints
-  a ready-to-paste API token for exercising the frontend against a genuine
+  a ready-to-use email/password login for exercising the frontend against a genuine
   backend during development.
 - `apps/web/e2e/global-setup.ts` — spawns
   `tests/integration/webguard_e2e_server.py` (a thin wrapper around the
   harness plus one controlled HTTPS fixture asset) as a subprocess before
   the Playwright suite runs, and publishes its base URL / bootstrapped
-  token / fixture target URL into `process.env` for the spec to read.
+  credentials / fixture target URL / a mail-sink file path into
+  `process.env` for each spec to read. `apps/web/e2e/mail-sink.ts`
+  reads that file to recover the exact verification/reset/invitation
+  link a browser action just caused the server to "send" -- see
+  `registration.spec.ts`, `password-reset.spec.ts`, and
+  `invitation.spec.ts`, none of which reach around the UI to poke the
+  API directly.
+- `tests/integration/test_production_mode_e2e.py` / `test_production_runtime_completion_e2e.py`
+  — the backend's own production E2E proofs, now including a real
+  report download against the fake-S3-backed object store with a
+  SHA-256 checksum assertion (Slice 17 requirement 15).
 
 The fixture asset intentionally sends no security headers, so a genuine
 *passive* `single_page` scan (the only kind the UI's Start Scan workflow

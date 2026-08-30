@@ -1,25 +1,37 @@
-"""Reusable production-mode WebGuard API startup harness (Slice 15).
+"""Reusable production-mode WebGuard API startup harness (Slice 15;
+extended in Slice 17 to fake the S3 and Postmark network boundaries the
+same way KMS was already faked).
 
 Extracts the exact "real production stack, no AWS" startup sequence
 already proven by `test_production_mode_e2e.py` into an importable,
-reusable form: a `_FakeKmsClient` performing real ECDSA P-256/SHA-256
+reusable form: a `FakeKmsClient` performing real ECDSA P-256/SHA-256
 signing in-process (matching AWS KMS's own request/response shape, so
 `KmsSigningProvider`'s verification path is exercised for real -- only
-the network boundary to AWS is substituted), plus a context manager
-that builds `ProductionComponents` against a real disposable
-PostgreSQL, starts the HTTP server and worker on real threads, and
-tears everything down cleanly on exit.
+the network boundary to AWS is substituted), a `FakeS3Client` holding
+objects in memory (so `ObjectStorageArtifactStore`'s real put/get/
+checksum/tenant-key logic runs for real, only the network boundary to
+S3 is substituted), and a `FakePostmarkTransport` capturing sent
+messages in memory and optionally to a JSON Lines sink file (so
+`ProductionMailProvider`'s real payload/retry/classification logic
+runs for real, only the network boundary to Postmark is substituted --
+mirroring `InMemoryMailProvider`'s own out-of-process-readable sink
+mechanism from Slice 16, but sitting one layer lower so the real
+production mail-provider code path is what actually executes). Plus a
+context manager that builds `ProductionComponents` against a real
+disposable PostgreSQL, starts the HTTP server and worker on real
+threads, and tears everything down cleanly on exit.
 
 Used by:
   - `scripts/dev/run_local_webguard_api.py` (manual frontend dev
     testing against a real backend)
   - `apps/web/e2e/global-setup.ts` (via a small subprocess wrapper)
-    for the Playwright browser E2E suite (Slice 15 requirement 28)
+    for the Playwright browser E2E suite (Slice 15 requirement 28;
+    Slice 17 requirement 24's real report-download flow)
 
 This harness does not itself constitute a new "test double" security
-posture: the only thing it fakes is the AWS network boundary, exactly
-as `webguard_api.signing`'s own module docstring anticipates for
-tests, and it always runs against a real PostgreSQL and the real,
+posture: the only thing it fakes is the AWS/Postmark network boundary,
+exactly as `webguard_api.signing`'s own module docstring anticipates
+for tests, and it always runs against a real PostgreSQL and the real,
 unmodified `webguard_api` production code paths.
 """
 
@@ -27,6 +39,8 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import io
+import json
 import secrets
 import threading
 from dataclasses import dataclass
@@ -68,6 +82,85 @@ class FakeKmsClient:
         return {"KeyId": KeyId, "PublicKey": public_bytes}
 
 
+class _FakeS3NotFoundError(Exception):
+    """Structurally matches `botocore.exceptions.ClientError` (a
+    `.response["Error"]["Code"]` attribute) without this module
+    importing botocore -- `ObjectStorageArtifactStore` only ever
+    inspects that shape, never the exception's real type."""
+
+    def __init__(self) -> None:
+        super().__init__("NoSuchKey")
+        self.response = {"Error": {"Code": "NoSuchKey"}}
+
+
+class FakeS3Client:
+    """Duck-typed `S3ClientProtocol`, in-memory only -- no AWS
+    credentials, no network call. Real put/get/head/delete semantics
+    (including "missing key raises a NoSuchKey-shaped error"), so
+    `ObjectStorageArtifactStore`'s own logic -- encryption parameters
+    passed through, checksum-by-reading-back, path-safety rejection --
+    all run for real against this fake, exactly like `FakeKmsClient`
+    exercises `KmsSigningProvider`'s real signing/verification logic."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+
+    def put_object(self, *, Bucket, Key, Body, ServerSideEncryption, SSEKMSKeyId, ContentType):
+        self.objects[Key] = Body
+        return {}
+
+    def get_object(self, *, Bucket, Key):
+        if Key not in self.objects:
+            raise _FakeS3NotFoundError()
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def head_object(self, *, Bucket, Key):
+        if Key not in self.objects:
+            raise _FakeS3NotFoundError()
+        return {}
+
+    def delete_object(self, *, Bucket, Key):
+        self.objects.pop(Key, None)
+        return {}
+
+
+class FakePostmarkTransport:
+    """Duck-typed `PostmarkClientProtocol`, in-memory only -- no
+    Postmark credentials, no network call. Always reports success, so
+    `ProductionMailProvider`'s real payload-construction/retry/
+    classification logic executes normally; only the actual HTTP call
+    to Postmark is substituted. Optionally mirrors each captured
+    message to a JSON Lines file (`sink_path`), exactly like
+    `InMemoryMailProvider`'s own mechanism, so an out-of-process reader
+    -- the Playwright browser E2E suite -- can observe a message sent
+    by a server running in a different process."""
+
+    def __init__(self, *, sink_path: Path | None = None) -> None:
+        self._sink_path = sink_path
+        self.sent: list[dict] = []
+
+    def send_email(self, payload: dict) -> dict:
+        self.sent.append(payload)
+        if self._sink_path is not None:
+            with open(self._sink_path, "a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "to": payload.get("To"),
+                            "subject": payload.get("Subject"),
+                            "body": payload.get("TextBody"),
+                            "category": payload.get("Tag"),
+                            "sent_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+                    + "\n"
+                )
+        return {
+            "status_code": 200,
+            "body": {"ErrorCode": 0, "Message": "OK", "MessageID": f"fake-{secrets.token_hex(8)}"},
+        }
+
+
 DEFAULT_OWNER_PASSWORD = "dev-harness-owner-password-123"  # noqa: S105 - a disposable local test fixture credential
 
 
@@ -82,6 +175,8 @@ class RunningStack:
     owner_password: str
     components: ProductionComponents
     authorization_directory: Path
+    s3_client: FakeS3Client
+    mail_transport: FakePostmarkTransport
 
     @property
     def base_url(self) -> str:
@@ -98,13 +193,19 @@ def run_production_stack(
     owner_email: str | None = None,
     owner_password: str = DEFAULT_OWNER_PASSWORD,
     allowed_origins: frozenset[str] = frozenset({"http://localhost:5173", "http://127.0.0.1:5173"}),
+    web_app_base_url: str = "http://127.0.0.1:5173",
+    mail_sink_path: Path | None = None,
 ) -> Iterator[RunningStack]:
     """Start a real production-mode WebGuard API + worker against
     `postgres_dsn`, with one bootstrapped organization/owner, and tear
     it down on exit. The owner gets both an API bearer token (for
     direct API testing/automation) and a real password credential (so
     the browser E2E suite can log in through the actual UI -- Slice 16
-    requirement 24 -- rather than pasting a token)."""
+    requirement 24 -- rather than pasting a token). Slice 17: object
+    storage and mail are both real production code (`ObjectStorageArtifactStore`,
+    `ProductionMailProvider`) running against `FakeS3Client`/
+    `FakePostmarkTransport` -- only the AWS/Postmark network boundary
+    is substituted, exactly like KMS already was."""
 
     with TemporaryDirectory() as directory:
         root = Path(directory)
@@ -125,8 +226,20 @@ def run_production_stack(
             authorization_directory=str(auth_dir),
             artifact_directory=str(artifacts),
             cursor_signing_secret=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(),
+            mail_provider="postmark",
+            postmark_server_token="fake-postmark-server-token-dev",  # noqa: S105 - never reaches a real network call
+            mail_from_address="alerts@webguard-dev.invalid",
+            web_app_base_url=web_app_base_url,
+            object_storage_provider="s3",
+            object_storage_bucket="webguard-dev-fake-bucket",
+            object_storage_region="eu-west-2",
+            object_storage_kms_key_id="fake-kms-key-dev-s3",
         )
-        components = build_production_components(config, kms_client=FakeKmsClient())
+        s3_client = FakeS3Client()
+        mail_transport = FakePostmarkTransport(sink_path=mail_sink_path)
+        components = build_production_components(
+            config, kms_client=FakeKmsClient(), s3_client=s3_client, mail_transport=mail_transport
+        )
         try:
             now = datetime.now(timezone.utc)
             resolved_name = organization_name or f"WebGuard Dev Org {secrets.token_hex(4)}"
@@ -180,6 +293,8 @@ def run_production_stack(
                     owner_password=owner_password,
                     components=components,
                     authorization_directory=auth_dir,
+                    s3_client=s3_client,
+                    mail_transport=mail_transport,
                 )
             finally:
                 stop.set()
