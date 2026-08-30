@@ -1,45 +1,89 @@
 @import "tailwindcss";
 
 /*
- * OpenHuntX WebGuard design tokens (Slice 15).
- * See docs/product/WEB_APP_DESIGN_SYSTEM.md for the full rationale.
- * Dark-first, carbon/graphite surfaces, off-white type, controlled
- * OpenHuntX red accents. No neon glow, no glassmorphism, no cyberpunk
- * decoration -- a credible enterprise application-security surface.
+ * OpenHuntX brand fonts (self-hosted -- see docs/product/OPENHUNTX_BRAND_MARK.md).
+ * Latin subset only (this is an English-only enterprise console);
+ * served from apps/web/public/fonts/ rather than Google Fonts so the
+ * app has no external runtime dependency and no CSP allowance is
+ * needed for a third-party font host.
+ */
+@font-face {
+  font-family: "Aldrich";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/aldrich-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Archivo";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/archivo-variable.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/ibm-plex-mono-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/fonts/ibm-plex-mono-500.woff2") format("woff2");
+}
+
+/*
+ * OpenHuntX WebGuard design tokens (Slice 15; recolored to the
+ * OpenHuntX brand mark).
+ * See docs/product/WEB_APP_DESIGN_SYSTEM.md for the original rationale
+ * and docs/product/OPENHUNTX_BRAND_MARK.md for the brand mark this
+ * palette now implements. Still dark-first, still a credible
+ * enterprise application-security surface -- functional UI (buttons,
+ * links, nav state) uses the brand's flat corporate/signal reds, never
+ * the wordmark's glow/gradient treatment, which is reserved for the
+ * brand mark itself (src/components/brand/Brand.tsx).
  */
 @theme {
-  /* Surfaces (graphite scale, darkest to lightest) */
-  --color-canvas: #0b0d10;
-  --color-surface: #111418;
-  --color-surface-raised: #171b20;
-  --color-surface-hover: #1d2228;
-  --color-border: #262b32;
-  --color-border-strong: #363c45;
+  /* Surfaces (carbon black scale, darkest to lightest) */
+  --color-canvas: #07090c;
+  --color-surface: #0d1117;
+  --color-surface-raised: #131820;
+  --color-surface-hover: #1b222b;
+  --color-border: rgba(245, 247, 250, 0.08);
+  --color-border-strong: rgba(245, 247, 250, 0.16);
 
   /* Type (off-white, never pure white) */
-  --color-text-primary: #e9e7e2;
-  --color-text-secondary: #a3a9b2;
-  --color-text-tertiary: #6b727c;
-  --color-text-on-accent: #fbf4f2;
+  --color-text-primary: #f5f7fa;
+  --color-text-secondary: #7a8593;
+  --color-text-tertiary: #4e5a67;
+  --color-text-on-accent: #ffffff;
 
-  /* OpenHuntX accent (controlled red, not neon) */
-  --color-accent: #d64a3c;
-  --color-accent-hover: #c23f32;
-  --color-accent-muted: #4a2620;
-  --color-accent-soft-bg: #251512;
+  /* OpenHuntX accent -- Corporate Red (flat, functional UI) and
+     Signal Red (hover/active state), per the brand mark's own
+     "flat reproduction" guidance rather than its glow treatment. */
+  --color-accent: #e51b2a;
+  --color-accent-hover: #ff2638;
+  --color-accent-muted: #7e0a12;
+  --color-accent-soft-bg: #2a1512;
 
-  /* Semantic status */
+  /* Semantic status (unchanged -- not part of the brand mark, which
+     defines no green/amber/blue; success/warning/info stay their
+     conventional hues for usability). */
   --color-success: #4c9a6a;
   --color-success-bg: #16241c;
   --color-warning: #c8912f;
   --color-warning-bg: #26200f;
-  --color-danger: #d64a3c;
-  --color-danger-bg: #2a1613;
+  --color-danger: #e51b2a;
+  --color-danger-bg: #2a1512;
   --color-info: #4b8fc4;
   --color-info-bg: #131f28;
 
   /* Severity scale */
-  --color-sev-critical: #e0483a;
+  --color-sev-critical: #e51b2a;
   --color-sev-critical-bg: #2a1512;
   --color-sev-high: #d67a2e;
   --color-sev-high-bg: #271a0f;
@@ -51,9 +95,12 @@
   --color-sev-info-bg: #1a1d22;
 
   --font-sans:
-    "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    "Archivo", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono:
-    "JetBrains Mono", ui-monospace, SFMono-Regular, "Menlo", monospace;
+    "IBM Plex Mono", ui-monospace, SFMono-Regular, "Menlo", monospace;
+  /* Brand wordmark/lockup only -- a geometric display face, never body
+     copy (see Brand.tsx; matches the brand mark's own usage). */
+  --font-display: "Aldrich", var(--font-sans);
 
   --radius-sm: 0.25rem;
   --radius-md: 0.375rem;
