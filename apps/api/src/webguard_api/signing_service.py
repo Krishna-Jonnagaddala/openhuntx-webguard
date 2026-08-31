@@ -175,6 +175,7 @@ def build_signing_service_handler(
                         "signing_service_message_too_large", "message exceeds the maximum signing payload size.",
                         status=400,
                     )
+                registry.ensure_active_key_signable()
                 signature = registry.active.sign(message)
                 self._send_json(
                     200, {"key_id": registry.active.key_id, "signature": _b64url_encode(signature)}

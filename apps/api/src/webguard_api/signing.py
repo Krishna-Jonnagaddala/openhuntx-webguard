@@ -460,6 +460,25 @@ class SigningKeyRegistry:
 
         self._verification_keys[key.key_id] = key
 
+    def ensure_active_key_signable(self) -> None:
+        """Raises if the active provider's own key has been marked
+        disabled via ``set_status`` -- disabling a key must stop it
+        from signing immediately, not just stop it from verifying.
+        ``self._active`` is fixed at construction and never mutated by
+        ``set_status`` (see this class's own docstring: a retired key
+        cannot become active by accident), so an operator who disables
+        the currently-active key mid-rotation or in response to a
+        suspected compromise needs this checked before every sign, not
+        just before every verify. The active key's own ID is always
+        present in ``_verification_keys`` (inserted at construction,
+        never removed), so this lookup cannot miss."""
+
+        if self._verification_keys[self._active.key_id].status == "disabled":
+            raise SigningProviderError(
+                "trustscan_signing_key_disabled",
+                "This signing key has been disabled and can no longer be used to sign.",
+            )
+
     def set_status(self, key_id: str, status: KeyStatus) -> None:
         existing = self._verification_keys.get(key_id)
         if existing is None:

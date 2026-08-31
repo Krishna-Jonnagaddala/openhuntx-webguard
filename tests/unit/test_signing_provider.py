@@ -191,6 +191,25 @@ class SigningKeyRegistryLifecycleTests(unittest.TestCase):
             registry.verify_by_key_id(provider.key_id, message, signature)
         self.assertEqual(caught.exception.code, "trustscan_signing_key_disabled")
 
+    def test_disabled_active_key_cannot_sign(self) -> None:
+        provider = LocalDevelopmentSigner(bytes(range(32)))
+        registry = SigningKeyRegistry(provider)
+
+        registry.set_status(provider.key_id, "disabled")
+
+        with self.assertRaises(SigningProviderError) as caught:
+            registry.ensure_active_key_signable()
+        self.assertEqual(caught.exception.code, "trustscan_signing_key_disabled")
+
+    def test_active_key_signable_by_default_and_after_non_disabling_status_change(self) -> None:
+        provider = LocalDevelopmentSigner(bytes(range(32)))
+        registry = SigningKeyRegistry(provider)
+
+        registry.ensure_active_key_signable()  # does not raise
+
+        registry.set_status(provider.key_id, "retired")
+        registry.ensure_active_key_signable()  # still does not raise -- only "disabled" blocks signing
+
     def test_tampered_message_fails_verification_deterministically(self) -> None:
         provider = LocalDevelopmentSigner(bytes(range(32)))
         registry = SigningKeyRegistry(provider)

@@ -230,6 +230,28 @@ class SigningServiceHandlerTests(unittest.TestCase):
         status, payload = self.request("POST", "/v1/sign", {"message": huge}, token=self.token)
         self.assertEqual(status, 400, payload)
 
+    def test_disabled_active_key_cannot_sign_over_http(self) -> None:
+        """A disabled key must stop signing immediately, not just stop
+        verifying -- disabling the currently-active key (e.g. mid-
+        rotation, or in response to a suspected compromise) previously
+        had no effect on this endpoint: ``registry.active.sign()`` was
+        called unconditionally, ignoring the key's own status."""
+
+        import base64
+
+        # First prove signing genuinely works before disabling, so the
+        # subsequent rejection is provably caused by the status change
+        # and not some other pre-existing failure.
+        message = base64.urlsafe_b64encode(b"trustscan-claims-bytes").rstrip(b"=").decode()
+        status, payload = self.request("POST", "/v1/sign", {"message": message}, token=self.token)
+        self.assertEqual(status, 200, payload)
+
+        self.registry.set_status(self.provider.key_id, "disabled")
+
+        status, payload = self.request("POST", "/v1/sign", {"message": message}, token=self.token)
+        self.assertEqual(status, 500, payload)
+        self.assertEqual(payload["error"]["code"], "trustscan_signing_key_disabled")
+
 
 class SigningServiceEndToEndTests(unittest.TestCase):
     """The full chain requirement 4 asks for, at the unit-test level:
