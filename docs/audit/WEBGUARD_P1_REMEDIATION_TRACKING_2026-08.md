@@ -249,7 +249,11 @@ POST-AUDIT OPEN P1 count for P1-11 is now **0**.
 
 ### P1-12 — Callback observation loss and response-oracle during PostgreSQL outage
 
-Discovered during the P1-11 investigation phase, as a narrow, separate question about the callback-service HTTP receiver's own outage behavior. Not part of the original 9 baseline P1 findings. **OPEN — investigated and classified, not yet remediated. Do not implement without separate approval; see the P1-12 design report for the required pre-implementation design questions this finding raises before any code changes.**
+Discovered during the P1-11 investigation phase, as a narrow, separate question about the callback-service HTTP receiver's own outage behavior. Not part of the original 9 baseline P1 findings.
+
+**OPEN FINDING COMMIT**: `09ce0f4` — *audit: record P1-12 callback outage finding*.
+**REMEDIATION COMMIT**: `b5d3bb9` — *fix(callback): harden postgres outage handling and evidence timing*.
+**STATUS**: **PARTIAL** — the response-oracle break, the connection-reset behavior, the brief-outage observation loss, and the persistence-latency confidence demotion are all closed. A sustained-outage observation-loss residual remains open, tracked below as P1-12-R1. Not deferred to a new finding ID (no P1-13) — it is the known, expected remainder of P1-12 itself.
 
 #### ROOT BEHAVIOR (proven live, real `webguard-api callback-service` subprocess + real disposable PostgreSQL)
 
@@ -282,15 +286,104 @@ Scoped honestly: because the failing read happens before any token-validity chec
 
 **POST-AUDIT P1.** Justified by the combination of (a) a demonstrated, reproducible break of a security-motivated design invariant, and (b) a silent, security-relevant functional-correctness gap (consequence 3-5 above) with no operator-visible signal — not merely a hardening nice-to-have.
 
-#### STATUS: OPEN
+#### COMPONENT STATUS
 
-No product code has been changed for this finding. Full pre-implementation design questions (recommended failure semantics, retry model, `observed_at` timing preservation, response-oracle test matrix, process/thread resilience requirements, SSRF end-to-end proof plan) are tracked in the P1-12 design report delivered alongside this record, not duplicated here — this entry exists to make the finding's existence and classification durable, independent of that report.
+- RESPONSE ORACLE: **CLOSED**
+- EXPECTED DATABASEERROR CONNECTION RESET: **CLOSED**
+- BRIEF-OUTAGE CALLBACK LOSS: **CLOSED**
+- PERSISTENCE-LATENCY CONFIDENCE DEMOTION: **CLOSED**
+- CLOCK-SKEW MODEL: **CHARACTERIZED — NO APPLICATION-LEVEL TOLERANCE**
+- P1-12-R1 SUSTAINED-OUTAGE CALLBACK LOSS: **OPEN**
+- FALSE NOT_VULNERABLE AFTER LOST SUSTAINED-OUTAGE CALLBACK: **OPEN**
+- **P1-12 OVERALL: PARTIAL**
+
+#### RETRY DESIGN
+
+- Callback-service connection checkout timeout: **0.25 seconds** default (`WEBGUARD_CALLBACK_SERVICE_DB_CHECKOUT_TIMEOUT_SECONDS`, scoped only to `webguard-api callback-service`'s own pool construction in `cli.py`).
+- Maximum persistence attempts: **2** (`DEFAULT_RECORD_OBSERVATION_MAXIMUM_ATTEMPTS`, `callback_server.py`).
+- Retry backoff: **0.1 seconds** (`DEFAULT_RECORD_OBSERVATION_RETRY_BACKOFF_SECONDS`).
+- Approximate maximum DB-wait/backoff budget per request: **~0.6 seconds** (2 × 0.25s checkout + 1 × 0.1s backoff).
+- Generic PostgreSQL connection-checkout timeout (`WebGuardPostgresPool`'s `DEFAULT_CONNECTION_TIMEOUT_SECONDS`): **unchanged**, still 5.0s, for every other caller (API, worker, scheduler).
+- Retry owner: `CallbackHttpReceiver`'s own ingestion layer (`_record_observation_with_bounded_retry` in `callback_server.py`) — not the generic repository, not a new service layer. Call-site audit found exactly one real production HTTP-ingestion call site (`_handle()` → the repository directly, no intermediate broker/service in that path), so the repository and the worker-side broker pass-through remain untouched and unretried, as does the contract-test suite that deliberately exercises the repository's raw behavior.
+- Retry condition: `DatabaseError` only. A semantic outcome (invalid/expired/revoked/rate-limited token) is `record_observation()` legitimately returning `False`, never raising — never retried, regardless.
+- `observed_at`: captured exactly once, in `_handle()`, at the moment the HTTP request arrives, before any persistence attempt; the identical value is reused, unchanged, across every retry attempt inside the helper.
+
+#### TIME MODEL
+
+- **Monotonic time** (`time.monotonic()`): sole authority for polling, waiting, and timeout termination in `wait_for_observation()`'s loop — untouched by this change, immune to wall-clock adjustment.
+- **UTC wall time**: the worker's evidence-window anchor. Captured once (`wait_started_at_utc = datetime.now(timezone.utc)`) at the same instant as the monotonic baseline, then used to derive `primary_evidence_deadline_utc`/`grace_evidence_deadline_utc`.
+- **Callback `observed_at`**: the evidence-arrival timestamp, written once by the callback-service process at HTTP receipt. Drives CONFIRMED/PROBABLE classification — compared against the UTC evidence deadlines above, never against monotonic time.
+- **Database persistence time is NOT evidence time.** **Poll-discovery time is NOT evidence time.** Both were the previous (pre-P1-12) implicit behavior; both are now explicitly excluded from the classification comparison.
+- **No application-level clock-skew tolerance exists.** The comparison is a bare inclusive `<=`/exclusive `>`, no epsilon.
+- **Infrastructure assumption**: the worker host and the callback-service host maintain reasonably synchronized UTC clocks — the same assumption this codebase already makes for TrustScan permit validity windows (`not_before <= now < expires_at`, checked across the process that issued a permit and whatever process later validates it). No Terraform-provisioned compute exists yet to point to a specific SLA, but the existing networking/IAM/Postgres Terraform is AWS-oriented, and mainstream AWS compute (EC2/ECS/Fargate) synchronizes via Amazon Time Sync Service by default, typically to single-digit milliseconds.
+- Near a timing boundary, host clock skew **may** change CONFIRMED ↔ PROBABLE. It does **not** fabricate a callback, remove a persisted callback, or change callback correlation (token/tenant scoping is entirely unrelated to this comparison).
+
+**Characterization proof** (`ClockSkewBoundaryCharacterizationTests`, `tests/unit/test_postgres_callback_broker.py`, 6/6 pass):
+- True arrival 50ms before the primary boundary, +100ms callback-service clock skew → stored `observed_at` reads past the boundary → **PROBABLE**.
+- True arrival 50ms after the primary boundary, −100ms skew → stored `observed_at` reads before the boundary → **CONFIRMED**.
+- True arrival comfortably inside primary (window midpoint), ±500ms skew → **CONFIRMED** both directions.
+- True arrival comfortably inside grace (band midpoint), ±500ms skew → **PROBABLE** both directions.
+- `observed_at` exactly on the primary deadline → **CONFIRMED** (inclusive).
+- `observed_at` exactly on the grace deadline → **PROBABLE**, not dropped (inclusive).
+
+±500ms is demonstrated safe only at these specific, boundary-distant points — not claimed as a general tolerance; the first two cases are the deliberate near-boundary counter-examples showing the opposite.
+
+---
+
+### P1-12-R1 — Sustained-outage callback evidence loss
+
+**Proven sequence** (real production architecture: worker → SSRF detector → real TLS fixture → real callback receiver → real PostgreSQL, fault-injected at the exact `INSERT INTO callback_observations` statement for the whole run):
+
+```
+real target callback
+  → callback-service receives request
+  → observed_at captured
+  → PostgreSQL persistence unavailable longer than the bounded retry budget
+  → external callback response remains uniform (204, unchanged)
+  → no observation fabricated
+  → no observation durably persisted
+  → worker-side DB reads remain healthy (only the write path was faulted)
+  → worker finds no callback row (a clean, error-free empty poll result)
+  → no CallbackBrokerError/DatabaseError occurs on the worker's own read path
+  → the existing INCONCLUSIVE safety path is never entered
+  → SsrfDetectionOutcome.NOT_VULNERABLE is returned
+```
+
+Verified two ways: (1) end-to-end, `test_no_fabricated_confirmation_when_persistence_never_recovers` in `tests/integration/test_production_ssrf_callback_e2e.py` — no fabricated CONFIRMED/PROBABLE finding, zero observation rows for the run; (2) directly, by reproducing `ssrf_callback_detector.py`'s own decision branch with the exact tuple `wait_for_observation()` returns in this scenario (`None, False, False`) — confirmed programmatically to resolve to `SsrfDetectionOutcome.NOT_VULNERABLE`, not `INCONCLUSIVE`.
+
+**Classification: KNOWN FALSE-NEGATIVE RESIDUAL.** Not hidden, not minimized: a target that is genuinely vulnerable and genuinely calls back during a sustained outage can be scored NOT_VULNERABLE, indistinguishable at the API level from an actually-safe target.
+
+#### WHY P1-12-R1 REMAINS OPEN
+
+PostgreSQL is currently the sole durable callback-observation store. This remediation deliberately does **not** introduce a second one — no Redis, no SQS, no Kafka, no local-disk WAL, no other database, no authoritative volatile in-memory queue — because secondary callback durability is an architecture decision, not something to smuggle in as a side effect of an outage-hardening fix.
+
+Increasing synchronous retries further is not a sufficient substitute, and was deliberately not done:
+- It blocks `ThreadingHTTPServer` request threads for longer, increasing resource-exhaustion risk under a real outage combined with real traffic.
+- It directly competes with, and can exceed, the SSRF detector's own 3s/5s observation window — a longer retry budget does not just risk lateness, it risks actively causing the CONFIRMED→PROBABLE (or worse) demotion this same remediation just closed for the brief-outage case.
+- No synchronous retry budget, however large, can guarantee survival through an outage of arbitrary duration — only a durable secondary store (an explicit architecture decision, out of scope here) or observability into the gap (P1-B) can change that.
+
+#### FINAL VERIFICATION EVIDENCE
+
+- Backend unit: **1642/1642**.
+- Backend contract (real PostgreSQL): **59/59**.
+- Backend integration + Juice Shop: **117/117**.
+- Callback classification test file (`test_postgres_callback_broker.py`, includes clock-skew characterization): **25/25**.
+- Vitest, genuine current-tree run: **39/39**.
+- Playwright: **4/4**.
+- Security gates (secret scan, Ruff `--select S`, dependency audit): **PASS**.
+- Terraform (`fmt -check`, `init -backend=false`, `validate`): **PASS**.
+- Trivy IaC (`infra/`, CRITICAL/HIGH): **0 misconfigurations**.
+- `git diff --check`: **clean**.
+
+Production SSRF evidence preserved from this remediation's E2E proofs:
+- Brief persistence failure (one forced connection error, resolves on retry) → observation recovered, original `observed_at` retained → **CONFIRMED CWE-918**.
+- Sustained persistence failure (every attempt fails for the whole run) → no fabricated observation, zero observation rows → **NOT_VULNERABLE residual confirmed** (P1-12-R1, above).
 
 ## CURRENT P1 ACCOUNTING
 
 - BASELINE OPEN P1: 9 (P1-1 through P1-9, unchanged, still open — see the immutable baseline audit)
 - POST-AUDIT P1-10: CLOSED
 - POST-AUDIT P1-11: CLOSED
-- POST-AUDIT P1-12: OPEN
-- OPEN POST-AUDIT P1: 1 (P1-12)
+- POST-AUDIT P1-12: PARTIAL (P1-12-R1 sustained-outage residual open within it — not a separate finding ID)
+- OPEN POST-AUDIT P1: 1 (P1-12, partially open via P1-12-R1)
 - CURRENT OPEN P1 TOTAL: 10
