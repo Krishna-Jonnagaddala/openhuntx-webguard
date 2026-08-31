@@ -609,7 +609,32 @@ def _signing_service_command(args: argparse.Namespace) -> int:
     `docs/production/TRUSTSCAN_SIGNING_SERVICE.md` for the full
     operational model, including the explicit statement that this
     exact code path has not been exercised against real CloudHSM
-    hardware in this repository."""
+    hardware in this repository.
+
+    P0-2 fail-closed gate (audit: docs/audit/WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md):
+    unlike `serve`/`worker`/`scheduler`, this subcommand previously had
+    no `--environment` concept at all, so `--key-source` silently
+    defaulted to "development" regardless of deployment target -- an
+    operator or deployment script that forgot `--key-source cloudhsm`
+    in production would start and listen anyway, signing every
+    TrustScan permit with a fixed, source-visible development key
+    while reporting success. `--environment production` (explicit
+    flag or `$WEBGUARD_ENVIRONMENT`, mirroring `serve`/`worker`/
+    `scheduler` exactly) now refuses to start unless `--key-source
+    cloudhsm` was also explicitly selected -- this must be checked
+    before any other startup work, so production never binds a socket
+    on a development key even transiently."""
+
+    environment = _resolve_environment(args)
+    if environment is Environment.PRODUCTION and args.key_source != "cloudhsm":
+        print(
+            "ERROR [signing_service_development_key_forbidden_in_production]: "
+            "--environment production requires --key-source cloudhsm; "
+            f'the signing service will not start with --key-source "{args.key_source}" '
+            "in production.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILURE
 
     bearer_token = os.environ.get("WEBGUARD_SIGNING_SERVICE_BEARER_TOKEN", "").strip()
     if not bearer_token:
@@ -629,13 +654,19 @@ def _signing_service_command(args: argparse.Namespace) -> int:
         except SigningServiceError as exc:
             print(f"ERROR [{exc.code}]: {exc.message}", file=sys.stderr)
             return EXIT_FAILURE
+        except Exception as exc:  # noqa: BLE001 - any CloudHSM/PKCS#11 failure must fail closed, not crash uncaught
+            print(f"ERROR [signing_service_cloudhsm_provider_unavailable]: {exc}", file=sys.stderr)
+            return EXIT_FAILURE
 
     registry = SigningKeyRegistry(provider)
     host = os.environ.get("WEBGUARD_SIGNING_SERVICE_HOST", "127.0.0.1")
     port = int(os.environ.get("WEBGUARD_SIGNING_SERVICE_PORT", "8766"))
     server = SigningServiceServer(registry, bearer_token=bearer_token, host=host, port=port)
     server.start()
-    print(f"TrustScan Signing Service listening on {server.base_url} (key_source={args.key_source}).")
+    print(
+        f"TrustScan Signing Service listening on {server.base_url} "
+        f"(environment={environment.value}, key_source={args.key_source})."
+    )
     print(f"Active key ID: {provider.key_id} (algorithm={provider.algorithm}).")
     print(
         "This service must never be reachable from the public Internet -- "
@@ -1190,6 +1221,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="development",
         help='"development" uses an in-process Ed25519 key (local/dev/test only); '
         '"cloudhsm" requires real PKCS#11 configuration (production).',
+    )
+    signing_service_parser.add_argument(
+        "--environment", choices=environment_choices, default=environment_default, help=environment_help
     )
     signing_service_parser.set_defaults(handler=_signing_service_command)
 
