@@ -245,10 +245,52 @@ Run against completely fresh, disposable infrastructure (a new Postgres containe
 
 POST-AUDIT OPEN P1 count for P1-11 is now **0**.
 
+---
+
+### P1-12 — Callback observation loss and response-oracle during PostgreSQL outage
+
+Discovered during the P1-11 investigation phase, as a narrow, separate question about the callback-service HTTP receiver's own outage behavior. Not part of the original 9 baseline P1 findings. **OPEN — investigated and classified, not yet remediated. Do not implement without separate approval; see the P1-12 design report for the required pre-implementation design questions this finding raises before any code changes.**
+
+#### ROOT BEHAVIOR (proven live, real `webguard-api callback-service` subprocess + real disposable PostgreSQL)
+
+```
+callback HTTP request
+  → CallbackHttpReceiver._handle()
+  → record_observation()
+  → PostgreSQL unavailable
+  → DatabaseError escapes handler (no try/except anywhere in the call chain)
+  → request thread terminates
+  → connection closes without any HTTP response
+  → observation is not persisted
+```
+
+`CallbackHttpReceiver._handle()` (`callback_server.py`) calls `repository.record_observation(...)` with no exception handling. `PostgresCallbackRegistrationRepository.record_observation()` (`postgres_callback_service.py`) can raise `DatabaseError` from its own unwrapped `with self._pool.connection()` read. The uncaught exception propagates into Python's default `socketserver`/`http.server` error handling, which logs and drops the connection before any status line is sent.
+
+#### SECURITY/RELIABILITY CONSEQUENCES
+
+1. A PostgreSQL outage becomes externally distinguishable from every other callback outcome: the client sees `RemoteDisconnected` (connection reset, no response) instead of the uniform `204 No Content` every other outcome produces.
+2. This breaks the module's own documented uniform-response invariant ("a throttled caller must not be able to distinguish 'throttled' from 'recorded' from the response alone").
+3. A genuine SSRF callback arriving during the outage window is silently lost — `record_observation()` never durably records it, and nothing retries.
+4. The worker/detector can later see no observation even though the target actually made the callback.
+5. This can cause an infrastructure-timing-dependent missed SSRF confirmation (a false negative on a real finding), with no operator-visible symptom.
+6. The default `http.server` traceback (internal file paths, SQL structure, client address) reaches stderr on every DB-outage-triggered request.
+7. No raw callback token value was observed in stderr in the live reproduction — the leak is internal-structure disclosure, not a secret leak.
+
+Scoped honestly: because the failing read happens before any token-validity check, every token — valid, invalid, or expired — gets the identical connection-reset during an outage, so this leaks "the database is currently down" (an infrastructure fact), not any per-token correlation state. The narrower anti-oracle property (can a caller tell if *this specific* token was recorded) is not broken by this; the broader "always identical response, period" property is.
+
+#### CLASSIFICATION
+
+**POST-AUDIT P1.** Justified by the combination of (a) a demonstrated, reproducible break of a security-motivated design invariant, and (b) a silent, security-relevant functional-correctness gap (consequence 3-5 above) with no operator-visible signal — not merely a hardening nice-to-have.
+
+#### STATUS: OPEN
+
+No product code has been changed for this finding. Full pre-implementation design questions (recommended failure semantics, retry model, `observed_at` timing preservation, response-oracle test matrix, process/thread resilience requirements, SSRF end-to-end proof plan) are tracked in the P1-12 design report delivered alongside this record, not duplicated here — this entry exists to make the finding's existence and classification durable, independent of that report.
+
 ## CURRENT P1 ACCOUNTING
 
 - BASELINE OPEN P1: 9 (P1-1 through P1-9, unchanged, still open — see the immutable baseline audit)
 - POST-AUDIT P1-10: CLOSED
 - POST-AUDIT P1-11: CLOSED
-- OPEN POST-AUDIT P1: 0
-- CURRENT OPEN P1 TOTAL: 9
+- POST-AUDIT P1-12: OPEN
+- OPEN POST-AUDIT P1: 1 (P1-12)
+- CURRENT OPEN P1 TOTAL: 10
