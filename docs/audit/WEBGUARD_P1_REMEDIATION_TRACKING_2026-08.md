@@ -138,3 +138,117 @@ Live-proven contained, not eliminated: if a heartbeat outage lets a lease lapse 
 #### STATUS: CLOSED
 
 POST-AUDIT OPEN P1 count for P1-10 is now **0**. History above is preserved, not erased.
+
+---
+
+### P1-11 — Scheduler run_forever() can be killed by a transient PostgreSQL outage
+
+Discovered while auditing runtime resilience after P1-10 closed — P1-10 was explicitly scoped to `worker.py` only, and `scheduler.py`'s `ScanScheduleCoordinator.run_forever()` turned out to have the identical, unfixed class of defect. Not part of the original 9 baseline P1 findings.
+
+**Remediation commit**: `41ea1b5` — *fix(scheduler): survive transient postgres outages*.
+
+#### ORIGINAL DISCOVERY
+
+```
+run_forever() → run_once() → list_due_schedules() / enqueue_due_schedule()
+  → PostgreSQL unavailable
+  → DatabaseError raised
+  → run_forever() has no exception handling at all
+  → loop terminates permanently
+```
+
+Confirmed by direct code read: `run_forever()` was `while not stop_event.is_set(): self.run_once(); stop_event.wait(self.poll_seconds)` — zero exception handling, structurally identical to `worker.py`'s pre-P1-10 `run_forever()`.
+
+#### ROOT CAUSE
+
+Same taxonomy mismatch as P1-10: `DatabaseError` (`RuntimeError` subclass) is structurally unrelated to `JobStoreError` (`ValueError` subclass). `run_once()` never wrapped its calls to `list_due_schedules()`/`enqueue_due_schedule()` in anything that would catch `DatabaseError`, so it always propagated straight out of `run_forever()`.
+
+#### STANDALONE IMPACT
+
+`_scheduler_command()` (`cli.py`) calls `scheduler.run_forever(stop_event)` directly on the main thread, no enclosing handler. Live-reproduced: a real subprocess launched against an already-stopped Postgres exited with code 1 and a full `DatabaseUnavailableError` traceback on stderr. Needs an external supervisor to recover.
+
+#### SERVE-MODE IMPACT
+
+`_serve_command()` runs the scheduler on a `daemon=True` background thread (`threading.Thread(target=scheduler.run_forever, ...)`). Live-reproduced: an uncaught `DatabaseError` killed only that thread (Python's default `threading.excepthook` logged it and the thread ended); the HTTP API and worker thread kept running normally, but recurring schedule materialization silently stopped forever with no operator-visible symptom beyond one stderr traceback.
+
+#### STARTUP-OUTAGE REPRODUCTION
+
+Live test: started `run_forever()` on a background thread against an already-stopped Postgres. Pre-fix, the thread died on its first iteration and never resumed even after Postgres came back — the same instance stayed dead until manually restarted, exactly mirroring P1-10's own pre-claim-outage finding for the worker. Post-fix, the same thread survives the outage and resumes on its own, materializing a real, previously-seeded, fully TrustScan-permit-validated due occurrence with no restart of any kind.
+
+#### ATOMICITY ANALYSIS
+
+This mattered more here than it did for the worker: `enqueue_due_schedule()` performs a row lock, several validation reads, a `scan_jobs` INSERT, a `job_permits` INSERT, and a `scan_schedules` UPDATE (revision CAS) — all inside one `with self._pool.connection() as connection:` block with **no explicit `.transaction()` wrapper**. Whether that block alone provides atomic commit-or-rollback was not assumed; it was checked against `psycopg_pool.ConnectionPool.connection()`'s own source (it wraps the borrowed connection in `with conn:` — `psycopg.Connection`'s own context manager, which commits on clean exit and rolls back on any exception) and confirmed this codebase never sets `autocommit=True` anywhere, so every call to `enqueue_due_schedule()` runs inside one implicit transaction by default.
+
+#### FAULT-INJECTION PROOF
+
+Empirically verified against real, disposable PostgreSQL with two live fault injections on a fully-seeded schedule (real organization/principal/authorization/permit/binding), re-run on completely fresh infrastructure immediately before this commit:
+
+- **Fault A** — connection failure injected immediately before the `scan_schedules` UPDATE, after the `scan_jobs`/`job_permits` INSERTs had already run: `scan_jobs` count, `job_permits` count, `scan_schedules.revision`, and `scan_schedules.next_run_at` all confirmed **unchanged** afterward.
+- **Fault B** — connection failure injected immediately after the `scan_schedules` UPDATE succeeded, before the connection block's implicit commit: all four of the same values confirmed **unchanged** afterward.
+
+Both fault points roll back completely — no orphan job can exist without a matching schedule advance, and no schedule can advance without its job, in either direction.
+
+#### IMPLEMENTATION
+
+One file changed: `apps/api/src/webguard_api/scheduler.py`. `run_forever()` now wraps `self.run_once()` in `try/except DatabaseError`, backing off via the existing `stop_event.wait(self.poll_seconds)` and continuing the loop. No changes to `run_once()`, `enqueue_due_schedule()`, or any repository SQL. Deliberately not a copy of `worker.py`'s pattern: no nested bounded-retry-with-backoff helper (unlike `worker.py`'s `_persist_terminal_state`), because the proven atomicity above means a failed attempt has nothing partially written to retry-in-place — the outer poll loop re-driving the whole batch on the next cycle is sufficient. Only `DatabaseError` is caught; `JobStoreError` and any unexpected exception still propagate and end the loop (verified live).
+
+#### RETRY POLICY
+
+Reuses `self.poll_seconds` as the backoff interval via the existing `stop_event.wait(...)` call, mirroring worker.py's own top-level boundary. No new constant introduced. No unbounded retry: each iteration is one bounded attempt, gated by the connection pool's own 5-second checkout timeout.
+
+#### STOP-EVENT BEHAVIOR
+
+Verified live: `stop_event.set()` during an active outage-backoff wait interrupts it immediately rather than blocking for the full `poll_seconds` (tested with a 10-second poll interval; returned in well under 3 seconds).
+
+#### REVISION/CAS PROOF
+
+Untouched by this change, and verified unaffected: revision starts at 0, increments to exactly 1 on the one successful enqueue, and a stale-revision retry attempt correctly returns `None`. Live concurrent-race test (two `ScanScheduleCoordinator` instances racing `run_once()` for the same due occurrence, one race staged immediately after a Postgres restart): exactly one job and one revision advance resulted; the loser cleanly returned `None` via the CAS.
+
+#### IDEMPOTENCY PROOF
+
+Untouched by this change. The unique idempotency-key index behind the revision CAS remains the second protection layer for duplicate-occurrence prevention; not exercised differently by this fix.
+
+#### FULL REGRESSION
+
+Run against completely fresh, disposable infrastructure (a new Postgres container and a new pinned Juice Shop container, neither reused from the fault-injection investigation), immediately before this commit:
+
+- Migrations from zero: 11/11 applied cleanly.
+- Backend unit (`tests/unit`): **1619/1619 pass**.
+- Backend contract against real PostgreSQL (`tests/contract`, `WEBGUARD_RUN_INTEGRATION=1` + `WEBGUARD_POSTGRES_TEST_DSN` set so the Postgres-backed cases actually execute rather than skip): **59/59 pass, 0 skipped**.
+- Backend integration including Juice Shop (`tests/integration`): **111/111 pass** — covers the new P1-11 scheduler outage suite (17/17), the existing P1-10 worker outage suite, the A2 worker crash/lease-recovery suite (`test_postgres_worker_crash_recovery.py`), the production SSRF callback E2E suite (`test_production_ssrf_callback_e2e.py`), the TrustScan permit-service lab, the signing-service E2E suite, and the full set of Scanner v1 lab tests (crawler, TLS analyzer, safe-HTTP, crawl-scan, professional-report, IDOR/Juice-Shop-authenticated-discovery).
+- P1-11 scheduler outage suite standalone re-run (`tests/integration/test_postgres_scheduler_outage_resilience.py`): **17/17 pass**.
+- Scheduler concurrency/idempotency: covered by the above (P1-11 suite scenarios 13-15) plus `tests/unit/test_phase2_cross_tenant_schedules.py` and `tests/unit/test_schedule_store.py` within the unit pass.
+- Job/executor regression: covered by the unit pass (`test_job_executor.py`, `test_job_executor_active_detection.py`, `test_phase4_executor_authority.py`, `test_job_leases.py`).
+- Callback tenant isolation: covered by `tests/unit/test_callback_service.py` (unit pass) and `tests/contract/test_callback_registration_repository_contract.py` (contract pass).
+- Signing-service regression: covered by the unit pass (`test_trustscan_signing.py`, `test_signing_provider.py`, `test_cloudhsm_signing.py`, `test_signing_service_cli_production_gate.py`) and the integration pass (`test_signing_service_e2e.py`).
+- TrustScan regression: covered by the unit pass (all `test_trustscan_*`/`test_*permit*` files) and the integration pass (`test_trustscan_permit_service_lab.py`).
+- Frontend typecheck (`tsc -b`): pass.
+- Frontend build (`tsc -b && vite build`): pass.
+- Frontend lint (`oxlint`): pass (pre-existing warnings only, no errors, none introduced by this change).
+- Vitest: **39/39 pass**.
+- Playwright (run only after the backend integration pass had fully finished, never concurrently against the same database): **4/4 pass**.
+- Secret scan, Ruff security checks (`--select S`), dependency audit (`scripts/run-security-gates.sh`): all pass.
+- Supply-chain pin verification (`scripts/verify-supply-chain-pins.py`) and security-governance document verification (`scripts/verify-governance-docs.py`): both pass.
+- `terraform fmt -check -recursive`, `terraform init -backend=false`, `terraform validate`: all pass.
+- Trivy IaC config scan (`infra/`, CRITICAL/HIGH): 0 misconfigurations.
+- `git diff --check`: clean throughout.
+- Both empirical atomicity fault injections (see FAULT-INJECTION PROOF) re-run on this same fresh infrastructure immediately before commit: both confirmed atomic.
+
+#### REMAINING LIMITATIONS
+
+1. The standalone-process test drives `ScanScheduleCoordinator.run_forever()` directly rather than the full `webguard-api scheduler` CLI entrypoint with production secrets/signing-service bootstrap — sound because `_scheduler_command()`'s only logic around `run_forever()` is "call it directly, no try/except," which the test reproduces exactly; the argparse/bootstrap layer is untouched by this fix.
+2. Combined `serve`-mode thread isolation was validated by reproducing `cli.py`'s exact `daemon=True, target=run_forever` thread construction, not by running a full `serve` process with a live HTTP server — a deliberate generalization from directly-tested Python threading semantics (an uncaught exception on one thread cannot propagate to another thread or the process), not an unverified assumption.
+3. Backoff reuses `poll_seconds` rather than a distinct outage constant, matching `worker.py`'s own choice — a very short `poll_seconds` configuration retries an outage just as fast as it polls normally; not a new risk, since that is also true of every other iteration already.
+4. Structured logging and service health/readiness remain absent pending P1-B — an operator still cannot *observe* that the scheduler absorbed an outage, only that it no longer dies from one.
+
+#### STATUS: CLOSED
+
+POST-AUDIT OPEN P1 count for P1-11 is now **0**.
+
+## CURRENT P1 ACCOUNTING
+
+- BASELINE OPEN P1: 9 (P1-1 through P1-9, unchanged, still open — see the immutable baseline audit)
+- POST-AUDIT P1-10: CLOSED
+- POST-AUDIT P1-11: CLOSED
+- OPEN POST-AUDIT P1: 0
+- CURRENT OPEN P1 TOTAL: 9
