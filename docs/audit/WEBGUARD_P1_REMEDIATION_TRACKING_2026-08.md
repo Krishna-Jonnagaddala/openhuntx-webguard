@@ -27,7 +27,11 @@ post-audit findings are discovered during that work.
 
 ## BASELINE P1 FINDINGS
 
-**BASELINE P1 = 9** (P1-1 through P1-9, from the immutable baseline audit — unchanged, still open, counted separately from anything below). See [WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md](WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md) for the original findings; none of them are rewritten here.
+**P1 FINDINGS AT BASELINE AUDIT = 9** (P1-1 through P1-9 — this historical count is immutable and is never rewritten; see [WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md](WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md) for the original findings, unchanged, never edited). Remediation status of each is tracked here, in this mutable document, without altering that historical baseline count.
+
+**CLOSED BASELINE P1: P1-5.** P1-5 was "no test in this repository exercises PostgreSQL-backed worker-crash/lease-expiry recovery... implemented-but-unproven" (baseline audit, line 294). Closed by Batch A's A2 work: `tests/integration/test_postgres_worker_crash_recovery.py` (commit `ee3c2c2`), 9 test methods, real PostgreSQL, already committed and part of every full-regression pass since — worker-A-disappears/worker-B-reclaims, claim-before/after-lease-expiry, stale-worker rejection, CAS-revision protection, no-duplicate-finding-on-recovered-retry, terminal-consistency-after-attempts-exhausted, cancellation-during-lease-becomes-cancelled-on-recovery, many-workers-racing-produces-one-winner. This closure was accurate at the time A2 completed but was not reflected in this document's running accounting until now — corrected here, not backdated into the immutable baseline audit.
+
+**CURRENT OPEN BASELINE P1: 8** (P1-1 through P1-4, P1-6 through P1-9 — P1-5 closed, as above).
 
 ## POST-AUDIT P1 FINDING
 
@@ -381,9 +385,9 @@ Production SSRF evidence preserved from this remediation's E2E proofs:
 
 ## CURRENT P1 ACCOUNTING
 
-- BASELINE OPEN P1: 9 (P1-1 through P1-9, unchanged, still open — see the immutable baseline audit)
-- POST-AUDIT P1-10: CLOSED
-- POST-AUDIT P1-11: CLOSED
-- POST-AUDIT P1-12: PARTIAL (P1-12-R1 sustained-outage residual open within it — not a separate finding ID)
-- OPEN POST-AUDIT P1: 1 (P1-12, partially open via P1-12-R1)
-- CURRENT OPEN P1 TOTAL: 10
+- BASELINE P1 AT AUDIT: 9 (P1-1 through P1-9 — immutable historical count, never altered)
+- CLOSED BASELINE P1: P1-5 (see BASELINE P1 FINDINGS above)
+- CURRENT OPEN BASELINE P1: 8
+- CLOSED POST-AUDIT: P1-10, P1-11
+- PARTIAL / OPEN POST-AUDIT: P1-12 (P1-12-R1 sustained-outage residual open within it — not a separate finding ID)
+- CURRENT OPEN P1 TOTAL: 9
