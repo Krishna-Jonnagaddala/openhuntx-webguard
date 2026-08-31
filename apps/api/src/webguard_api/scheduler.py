@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
+from .db_errors import DatabaseError
 from .identity import IdentityStore
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .store import JobStoreError, ScanJobStore
@@ -169,7 +170,48 @@ class ScanScheduleCoordinator:
 
     def run_forever(self, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
-            self.run_once()
+            try:
+                self.run_once()
+            except DatabaseError:
+                # P1-11 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+                # analogous in shape to worker.py's P1-10 run_forever()
+                # boundary, but justified independently -- scheduler
+                # semantics differ enough that the same shape had to be
+                # proven safe here on its own terms, not assumed from
+                # the worker precedent.
+                #
+                # run_once() can raise DatabaseError from list_due_schedules()
+                # (a plain read, nothing to lose) or from enqueue_due_schedule()
+                # partway through a batch (a write). enqueue_due_schedule()
+                # was empirically proven atomic under a mid-method connection
+                # failure -- a fault injected between its scan_jobs INSERT
+                # and its scan_schedules UPDATE, and one injected after the
+                # UPDATE but before the connection block's implicit commit,
+                # both left neither a job row nor a revision/next_run_at
+                # advance behind (see the P1-11 investigation report). So
+                # there is no partial per-schedule state a retry could
+                # observe or duplicate: every schedule this batch either
+                # fully materialized (job created + revision advanced,
+                # durably) before the failure, or is untouched and will be
+                # picked up again -- as the same still-due row -- on a
+                # later run_once() call. Unlike worker.py's terminal-state
+                # writes, there is nothing here that must eventually
+                # persist regardless of retries, so no nested bounded-
+                # retry-with-backoff helper is needed for the write itself;
+                # the outer poll loop already re-drives the whole batch.
+                #
+                # Only DatabaseError is caught here, deliberately: a
+                # semantic JobStoreError (schedule_enqueue_conflict, a
+                # trustscan binding change, etc.) must keep propagating
+                # unchanged, and an unexpected programming error must keep
+                # its existing visibility rather than being silently
+                # absorbed by an infrastructure-outage handler. The
+                # revision CAS and idempotency-key protections are
+                # untouched by this change, so a retried batch cannot
+                # duplicate an occurrence beyond what those already allow.
+                if stop_event.wait(self.poll_seconds):
+                    return
+                continue
             stop_event.wait(self.poll_seconds)
 
 
