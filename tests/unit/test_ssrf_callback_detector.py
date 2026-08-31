@@ -25,7 +25,11 @@ from webguard_scanner import (
     RequestTemplate,
     ValidatedTarget,
 )
-from webguard_scanner.callback_broker import CallbackPolicy, InMemoryCallbackBroker
+from webguard_scanner.callback_broker import (
+    CallbackBrokerError,
+    CallbackPolicy,
+    InMemoryCallbackBroker,
+)
 from webguard_scanner.ssrf_callback_detector import (
     SsrfDetectionOutcome,
     is_ssrf_candidate_parameter,
@@ -387,6 +391,76 @@ class SafetyBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(result.records[0].outcome, SsrfDetectionOutcome.INCONCLUSIVE)
         self.assertEqual(result.findings, ())
+
+    def test_callback_storage_failure_while_waiting_is_inconclusive_not_a_crash(self) -> None:
+        # A1: a callback-storage failure while waiting for an
+        # observation (e.g. PostgresCallbackBroker translating a
+        # PostgreSQL outage into CallbackBrokerError) must degrade only
+        # this one candidate to INCONCLUSIVE -- the identical treatment
+        # a registration-time CallbackBrokerError already gets -- never
+        # propagate and crash the whole detector run.
+        broker = InMemoryCallbackBroker(base_url="http://127.0.0.1:9/")
+        connection = _ScriptedConnection(status=200, body=b"ok")
+
+        def failing_wait(*args, **kwargs):
+            raise CallbackBrokerError(
+                "database_unavailable", "The database is currently unavailable."
+            )
+
+        broker.wait_for_observation = failing_wait  # type: ignore[method-assign]
+
+        result = _run(connection, candidates=(_template(),), broker=broker)
+
+        self.assertEqual(result.records[0].outcome, SsrfDetectionOutcome.INCONCLUSIVE)
+        self.assertEqual(result.findings, ())
+        self.assertIn("database_unavailable", result.probe_errors)
+
+    def test_callback_storage_failure_on_one_candidate_does_not_affect_another(self) -> None:
+        # Requirement 10: a callback-storage failure on one candidate
+        # must not fail unrelated candidates (or, by the identical
+        # per-candidate isolation this proves, unrelated detectors/the
+        # rest of the job) -- the loop must continue, not abort.
+        broker = InMemoryCallbackBroker(base_url="http://127.0.0.1:9/")
+        connection = _ScriptedConnection(status=200, body=b"ok")
+
+        real_wait = broker.wait_for_observation
+        real_register = broker.register
+        calls = {"count": 0}
+
+        def register_and_deliver_second_only(**kwargs):
+            token = real_register(**kwargs)
+            calls["count"] += 1
+            if calls["count"] == 2:
+                def deliver() -> None:
+                    time.sleep(0.02)
+                    broker.record_observation(token.value, method="GET")
+
+                threading.Thread(target=deliver).start()
+            return token
+
+        def wait_fails_only_first(token, **kwargs):
+            if calls["count"] == 1:
+                raise CallbackBrokerError(
+                    "database_unavailable", "The database is currently unavailable."
+                )
+            return real_wait(token, **kwargs)
+
+        broker.register = register_and_deliver_second_only  # type: ignore[method-assign]
+        broker.wait_for_observation = wait_fails_only_first  # type: ignore[method-assign]
+
+        result = _run(
+            connection,
+            candidates=(
+                _template(parameter="url", source_candidate_id="a"),
+                _template(parameter="callback", source_candidate_id="b"),
+            ),
+            broker=broker,
+        )
+
+        self.assertEqual(len(result.records), 2)
+        self.assertEqual(result.records[0].outcome, SsrfDetectionOutcome.INCONCLUSIVE)
+        self.assertEqual(result.records[1].outcome, SsrfDetectionOutcome.CONFIRMED)
+        self.assertEqual(len(result.findings), 1)
 
     def test_probe_request_failure_is_error_outcome(self) -> None:
         broker = InMemoryCallbackBroker(base_url="http://127.0.0.1:9/")

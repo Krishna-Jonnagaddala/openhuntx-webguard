@@ -746,12 +746,15 @@ class _ScanScopedCallbackBroker:
             raise CallbackBrokerError(exc.code, exc.message) from exc
 
     def wait_for_observation(self, token, *, policy, cancellation_check=None):
-        return self._repository.wait_for_observation(
-            token,
-            organization_id=self._organization_id,
-            policy=policy,
-            cancellation_check=cancellation_check,
-        )
+        try:
+            return self._repository.wait_for_observation(
+                token,
+                organization_id=self._organization_id,
+                policy=policy,
+                cancellation_check=cancellation_check,
+            )
+        except CallbackServiceError as exc:
+            raise CallbackBrokerError(exc.code, exc.message) from exc
 
 
 def _apply_ssrf_callback_detection(

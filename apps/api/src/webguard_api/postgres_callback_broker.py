@@ -166,15 +166,32 @@ class PostgresCallbackBroker:
         # is a genuine integrity violation in correct code (the caller
         # is holding a token it did not register for this
         # organization), so this is allowed to raise `CallbackServiceError`
-        # rather than degrade to "no observation".
-        self._repository.get_registration(token.value, organization_id=organization_id)
+        # rather than degrade to "no observation". A `DatabaseError` here
+        # (Postgres unreachable at wait-start) is translated the same
+        # way -- see the identical `except DatabaseError` below for why.
+        try:
+            self._repository.get_registration(token.value, organization_id=organization_id)
+        except DatabaseError as exc:
+            raise CallbackServiceError(exc.code, exc.message) from exc
 
         deadline_primary = time.monotonic() + policy.maximum_wait_seconds
         deadline_grace = deadline_primary + policy.grace_seconds
         while True:
             if cancellation_check is not None and cancellation_check():
                 return None, False, True
-            observation = self._latest_observation(token.value)
+            # A storage failure here (e.g. Postgres becomes unavailable
+            # mid-poll) must never be silently folded into "no
+            # observation yet" -- that would be indistinguishable from
+            # a genuine NOT_VULNERABLE result to every caller above this
+            # one. Translating to `CallbackServiceError` mirrors
+            # `register()`'s own DatabaseError handling exactly, so this
+            # candidate degrades to INCONCLUSIVE (scanner-layer, via
+            # `_ScanScopedCallbackBroker`/`ssrf_callback_detector.py`)
+            # rather than crashing the whole scan job.
+            try:
+                observation = self._latest_observation(token.value)
+            except DatabaseError as exc:
+                raise CallbackServiceError(exc.code, exc.message) from exc
             if observation is not None:
                 return observation, time.monotonic() <= deadline_primary, False
             if time.monotonic() >= deadline_grace:

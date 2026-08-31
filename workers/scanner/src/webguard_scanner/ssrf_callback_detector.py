@@ -383,13 +383,34 @@ def run_ssrf_callback_detector(
 
         throttle(policy)
 
-        observation, within_primary_window, was_cancelled = (
-            callback_broker.wait_for_observation(
-                token,
-                policy=callback_policy,
-                cancellation_check=cancellation_check,
+        try:
+            observation, within_primary_window, was_cancelled = (
+                callback_broker.wait_for_observation(
+                    token,
+                    policy=callback_policy,
+                    cancellation_check=cancellation_check,
+                )
             )
-        )
+        except CallbackBrokerError as exc:
+            # A callback-storage failure while waiting (e.g. the
+            # backing database becomes unavailable mid-poll) must
+            # degrade only this one candidate to INCONCLUSIVE -- the
+            # identical treatment `register()`'s own CallbackBrokerError
+            # already gets above -- never silently reclassified as
+            # NOT_VULNERABLE (which would be indistinguishable from a
+            # genuine negative result) and never left to propagate and
+            # fail the whole scan job.
+            probe_errors.append(exc.code)
+            records.append(
+                SsrfProbeRecord(
+                    candidate_endpoint=template.endpoint,
+                    method=template.method,
+                    parameter=template.parameter,
+                    outcome=SsrfDetectionOutcome.INCONCLUSIVE,
+                    detected_at=_utc_now(),
+                )
+            )
+            continue
 
         if was_cancelled:
             outcome = SsrfDetectionOutcome.INCONCLUSIVE
