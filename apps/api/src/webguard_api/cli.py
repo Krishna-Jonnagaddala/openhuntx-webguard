@@ -709,8 +709,22 @@ def _callback_service_command(args: argparse.Namespace) -> int:
     port = int(os.environ.get("WEBGUARD_CALLBACK_SERVICE_PORT", "8767"))
     rate_limit_requests = int(os.environ.get("WEBGUARD_CALLBACK_SERVICE_RATE_LIMIT_REQUESTS", "60"))
     rate_limit_window = int(os.environ.get("WEBGUARD_CALLBACK_SERVICE_RATE_LIMIT_WINDOW_SECONDS", "60"))
+    # P1-12: this process only ever does one latency-sensitive job --
+    # persist an inbound callback observation inside an HTTP request
+    # that the SSRF detector is simultaneously racing a 3s/5s
+    # (primary/grace) observation window against. The default 5s
+    # connection-checkout timeout (tuned for worker/scheduler background
+    # loops, where "eventually" is fine) would on its own already
+    # consume that entire window on a single failed attempt, defeating
+    # `callback_server.py`'s bounded retry before it even starts. A
+    # short, dedicated timeout keeps a real outage failing fast enough
+    # for that retry to matter, without touching the default any other
+    # caller relies on.
+    connection_timeout_seconds = float(
+        os.environ.get("WEBGUARD_CALLBACK_SERVICE_DB_CHECKOUT_TIMEOUT_SECONDS", "0.25")
+    )
 
-    pool = WebGuardPostgresPool(database_url)
+    pool = WebGuardPostgresPool(database_url, connection_timeout_seconds=connection_timeout_seconds)
     try:
         repository = PostgresCallbackRegistrationRepository(pool)
         rate_limiter = FixedWindowRateLimiter(requests=rate_limit_requests, window_seconds=rate_limit_window)

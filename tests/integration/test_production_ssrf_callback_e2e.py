@@ -213,7 +213,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         return server, stop, worker_thread, server_thread
 
-    def _run_job_and_get_findings(self, active_checks: list[str]) -> list[dict]:
+    def _run_job_and_get_findings(self, active_checks: list[str], *, completion_timeout_seconds: float = 25) -> list[dict]:
         config, components, auth_dir = self._build_components()
         organization, owner, token, now = self._bootstrap_org(components)
 
@@ -286,7 +286,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
                 self.assertEqual(response.status, 201, created)
                 job_id = created["job_id"]
 
-                deadline = time.monotonic() + 25
+                deadline = time.monotonic() + completion_timeout_seconds
                 result_payload = None
                 while time.monotonic() < deadline:
                     connection = http.client.HTTPConnection(host, port, timeout=5)
@@ -344,6 +344,102 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
 
         findings = self._run_job_and_get_findings([])
         self.assertFalse(any(f["check_id"].startswith("active.ssrf.callback") for f in findings), findings)
+
+    def test_ssrf_confirmed_despite_a_transient_persistence_failure_within_retry_budget(self) -> None:
+        """P1-12 end-to-end proof, scenario 1: the real fixture's
+        vulnerable route makes a real outbound request to the real
+        callback receiver; the very first attempt to persist that
+        observation hits a simulated, one-time connection failure
+        (`callback_server.py`'s bounded retry is what this test is
+        actually proving survives), the second attempt succeeds, and
+        the finding is still confirmed -- not degraded, not lost --
+        exactly as if no interruption had occurred. Fault injection
+        (not `docker stop`) is used deliberately here: the callback
+        arrives at a point in a real, unmodified 25-second job run that
+        is not practical to time a real container stop/start against
+        precisely, whereas this proves the identical code path
+        (`PostgresCallbackRegistrationRepository.record_observation`'s
+        own `DatabaseError`) with exact, reliable timing."""
+        import psycopg
+
+        real_execute = psycopg.Connection.execute
+        state = {"failed_once": False}
+
+        def faulty_execute(self_conn, query, params=None, **kwargs):
+            text = query if isinstance(query, str) else query.as_string(self_conn)
+            if not state["failed_once"] and "INSERT INTO callback_observations" in text:
+                state["failed_once"] = True
+                raise psycopg.OperationalError("simulated one-time connection failure (P1-12 E2E proof)")
+            return real_execute(self_conn, query, params, **kwargs)
+
+        with patch.object(psycopg.Connection, "execute", faulty_execute):
+            findings = self._run_job_and_get_findings(["active.ssrf.callback"])
+
+        self.assertTrue(state["failed_once"], "the fault injection must actually have fired at least once")
+        ssrf_findings = [f for f in findings if f["check_id"].startswith("active.ssrf.callback")]
+        vulnerable = [f for f in ssrf_findings if f["endpoint"] == "/fetch-vulnerable"]
+        self.assertEqual(len(vulnerable), 1, ssrf_findings)
+        self.assertEqual(vulnerable[0]["cwe_id"], "CWE-918")
+
+    def test_no_fabricated_confirmation_when_persistence_never_recovers(self) -> None:
+        """P1-12 end-to-end proof, scenario 3: the real fixture makes
+        the real outbound request, but every persistence attempt fails
+        for the whole run (a simulated outage that outlasts the
+        receiver's own bounded retry budget entirely). PostgreSQL
+        remains authoritative: no observation is ever durably written,
+        so the detector must not confirm anything it never actually
+        saw. This is the residual, honest limitation P1-12 accepts by
+        design -- see the P1-12 remediation report's LONG-OUTAGE
+        BEHAVIOR / FALSE-NEGATIVE RESIDUAL sections."""
+        import psycopg
+
+        real_execute = psycopg.Connection.execute
+
+        def always_faulty_execute(self_conn, query, params=None, **kwargs):
+            text = query if isinstance(query, str) else query.as_string(self_conn)
+            if "INSERT INTO callback_observations" in text:
+                raise psycopg.OperationalError("simulated permanent connection failure (P1-12 E2E proof)")
+            return real_execute(self_conn, query, params, **kwargs)
+
+        # This scenario is structurally slower than every sibling test
+        # in this file, not flaky: the fixture probes three candidates
+        # (/fetch-vulnerable, /fetch-safe, /reflect-only), and under
+        # this patch NONE of their observations can ever persist -- so
+        # every one of them waits out the full primary+grace window
+        # (3s + 2s, see CallbackPolicy's production defaults) rather
+        # than resolving in a couple of poll cycles like the
+        # already-recorded or fails-once-then-succeeds cases do. A
+        # generous, explicit budget here reflects that real, structural
+        # cost, not system-load tolerance.
+        run_started_at = _utc_now()
+        with patch.object(psycopg.Connection, "execute", always_faulty_execute):
+            findings = self._run_job_and_get_findings(["active.ssrf.callback"], completion_timeout_seconds=60)
+
+        ssrf_findings = [f for f in findings if f["check_id"].startswith("active.ssrf.callback")]
+        confirmed_or_probable = [
+            f for f in ssrf_findings
+            if f["endpoint"] == "/fetch-vulnerable" and f.get("cwe_id") == "CWE-918"
+        ]
+        self.assertEqual(
+            confirmed_or_probable, [],
+            "must never fabricate a CWE-918 finding for an observation that was never durably persisted",
+        )
+
+        from webguard_api.postgres_pool import WebGuardPostgresPool
+
+        assertion_pool = WebGuardPostgresPool(POSTGRES_TEST_DSN)
+        try:
+            with assertion_pool.connection() as connection:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM callback_observations WHERE observed_at > %s",
+                    (run_started_at,),
+                ).fetchone()[0]
+        finally:
+            assertion_pool.close()
+        self.assertEqual(
+            count, 0,
+            "no observation row from this run may exist -- persistence genuinely never succeeded",
+        )
 
 
 if __name__ == "__main__":

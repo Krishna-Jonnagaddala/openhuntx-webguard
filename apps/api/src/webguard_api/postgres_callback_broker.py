@@ -76,7 +76,7 @@ semantics, not by row deletion. This is a named gap, not a silent one.
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from webguard_scanner.callback_broker import CallbackObservation, CallbackPolicy, CallbackToken
 
@@ -174,8 +174,55 @@ class PostgresCallbackBroker:
         except DatabaseError as exc:
             raise CallbackServiceError(exc.code, exc.message) from exc
 
+        # P1-12: two clocks, deliberately kept separate rather than one
+        # doing both jobs. `time.monotonic()` remains the sole authority
+        # for LOOP CONTROL -- when to stop polling -- exactly as before;
+        # it is immune to wall-clock adjustments (NTP step, DST), which
+        # is exactly why it belongs here and nowhere else in this
+        # method. It was never suitable for CLASSIFICATION, though: the
+        # previous code compared `time.monotonic()` at the moment this
+        # process's poll query happened to notice the row, which is a
+        # measure of database/poll discovery latency, not of when the
+        # callback actually arrived. A `record_observation()` retry (or
+        # simply this process being slow to poll) could delay discovery
+        # without the underlying event having moved at all, silently
+        # demoting a CONFIRMED result to PROBABLE for reasons that have
+        # nothing to do with the target.
+        #
+        # `observed_at` is written by the callback-service process (a
+        # separate process, and eventually a separate host) at the
+        # moment the HTTP request actually arrived -- see
+        # `callback_server.py`'s `_handle()`, which captures it exactly
+        # once, before any persistence attempt or retry. Comparing it
+        # against UTC deadlines anchored to this method's own start
+        # (captured once, at the same instant as the monotonic
+        # baseline below, so the two clocks share one anchor point on
+        # this process) makes classification a function of when the
+        # event happened, not of how long it took this process to
+        # notice it.
+        #
+        # This assumes the callback-service host's and this worker
+        # host's wall clocks are synchronized to within a small
+        # fraction of `maximum_wait_seconds` -- the same assumption
+        # this codebase already makes for TrustScan permit validity
+        # windows (`not_before <= now < expires_at`, checked across the
+        # process that issued a permit and whatever process later
+        # validates it). No new clock-skew tolerance is introduced here
+        # for the same reason none exists there: ordinary cloud-host
+        # clock synchronization already keeps skew several orders of
+        # magnitude below this window, and an arbitrary tolerance would
+        # only widen the CONFIRMED/PROBABLE boundary without evidence
+        # that anything is actually needed. See the P1-12 design
+        # report's clock-skew analysis for the full justification.
+        wait_started_at_utc = datetime.now(timezone.utc)
         deadline_primary = time.monotonic() + policy.maximum_wait_seconds
         deadline_grace = deadline_primary + policy.grace_seconds
+        primary_evidence_deadline_utc = wait_started_at_utc + timedelta(
+            seconds=policy.maximum_wait_seconds
+        )
+        grace_evidence_deadline_utc = primary_evidence_deadline_utc + timedelta(
+            seconds=policy.grace_seconds
+        )
         while True:
             if cancellation_check is not None and cancellation_check():
                 return None, False, True
@@ -193,7 +240,18 @@ class PostgresCallbackBroker:
             except DatabaseError as exc:
                 raise CallbackServiceError(exc.code, exc.message) from exc
             if observation is not None:
-                return observation, time.monotonic() <= deadline_primary, False
+                if observation.observed_at > grace_evidence_deadline_utc:
+                    # Discovered inside the polling window (the loop is
+                    # still running), but the event itself happened too
+                    # late to count -- treated exactly like "no
+                    # observation", never resurrected as PROBABLE. A row
+                    # discovered only *after* the loop has already given
+                    # up can never reach this branch at all, since the
+                    # loop stops polling entirely once `deadline_grace`
+                    # (monotonic) passes.
+                    return None, False, False
+                within_primary_window = observation.observed_at <= primary_evidence_deadline_utc
+                return observation, within_primary_window, False
             if time.monotonic() >= deadline_grace:
                 return None, False, False
             time.sleep(policy.poll_interval_seconds)

@@ -55,9 +55,29 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Protocol
+from typing import Callable, Protocol
 
+from .db_errors import DatabaseError
 from .rate_limit import FixedWindowRateLimiter, RateLimitError
+
+# P1-12: this receiver's own latency budget, deliberately much smaller
+# than worker.py's/scheduler.py's P1-10/P1-11 retry constants -- those
+# back off a background poll loop that has nothing else waiting on it,
+# while this one sits inside a synchronous HTTP request that the SSRF
+# detector is simultaneously racing against a 3s primary / 5s total
+# (primary + grace) observation window (`CallbackPolicy.
+# maximum_wait_seconds`/`grace_seconds`). A single failed connection
+# attempt can itself take up to `WebGuardPostgresPool`'s default 5s
+# checkout timeout -- equal to the *entire* detection window -- which is
+# exactly why `webguard-api callback-service` constructs its pool with a
+# short, dedicated `connection_timeout_seconds` (see `cli.py`) rather
+# than the default. Two short attempts here, worst case, add a few
+# hundred milliseconds -- small enough to leave the detector's window
+# essentially undisturbed for a genuine sub-second blip, while a real
+# multi-second outage still exhausts this budget on the very first
+# attempt and the observation is honestly lost, not fabricated.
+DEFAULT_RECORD_OBSERVATION_MAXIMUM_ATTEMPTS = 2
+DEFAULT_RECORD_OBSERVATION_RETRY_BACKOFF_SECONDS = 0.1
 
 
 class _ObservationSink(Protocol):
@@ -76,11 +96,48 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _record_observation_with_bounded_retry(
+    repository: _ObservationSink,
+    token_value: str,
+    *,
+    method: str,
+    now: datetime,
+    maximum_attempts: int,
+    retry_backoff_seconds: float,
+    sleep: Callable[[float], None],
+) -> None:
+    """Retries only a genuine infrastructure failure (`DatabaseError`),
+    never a semantic outcome -- an invalid/expired/revoked/rate-limited
+    token is `record_observation()` legitimately returning `False`, not
+    raising, so it is never retried here regardless. `now` is captured
+    exactly once by the caller, before this function (or any retry
+    inside it) runs, and is passed through unchanged on every attempt --
+    the persisted `observed_at` must reflect when the callback actually
+    arrived, never when a retry happened to succeed (see the P1-12
+    design report's OBSERVED_AT SEMANTICS). On exhaustion this returns
+    normally rather than raising or falling back to anything else -- the
+    caller's response is uniform either way, and PostgreSQL remains the
+    sole authority on whether the observation exists; nothing here
+    fabricates one that was never durably persisted."""
+
+    for attempt in range(1, maximum_attempts + 1):
+        try:
+            repository.record_observation(token_value, method=method, now=now)
+            return
+        except DatabaseError:
+            if attempt >= maximum_attempts:
+                return
+            sleep(retry_backoff_seconds)
+
+
 def _make_handler(
     repository: _ObservationSink,
     *,
     respond_with_redirect: bool,
     rate_limiter: FixedWindowRateLimiter | None,
+    record_observation_maximum_attempts: int,
+    record_observation_retry_backoff_seconds: float,
+    sleep: Callable[[float], None],
 ) -> type[BaseHTTPRequestHandler]:
     class _CallbackHandler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:  # noqa: D401
@@ -100,7 +157,29 @@ def _make_handler(
                 except RateLimitError:
                     within_limit = False
             if within_limit:
-                repository.record_observation(token_value, method=self.command, now=_utc_now())
+                # P1-12: `now` is captured exactly once, here, before
+                # any persistence attempt -- never recomputed inside the
+                # retry helper, so the persisted `observed_at` always
+                # reflects the moment this request actually arrived.
+                # A `DatabaseError` (expected under a PostgreSQL outage)
+                # must never escape this call: it would otherwise reach
+                # Python's default `http.server`/`socketserver` error
+                # handling, which drops the connection with no HTTP
+                # response at all -- a third, externally-distinguishable
+                # outcome this receiver's whole design exists to avoid.
+                # Only `DatabaseError` is caught, deliberately: an
+                # unexpected programming error must keep its existing
+                # visibility, not be silently folded into a 204 that
+                # looks identical to a successful recording.
+                _record_observation_with_bounded_retry(
+                    repository,
+                    token_value,
+                    method=self.command,
+                    now=_utc_now(),
+                    maximum_attempts=record_observation_maximum_attempts,
+                    retry_backoff_seconds=record_observation_retry_backoff_seconds,
+                    sleep=sleep,
+                )
             # A rate-limited request is deliberately never recorded,
             # but still receives the identical generic response every
             # other request gets (see module docstring) -- a
@@ -147,9 +226,17 @@ class CallbackHttpReceiver:
         port: int = 0,
         respond_with_redirect: bool = False,
         rate_limiter: FixedWindowRateLimiter | None = None,
+        record_observation_maximum_attempts: int = DEFAULT_RECORD_OBSERVATION_MAXIMUM_ATTEMPTS,
+        record_observation_retry_backoff_seconds: float = DEFAULT_RECORD_OBSERVATION_RETRY_BACKOFF_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         handler = _make_handler(
-            repository, respond_with_redirect=respond_with_redirect, rate_limiter=rate_limiter
+            repository,
+            respond_with_redirect=respond_with_redirect,
+            rate_limiter=rate_limiter,
+            record_observation_maximum_attempts=record_observation_maximum_attempts,
+            record_observation_retry_backoff_seconds=record_observation_retry_backoff_seconds,
+            sleep=sleep,
         )
         self._server = ThreadingHTTPServer((host, port), handler)
         self._thread: threading.Thread | None = None

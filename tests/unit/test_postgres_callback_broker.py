@@ -342,5 +342,338 @@ class WaitForObservationDatabaseFailureTests(unittest.TestCase):
             self.fail("a raw DatabaseError escaped instead of the translated CallbackServiceError")
 
 
+class EvidenceTimeClassificationTests(unittest.TestCase):
+    """P1-12: `wait_for_observation()`'s CONFIRMED-vs-PROBABLE decision
+    is based on `observation.observed_at` (when the callback actually
+    arrived, timestamped by the callback-service process) compared
+    against UTC deadlines anchored to this call's own start -- never on
+    `time.monotonic()` at the moment this process's poll query happens
+    to notice the row. `policy.maximum_wait_seconds`/`grace_seconds`
+    are kept short (well under a second) purely so these tests run
+    fast and deterministically; the boundary offsets below (0.5s
+    margins) are chosen to be far larger than any realistic jitter
+    between this test's own `datetime.now(timezone.utc)` capture and
+    the method's internal one, so there is no flakiness risk."""
+
+    POLICY = CallbackPolicy(maximum_wait_seconds=1.0, grace_seconds=1.0, poll_interval_seconds=0.01)
+
+    def _token(self):
+        from webguard_scanner.callback_broker import CallbackToken
+
+        return CallbackToken(
+            value="tok-1", url=f"{BASE_URL}scan-1/tok-1", scan_id="scan-1",
+            candidate_fingerprint="url", expires_at=NOW + timedelta(minutes=5),
+        )
+
+    @staticmethod
+    def _row(observed_at: datetime) -> tuple:
+        return ("GET", "external", observed_at)
+
+    def test_a_late_discovery_of_an_in_window_callback_is_still_confirmed(self) -> None:
+        """Scenario A: the callback genuinely arrived well inside the
+        primary window, but this process's poll was slow to notice it
+        (simulated here as the first poll attempt finding nothing, the
+        second finding the row) -- discovery latency must not affect
+        the outcome. This is the exact regression P1-12 exists to fix:
+        before this change, a delayed *discovery* (e.g. from a
+        persistence retry) would have compared `time.monotonic()` at
+        discovery time, not the event's own timestamp, and could wrongly
+        demote this to PROBABLE."""
+        started = datetime.now(timezone.utc)
+        observed_at = started + timedelta(seconds=0.3)  # well inside the 1.0s primary window
+        repository = _FakeRepository()
+        pool = _FakePool([None, self._row(observed_at)])  # first poll: nothing yet; second: found
+        broker = _broker(repository, pool, policy=self.POLICY)
+
+        observation, within_primary, cancelled = broker.wait_for_observation(
+            self._token(), organization_id=ORG_ID, policy=self.POLICY
+        )
+        self.assertIsNotNone(observation)
+        self.assertTrue(within_primary, "a persistence/discovery delay must not demote an in-window callback")
+        self.assertFalse(cancelled)
+
+    def test_b_genuine_grace_window_arrival_is_probable(self) -> None:
+        """Scenario B: the callback itself genuinely arrived after the
+        primary deadline but inside grace -- PROBABLE is the correct,
+        honest outcome (weaker timing evidence), not an artifact to
+        eliminate."""
+        started = datetime.now(timezone.utc)
+        observed_at = started + timedelta(seconds=1.5)  # past the 1.0s primary, inside the 1.0-2.0s grace band
+        repository = _FakeRepository()
+        pool = _FakePool([self._row(observed_at)])
+        broker = _broker(repository, pool, policy=self.POLICY)
+
+        observation, within_primary, cancelled = broker.wait_for_observation(
+            self._token(), organization_id=ORG_ID, policy=self.POLICY
+        )
+        self.assertIsNotNone(observation)
+        self.assertFalse(within_primary)
+        self.assertFalse(cancelled)
+
+    def test_c_arrival_after_grace_is_never_confirmed_or_probable(self) -> None:
+        """Scenario C: the callback's own timestamp is past the grace
+        deadline, discovered while the poll loop is (by construction of
+        this test) still running -- must be treated exactly like no
+        observation at all (`observation is None`), never resurrected
+        as PROBABLE just because the row happened to be visible."""
+        started = datetime.now(timezone.utc)
+        observed_at = started + timedelta(seconds=3.0)  # past the full 2.0s (primary+grace) window
+        repository = _FakeRepository()
+        pool = _FakePool([self._row(observed_at)])
+        broker = _broker(repository, pool, policy=self.POLICY)
+
+        observation, within_primary, cancelled = broker.wait_for_observation(
+            self._token(), organization_id=ORG_ID, policy=self.POLICY
+        )
+        self.assertIsNone(observation)
+        self.assertFalse(within_primary)
+        self.assertFalse(cancelled)
+
+    def test_d_never_persisted_never_fabricated(self) -> None:
+        """Scenario D: no row ever appears (persistence permanently
+        failed) -- must time out to (None, False, False), identical to
+        a genuine NOT_VULNERABLE result. Nothing here fabricates an
+        observation that was never durably written."""
+        repository = _FakeRepository()
+        pool = _FakePool([None] * 500)  # every poll finds nothing, for the whole wait+grace window
+        broker = _broker(repository, pool, policy=self.POLICY)
+
+        observation, within_primary, cancelled = broker.wait_for_observation(
+            self._token(), organization_id=ORG_ID, policy=self.POLICY
+        )
+        self.assertIsNone(observation)
+        self.assertFalse(within_primary)
+        self.assertFalse(cancelled)
+
+    def test_e_discovery_delay_alone_never_changes_the_outcome(self) -> None:
+        """Scenario E: same in-window `observed_at` as scenario A, but
+        with several extra empty polls first to simulate a longer
+        discovery delay -- still CONFIRMED, as long as discovery occurs
+        before the overall wait actually ends."""
+        started = datetime.now(timezone.utc)
+        observed_at = started + timedelta(seconds=0.2)
+        repository = _FakeRepository()
+        pool = _FakePool([None, None, None, self._row(observed_at)])
+        broker = _broker(repository, pool, policy=self.POLICY)
+
+        observation, within_primary, cancelled = broker.wait_for_observation(
+            self._token(), organization_id=ORG_ID, policy=self.POLICY
+        )
+        self.assertIsNotNone(observation)
+        self.assertTrue(within_primary)
+        self.assertFalse(cancelled)
+
+    def test_f_observed_at_exactly_on_primary_boundary_is_confirmed(self) -> None:
+        """Scenario F: deterministic, documented boundary semantics --
+        the primary-window comparison is inclusive (`<=`), so an
+        observation timestamped exactly at the primary deadline counts
+        as CONFIRMED, not PROBABLE."""
+        started = datetime.now(timezone.utc)
+        observed_at = started + timedelta(seconds=self.POLICY.maximum_wait_seconds)
+        repository = _FakeRepository()
+        pool = _FakePool([self._row(observed_at)])
+        broker = _broker(repository, pool, policy=self.POLICY)
+
+        observation, within_primary, cancelled = broker.wait_for_observation(
+            self._token(), organization_id=ORG_ID, policy=self.POLICY
+        )
+        self.assertIsNotNone(observation)
+        self.assertTrue(within_primary)
+
+    def test_g_observed_at_exactly_on_grace_boundary_is_probable_not_dropped(self) -> None:
+        """Scenario G: the grace-window comparison is also inclusive
+        (`<=`) -- an observation timestamped exactly at the grace
+        deadline still counts as PROBABLE, not silently dropped as
+        "too late"."""
+        started = datetime.now(timezone.utc)
+        observed_at = started + timedelta(
+            seconds=self.POLICY.maximum_wait_seconds + self.POLICY.grace_seconds
+        )
+        repository = _FakeRepository()
+        pool = _FakePool([self._row(observed_at)])
+        broker = _broker(repository, pool, policy=self.POLICY)
+
+        observation, within_primary, cancelled = broker.wait_for_observation(
+            self._token(), organization_id=ORG_ID, policy=self.POLICY
+        )
+        self.assertIsNotNone(observation)
+        self.assertFalse(within_primary, "on the grace boundary this is PROBABLE, not CONFIRMED")
+
+    def test_small_clock_offsets_do_not_change_classification_near_the_middle_of_a_window(self) -> None:
+        """Synthetic clock-skew check (not a tolerance mechanism -- see
+        the P1-12 design report's clock-skew analysis): small offsets
+        (+-100ms, +-500ms) applied to an `observed_at` that sits well
+        inside the primary window must not perturb the outcome, since
+        none of these offsets approach either boundary. This documents
+        the current, deliberately-untolerant behavior rather than
+        introducing new slack."""
+        started = datetime.now(timezone.utc)
+        for offset_ms in (-500, -100, 0, 100, 500):
+            with self.subTest(offset_ms=offset_ms):
+                observed_at = started + timedelta(seconds=0.4) + timedelta(milliseconds=offset_ms)
+                repository = _FakeRepository()
+                pool = _FakePool([self._row(observed_at)])
+                broker = _broker(repository, pool, policy=self.POLICY)
+
+                observation, within_primary, _ = broker.wait_for_observation(
+                    self._token(), organization_id=ORG_ID, policy=self.POLICY
+                )
+                self.assertIsNotNone(observation)
+                self.assertTrue(within_primary)
+
+
+class ClockSkewBoundaryCharacterizationTests(unittest.TestCase):
+    """P1-12 follow-up: CHARACTERIZATION tests only. These prove, with
+    concrete near-boundary numbers, exactly how the CURRENT
+    implementation behaves under distributed clock skew between the
+    callback-service host (which stamps `observed_at` at the moment a
+    callback physically arrives) and the worker host (which computes
+    the UTC evidence deadlines `observed_at` is compared against).
+    Nothing here changes classification code and nothing here adds an
+    application-level clock-skew tolerance -- none exists before or
+    after this file, and this file's job is to make that fact
+    concrete and testable, not to fix it.
+
+    What these tests establish, explicitly:
+
+    1. No application-level clock-skew tolerance exists. The
+       comparison is a bare `<=`/`>` against a UTC deadline; there is
+       no epsilon, grace band, or fuzz applied to absorb skew between
+       hosts.
+    2. Synchronized UTC clocks between the worker host and the
+       callback-service host is an INFRASTRUCTURE assumption this code
+       relies on (see the P1-12 design report's clock-skew analysis --
+       the same assumption this codebase already makes for TrustScan
+       permit validity windows), not something this code enforces,
+       measures, or compensates for itself.
+    3. Clock skew near an evidence boundary CAN change which bucket a
+       genuine observation lands in -- tests 1 and 2 below demonstrate
+       exactly that, with real numbers, in both directions.
+    4. This does NOT alter WHETHER callback evidence exists. A real
+       callback either arrived or it did not; skew can only move an
+       arrival that genuinely happened across the CONFIRMED/PROBABLE
+       line -- it can never fabricate an observation from nothing, and
+       it can never make a genuine arrival vanish (see
+       EvidenceTimeClassificationTests.test_d_never_persisted_never_fabricated
+       for the "nothing ever arrived" case, which skew cannot affect
+       since there is no observed_at to skew in the first place).
+    5. It affects only the TIMING/CONFIDENCE category (CONFIRMED vs.
+       PROBABLE), never whether a candidate is flagged as vulnerable
+       at all -- NOT_VULNERABLE/INCONCLUSIVE classification is
+       unrelated to this comparison.
+    6. Monotonic time (`time.monotonic()`) remains solely responsible
+       for wait-loop termination (when to stop polling) throughout --
+       untouched by, and irrelevant to, every scenario below.
+
+    Tests 3 and 4 show +-500ms surviving unperturbed ONLY because the
+    chosen arrival times sit far enough from a boundary for that
+    specific window (production defaults: 3.0s primary, 2.0s grace) --
+    this is NOT a general "+-500ms is always safe" claim. Tests 1 and 2
+    are the deliberate counter-examples: the identical +-100ms class of
+    offset, placed near a boundary instead of mid-window, flips the
+    outcome both ways.
+    """
+
+    POLICY = CallbackPolicy(maximum_wait_seconds=3.0, grace_seconds=2.0, poll_interval_seconds=0.01)
+
+    def _token(self):
+        from webguard_scanner.callback_broker import CallbackToken
+
+        return CallbackToken(
+            value="tok-1", url=f"{BASE_URL}scan-1/tok-1", scan_id="scan-1",
+            candidate_fingerprint="url", expires_at=NOW + timedelta(minutes=5),
+        )
+
+    def _classify(self, observed_at: datetime) -> str:
+        repository = _FakeRepository()
+        pool = _FakePool([("GET", "external", observed_at)])
+        broker = _broker(repository, pool, policy=self.POLICY)
+        observation, within_primary, cancelled = broker.wait_for_observation(
+            self._token(), organization_id=ORG_ID, policy=self.POLICY
+        )
+        self.assertIsNotNone(observation)
+        self.assertFalse(cancelled)
+        return "CONFIRMED" if within_primary else "PROBABLE"
+
+    def test_1_true_arrival_just_before_primary_boundary_with_positive_skew_reads_probable(self) -> None:
+        """TRUE arrival: primary_deadline - 50ms -- a genuinely
+        in-window callback that, absent any skew, would be CONFIRMED.
+        Callback-service clock is +100ms fast, so the value it stamps
+        into `observed_at` reads as primary_deadline + 50ms -- past the
+        boundary. Result: PROBABLE. The skew, not the target's actual
+        timing, decided the bucket. Expected and unfixed by design --
+        no tolerance exists to correct for this."""
+        started = datetime.now(timezone.utc)
+        primary_deadline = started + timedelta(seconds=self.POLICY.maximum_wait_seconds)
+        true_arrival = primary_deadline - timedelta(milliseconds=50)
+        callback_service_clock_offset = timedelta(milliseconds=100)
+        stored_observed_at = true_arrival + callback_service_clock_offset
+        self.assertEqual(self._classify(stored_observed_at), "PROBABLE")
+
+    def test_2_true_arrival_just_after_primary_boundary_with_negative_skew_reads_confirmed(self) -> None:
+        """Mirror of test 1: TRUE arrival is primary_deadline + 50ms --
+        a genuinely late callback that, absent skew, would be PROBABLE.
+        Callback-service clock is 100ms SLOW, so the stamped
+        `observed_at` reads as primary_deadline - 50ms. Result:
+        CONFIRMED -- a higher confidence bucket than the real event
+        timing warrants, purely from clock skew, in the opposite
+        direction from test 1. Both directions are possible; neither is
+        corrected for."""
+        started = datetime.now(timezone.utc)
+        primary_deadline = started + timedelta(seconds=self.POLICY.maximum_wait_seconds)
+        true_arrival = primary_deadline + timedelta(milliseconds=50)
+        callback_service_clock_offset = timedelta(milliseconds=-100)
+        stored_observed_at = true_arrival + callback_service_clock_offset
+        self.assertEqual(self._classify(stored_observed_at), "CONFIRMED")
+
+    def test_3_arrival_comfortably_inside_primary_survives_500ms_skew_either_direction(self) -> None:
+        """NOT a claim that +-500ms is always safe -- see tests 1/2 for
+        the near-boundary counter-example. Here the true arrival sits
+        at the midpoint of a 3.0s primary window (1.5s from wait
+        start), far enough from both the window start and the primary
+        deadline that a +-500ms offset in either direction keeps the
+        stamped `observed_at` inside primary."""
+        started = datetime.now(timezone.utc)
+        true_arrival = started + timedelta(seconds=1.5)  # midpoint of a 3.0s primary window
+        for offset_ms in (-500, 500):
+            with self.subTest(offset_ms=offset_ms):
+                stored_observed_at = true_arrival + timedelta(milliseconds=offset_ms)
+                self.assertEqual(self._classify(stored_observed_at), "CONFIRMED")
+
+    def test_4_arrival_comfortably_inside_grace_survives_500ms_skew_either_direction(self) -> None:
+        """Same caveat as test 3: safe here because of distance from
+        the boundaries, not a general guarantee. True arrival at the
+        midpoint of the grace band (4.0s from wait start, for a 3.0s
+        primary + 2.0s grace = 3.0-5.0s band), +-500ms stays inside
+        grace (3.5s-4.5s)."""
+        started = datetime.now(timezone.utc)
+        true_arrival = started + timedelta(seconds=4.0)  # midpoint of the 3.0-5.0s grace band
+        for offset_ms in (-500, 500):
+            with self.subTest(offset_ms=offset_ms):
+                stored_observed_at = true_arrival + timedelta(milliseconds=offset_ms)
+                self.assertEqual(self._classify(stored_observed_at), "PROBABLE")
+
+    def test_5_observed_at_exactly_on_primary_deadline_is_confirmed(self) -> None:
+        """Deterministic boundary semantics, restated here for this
+        characterization suite's own completeness (also covered by
+        EvidenceTimeClassificationTests.test_f): the primary comparison
+        is inclusive (`<=`)."""
+        started = datetime.now(timezone.utc)
+        primary_deadline = started + timedelta(seconds=self.POLICY.maximum_wait_seconds)
+        self.assertEqual(self._classify(primary_deadline), "CONFIRMED")
+
+    def test_6_observed_at_exactly_on_grace_deadline_is_probable(self) -> None:
+        """Deterministic boundary semantics, restated here for this
+        characterization suite's own completeness (also covered by
+        EvidenceTimeClassificationTests.test_g): the grace comparison
+        is also inclusive (`<=`), so the exact boundary is PROBABLE,
+        never silently dropped."""
+        started = datetime.now(timezone.utc)
+        grace_deadline = started + timedelta(
+            seconds=self.POLICY.maximum_wait_seconds + self.POLICY.grace_seconds
+        )
+        self.assertEqual(self._classify(grace_deadline), "PROBABLE")
+
+
 if __name__ == "__main__":
     unittest.main()
