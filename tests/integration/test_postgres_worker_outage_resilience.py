@@ -501,21 +501,35 @@ class PostgresWorkerOutageResilienceTests(unittest.TestCase):
         finally:
             _start_postgres()
 
-        # A later run_once() call, once Postgres is back, must still be
-        # able to process a completely different job normally. The
-        # connection pool can need a little longer than pg_isready to
-        # fully re-establish, so retry the call itself, not just reads.
-        processed = False
+        # Later run_once() calls, once Postgres is back, must still be
+        # able to process jobs normally. Call it repeatedly (bounded)
+        # rather than assuming exactly one call suffices: record_1 was
+        # abandoned RUNNING with its own still-live lease, submitted
+        # before record_2, so a call that happens to land after enough
+        # wall-clock time has passed for record_1's lease to expire may
+        # legitimately reclaim record_1 first (claim_next_leased()
+        # always picks the oldest submitted QUEUED job) rather than
+        # reaching record_2 on its very first opportunity -- that is
+        # correct, expected recovery behavior (A2), not a failure of
+        # this fix. What this test actually asserts is that record_2
+        # eventually processes normally, not that one specific call
+        # reaches it. The connection pool can also need a little
+        # longer than pg_isready to fully re-establish, so failed
+        # attempts are retried too.
+        final_2 = None
         last_exc = None
-        for _ in range(10):
+        for _ in range(15):
             try:
-                processed = worker.run_once()
-                break
+                worker.run_once()
             except Exception as exc:  # noqa: BLE001 - test-harness retry for pool reconnection lag
                 last_exc = exc
                 time.sleep(1)
-        self.assertTrue(processed, f"run_once() never succeeded after recovery: {last_exc!r}")
-        final_2 = self._get_with_retry(record_2.job_id)
+                continue
+            final_2 = self.jobs.get(record_2.job_id)
+            if final_2.state.value != "queued":
+                break
+            time.sleep(0.5)
+        self.assertIsNotNone(final_2, f"run_once() never succeeded after recovery: {last_exc!r}")
         self.assertEqual(final_2.state.value, "completed", "a later job must process normally once Postgres returns")
 
 
