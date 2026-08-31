@@ -157,6 +157,44 @@ class CallbackRegistrationRepository(Protocol):
 
 
 @runtime_checkable
+class TenantScopedCallbackBroker(Protocol):
+    """What ``executor.py``'s ``_ScanScopedCallbackBroker`` actually
+    needs from whatever ``ScanJobExecutor.callback_repository`` holds:
+    a ``policy`` to hand the detector, and tenant-scoped
+    register/wait -- distinct from ``CallbackRegistrationRepository``
+    above, which is the durable *metadata* surface (no ``policy``, no
+    ``wait_for_observation``, and its ``register()`` returns a
+    ``ScopedCallbackRegistration``, not a scanner-layer
+    ``CallbackToken``). The in-memory ``CallbackRepository`` and
+    ``postgres_callback_broker.PostgresCallbackBroker`` both satisfy
+    this; a bare ``CallbackRegistrationRepository`` does not."""
+
+    @property
+    def policy(self): ...
+
+    def register(
+        self,
+        *,
+        scan_id: str,
+        candidate_fingerprint: str,
+        organization_id: str,
+        target: str,
+        authorization_id: str,
+        job_id: str | None = None,
+        permit_id: str | None = None,
+    ): ...
+
+    def wait_for_observation(
+        self,
+        token,
+        *,
+        organization_id: str,
+        policy,
+        cancellation_check=None,
+    ): ...
+
+
+@runtime_checkable
 class JobRepository(Protocol):
     """Scan-job queue, lease, and TrustScan-permit-binding surface
     (Slice 13 requirements 1-4). Matches ``store.ScanJobStore``'s real
@@ -283,4 +321,5 @@ __all__ = [
     "JobRepository",
     "ScanRepository",
     "TargetRepository",
+    "TenantScopedCallbackBroker",
 ]

@@ -6,14 +6,31 @@ revoke_registration / record_observation), reusing its
 error codes so both backends are contract-test-compatible.
 
 Scope, stated plainly: this repository proves durable, tenant-isolated
-callback-registration storage in PostgreSQL -- it does not replace the
-in-memory ``InMemoryCallbackBroker``'s real-time wait/correlate
-mechanism used by a live scan (``wait_for_observation``), which is
-inherently a low-latency, in-process operation tied to one worker
-actively running one scan. Wiring this repository in as the executor's
-live callback broker (rather than a durable audit/introspection store
-alongside it) is explicitly future work -- see the Slice 12 audit
-doc's "Known limitations".
+callback-registration storage in PostgreSQL -- it does not itself
+implement the real-time wait/correlate mechanism a live scan uses
+(``wait_for_observation``); that now lives in
+``postgres_callback_broker.PostgresCallbackBroker``, a thin adapter
+over this repository that polls ``callback_observations`` instead of
+consulting an in-process dict, because Slice 18 made the callback
+receiver a separately-deployable process (``webguard-api
+callback-service``) that can no longer share memory with the worker
+process waiting on an observation. Wiring that adapter in as the
+executor's live callback broker was previously named as future work
+here (Slice 12's audit doc's "Known limitations") -- it is now done;
+see ``production_startup.py``.
+
+``maximum_active_registrations`` enforcement (the one policy control
+the in-memory broker had that this repository previously did not
+reproduce) is implemented directly below, scoped per-organization
+rather than process-wide the way ``InMemoryCallbackBroker`` scopes it
+-- a shared production deployment must not let one noisy-neighbor
+organization exhaust a global budget that affects every other tenant's
+scans. It is a best-effort count-then-insert, not a hard
+serialization-guaranteed cap (no ``SELECT ... FOR UPDATE`` on a
+sentinel row): this is a soft abuse control, not a security invariant,
+so a small race window under a heavy concurrent-registration burst
+(briefly exceeding the limit by a handful of rows) is an accepted
+trade-off against added lock contention on every single registration.
 """
 
 from __future__ import annotations
@@ -60,6 +77,19 @@ class PostgresCallbackRegistrationRepository:
         created_at = now or datetime.now(timezone.utc)
         expires_at = created_at + timedelta(seconds=effective_policy.token_ttl_seconds)
         with self._pool.connection() as connection:
+            active_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM callback_registrations
+                WHERE organization_id = %s AND revoked_at IS NULL AND expires_at > %s
+                """,
+                (organization_id, created_at),
+            ).fetchone()[0]
+            if active_count >= effective_policy.maximum_active_registrations:
+                raise CallbackServiceError(
+                    "callback_registration_limit_exceeded",
+                    f"{active_count} active callback registrations already exist for "
+                    f"this organization, at the {effective_policy.maximum_active_registrations} limit.",
+                )
             connection.execute(
                 """
                 INSERT INTO callback_registrations

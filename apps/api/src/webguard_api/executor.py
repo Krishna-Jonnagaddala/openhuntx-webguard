@@ -81,7 +81,7 @@ from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .safety import TrustScanRuntimeSafetyEngine, TrustScanRuntimeSafetyError
 from .scan_store import InMemoryScanRepository
 from .secret_provider import LocalSecretProvider, SecretProvider, SecretProviderError
-from .repository_contracts import JobRepository
+from .repository_contracts import JobRepository, TenantScopedCallbackBroker
 from .store import JobStoreError
 
 
@@ -716,7 +716,7 @@ class _ScanScopedCallbackBroker:
 
     def __init__(
         self,
-        repository: CallbackRepository,
+        repository: TenantScopedCallbackBroker,
         *,
         organization_id: str,
         target: str,
@@ -767,7 +767,7 @@ def _apply_ssrf_callback_detection(
     authentication_context_id: str | None,
     authentication_contexts: AuthenticationContextRepository,
     secret_provider: SecretProvider,
-    callback_repository: CallbackRepository,
+    callback_repository: TenantScopedCallbackBroker,
     fetch_policy: FetchPolicy,
     safety: TrustScanRuntimeSafetyEngine,
     cancellation_token: CrawlCancellationToken,
@@ -906,7 +906,7 @@ class ScanJobExecutor:
         ) = None,
         authentication_contexts: AuthenticationContextRepository | None = None,
         authorization_comparison_plans: AuthorizationComparisonPlanRepository | None = None,
-        callback_repository: CallbackRepository | None = None,
+        callback_repository: TenantScopedCallbackBroker | None = None,
         scan_repository=None,
         finding_repository=None,
         secret_provider: SecretProvider | None = None,

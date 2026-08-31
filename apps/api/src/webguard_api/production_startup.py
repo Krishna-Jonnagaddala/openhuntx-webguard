@@ -37,6 +37,26 @@ default (``LocalSecretProvider`` wrapping
 ``PostgresAuthenticationContextRepository``, which has no secret
 material) fails closed the moment an authenticated scan actually needs
 one, not at startup.
+
+SSRF-callback wiring fix (post-Slice-17, closes audit finding P0-1):
+``ScanJobExecutor`` used to receive the raw
+``PostgresCallbackRegistrationRepository`` directly as its
+``callback_repository`` -- a durable *metadata* store, not the live
+broker the executor actually needs (no ``.policy``, no
+``wait_for_observation()``, and a ``register()`` returning a
+``ScopedCallbackRegistration`` with no ``.url``). Every production scan
+whose permit included ``active.ssrf.callback`` crashed with an
+``AttributeError`` the moment it reached that detector. The executor
+now receives a ``postgres_callback_broker.PostgresCallbackBroker``
+instead: an adapter over the same durable repository that also polls
+``callback_observations`` for a real-time wait (necessary because the
+callback receiver, ``webguard-api callback-service``, is an
+independently deployable process with no shared memory with the
+worker) and finally consumes ``callback_service_hostname`` -- validated
+by ``ProductionServiceConfig`` since it was introduced but, until now,
+never read anywhere -- to build the actual public callback URL a probe
+embeds. See ``postgres_callback_broker.py``'s module docstring for the
+full design.
 """
 
 from __future__ import annotations
@@ -64,6 +84,7 @@ from .mail import PostmarkClientProtocol, PostmarkHttpClient, ProductionMailProv
 from .pagination import SignedCursorCodec
 from .postgres_authentication_contexts import PostgresAuthenticationContextRepository
 from .postgres_authorization_comparison import PostgresAuthorizationComparisonPlanRepository
+from .postgres_callback_broker import PostgresCallbackBroker
 from .postgres_callback_service import PostgresCallbackRegistrationRepository
 from .postgres_findings import PostgresFindingRepository
 from .postgres_identity import PostgresIdentityRepository
@@ -98,7 +119,7 @@ class ProductionComponents:
     jobs: PostgresJobRepository
     scans: PostgresScanRepository
     findings: PostgresFindingRepository
-    callback_repository: PostgresCallbackRegistrationRepository
+    callback_repository: PostgresCallbackBroker
     authentication_contexts: PostgresAuthenticationContextRepository
     authorization_comparison_plans: PostgresAuthorizationComparisonPlanRepository
     reports: PostgresReportRepository
@@ -140,7 +161,22 @@ def build_production_components(
     jobs = PostgresJobRepository(pool)
     scans = PostgresScanRepository(pool)
     findings = PostgresFindingRepository(pool)
-    callback_repository = PostgresCallbackRegistrationRepository(pool)
+    # Requirement (SSRF-callback wiring fix, closes audit finding
+    # P0-1): the durable repository is still constructed directly here
+    # (and still what `webguard-api callback-service` uses to record
+    # inbound observations -- see `cli.py`), but `ScanJobExecutor`
+    # needs the live broker adapter wrapping it, not the raw
+    # repository -- see `PostgresCallbackBroker`'s module docstring
+    # and this module's own docstring above for why.
+    # `callback_service_hostname` is what finally makes this a real,
+    # publicly-reachable callback URL rather than the loopback-only
+    # `http://127.0.0.1:0/` every non-production caller defaults to.
+    callback_registration_repository = PostgresCallbackRegistrationRepository(pool)
+    callback_repository = PostgresCallbackBroker(
+        callback_registration_repository,
+        pool,
+        base_url=f"https://{config.callback_service_hostname}/",
+    )
     authentication_contexts = PostgresAuthenticationContextRepository(pool)
     authorization_comparison_plans = PostgresAuthorizationComparisonPlanRepository(pool)
     reports = PostgresReportRepository(pool)
