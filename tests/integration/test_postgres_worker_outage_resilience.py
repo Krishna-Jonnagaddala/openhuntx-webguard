@@ -532,6 +532,41 @@ class PostgresWorkerOutageResilienceTests(unittest.TestCase):
         self.assertIsNotNone(final_2, f"run_once() never succeeded after recovery: {last_exc!r}")
         self.assertEqual(final_2.state.value, "completed", "a later job must process normally once Postgres returns")
 
+    # -- P1-B1: structured events during a REAL outage/recovery, edge-triggered --
+    def test_p1b1_database_outage_events_are_edge_triggered_during_a_real_outage(self) -> None:
+        """Does not alter run_forever()'s actual outage-survival
+        outcome (proven unchanged by every other test in this suite) --
+        purely layers a structured-logging assertion on top of the
+        identical real docker stop/start cycle test_c above already
+        uses, to prove database_outage_detected/_recovered fire
+        exactly once each against a genuine outage, not a mock."""
+        import io
+        import json
+
+        from webguard_api.structured_logging import configure_structured_logging
+
+        buf = io.StringIO()
+        configure_structured_logging(service="worker", stream=buf)
+
+        worker = self._worker(SimpleNamespace(execute=lambda *a, **k: self._succeeding_outcome()), poll_seconds=0.25)
+        stop_event = threading.Event()
+        _stop_postgres()
+        thread = threading.Thread(target=worker.run_forever, args=(stop_event,), name="p1b1-worker-events", daemon=True)
+        thread.start()
+        time.sleep(2.0)
+        self.assertTrue(thread.is_alive())
+        _start_postgres()
+        time.sleep(3.0)
+        self.assertTrue(thread.is_alive())
+        stop_event.set()
+        thread.join(timeout=3.0)
+
+        lines = [json.loads(line) for line in buf.getvalue().splitlines() if line]
+        detected = [line for line in lines if line.get("event") == "database_outage_detected"]
+        recovered = [line for line in lines if line.get("event") == "database_outage_recovered"]
+        self.assertEqual(len(detected), 1, f"expected exactly one detected event, got {len(detected)}")
+        self.assertEqual(len(recovered), 1, f"expected exactly one recovered event, got {len(recovered)}")
+
 
 if __name__ == "__main__":
     unittest.main()

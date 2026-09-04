@@ -66,6 +66,7 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 from .signing import CloudHsmSigningProvider, SigningKeyRegistry, SigningProviderError
+from .structured_logging import log_event
 
 _MAXIMUM_MESSAGE_BYTES = 4096  # a TrustScan permit/receipt's signing_bytes is always small
 
@@ -180,6 +181,13 @@ def build_signing_service_handler(
                 self._send_json(
                     200, {"key_id": registry.active.key_id, "signature": _b64url_encode(signature)}
                 )
+                # P1-B1: key_id is permitted (an identifier, not
+                # secret material); the message and signature bytes
+                # are never logged, and no synthetic signing operation
+                # is performed merely to produce this event.
+                log_event(service="signing-service",
+                    event="sign_request_completed", level="info", key_id=registry.active.key_id,
+                )
             except SigningServiceError as exc:
                 self._error(exc)
             except (ValueError, json.JSONDecodeError):
@@ -188,6 +196,10 @@ def build_signing_service_handler(
                 )
             except SigningProviderError as exc:
                 self._error(SigningServiceError(exc.code, exc.message, status=500))
+                if exc.code == "trustscan_signing_key_disabled":
+                    log_event(service="signing-service", event="active_key_unavailable", level="error", error_code=exc.code)
+                else:
+                    log_event(service="signing-service", event="sign_request_failed", level="error", error_code=exc.code)
 
         def do_GET(self) -> None:  # noqa: N802
             if not self._require_auth():
@@ -249,12 +261,14 @@ class SigningServiceServer:
     def start(self) -> None:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
+        log_event(service="signing-service", event="signing_service_started", level="info")
 
     def stop(self) -> None:
         self._server.shutdown()
         self._server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
+        log_event(service="signing-service", event="signing_service_stopped", level="info")
 
 
 def build_cloudhsm_signing_provider_from_env():

@@ -59,6 +59,7 @@ from typing import Callable, Protocol
 
 from .db_errors import DatabaseError
 from .rate_limit import FixedWindowRateLimiter, RateLimitError
+from .structured_logging import log_event
 
 # P1-12: this receiver's own latency budget, deliberately much smaller
 # than worker.py's/scheduler.py's P1-10/P1-11 retry constants -- those
@@ -123,10 +124,37 @@ def _record_observation_with_bounded_retry(
     for attempt in range(1, maximum_attempts + 1):
         try:
             repository.record_observation(token_value, method=method, now=now)
+            if attempt > 1:
+                # P1-B1: only logged when a later attempt succeeded
+                # after an earlier one failed -- a clean first-attempt
+                # success is the overwhelming common case and is not
+                # itself an event (see the P1-B1 report's LOG VOLUME
+                # POLICY: no success-path spam). No extra database
+                # lookup is performed to enrich this event -- only the
+                # attempt count already known from this loop, and no
+                # raw token value (see the P1-12-R1 sensitivity note in
+                # the module docstring).
+                log_event(service="callback-service",
+                    event="callback_observation_persistence_recovered", level="info", attempt=attempt,
+                )
             return
         except DatabaseError:
             if attempt >= maximum_attempts:
+                # P1-12-R1's own critical operational event: every
+                # persistence attempt for this observation failed.
+                # PostgreSQL remains authoritative -- nothing here
+                # fabricates a recording that never happened, and this
+                # event is what makes that loss observable (see the
+                # P1-B1 report's P1-12-R1 OBSERVABILITY DESIGN and the
+                # module docstring above).
+                log_event(service="callback-service",
+                    event="callback_observation_persistence_exhausted", level="error",
+                    attempt=attempt, error_code="callback_observation_persistence_unavailable",
+                )
                 return
+            log_event(service="callback-service",
+                event="callback_observation_persistence_retry", level="warning", attempt=attempt,
+            )
             sleep(retry_backoff_seconds)
 
 

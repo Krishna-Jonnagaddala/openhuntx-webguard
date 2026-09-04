@@ -59,6 +59,7 @@ from .signing_service import (
     build_cloudhsm_signing_provider_from_env,
 )
 from .store import JobStoreError, ScanJobStore
+from .structured_logging import configure_structured_logging
 from .worker import ScanJobWorker
 
 
@@ -520,6 +521,7 @@ def _worker_command(args: argparse.Namespace) -> int:
     else:
         config = _config(args)
         _, _, _, worker, _, _, _ = _components(config)
+    configure_structured_logging(service="worker")
     try:
         if args.once:
             processed = worker.run_once()
@@ -565,6 +567,7 @@ def _scheduler_command(args: argparse.Namespace) -> int:
     else:
         config = _config(args)
         _, _, _, _, scheduler, _, _ = _components(config)
+    configure_structured_logging(service="scheduler")
     try:
         if args.once:
             summary = scheduler.run_once()
@@ -661,6 +664,7 @@ def _signing_service_command(args: argparse.Namespace) -> int:
     registry = SigningKeyRegistry(provider)
     host = os.environ.get("WEBGUARD_SIGNING_SERVICE_HOST", "127.0.0.1")
     port = int(os.environ.get("WEBGUARD_SIGNING_SERVICE_PORT", "8766"))
+    configure_structured_logging(service="signing-service")
     server = SigningServiceServer(registry, bearer_token=bearer_token, host=host, port=port)
     server.start()
     print(
@@ -725,6 +729,7 @@ def _callback_service_command(args: argparse.Namespace) -> int:
     )
 
     pool = WebGuardPostgresPool(database_url, connection_timeout_seconds=connection_timeout_seconds)
+    configure_structured_logging(service="callback-service")
     try:
         repository = PostgresCallbackRegistrationRepository(pool)
         rate_limiter = FixedWindowRateLimiter(requests=rate_limit_requests, window_seconds=rate_limit_window)
@@ -779,6 +784,14 @@ def _serve_command(args: argparse.Namespace) -> int:
         session_authenticator = BrowserSessionAuthenticator(identity, service.sessions)
         host, port = config.host, config.port
         maximum_request_bytes = config.maximum_request_bytes
+    # P1-B1: the combined `serve` process is configured as service
+    # "api" -- a single process-wide structured-logging identity, not
+    # a separate one per embedded worker/scheduler thread (this
+    # module intentionally has no thread-local service concept). The
+    # `event` field itself (job_claimed, schedule_materialized,
+    # request_completed, ...) still discriminates which subsystem
+    # produced each line even though `service` reads "api" throughout.
+    configure_structured_logging(service="api")
     stop_event = threading.Event()
     worker_thread = threading.Thread(
         target=worker.run_forever,

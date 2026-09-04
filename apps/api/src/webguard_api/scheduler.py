@@ -12,6 +12,7 @@ from .db_errors import DatabaseError
 from .identity import IdentityStore
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .store import JobStoreError, ScanJobStore
+from .structured_logging import log_event
 
 
 def _utc_now() -> datetime:
@@ -55,9 +56,12 @@ class ScanScheduleCoordinator:
             raise ValueError("batch_size must be an integer.")
         if not 1 <= self.batch_size <= 1000:
             raise ValueError("batch_size must be from 1 to 1000.")
+        # P1-B1: edge-trigger state for database_outage_detected/
+        # _recovered -- touched only from run_forever()'s own thread.
+        self._in_database_outage = False
 
     def _block(self, schedule, *, code: str, now: datetime) -> bool:
-        return (
+        blocked = (
             self.store.block_due_schedule(
                 schedule.schedule_id,
                 expected_revision=schedule.revision,
@@ -66,6 +70,12 @@ class ScanScheduleCoordinator:
             )
             is not None
         )
+        if blocked:
+            log_event(service="scheduler",
+                event="schedule_materialization_failed", level="warning",
+                schedule_id=schedule.schedule_id, error_code=code,
+            )
+        return blocked
 
     def run_once(self) -> ScheduleRunSummary:
         now = self.clock()
@@ -161,6 +171,11 @@ class ScanScheduleCoordinator:
                 raced += 1
             else:
                 enqueued += 1
+                _, job_record = result
+                log_event(service="scheduler",
+                    event="schedule_materialized", level="info",
+                    schedule_id=schedule.schedule_id, job_id=job_record.job_id,
+                )
         return ScheduleRunSummary(
             inspected=len(schedules),
             enqueued=enqueued,
@@ -169,6 +184,13 @@ class ScanScheduleCoordinator:
         )
 
     def run_forever(self, stop_event: threading.Event) -> None:
+        log_event(service="scheduler", event="scheduler_started", level="info")
+        try:
+            self._run_forever(stop_event)
+        finally:
+            log_event(service="scheduler", event="scheduler_stopped", level="info")
+
+    def _run_forever(self, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
             try:
                 self.run_once()
@@ -209,9 +231,17 @@ class ScanScheduleCoordinator:
                 # revision CAS and idempotency-key protections are
                 # untouched by this change, so a retried batch cannot
                 # duplicate an occurrence beyond what those already allow.
+                if not self._in_database_outage:
+                    # P1-B1: edge-triggered -- one event per outage
+                    # episode, not one per poll cycle.
+                    self._in_database_outage = True
+                    log_event(service="scheduler", event="database_outage_detected", level="error")
                 if stop_event.wait(self.poll_seconds):
                     return
                 continue
+            if self._in_database_outage:
+                self._in_database_outage = False
+                log_event(service="scheduler", event="database_outage_recovered", level="info")
             stop_event.wait(self.poll_seconds)
 
 

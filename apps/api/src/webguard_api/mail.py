@@ -6,14 +6,18 @@ depends on -- ``send(to, subject, body, category)`` and nothing else --
 plus four backends:
 
 - ``DevelopmentMailProvider`` (renamed from Slice 16's
-  ``LoggingMailProvider``) -- writes the message to the application log.
-  Local/dev default only; a real production deployment must configure
-  ``ProductionMailProvider`` explicitly (``production_config.py`` fails
-  closed otherwise). Still logs the full message body, including the
-  one-time token embedded in a verification/reset/invitation link --
-  a local/dev console is not a production log-aggregation exposure
-  surface, matching every other local-vs-production distinction this
-  project already draws.
+  ``LoggingMailProvider``) -- local/dev default only; a real production
+  deployment must configure ``ProductionMailProvider`` explicitly
+  (``production_config.py`` fails closed otherwise). P1-B1 removed its
+  original behavior of writing the full message body -- including the
+  one-time token embedded in a verification/reset/invitation link -- to
+  the application log: the redaction boundary that keeps that kind of
+  value out of every other log path must not depend on what level a
+  given process happens to have its logging configured at, and a
+  local/dev console is reachable by exactly the same stdlib logging
+  machinery as anything else in this process. It is now a documented
+  no-op; see its own class docstring for how to actually inspect a
+  message sent during local development.
 - ``InMemoryMailProvider`` -- test-only sink, unchanged from Slice 16.
 - ``ProductionMailProvider`` -- real transactional delivery via
   Postmark (``docs/production/PROVIDER_EVALUATION.md``'s own
@@ -52,7 +56,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -60,7 +63,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol
 
-_logger = logging.getLogger("webguard_api.mail")
+from .structured_logging import log_event
+
+# P1-B1: this module previously kept one plain, unconverted stdlib
+# logger (`_logger = logging.getLogger("webguard_api.mail")`) for
+# `DevelopmentMailProvider.send()`, on the reasoning that a local/dev
+# console logging the full message body -- including a real one-time
+# verification/reset/invitation token -- for operator convenience was
+# an acceptable, deliberately-out-of-scope exception to the structured-
+# logging allowlist. A pre-commit review correctly rejected that: the
+# redaction boundary must not depend on which level a process's root
+# logger happens to be configured at (this codebase never calls
+# `logging.basicConfig()`, so that line was, in the current state of
+# the code, already silently inert -- but relying on that as a safety
+# property is exactly the "current configuration happens to suppress
+# it" trap the reviewer flagged, not a real guarantee). The logger and
+# the call are removed entirely rather than reduced in level or
+# partially redacted; see `DevelopmentMailProvider`'s own docstring.
+# `ProductionMailProvider`'s calls below (already safe -- category/
+# error-code-shaped values only, per this module's own pre-existing
+# "no vendor leakage" discipline) remain converted to `log_event()`.
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,12 +116,25 @@ class MailDeliveryError(RuntimeError):
 
 
 class DevelopmentMailProvider:
-    """Local/dev default: writes the message to the application log
-    instead of sending it. An operator running the API locally can read
-    a verification/reset/invitation link straight off the console."""
+    """Local/dev default when no mail provider is explicitly configured
+    and production config hasn't been validated -- `production_startup.py`
+    substitutes `ProductionMailProvider` once it has. Deliberately does
+    not log the message anywhere, through stdlib logging or structured
+    logging: a verification/reset/invitation link embeds a real
+    one-time token, and nothing about "this is only a local/dev
+    console" changes that a logger is a logger, reachable the same way
+    regardless of what level it happens to be configured at today. To
+    inspect what a local run "sent" -- the approach the Playwright
+    browser E2E suite already uses -- construct the service with an
+    explicit `InMemoryMailProvider(sink_path=...)` instead: it captures
+    every message programmatically (`messages_to`/`latest_to`) and can
+    mirror it to a JSON Lines file for a separate process to read, with
+    no logging path involved at all."""
 
     def send(self, *, to: str, subject: str, body: str, category: str) -> None:
-        _logger.info("mail[%s] to=%s subject=%r\n%s", category, to, subject, body)
+        """Intentionally a no-op beyond accepting the call -- see this
+        class's own docstring for why, and for how to actually inspect
+        a message sent during local development."""
 
 
 class InMemoryMailProvider:
@@ -295,27 +330,32 @@ class ProductionMailProvider:
                 if exc.category in ("temporary", "timeout") and attempt < attempts - 1:
                     self._sleep(0.5)
                     continue
-                _logger.warning("mail delivery failed category=%s reason=%s", category, exc.category)
+                log_event(
+                    event="mail_delivery_failed", level="warning",
+                    error_code=exc.code, reason_code=exc.category, attempt=attempt + 1,
+                )
                 raise
             status_code = result.get("status_code")
             response_body = result.get("body") or {}
             error_code = response_body.get("ErrorCode")
             if status_code == 200 and error_code == 0:
-                _logger.info(
-                    "mail delivered category=%s message_id=%s", category, response_body.get("MessageID")
-                )
+                log_event(event="mail_delivery_completed", level="info", attempt=attempt + 1)
                 return
             classified = _classify_postmark_failure(
                 status_code=status_code, error_code=error_code, vendor_message=response_body.get("Message")
             )
             last_error = classified
             if classified.category in ("temporary", "timeout") and attempt < attempts - 1:
-                _logger.info(
-                    "mail delivery attempt failed, retrying category=%s reason=%s", category, classified.category
+                log_event(
+                    event="mail_delivery_retry", level="info",
+                    reason_code=classified.category, attempt=attempt + 1,
                 )
                 self._sleep(0.5)
                 continue
-            _logger.warning("mail delivery failed category=%s reason=%s", category, classified.category)
+            log_event(
+                event="mail_delivery_failed", level="warning",
+                error_code=classified.code, reason_code=classified.category, attempt=attempt + 1,
+            )
             raise classified
         assert last_error is not None  # pragma: no cover - loop always returns or raises
         raise last_error

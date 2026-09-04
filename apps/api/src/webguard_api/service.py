@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 from uuid import uuid4
-
-_logger = logging.getLogger("webguard_api.service")
 
 from webguard_contracts import (
     AuditOutcome,
@@ -70,6 +67,7 @@ from .permits import (
 )
 from .repository_contracts import IdentityRepository, JobRepository
 from .store import JobStoreError
+from .structured_logging import log_event
 
 
 def _utc_now() -> datetime:
@@ -269,9 +267,9 @@ class WebGuardJobService:
         try:
             self.mail_provider.send(to=to, subject=subject, body=body, category=category)
         except MailDeliveryError as exc:
-            _logger.warning(
-                "mail delivery failed, continuing without it: category=%s failure_category=%s code=%s",
-                category, exc.category, exc.code,
+            log_event(
+                event="mail_delivery_failed", level="warning",
+                error_code=exc.code, reason_code=exc.category,
             )
 
     def _audit(

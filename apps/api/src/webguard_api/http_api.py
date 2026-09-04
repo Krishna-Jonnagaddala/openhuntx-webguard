@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import ipaddress
 import json
 import re
@@ -19,6 +20,7 @@ from .identity import TOKEN_PREFIX
 from .pagination import PaginationError, parse_page_request
 from .rate_limit import FixedWindowRateLimiter, RateLimitDecision, RateLimitError
 from .service import ApiServiceError, WebGuardJobService
+from .structured_logging import exception_fields, log_event
 
 SESSION_COOKIE_NAME = "wg_session"  # noqa: S105
 CSRF_COOKIE_NAME = "wg_csrf"  # noqa: S105
@@ -82,6 +84,38 @@ def _looks_like_ip(value: str) -> bool:
 
 _CORS_ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS"
 _CORS_ALLOWED_HEADERS = "Authorization, Content-Type, Idempotency-Key, TrustScan-Permit, X-CSRF-Token"
+
+
+def _log_api_request(handler_method: Callable) -> Callable:
+    """P1-B1: applied to each `do_GET`/`do_POST`/etc. -- times the
+    request and, only for a genuinely UNEXPECTED exception (never the
+    existing `ApiTransportError`/`ApiServiceError`/`AuthenticationError`/
+    `RateLimitError` family, which already produces its own well-formed
+    error response via `_error()` and therefore never escapes the
+    handler method at all), logs `request_failed` with safe diagnostic
+    fields before re-raising completely unchanged -- this decorator
+    never swallows, alters, or delays the exception's existing fate,
+    it only adds visibility that did not exist before. The dominant
+    `request_completed`/`request_failed`-by-status-code case is logged
+    separately, in `_send_json()` itself (and the one raw-byte-stream
+    download branch that bypasses it) -- this decorator's own
+    `except` is a secondary safety net for whatever bypasses even
+    that (a crash before any response was ever sent)."""
+
+    @functools.wraps(handler_method)
+    def wrapper(self, *args, **kwargs):
+        self._request_start_monotonic = time.monotonic()
+        try:
+            return handler_method(self, *args, **kwargs)
+        except BaseException as exc:
+            log_event(service="api",
+                event="request_failed", level="error",
+                request_id=getattr(self, "_request_id", None), http_method=self.command,
+                duration_ms=int((time.monotonic() - self._request_start_monotonic) * 1000),
+                **exception_fields(exc),
+            )
+            raise
+    return wrapper
 
 
 def build_handler(
@@ -149,6 +183,17 @@ def build_handler(
     arbitrary source IP into abuse-protection and audit logging
     (over-broad trust).
     """
+
+    # P1-B1: edge-trigger state for readiness_failed -- a plain dict
+    # captured by closure (mirroring callback_server.py's own
+    # closure-captured `repository`/`rate_limiter`) since a fresh
+    # `Handler` instance is constructed per connection; this is the
+    # one piece of state that must persist across requests to this
+    # server. A simple dict write is not lock-protected -- the
+    # consequence of a rare race between two /ready probes landing at
+    # exactly the same instant is at worst one duplicate edge-log
+    # line, never a semantic behavior change to readiness itself.
+    readiness_state: dict[str, bool] = {"ready": True}
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "OpenHuntX-WebGuard-API"
@@ -294,6 +339,42 @@ def build_handler(
             self.end_headers()
             self.wfile.write(body)
             self.close_connection = True
+            self._log_response(status, request_id=request_id)
+
+        def _log_response(self, status: int, *, request_id: str) -> None:
+            # P1-B1: the dominant logging point -- covers every
+            # response sent through _send_json(), which is virtually
+            # all of them, including every ApiTransportError/
+            # ApiServiceError/AuthenticationError/RateLimitError
+            # already handled by _error() -> _send_json(). Health-
+            # probe traffic is excluded from request_completed to
+            # avoid drowning real traffic in probe spam; a raw path
+            # (never a route_name/template in this batch -- see the
+            # P1-B1 report's known limitations) is never logged, only
+            # the numeric status.
+            path = urlsplit(self.path).path
+            if path in ("/healthz", "/health", "/ready"):
+                # Health-probe traffic never contributes to
+                # request_completed/request_failed at all, success or
+                # failure -- /ready's own state-transition-based
+                # readiness_failed (emitted where /ready is handled)
+                # is the dedicated signal for that path, so a generic
+                # request_failed here would double up on it and, worse,
+                # fire on every single probe for as long as an outage
+                # continues (exactly the spam edge-triggering exists to
+                # avoid).
+                return
+            start = getattr(self, "_request_start_monotonic", None)
+            duration_ms = int((time.monotonic() - start) * 1000) if start is not None else None
+            fields = dict(
+                request_id=request_id, http_method=self.command, status_code=status,
+            )
+            if duration_ms is not None:
+                fields["duration_ms"] = duration_ms
+            if status >= 500:
+                log_event(service="api", event="request_failed", level="error", **fields)
+            else:
+                log_event(service="api", event="request_completed", level="info", **fields)
 
         def do_OPTIONS(self) -> None:  # noqa: N802
             origin = self.headers.get("Origin")
@@ -580,8 +661,10 @@ def build_handler(
                 "RateLimit-Reset": str(decision.reset_after_seconds),
             }
 
+        @_log_api_request
         def do_GET(self) -> None:  # noqa: N802
             request_id = str(uuid4())
+            self._request_id = request_id
             try:
                 path, query = self._request_target()
                 if path in ("/healthz", "/health"):
@@ -603,6 +686,14 @@ def build_handler(
                     # host, port, connection string, or schema detail.
                     self._require_empty_query(query)
                     ready, reason = service.readiness()
+                    if not ready and readiness_state["ready"]:
+                        # P1-B1: edge-triggered -- one event per
+                        # outage episode, not one per probe for as
+                        # long as the same outage continues.
+                        readiness_state["ready"] = False
+                        log_event(service="api", event="readiness_failed", level="error", reason_code=reason)
+                    elif ready:
+                        readiness_state["ready"] = True
                     self._send_json(
                         200 if ready else 503,
                         {"status": "ready" if ready else "not_ready", "reason": reason},
@@ -640,6 +731,7 @@ def build_handler(
                         self.send_header(name, value)
                     self.end_headers()
                     self.wfile.write(content)
+                    self._log_response(200, request_id=request_id)
                     return
                 if path == "/v1/auth/session":
                     self._require_empty_query(query)
@@ -848,8 +940,10 @@ def build_handler(
             values = self.headers.get_all("User-Agent") or []
             return values[0][:512] if values else None
 
+        @_log_api_request
         def do_POST(self) -> None:  # noqa: N802
             request_id = str(uuid4())
+            self._request_id = request_id
             try:
                 path, query = self._request_target()
                 self._require_empty_query(query)
@@ -1310,16 +1404,20 @@ def build_handler(
             except (ApiTransportError, ApiServiceError, AuthenticationError, RateLimitError) as exc:
                 self._error(exc, request_id=request_id)
 
+        @_log_api_request
         def do_PUT(self) -> None:  # noqa: N802
             request_id = str(uuid4())
+            self._request_id = request_id
             self._send_json(
                 HTTPStatus.METHOD_NOT_ALLOWED,
                 {"error": {"code": "method_not_allowed", "message": "Method not allowed.", "request_id": request_id}},
                 request_id=request_id,
             )
 
+        @_log_api_request
         def do_PATCH(self) -> None:  # noqa: N802
             request_id = str(uuid4())
+            self._request_id = request_id
             try:
                 path, query = self._request_target()
                 self._require_empty_query(query)
@@ -1364,8 +1462,10 @@ def build_handler(
             except (ApiTransportError, ApiServiceError, AuthenticationError, RateLimitError) as exc:
                 self._error(exc, request_id=request_id)
 
+        @_log_api_request
         def do_DELETE(self) -> None:  # noqa: N802
             request_id = str(uuid4())
+            self._request_id = request_id
             try:
                 path, query = self._request_target()
                 self._require_empty_query(query)

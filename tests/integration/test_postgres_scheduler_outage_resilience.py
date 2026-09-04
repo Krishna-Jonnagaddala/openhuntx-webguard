@@ -635,6 +635,39 @@ print("UNEXPECTED: returned normally", flush=True)
         self.assertEqual(self._job_count(schedule.organization_id), 1, "the occurrence must eventually materialize exactly once, never skipped")
         self.assertEqual(self._schedule_revision(schedule.schedule_id), 1)
 
+    # -- P1-B1: structured events during a REAL outage/recovery, edge-triggered --
+    def test_p1b1_database_outage_events_are_edge_triggered_during_a_real_outage(self) -> None:
+        """Purely layers a structured-logging assertion on top of a
+        real docker stop/start cycle -- does not alter run_forever()'s
+        actual outage-survival outcome (proven unchanged by the rest
+        of this suite)."""
+        import io
+        import json
+
+        from webguard_api.structured_logging import configure_structured_logging
+
+        buf = io.StringIO()
+        configure_structured_logging(service="scheduler", stream=buf)
+
+        coordinator = self._coordinator(poll_seconds=0.5)
+        stop_event = threading.Event()
+        _stop_postgres()
+        thread = threading.Thread(target=coordinator.run_forever, args=(stop_event,), name="p1b1-scheduler-events", daemon=True)
+        thread.start()
+        time.sleep(2.0)
+        self.assertTrue(thread.is_alive())
+        _start_postgres()
+        time.sleep(4.0)
+        self.assertTrue(thread.is_alive())
+        stop_event.set()
+        thread.join(timeout=3.0)
+
+        lines = [json.loads(line) for line in buf.getvalue().splitlines() if line]
+        detected = [line for line in lines if line.get("event") == "database_outage_detected"]
+        recovered = [line for line in lines if line.get("event") == "database_outage_recovered"]
+        self.assertEqual(len(detected), 1, f"expected exactly one detected event, got {len(detected)}")
+        self.assertEqual(len(recovered), 1, f"expected exactly one recovered event, got {len(recovered)}")
+
 
 if __name__ == "__main__":
     unittest.main()

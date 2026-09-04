@@ -66,6 +66,7 @@ from .config import (
 from .db_errors import DatabaseError
 from .executor import JobExecutionError, ScanJobExecutor
 from .repository_contracts import JobRepository
+from .structured_logging import exception_fields, log_event
 from .store import (
     JobStoreError,
     LeaseRecoverySummary,
@@ -159,6 +160,15 @@ class ScanJobWorker:
         self.heartbeat_retry_backoff_seconds = float(heartbeat_retry_backoff_seconds)
         self._sleep = sleep
         self.last_recovery_summary = LeaseRecoverySummary()
+        # P1-B1: edge-trigger state for database_outage_detected/
+        # _recovered -- read and written only from run_forever()'s own
+        # thread (the loop-boundary DatabaseError catch, and the
+        # success path right after it), so no lock is needed. This is
+        # deliberately scoped to that one boundary for this batch, not
+        # also wired into monitor_job()'s own separate heartbeat-
+        # DatabaseError handling (a lower-severity, already-resilient
+        # path) -- see the P1-B1 report's WORKER EVENTS section.
+        self._in_database_outage = False
         self._validate_configuration()
 
     def _validate_configuration(self) -> None:
@@ -204,7 +214,16 @@ class ScanJobWorker:
                 return True
             except DatabaseError:
                 if attempt >= self.terminal_persistence_maximum_attempts:
+                    log_event(service="worker",
+                        event="terminal_persistence_exhausted", level="error",
+                        worker_id=self.worker_id, attempt=attempt,
+                        reason_code="terminal_persistence_unavailable",
+                    )
                     return False
+                log_event(service="worker",
+                    event="terminal_persistence_retry", level="warning",
+                    worker_id=self.worker_id, attempt=attempt,
+                )
                 self._sleep(self.terminal_persistence_retry_backoff_seconds)
         return False
 
@@ -270,6 +289,7 @@ class ScanJobWorker:
             return False
 
         record = lease.record
+        log_event(service="worker", event="job_claimed", level="info", worker_id=self.worker_id, job_id=record.job_id)
         token = CrawlCancellationToken()
         monitor_stop = threading.Event()
         lease_lost = threading.Event()
@@ -349,7 +369,11 @@ class ScanJobWorker:
                 # to reclaim. This is not an error to raise or a
                 # reason to fall through to _fail() -- the scan
                 # genuinely succeeded; only recording that fact failed.
-                self._finish_result(lease, outcome)
+                if self._finish_result(lease, outcome):
+                    log_event(service="worker",
+                        event="job_completed", level="info",
+                        worker_id=self.worker_id, job_id=record.job_id, scan_id=outcome.report.scan_id,
+                    )
             except JobStoreError as exc:
                 if not self._is_stale_lease_error(exc):
                     raise
@@ -360,13 +384,16 @@ class ScanJobWorker:
             try:
                 if token.is_cancelled or exc.code == "job_cancelled_before_execution":
                     self._cancel(lease)
-                else:
-                    self._fail(
-                        lease,
-                        code=exc.code,
-                        message=exc.message,
-                        safety_receipt_ref=exc.safety_receipt_ref,
-                        safety_receipt_sha256=exc.safety_receipt_sha256,
+                elif self._fail(
+                    lease,
+                    code=exc.code,
+                    message=exc.message,
+                    safety_receipt_ref=exc.safety_receipt_ref,
+                    safety_receipt_sha256=exc.safety_receipt_sha256,
+                ):
+                    log_event(service="worker",
+                        event="job_failed", level="warning",
+                        worker_id=self.worker_id, job_id=record.job_id, error_code=exc.code,
                     )
             except JobStoreError as store_error:
                 if not self._is_stale_lease_error(store_error):
@@ -374,7 +401,7 @@ class ScanJobWorker:
         except JobStoreError:
             stop_monitor()
             raise
-        except Exception:
+        except Exception as exc:
             stop_monitor()
             if lease_lost.is_set():
                 return True
@@ -388,13 +415,18 @@ class ScanJobWorker:
                 # moves on. This is the exact chain (executor raises ->
                 # _fail() needs Postgres -> Postgres unavailable ->
                 # _fail() itself throws -> worker dies) P1-10 closes.
-                self._fail(
+                if self._fail(
                     lease,
                     code="worker_internal_error",
                     message=(
                         "The scanner worker encountered an unexpected internal error."
                     ),
-                )
+                ):
+                    log_event(service="worker",
+                        event="job_failed", level="error",
+                        worker_id=self.worker_id, job_id=record.job_id,
+                        error_code="worker_internal_error", **exception_fields(exc),
+                    )
             except JobStoreError as store_error:
                 if not self._is_stale_lease_error(store_error):
                     raise
@@ -403,28 +435,44 @@ class ScanJobWorker:
         return True
 
     def run_forever(self, stop_event: threading.Event) -> None:
-        while not stop_event.is_set():
-            try:
-                processed = self.run_once()
-            except DatabaseError:
-                # P1-10: recover_expired_leases()/claim_next_leased()
-                # (run_once()'s own first two calls, before any job is
-                # even claimed) are deliberately left unwrapped inside
-                # run_once() itself -- neither holds any in-progress
-                # work a retry could lose, so there is nothing to gain
-                # from a separate retry-of-retries there. This boundary
-                # is the single place that absorbs a DatabaseError from
-                # either: back off (stop_event-responsive, so shutdown
-                # is never delayed by an outage) and let the next loop
-                # iteration retry naturally. Only DatabaseError is
-                # caught here, deliberately -- an unexpected programming
-                # error must keep its existing visibility, not be
-                # silently absorbed by an infrastructure-outage handler.
-                if stop_event.wait(self.poll_seconds):
-                    return
-                continue
-            if not processed:
-                stop_event.wait(self.poll_seconds)
+        log_event(service="worker", event="worker_started", level="info", worker_id=self.worker_id)
+        try:
+            while not stop_event.is_set():
+                try:
+                    processed = self.run_once()
+                except DatabaseError:
+                    # P1-10: recover_expired_leases()/claim_next_leased()
+                    # (run_once()'s own first two calls, before any job is
+                    # even claimed) are deliberately left unwrapped inside
+                    # run_once() itself -- neither holds any in-progress
+                    # work a retry could lose, so there is nothing to gain
+                    # from a separate retry-of-retries there. This boundary
+                    # is the single place that absorbs a DatabaseError from
+                    # either: back off (stop_event-responsive, so shutdown
+                    # is never delayed by an outage) and let the next loop
+                    # iteration retry naturally. Only DatabaseError is
+                    # caught here, deliberately -- an unexpected programming
+                    # error must keep its existing visibility, not be
+                    # silently absorbed by an infrastructure-outage handler.
+                    if not self._in_database_outage:
+                        # P1-B1: edge-triggered -- exactly one event per
+                        # outage episode, not one per poll cycle.
+                        self._in_database_outage = True
+                        log_event(service="worker",
+                            event="database_outage_detected", level="error", worker_id=self.worker_id,
+                        )
+                    if stop_event.wait(self.poll_seconds):
+                        return
+                    continue
+                if self._in_database_outage:
+                    self._in_database_outage = False
+                    log_event(service="worker",
+                        event="database_outage_recovered", level="info", worker_id=self.worker_id,
+                    )
+                if not processed:
+                    stop_event.wait(self.poll_seconds)
+        finally:
+            log_event(service="worker", event="worker_stopped", level="info", worker_id=self.worker_id)
 
 
 __all__ = [

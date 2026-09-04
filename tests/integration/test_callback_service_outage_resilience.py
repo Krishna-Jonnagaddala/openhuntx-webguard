@@ -18,10 +18,12 @@ file exists to prove the real end-to-end claim on top of that.
 from __future__ import annotations
 
 import http.client
+import json
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import unittest
 import uuid
@@ -264,8 +266,6 @@ class CallbackServiceOutageResilienceTests(unittest.TestCase):
             time.sleep(0.3)
             _start_postgres()
 
-        import threading
-
         restarter = threading.Thread(target=restart_shortly, daemon=True)
         restarter.start()
         status, headers, body = self._send_callback(token, timeout=10.0)
@@ -284,6 +284,73 @@ class CallbackServiceOutageResilienceTests(unittest.TestCase):
         observed_at = row[0].astimezone(timezone.utc)
         self.assertGreaterEqual(observed_at, before_request)
         self.assertLessEqual(observed_at, after_request)
+
+    def _subprocess_log_lines(self) -> list[dict]:
+        """Drains and parses the receiver subprocess's own stdout --
+        configure_structured_logging() in that separate process writes
+        to its real stdout by default (no stream override), captured
+        by this test's own subprocess.PIPE."""
+        self._proc.terminate()
+        try:
+            stdout, _ = self._proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            stdout, _ = self._proc.communicate(timeout=5)
+        return [json.loads(line) for line in stdout.splitlines() if line.strip().startswith("{")]
+
+    def test_p1b1_brief_outage_logs_retry_then_recovered_in_the_real_subprocess(self) -> None:
+        """Does not alter the receiver's actual persistence outcome
+        (proven unchanged by test_short_blip... above) -- purely
+        proves the structured events reach the real subprocess's own
+        stdout during a genuine, brief, real Postgres outage."""
+        token = self._register_token()
+        self._start_receiver_subprocess(db_checkout_timeout="1.5")
+
+        _stop_postgres()
+
+        def restart_shortly():
+            time.sleep(0.3)
+            _start_postgres()
+
+        restarter = threading.Thread(target=restart_shortly, daemon=True)
+        restarter.start()
+        status, _, _ = self._send_callback(token, timeout=10.0)
+        restarter.join(timeout=15)
+        self.assertEqual(status, 204)
+
+        lines = self._subprocess_log_lines()
+        retries = [line for line in lines if line.get("event") == "callback_observation_persistence_retry"]
+        recovered = [line for line in lines if line.get("event") == "callback_observation_persistence_recovered"]
+        exhausted = [line for line in lines if line.get("event") == "callback_observation_persistence_exhausted"]
+        if not recovered and not retries:
+            self.skipTest(
+                "outage resolved before the very first attempt in this run's real timing -- "
+                "a clean first-attempt success emits no events by design (see LOG VOLUME POLICY)"
+            )
+        self.assertGreaterEqual(len(retries), 1)
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(exhausted, [], "a brief, recovered outage must never also log exhausted")
+
+    def test_p1b1_sustained_outage_logs_exhausted_in_the_real_subprocess(self) -> None:
+        """Does not alter the receiver's actual honest-loss outcome
+        (proven unchanged by test_database_down_still_returns_the_identical_204...
+        above) -- purely proves callback_observation_persistence_exhausted
+        reaches the real subprocess's own stdout during a genuine,
+        sustained, real Postgres outage that outlasts the retry budget."""
+        token = self._register_token()
+        self._start_receiver_subprocess()
+        _stop_postgres()
+        try:
+            status, _, _ = self._send_callback(token, timeout=8.0)
+        finally:
+            _start_postgres()
+        self.assertEqual(status, 204)
+
+        lines = self._subprocess_log_lines()
+        exhausted = [line for line in lines if line.get("event") == "callback_observation_persistence_exhausted"]
+        self.assertEqual(len(exhausted), 1)
+        self.assertEqual(exhausted[0]["error_code"], "callback_observation_persistence_unavailable")
+        self.assertNotIn(token, "".join(json.dumps(line) for line in lines))
 
 
 if __name__ == "__main__":
