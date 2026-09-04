@@ -31,7 +31,64 @@ post-audit findings are discovered during that work.
 
 **CLOSED BASELINE P1: P1-5.** P1-5 was "no test in this repository exercises PostgreSQL-backed worker-crash/lease-expiry recovery... implemented-but-unproven" (baseline audit, line 294). Closed by Batch A's A2 work: `tests/integration/test_postgres_worker_crash_recovery.py` (commit `ee3c2c2`), 9 test methods, real PostgreSQL, already committed and part of every full-regression pass since — worker-A-disappears/worker-B-reclaims, claim-before/after-lease-expiry, stale-worker rejection, CAS-revision protection, no-duplicate-finding-on-recovered-retry, terminal-consistency-after-attempts-exhausted, cancellation-during-lease-becomes-cancelled-on-recovery, many-workers-racing-produces-one-winner. This closure was accurate at the time A2 completed but was not reflected in this document's running accounting until now — corrected here, not backdated into the immutable baseline audit.
 
-**CURRENT OPEN BASELINE P1: 8** (P1-1 through P1-4, P1-6 through P1-9 — P1-5 closed, as above).
+**CLOSED BASELINE P1: P1-3.** P1-3 was the baseline audit's structured/operational logging gap — no consistent, machine-parseable operational log stream across `api`/`worker`/`scheduler`/`callback-service`/`signing-service`, only ad hoc or absent logging. Closed by the P1-B1 batch below.
+
+**CURRENT OPEN BASELINE P1: 7** (P1-1, P1-2, P1-4, P1-6 through P1-9 — P1-5 and P1-3 closed, as above).
+
+### P1-3 — Structured logging / operational log stream
+
+**Remediation commit**: `a2f385b` — *feat(logging): add structured runtime observability*.
+
+**STATUS: CLOSED.**
+
+#### LOGGING ARCHITECTURE
+
+New module `apps/api/src/webguard_api/structured_logging.py`, built on Python's standard `logging.Logger`/`logging.StreamHandler`/a custom `logging.Formatter` — not a bespoke stdout writer. Thread-safety comes from `StreamHandler.emit()`'s own internal lock (relied on, not reimplemented), which is what makes the module safe across worker/scheduler background threads and per-connection HTTP handler threads at once. One dedicated logger (`webguard.structured`, `propagate=False`) so nothing else in a process's logging tree gets swept in by accident. One JSON object per physical output line (NDJSON). `configure_structured_logging(service=...)` runs once per process, before that process's runtime loop starts; `log_event(...)` is the call-site API and is a safe no-op if configuration never ran (so the large pre-existing test suite, which constructs `ScanJobWorker`/`ScanScheduleCoordinator`/etc. directly, is unaffected).
+
+The output boundary — not just `log_event()` — enforces the redaction contract. `_JsonLineFormatter.format()` independently re-derives `timestamp` (from `record.created`) and `level` (from `record.levelname`), and re-validates `service`/`event`/every field against the same central allowlist, regardless of what already happened upstream. A record that isn't a dict, or lacks a valid `service`/`event`/recognized level, is dropped by returning `None`, which `_StructuredStreamHandler.emit()` treats as "write nothing." A formatting or write failure never propagates. Proven directly by bypassing `log_event()` entirely — calling `logging.getLogger("webguard.structured")` directly with unsafe fields, an unknown-shaped payload, a plain string, and a custom object whose `__str__` returns a marked secret — none of it reaches the output.
+
+#### REDACTION MODEL
+
+Closed allowlist, checked by field NAME and VALUE SHAPE both: `request_id, organization_id, principal_id, scan_id, job_id, schedule_id, finding_id, worker_id, key_id, route_name, reason_code, error_code, exception_type, source_module, source_function, status_code, attempt, source_line, duration_ms, http_method`. Everything else is silently dropped, never raised (a logging-call mistake must never become a new failure in the code path being logged). Never present, by construction (none are allowlisted field names): `Authorization`, `Cookie`, session/CSRF/identity tokens, raw callback tokens, passwords, database DSNs, request/response bodies, signing message/signature bytes, CloudHSM PINs/private keys/provider secrets, arbitrary exception `str()`/`repr()`, absolute filesystem paths. Exception diagnostics (`exception_type`, `source_module`, `source_function`, `source_line`) are extracted by walking the traceback to its innermost frame and reading `frame.f_globals["__name__"]` — never `f_code.co_filename` — so a stack trace can never leak a path.
+
+#### SERVICE IDENTITY
+
+Every call site outside `mail.py`/`service.py` passes its own explicit `service=` — `worker.py` → `"worker"` (10 call sites), `scheduler.py` → `"scheduler"` (6), `callback_server.py` → `"callback-service"` (3), `signing_service.py` → `"signing-service"` (5), `http_api.py` → `"api"` (4) — rather than relying on whatever `configure_structured_logging()` set for the whole process. No thread-local state, no per-thread loggers/handlers, same single logger/handler/stream throughout. This is what makes the combined `webguard-api serve` process (configured once as `service="api"`) correctly label its embedded worker's `job_claimed` as `worker` and its embedded scheduler's `schedule_materialized` as `scheduler`, instead of mislabeling every embedded event `api`. `mail.py`/`service.py` deliberately have no fixed identity of their own and inherit whichever process they run in, which is correct for both.
+
+#### OUTAGE EVENTS
+
+Edge-triggered, not per-poll-cycle: `worker.py`/`scheduler.py` each track a single boolean (`_in_database_outage`) touched only by their own `run_forever()` thread, producing exactly one `database_outage_detected` and one `database_outage_recovered` per outage episode. Proven both with fast fake-DB-error injection and against real, genuine PostgreSQL outages (real `docker stop`/`start`) layered as additive test methods onto the existing P1-10/P1-11 suites — none of which altered those suites' own pre-existing assertions or runtime semantics. `callback_observation_persistence_retry`/`_recovered`/`_exhausted` layer identically onto P1-12's existing bounded-retry loop, with `_exhausted` carrying the fixed `error_code="callback_observation_persistence_unavailable"` — this is P1-12-R1's own operational signal.
+
+**P1-12-R1 is now operationally observable** through `callback_observation_persistence_exhausted` — an operator watching the structured stream can now see a sustained-outage callback loss happen, in real time, rather than only inferring it after the fact from a missing finding. **This does not functionally solve P1-12-R1** — no observation is recovered, no fabricated confirmation is prevented that wasn't already prevented, nothing about the false-NOT_VULNERABLE outcome changes. **P1-12 remains PARTIAL/open**, unchanged by this batch.
+
+#### DEVELOPMENT MAIL
+
+`DevelopmentMailProvider.send()`'s original stdlib-logger call — which wrote the complete message body, including a real one-time verification/reset/invitation token, to the application log — was removed entirely during pre-commit review, not weakened or level-adjusted. A pre-commit check correctly rejected the first cut of this work, which had left that call in place on the reasoning that it was currently inert (nothing in this codebase calls `logging.basicConfig()`, so the call happened to be filtered by the stdlib default `WARNING` level) — that is not a security property, since any future change enabling logging would have silently reopened the leak. `DevelopmentMailProvider.send()` is now a documented no-op. `InMemoryMailProvider` (already existing, unmodified) remains the safe, explicit inspection seam for tests and local development — it captures every message programmatically (`messages_to`/`latest_to`) and can mirror it to a JSON Lines file, exactly as the Playwright browser E2E suite already relies on. Plain `webguard-api serve` local-dev usage has a resulting, documented, non-security **LOCAL-DEVELOPMENT UX LIMITATION**: an operator has no console-visible way to read a verification/reset/invitation link unless they explicitly construct the service with `InMemoryMailProvider(sink_path=...)` themselves. Deliberately left open rather than closed by weakening the redaction boundary.
+
+#### VERIFICATION
+
+- Structured logging (core + bypass + combined-serve-identity + standalone + mail-root-logger-leakage + all five per-service call-site test files): **53/53 pass**.
+- Backend unit (`tests/unit`): **1701/1701 pass**.
+- Real-outage logging suites (P1-10/P1-11/P1-12, real Postgres, genuine `docker stop`/`start`, additive assertions layered on unmodified pre-existing tests): **37/37 pass**.
+- Backend contract (real PostgreSQL): **59/59 pass**.
+- Backend integration incl. Juice Shop: **121/121 pass**.
+- Frontend build (`tsc -b && vite build`): **PASS**.
+- Vitest: **39/39 pass**.
+- Playwright: **4/4 pass**.
+- Security gates (secret scan, Ruff `--select S`, dependency audit): **PASS**.
+- Terraform (`fmt -check`, `init -backend=false`, `validate`): **PASS**.
+- Trivy IaC (`infra/`, CRITICAL/HIGH): **0 misconfigurations**.
+- `git diff --check`: **clean**.
+- Root-logger-enabled token leakage regression (deliberately configures the ROOT logger to `DEBUG` with its own capturing handler, sends a marked fake one-time token through `DevelopmentMailProvider.send()`, asserts the marker absent from captured root output/stdout/stderr/the structured stream): **PASS**.
+- Raw runtime stdlib logging calls remaining anywhere in `apps/api/src/webguard_api` (`git grep -e 'logging\.getLogger' -e '_logger\.' -e '\blogger\.'`): **zero** (the one remaining match is inside an explanatory comment, not executable code).
+
+#### REMAINING LIMITATIONS
+
+1. No `route_name` template on API events yet (would need deriving one safely across ~40 inline route branches without raw-path leakage — judged out of proportion for this batch).
+2. No `request_id`↔`job_id` correlation bridge on job-creation API responses yet.
+3. Worker's `monitor_job()` heartbeat-`DatabaseError` path doesn't yet participate in the top-level `database_outage_detected`/`_recovered` transition event (scoped to `run_forever()` only, documented in-code as deliberate).
+4. LOCAL-DEVELOPMENT UX LIMITATION (see DEVELOPMENT MAIL above) — non-security.
+5. Health/readiness (P1-4, targeted by P1-B2) remains entirely unimplemented.
 
 ## POST-AUDIT P1 FINDING
 
@@ -386,8 +443,8 @@ Production SSRF evidence preserved from this remediation's E2E proofs:
 ## CURRENT P1 ACCOUNTING
 
 - BASELINE P1 AT AUDIT: 9 (P1-1 through P1-9 — immutable historical count, never altered)
-- CLOSED BASELINE P1: P1-5 (see BASELINE P1 FINDINGS above)
-- CURRENT OPEN BASELINE P1: 8
+- CLOSED BASELINE P1: P1-5, P1-3 (see BASELINE P1 FINDINGS above)
+- CURRENT OPEN BASELINE P1: 7 (P1-1, P1-2, P1-4, P1-6, P1-7, P1-8, P1-9)
 - CLOSED POST-AUDIT: P1-10, P1-11
-- PARTIAL / OPEN POST-AUDIT: P1-12 (P1-12-R1 sustained-outage residual open within it — not a separate finding ID)
-- CURRENT OPEN P1 TOTAL: 9
+- PARTIAL / OPEN POST-AUDIT: P1-12 (P1-12-R1 sustained-outage residual open within it — not a separate finding ID; now operationally observable via `callback_observation_persistence_exhausted`, not functionally solved)
+- CURRENT OPEN P1 TOTAL: 8
