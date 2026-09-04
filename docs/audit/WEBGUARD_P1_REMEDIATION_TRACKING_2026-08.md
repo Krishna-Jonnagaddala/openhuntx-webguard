@@ -33,7 +33,9 @@ post-audit findings are discovered during that work.
 
 **CLOSED BASELINE P1: P1-3.** P1-3 was the baseline audit's structured/operational logging gap — no consistent, machine-parseable operational log stream across `api`/`worker`/`scheduler`/`callback-service`/`signing-service`, only ad hoc or absent logging. Closed by the P1-B1 batch below.
 
-**CURRENT OPEN BASELINE P1: 7** (P1-1, P1-2, P1-4, P1-6 through P1-9 — P1-5 and P1-3 closed, as above).
+**CLOSED BASELINE P1: P1-4.** P1-4 was the baseline audit's process health/readiness gap — no liveness or readiness signal for `api`/`worker`/`scheduler`/`callback-service`/`signing-service`, so an operator (or an orchestrator) had no way to detect a stalled process or a lost database dependency short of watching for silence. Closed by the P1-B2 batch below.
+
+**CURRENT OPEN BASELINE P1: 6** (P1-1, P1-2, P1-6 through P1-9 — P1-5, P1-3, and P1-4 closed, as above).
 
 ### P1-3 — Structured logging / operational log stream
 
@@ -88,7 +90,69 @@ Edge-triggered, not per-poll-cycle: `worker.py`/`scheduler.py` each track a sing
 2. No `request_id`↔`job_id` correlation bridge on job-creation API responses yet.
 3. Worker's `monitor_job()` heartbeat-`DatabaseError` path doesn't yet participate in the top-level `database_outage_detected`/`_recovered` transition event (scoped to `run_forever()` only, documented in-code as deliberate).
 4. LOCAL-DEVELOPMENT UX LIMITATION (see DEVELOPMENT MAIL above) — non-security.
-5. Health/readiness (P1-4, targeted by P1-B2) remains entirely unimplemented.
+5. Health/readiness (P1-4) was open at the time this section was written; see the P1-4 section immediately below — now closed by P1-B2.
+
+### P1-4 — Process health/readiness
+
+**Remediation commit**: `2ba35a1` — *feat(health): add runtime liveness and readiness monitoring*.
+
+**STATUS: CLOSED.**
+
+#### SHARED INTERNAL HEALTH SERVER
+
+New `apps/api/src/webguard_api/health_server.py`: one `HealthServer` class, reusing the exact `ThreadingHTTPServer` + explicit `start()`/`stop()` daemon-thread idiom already used identically by `http_api.py::create_server`, `callback_server.py::CallbackHttpReceiver`, and `signing_service.py::SigningServiceServer` — the same pattern, not a new one. Used standalone by `worker`/`scheduler`/`callback-service`/`signing-service`; the main API keeps its existing in-band `/healthz`/`/health`/`/ready`, no new port. Hardcoded to bind `127.0.0.1` only — no host is ever configurable, anywhere in this module or its callers, since these listeners answer with no authentication at all (their bodies never carry anything worth protecting). Exactly two routes, `/healthz` and `/ready`; unknown paths get a fixed `404`, non-GET a fixed `405`. Response bodies are a closed, fixed shape (`{"status":"ok"}` or `{"status":"not_ready","reason":"<fixed_code>"}`) with `Content-Type: application/json`, `Cache-Control: no-store`, and an explicit `Content-Length` — never a stack trace, hostname, DSN, port, database name, token, key ID, PIN, or absolute path. A liveness/readiness callback that raises unexpectedly is caught and reported as the fixed reason `health_check_failed`; its safe diagnostic metadata (P1-B1's own `exception_type`/`source_module`/`source_function`/`source_line`, never `str(exc)`/`repr(exc)`) goes only to the structured log, never into the HTTP response.
+
+#### LIVENESS VS READINESS
+
+Liveness answers "is this process's own loop/listener still functioning," independent of external dependency state where that's the correct question (worker/scheduler: is the loop still turning; callback/signing: is the listener still running). Readiness additionally requires the real dependency to be reachable. This distinction is enforced structurally, not just documented: `/healthz` never touches a Postgres pool at all for worker/scheduler/callback/signing.
+
+#### WORKER
+
+`ScanJobWorker._last_progress_monotonic`, touched at every `run_forever()` iteration (idle, processed, outage-backoff) and every `monitor_job()` heartbeat cycle — the second source is what keeps a long-running scan from ever looking stalled just because `run_forever()` hasn't returned from `run_once()` yet, proven with a real 0.4s simulated job against a real thread. `progress_stale_after_seconds = max(poll_seconds×6, 3.0, 7.0)` — the `7.0` (`DEFAULT_PROGRESS_STALE_DB_OUTAGE_FLOOR_SECONDS`) term was added after a real-outage re-measurement caught the original two-term formula (validated only against a fake, instant `DatabaseError`) understating the true worst-case gap: during a genuine outage, `run_once()`'s own first DB call is itself bound by the *ordinary* ~5s pool checkout timeout (which this batch deliberately never shortens), so the real gap between touches can approach 5s+poll_seconds, not poll_seconds alone. Re-verified against a real ~9s outage, sampled every second: `/healthz` stayed `200` throughout. Readiness = `progress_healthy()` AND a real `pool.check_connectivity(timeout_seconds=1.0)` call — the health-specific bound, not the ordinary 5s one (see POSTGRES HEALTH PROBE below).
+
+#### SCHEDULER
+
+Identical shape, adapted: `_last_progress_monotonic` touched once per `_run_forever()` iteration AND — a pre-commit correction — once per schedule `run_once()` actually reaches inside its own per-schedule loop, since a single `run_once()` call processing a large, legitimately slow batch (many due schedules, each materialization taking real time) was proven, with a real deterministic per-schedule delay, to otherwise go stale mid-batch. Never touched for a call that hasn't returned (`list_due_schedules()` itself, or one schedule's own hung DB call, still correctly reads as stale — no fake timer thread was used to paper over this). Same `7.0s` DB-outage floor and same real-outage re-verification, twice: once immediately after the fix (a real ~9s outage, sampled every second, all `200`), and again in the final pre-commit round against completely fresh disposable Postgres, where `/ready`'s `503` responses carried reason `scheduler_dependency_unavailable` — not `scheduler_progress_stalled` — on every one of 10 samples (median 1006.0ms, max 1072.4ms), proving the real dependency probe is genuinely reached, not short-circuited by a stale progress check.
+
+#### CALLBACK
+
+Liveness reflects `CallbackHttpReceiver.is_running` (`self._thread is not None and self._thread.is_alive()` — a boolean only, never the `Thread` object) — a pre-commit correction from an earlier draft that only checked whether the *separate* health listener itself was answering, which would have reported healthy even with a crashed or never-started public listener. Readiness fails whenever liveness fails, then checks the SAME Postgres pool object callback persistence already uses (confirmed by tracing the actual code, not assumed) with its existing, unmodified `WEBGUARD_CALLBACK_SERVICE_DB_CHECKOUT_TIMEOUT_SECONDS` (0.25s default) — deliberately never lengthened to the 1.0s health-specific bound used elsewhere. The public callback protocol listener gained zero new routes: proven both by unit-level route-inventory tests (`/healthz`/`/ready` through the public listener produce the byte-identical uniform `204` any other unknown-token path would) and by a real-subprocess integration test showing the identical response during a genuine outage. Production-wiring latency measured through the actual `webguard-api callback-service` subprocess: `/ready` during a real outage bounded at median 254.6ms/max 257.5ms — matching its 0.25s configuration, not the 1.0s or 5s bounds used elsewhere. **P1-12-R1 remains functionally OPEN** — this batch makes the sustained-outage loss observable (already true since P1-B1's `callback_observation_persistence_exhausted`), it does not solve it.
+
+#### SIGNING
+
+Liveness reflects `SigningServiceServer.is_running`, same pattern and same pre-commit correction as callback. Readiness reuses `SigningKeyRegistry.ensure_active_key_signable()` — the exact check the real `/v1/sign` path already runs before every signature — proven to trigger zero synthetic sign operations and to never expose `key_id` or key material in the health response body.
+
+#### COMBINED SERVE
+
+`create_server`/`build_handler` gained `additional_readiness_checks: Sequence[Callable[[], tuple[bool, str]]] = ()` — empty by default, proven byte-for-byte identical to pre-P1-B2 `/ready` behavior for a standalone API-only process. `_serve_command` composes, in fixed precedence: API dependency (`service.readiness()`, evaluated first, unconditionally) → worker progress → worker dependency → scheduler progress → scheduler dependency, each only reached if everything before it passed. Never `Thread.is_alive()` for worker/scheduler (explicitly reserved for callback/signing's simpler listener-lifecycle case only). The API's own `service.readiness_check` is reassigned (only when a real Postgres pool exists) to the same 1.0s health-specific bound, closing the gap where it would otherwise have kept blocking ~5s regardless of how fast the composed checks were. Proven: `/healthz` stays `200` even while `/ready` correctly fails on a stalled embedded worker — the core P1-4 claim, that "the HTTP server answering" can never mask a wedged embedded component.
+
+#### POSTGRES HEALTH PROBE
+
+`WebGuardPostgresPool.connection()`/`check_connectivity()` gained an optional, keyword-only `timeout_seconds: float | None = None` — `None` (the default, used by every pre-existing caller and every ordinary business/job/schedule DB operation) preserves the pool's own configured timeout exactly, passed straight through to `psycopg_pool.ConnectionPool.connection(timeout=...)`'s own existing per-call parameter, not a new mechanism. `DEFAULT_CONNECTION_TIMEOUT_SECONDS` (5.0) is untouched. New `WEBGUARD_HEALTH_DB_CHECKOUT_TIMEOUT_SECONDS` (default `1.0`, bounded `0.1..5.0`, validated) is passed only from the worker/scheduler/API(combined-serve) health-readiness closures — confirmed by grep: exactly three real call sites, all in `cli.py`'s health wiring, zero in any repository module. Callback deliberately keeps its own existing 0.25s configuration unchanged.
+
+#### STRUCTURED TELEMETRY
+
+Reuses P1-B1's `log_event`/`configure_structured_logging` directly — no second logging mechanism. Every internal `HealthServer`'s `/ready` transition is edge-triggered: proven that 5 consecutive failing probes during one continuous outage produce exactly one `readiness_failed`, and recovery-then-continued-healthy-probes produce exactly one `readiness_recovered` — never one event per probe. Each event carries only `service` + `reason_code` (plus safe exception metadata on the rare unexpected-failure path) — verified to contain nothing else, including under a deliberately marked fake-secret-bearing exception message.
+
+#### VERIFICATION EVIDENCE
+
+- Backend unit: **1777/1777 pass**.
+- Backend contract (fresh disposable Postgres): **59/59 pass**.
+- Backend integration (fresh disposable Postgres + fresh pinned Juice Shop; includes P1-10/P1-11/P1-12 real-outage suites, the three P1-B2 health real-outage tests, production SSRF callback E2E, TrustScan, Scanner v1, signing service): **124/124 pass**.
+- Scheduler real-outage final measurement (fresh disposable Postgres): `/healthz` 10/10 `200`, fast (0.4–2.1ms); `/ready` 10/10 `503` `scheduler_dependency_unavailable`, median 1006.0ms, max 1072.4ms; same process recovers to `200` after restart.
+- Worker cross-check, same outage window: `/healthz` `200`, `/ready` `503` `worker_dependency_unavailable`, ~1.0s bounded.
+- Callback production-wiring latency: `/ready` bounded ~0.25s during a real outage through the actual subprocess construction path; public protocol response byte-identical before/during/after.
+- Concurrent readiness pressure (20 concurrent `/ready` during a real outage, worker and combined-serve): all complete, no traceback, no hang, process alive, `/healthz` still fast immediately after.
+- Vite build: **PASS** (real `dist/` output). Vitest: **39/39 pass**, genuine canonical run. Playwright: **4/4 pass**.
+- Secret scan / Ruff / dependency audit / Terraform / Trivy / `git diff --check`: all **PASS**.
+
+#### REMAINING LIMITATIONS
+
+1. No `route_name` template, no `request_id`↔`job_id` correlation bridge — unchanged carry-overs from P1-3.
+2. Worker's `monitor_job()` heartbeat-`DatabaseError` path still doesn't feed the top-level `database_outage_detected`/`_recovered` event — unchanged, deliberate batch scoping.
+3. LOCAL-DEVELOPMENT UX LIMITATION (P1-3) — unchanged, non-security.
+4. P1-12-R1 remains functionally open — health makes it observable, does not close it.
+5. Four new loopback-only listening sockets (worker/scheduler/callback/signing, when run standalone) — more surface even at zero-auth-zero-secret-body; a deliberate, reviewed trade-off, not an oversight.
 
 ## POST-AUDIT P1 FINDING
 
@@ -443,8 +507,8 @@ Production SSRF evidence preserved from this remediation's E2E proofs:
 ## CURRENT P1 ACCOUNTING
 
 - BASELINE P1 AT AUDIT: 9 (P1-1 through P1-9 — immutable historical count, never altered)
-- CLOSED BASELINE P1: P1-5, P1-3 (see BASELINE P1 FINDINGS above)
-- CURRENT OPEN BASELINE P1: 7 (P1-1, P1-2, P1-4, P1-6, P1-7, P1-8, P1-9)
+- CLOSED BASELINE P1: P1-3, P1-4, P1-5 (see BASELINE P1 FINDINGS above)
+- CURRENT OPEN BASELINE P1: 6 (P1-1, P1-2, P1-6, P1-7, P1-8, P1-9)
 - CLOSED POST-AUDIT: P1-10, P1-11
-- PARTIAL / OPEN POST-AUDIT: P1-12 (P1-12-R1 sustained-outage residual open within it — not a separate finding ID; now operationally observable via `callback_observation_persistence_exhausted`, not functionally solved)
-- CURRENT OPEN P1 TOTAL: 8
+- PARTIAL / OPEN POST-AUDIT: P1-12 (P1-12-R1 sustained-outage residual open within it — not a separate finding ID; operationally observable via `callback_observation_persistence_exhausted` and, since P1-B2, via `readiness_failed`, not functionally solved)
+- CURRENT OPEN P1 TOTAL: 7
