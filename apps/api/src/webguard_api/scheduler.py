@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
@@ -13,6 +14,22 @@ from .identity import IdentityStore
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .store import JobStoreError, ScanJobStore
 from .structured_logging import log_event
+
+# P1-B2 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+# progress-staleness bound for health/readiness -- see
+# ScanScheduleCoordinator.progress_stale_after_seconds's own docstring.
+DEFAULT_PROGRESS_STALE_MULTIPLIER = 6.0
+DEFAULT_PROGRESS_STALE_FLOOR_SECONDS = 3.0
+# P1-B2 pre-commit correction: identical reasoning and value to
+# worker.py's own constant of the same name -- a real-outage
+# re-measurement caught that _run_forever()'s first DB call
+# (list_due_schedules()) can legitimately block for up to the pool's
+# ordinary ~5s checkout timeout before the except DatabaseError:
+# branch is reached to touch progress at all, exceeding the
+# healthy-path-only floor above. Duplicated rather than imported to
+# keep this module storage-agnostic (SQLite-backed tests never
+# exercise this path).
+DEFAULT_PROGRESS_STALE_DB_OUTAGE_FLOOR_SECONDS = 7.0
 
 
 def _utc_now() -> datetime:
@@ -42,6 +59,7 @@ class ScanScheduleCoordinator:
         poll_seconds: float = 1.0,
         batch_size: int = 100,
         clock: Callable[[], datetime] = _utc_now,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
@@ -50,6 +68,7 @@ class ScanScheduleCoordinator:
         self.poll_seconds = float(poll_seconds)
         self.batch_size = batch_size
         self.clock = clock
+        self.monotonic = monotonic
         if not 0.1 <= self.poll_seconds <= 60.0:
             raise ValueError("poll_seconds must be from 0.1 to 60 seconds.")
         if isinstance(self.batch_size, bool) or not isinstance(self.batch_size, int):
@@ -59,6 +78,31 @@ class ScanScheduleCoordinator:
         # P1-B1: edge-trigger state for database_outage_detected/
         # _recovered -- touched only from run_forever()'s own thread.
         self._in_database_outage = False
+        # P1-B2: touched at the top of every _run_forever() iteration
+        # (processed, idle, or outage-backoff alike) -- see
+        # progress_healthy().
+        self._last_progress_monotonic = self.monotonic()
+
+    def _touch_progress(self) -> None:
+        self._last_progress_monotonic = self.monotonic()
+
+    @property
+    def progress_stale_after_seconds(self) -> float:
+        return max(
+            self.poll_seconds * DEFAULT_PROGRESS_STALE_MULTIPLIER,
+            DEFAULT_PROGRESS_STALE_FLOOR_SECONDS,
+            DEFAULT_PROGRESS_STALE_DB_OUTAGE_FLOOR_SECONDS,
+        )
+
+    def progress_healthy(self, *, stale_after_seconds: float | None = None) -> bool:
+        """Pure, local, non-raising -- see ScanJobWorker.progress_healthy's
+        own docstring for the same reasoning applied here: no
+        dependency knowledge belongs in this method, only "is the loop
+        itself still turning." Composed with a separate dependency
+        check at the CLI/health-server wiring layer."""
+
+        threshold = self.progress_stale_after_seconds if stale_after_seconds is None else stale_after_seconds
+        return (self.monotonic() - self._last_progress_monotonic) <= threshold
 
     def _block(self, schedule, *, code: str, now: datetime) -> bool:
         blocked = (
@@ -82,6 +126,19 @@ class ScanScheduleCoordinator:
         schedules = self.store.list_due_schedules(now=now, limit=self.batch_size)
         enqueued = blocked = raced = 0
         for schedule in schedules:
+            # P1-B2 pre-commit correction: a single run_once() call
+            # processing a large, legitimately slow batch (many due
+            # schedules, each materialization attempt taking real
+            # time) must not look progress-stale just because
+            # _run_forever()'s own touch only happens after the whole
+            # call returns -- this is the scheduler's equivalent of
+            # worker.py's monitor_job() touching progress every
+            # heartbeat cycle during one long job. Touched once per
+            # schedule actually reached, regardless of which branch
+            # below handles it -- never for a call that never returns
+            # (list_due_schedules() above, or a single schedule's own
+            # DB calls hanging) -- that must keep reading as stale.
+            self._touch_progress()
             if not self.identity.authorization_is_assigned(
                 schedule.organization_id,
                 schedule.authorization_id,
@@ -236,12 +293,17 @@ class ScanScheduleCoordinator:
                     # episode, not one per poll cycle.
                     self._in_database_outage = True
                     log_event(service="scheduler", event="database_outage_detected", level="error")
+                # P1-B2: touched even on the outage-backoff path -- see
+                # the identical worker.py reasoning: backing off and
+                # retrying on schedule IS legitimate progress.
+                self._touch_progress()
                 if stop_event.wait(self.poll_seconds):
                     return
                 continue
             if self._in_database_outage:
                 self._in_database_outage = False
                 log_event(service="scheduler", event="database_outage_recovered", level="info")
+            self._touch_progress()
             stop_event.wait(self.poll_seconds)
 
 

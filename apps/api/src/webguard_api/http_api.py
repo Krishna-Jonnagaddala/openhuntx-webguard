@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Type
+from typing import Callable, Sequence, Type
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
@@ -133,8 +133,24 @@ def build_handler(
     trusted_proxy_networks: frozenset[
         ipaddress.IPv4Network | ipaddress.IPv6Network
     ] = frozenset(),
+    additional_readiness_checks: Sequence[Callable[[], tuple[bool, str]]] = (),
 ) -> Type[BaseHTTPRequestHandler]:
     """Create a request handler bound to authenticated service dependencies.
+
+    ``additional_readiness_checks`` (P1-B2, docs/audit/
+    WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md): empty by default,
+    which preserves every pre-P1-B2 caller's ``/ready`` behavior byte-
+    for-byte (only ``service.readiness()`` is ever consulted). Only
+    ``cli.py``'s combined ``serve`` command passes anything here --
+    one callable per embedded worker/scheduler progress/dependency
+    check, in the exact deterministic precedence order documented in
+    the P1-B2 report's COMBINED SERVE REASON PRECEDENCE section.
+    ``service.readiness()`` is always evaluated first, unconditionally;
+    these run only if it reported healthy, and stop at the first
+    failure -- so "the HTTP server answering alone" can never be
+    reported ready while an embedded worker/scheduler is stalled or its
+    own dependency is unavailable, without changing what a standalone
+    API-only process (no worker/scheduler embedded) reports at all.
 
     ``allowed_origins`` is an explicit allowlist for browser CORS
     (Slice 15: the WebGuard web app is a pure SPA calling this API
@@ -686,6 +702,15 @@ def build_handler(
                     # host, port, connection string, or schema detail.
                     self._require_empty_query(query)
                     ready, reason = service.readiness()
+                    if ready:
+                        # P1-B2: composed checks only run once the
+                        # API's own dependency is healthy, and stop at
+                        # the first failure -- see this function's own
+                        # docstring for the precedence this enforces.
+                        for extra_check in additional_readiness_checks:
+                            ready, reason = extra_check()
+                            if not ready:
+                                break
                     if not ready and readiness_state["ready"]:
                         # P1-B1: edge-triggered -- one event per
                         # outage episode, not one per probe for as
@@ -1513,6 +1538,7 @@ def create_server(
     trusted_proxy_networks: frozenset[
         ipaddress.IPv4Network | ipaddress.IPv6Network
     ] = frozenset(),
+    additional_readiness_checks: Sequence[Callable[[], tuple[bool, str]]] = (),
 ) -> ThreadingHTTPServer:
     """Bind the authenticated local HTTP transport."""
 
@@ -1540,6 +1566,7 @@ def create_server(
         secure_cookies=secure_cookies,
         hsts_enabled=hsts_enabled,
         trusted_proxy_networks=trusted_proxy_networks,
+        additional_readiness_checks=additional_readiness_checks,
     )
     server = ThreadingHTTPServer((address.compressed, port), handler)
     server.daemon_threads = True

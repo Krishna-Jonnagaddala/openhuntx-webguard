@@ -59,7 +59,7 @@ class WebGuardPostgresPool:
         )
 
     @contextmanager
-    def connection(self) -> Iterator[psycopg.Connection]:
+    def connection(self, *, timeout_seconds: float | None = None) -> Iterator[psycopg.Connection]:
         """Only ``psycopg.Error`` (including pool exhaustion/timeout,
         which ``psycopg_pool.PoolTimeout`` subclasses) is normalized
         here. Anything else raised inside the ``with`` block --
@@ -67,20 +67,41 @@ class WebGuardPostgresPool:
         (``IdentityStoreError`` and friends) -- is deliberately left
         untouched and propagates as-is; this context manager's job is
         translating *driver* failures, never masking application-level
-        ones raised by code that happens to run inside it."""
+        ones raised by code that happens to run inside it.
+
+        ``timeout_seconds`` (P1-B2, docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        ``None`` (the default) preserves this pool's own configured
+        checkout timeout exactly, for every caller that doesn't pass
+        it -- every repository, every existing test, every business-
+        request DB operation. Only a caller that explicitly needs a
+        *shorter* bound for a single checkout (a health/readiness
+        probe -- see ``check_connectivity``) passes one, using
+        ``psycopg_pool.ConnectionPool.connection``'s own existing
+        per-call ``timeout`` parameter -- not a second pool, not a
+        change to this pool's own configured default."""
 
         try:
-            with self._pool.connection() as connection:
+            with self._pool.connection(timeout=timeout_seconds) as connection:
                 yield connection
         except psycopg.Error as exc:
             raise normalize(exc) from exc
 
-    def check_connectivity(self) -> None:
+    def check_connectivity(self, *, timeout_seconds: float | None = None) -> None:
         """Used by the readiness endpoint (requirement 14) -- a cheap
         round trip proving the pool can actually reach the database
-        right now, not just that it was reachable at process start."""
+        right now, not just that it was reachable at process start.
 
-        with self.connection() as connection:
+        ``timeout_seconds``: ``None`` (the default) uses this pool's
+        own configured checkout timeout, unchanged -- every pre-P1-B2
+        caller of this method keeps its exact existing behavior. A
+        health/readiness caller may pass a shorter bound explicitly
+        (see cli.py's health-server wiring) so one probe during a real
+        outage cannot occupy a request thread for the full ordinary
+        timeout; this never affects any other caller sharing the same
+        pool, including P1-12's own callback-observation ingestion
+        path."""
+
+        with self.connection(timeout_seconds=timeout_seconds) as connection:
             connection.execute("SELECT 1")
 
     def close(self) -> None:

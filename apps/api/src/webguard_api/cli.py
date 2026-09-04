@@ -37,6 +37,13 @@ from .config import (
 )
 from .environment import Environment
 from .executor import ScanJobExecutor
+from .health_server import (
+    DEFAULT_HEALTH_DB_TIMEOUT_SECONDS,
+    HealthServer,
+    validate_health_db_timeout,
+    validate_health_port,
+    validate_stale_seconds,
+)
 from .http_api import create_server
 from .identity import (
     DEFAULT_TOKEN_VALIDITY_DAYS,
@@ -52,7 +59,7 @@ from .rate_limit import FixedWindowRateLimiter
 from .permits import TrustScanSigner
 from .scheduler import ScanScheduleCoordinator
 from .service import ApiServiceError, WebGuardJobService
-from .signing import LocalDevelopmentSigner, SigningKeyRegistry
+from .signing import LocalDevelopmentSigner, SigningKeyRegistry, SigningProviderError
 from .signing_service import (
     SigningServiceError,
     SigningServiceServer,
@@ -66,6 +73,49 @@ from .worker import ScanJobWorker
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
+
+# P1-B2 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+# internal-only health-listener ports for each standalone service-mode
+# command -- sequential after the existing WEBGUARD_SIGNING_SERVICE_PORT
+# (8766) / WEBGUARD_CALLBACK_SERVICE_PORT (8767), never overlapping
+# DEFAULT_API_PORT (8765) or either of those. The main API keeps its
+# existing in-band /healthz, /health, /ready -- no new port for it.
+DEFAULT_WORKER_HEALTH_PORT = 8768
+DEFAULT_SCHEDULER_HEALTH_PORT = 8769
+DEFAULT_CALLBACK_SERVICE_HEALTH_PORT = 8770
+DEFAULT_SIGNING_SERVICE_HEALTH_PORT = 8771
+
+
+def _resolve_health_port(env_var_name: str, default: int) -> int:
+    return validate_health_port(os.environ.get(env_var_name, str(default)), env_var_name=env_var_name)
+
+
+def _resolve_stale_seconds_override(env_var_name: str) -> float | None:
+    """`None` means "use the service's own evidence-derived default" --
+    see worker.py/scheduler.py's own `progress_stale_after_seconds`.
+    Only returns a value when an operator has explicitly set the
+    override env var, and only after bounds validation."""
+
+    raw = os.environ.get(env_var_name)
+    return None if raw is None else validate_stale_seconds(raw, env_var_name=env_var_name)
+
+
+def _resolve_health_db_timeout() -> float:
+    """P1-B2 pre-commit correction: the short, per-call Postgres
+    checkout timeout worker/scheduler/API readiness probes pass to
+    `WebGuardPostgresPool.check_connectivity(timeout_seconds=...)` --
+    deliberately NOT applied to callback-service readiness, which
+    stays bound by its own already-tight
+    `WEBGUARD_CALLBACK_SERVICE_DB_CHECKOUT_TIMEOUT_SECONDS` (0.25s
+    default) instead of being lengthened to this value. Never affects
+    any ordinary (non-health) database operation -- see
+    `WebGuardPostgresPool.connection`'s own docstring for why `None`
+    stays the default everywhere else."""
+
+    return validate_health_db_timeout(
+        os.environ.get("WEBGUARD_HEALTH_DB_CHECKOUT_TIMEOUT_SECONDS", str(DEFAULT_HEALTH_DB_TIMEOUT_SECONDS)),
+        env_var_name="WEBGUARD_HEALTH_DB_CHECKOUT_TIMEOUT_SECONDS",
+    )
 
 
 def _utc_now() -> datetime:
@@ -534,24 +584,66 @@ def _worker_command(args: argparse.Namespace) -> int:
                 )
             print("Processed one job." if processed else "No queued job was available.")
             return EXIT_SUCCESS
-        stop_event = threading.Event()
-
-        def request_stop(_signum: int, _frame: object) -> None:
-            stop_event.set()
-
-        signal.signal(signal.SIGINT, request_stop)
-        signal.signal(signal.SIGTERM, request_stop)
-        print(f"WebGuard worker started: {worker.worker_id} (environment={environment.value})")
-        print(
-            "Lease: "
-            f"{worker.lease_seconds:g}s; heartbeat: "
-            f"{worker.heartbeat_seconds:g}s; maximum attempts: "
-            f"{worker.maximum_attempts}."
+        try:
+            health_port = _resolve_health_port("WEBGUARD_WORKER_HEALTH_PORT", DEFAULT_WORKER_HEALTH_PORT)
+            stale_after_seconds = _resolve_stale_seconds_override("WEBGUARD_WORKER_HEALTH_STALE_SECONDS")
+            health_db_timeout = _resolve_health_db_timeout()
+        except ValueError as exc:
+            print(f"ERROR [worker_health_config_invalid]: {exc}", file=sys.stderr)
+            return EXIT_FAILURE
+        # P1-B2: dependency check reuses the SAME pool this process
+        # already uses for job persistence (production mode); in local/
+        # dev SQLite mode there is no live network dependency to probe,
+        # matching service.py's own existing readiness_check default.
+        # Pre-commit correction: bounded by the short, health-specific
+        # per-call timeout (never the pool's own ~5s ordinary default)
+        # so one /ready probe during a real outage cannot occupy a
+        # request thread anywhere near that long -- never affects
+        # run_once()'s own claim/terminal-persistence DB calls, which
+        # never pass this override.
+        dependency_check = (
+            (lambda: pool.check_connectivity(timeout_seconds=health_db_timeout)) if pool is not None
+            else (lambda: None)
         )
-        print("Press Ctrl+C to stop.")
-        worker.run_forever(stop_event)
-        print("WebGuard worker stopped.")
-        return EXIT_SUCCESS
+
+        def worker_liveness() -> tuple[bool, str]:
+            return worker.progress_healthy(stale_after_seconds=stale_after_seconds), "worker_progress_stalled"
+
+        def worker_readiness() -> tuple[bool, str]:
+            if not worker.progress_healthy(stale_after_seconds=stale_after_seconds):
+                return False, "worker_progress_stalled"
+            try:
+                dependency_check()
+            except Exception:  # noqa: BLE001 - classified uniformly as "dependency unavailable", see service.py's own readiness()
+                return False, "worker_dependency_unavailable"
+            return True, "ready"
+
+        health_server = HealthServer(
+            service="worker", liveness_check=worker_liveness, readiness_check=worker_readiness, port=health_port,
+        )
+        health_server.start()
+        try:
+            stop_event = threading.Event()
+
+            def request_stop(_signum: int, _frame: object) -> None:
+                stop_event.set()
+
+            signal.signal(signal.SIGINT, request_stop)
+            signal.signal(signal.SIGTERM, request_stop)
+            print(f"WebGuard worker started: {worker.worker_id} (environment={environment.value})")
+            print(
+                "Lease: "
+                f"{worker.lease_seconds:g}s; heartbeat: "
+                f"{worker.heartbeat_seconds:g}s; maximum attempts: "
+                f"{worker.maximum_attempts}."
+            )
+            print(f"Internal health listener: {health_server.base_url} (/healthz, /ready)")
+            print("Press Ctrl+C to stop.")
+            worker.run_forever(stop_event)
+            print("WebGuard worker stopped.")
+            return EXIT_SUCCESS
+        finally:
+            health_server.stop()
     finally:
         if pool is not None:
             pool.close()
@@ -577,22 +669,58 @@ def _scheduler_command(args: argparse.Namespace) -> int:
                 f"blocked={summary.blocked}, raced={summary.raced}."
             )
             return EXIT_SUCCESS
-        stop_event = threading.Event()
-
-        def request_stop(_signum: int, _frame: object) -> None:
-            stop_event.set()
-
-        signal.signal(signal.SIGINT, request_stop)
-        signal.signal(signal.SIGTERM, request_stop)
-        print(
-            "WebGuard scheduler started "
-            f"(environment={environment.value}): "
-            f"poll={scheduler.poll_seconds:g}s; batch={scheduler.batch_size}."
+        try:
+            health_port = _resolve_health_port("WEBGUARD_SCHEDULER_HEALTH_PORT", DEFAULT_SCHEDULER_HEALTH_PORT)
+            stale_after_seconds = _resolve_stale_seconds_override("WEBGUARD_SCHEDULER_HEALTH_STALE_SECONDS")
+            health_db_timeout = _resolve_health_db_timeout()
+        except ValueError as exc:
+            print(f"ERROR [scheduler_health_config_invalid]: {exc}", file=sys.stderr)
+            return EXIT_FAILURE
+        # P1-B2 pre-commit correction: see the identical worker.py
+        # comment -- bounded by the short health-specific timeout,
+        # never the pool's own ordinary default; run_once()'s own
+        # materialization DB calls never pass this override.
+        dependency_check = (
+            (lambda: pool.check_connectivity(timeout_seconds=health_db_timeout)) if pool is not None
+            else (lambda: None)
         )
-        print("Press Ctrl+C to stop.")
-        scheduler.run_forever(stop_event)
-        print("WebGuard scheduler stopped.")
-        return EXIT_SUCCESS
+
+        def scheduler_liveness() -> tuple[bool, str]:
+            return scheduler.progress_healthy(stale_after_seconds=stale_after_seconds), "scheduler_progress_stalled"
+
+        def scheduler_readiness() -> tuple[bool, str]:
+            if not scheduler.progress_healthy(stale_after_seconds=stale_after_seconds):
+                return False, "scheduler_progress_stalled"
+            try:
+                dependency_check()
+            except Exception:  # noqa: BLE001 - classified uniformly as "dependency unavailable", see service.py's own readiness()
+                return False, "scheduler_dependency_unavailable"
+            return True, "ready"
+
+        health_server = HealthServer(
+            service="scheduler", liveness_check=scheduler_liveness, readiness_check=scheduler_readiness, port=health_port,
+        )
+        health_server.start()
+        try:
+            stop_event = threading.Event()
+
+            def request_stop(_signum: int, _frame: object) -> None:
+                stop_event.set()
+
+            signal.signal(signal.SIGINT, request_stop)
+            signal.signal(signal.SIGTERM, request_stop)
+            print(
+                "WebGuard scheduler started "
+                f"(environment={environment.value}): "
+                f"poll={scheduler.poll_seconds:g}s; batch={scheduler.batch_size}."
+            )
+            print(f"Internal health listener: {health_server.base_url} (/healthz, /ready)")
+            print("Press Ctrl+C to stop.")
+            scheduler.run_forever(stop_event)
+            print("WebGuard scheduler stopped.")
+            return EXIT_SUCCESS
+        finally:
+            health_server.stop()
     finally:
         if pool is not None:
             pool.close()
@@ -664,30 +792,78 @@ def _signing_service_command(args: argparse.Namespace) -> int:
     registry = SigningKeyRegistry(provider)
     host = os.environ.get("WEBGUARD_SIGNING_SERVICE_HOST", "127.0.0.1")
     port = int(os.environ.get("WEBGUARD_SIGNING_SERVICE_PORT", "8766"))
+    try:
+        health_port = _resolve_health_port("WEBGUARD_SIGNING_SERVICE_HEALTH_PORT", DEFAULT_SIGNING_SERVICE_HEALTH_PORT)
+    except ValueError as exc:
+        print(f"ERROR [signing_service_health_config_invalid]: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
     configure_structured_logging(service="signing-service")
+
+    # Constructed (not yet started) before the closures below are
+    # defined, so `server.is_running` is always a valid reference by
+    # the time any health probe could possibly call it.
     server = SigningServiceServer(registry, bearer_token=bearer_token, host=host, port=port)
-    server.start()
-    print(
-        f"TrustScan Signing Service listening on {server.base_url} "
-        f"(environment={environment.value}, key_source={args.key_source})."
-    )
-    print(f"Active key ID: {provider.key_id} (algorithm={provider.algorithm}).")
-    print(
-        "This service must never be reachable from the public Internet -- "
-        "see docs/production/TRUSTSCAN_SIGNING_SERVICE.md."
-    )
-    print("Press Ctrl+C to stop.")
-    stop_event = threading.Event()
 
-    def request_stop(_signum: int, _frame: object) -> None:
-        stop_event.set()
+    def signing_liveness() -> tuple[bool, str]:
+        # P1-B2 pre-commit correction: liveness must reflect the
+        # actual bearer-protected /v1/sign listener's own running
+        # state, not merely "the separate health listener answered."
+        # `is_running` is a narrow boolean accessor (never the Thread
+        # object itself).
+        return server.is_running, "signing_listener_not_running"
 
-    signal.signal(signal.SIGINT, request_stop)
-    signal.signal(signal.SIGTERM, request_stop)
-    stop_event.wait()
-    server.stop()
-    print("TrustScan Signing Service stopped.")
-    return EXIT_SUCCESS
+    def signing_readiness() -> tuple[bool, str]:
+        # Readiness must fail whenever liveness fails.
+        if not server.is_running:
+            return False, "signing_listener_not_running"
+        # P1-B2: reuses the SAME active-key check the real /v1/sign
+        # path already runs before every signature (see this file's
+        # own do_POST handler) -- no synthetic sign operation is
+        # performed merely for a health probe, mirroring the principle
+        # P1-B1 already applied to structured logging.
+        try:
+            registry.ensure_active_key_signable()
+        except SigningProviderError:
+            return False, "signing_key_unavailable"
+        return True, "ready"
+
+    # P1-B2: a completely separate loopback listener from the bearer-
+    # token-protected /v1/sign surface above -- see health_server.py's
+    # own binding discipline. Started before the signing listener so a
+    # health-port bind failure never leaves the primary listener
+    # partially started.
+    health_server = HealthServer(
+        service="signing-service", liveness_check=signing_liveness, readiness_check=signing_readiness, port=health_port,
+    )
+    health_server.start()
+    try:
+        server.start()
+        try:
+            print(
+                f"TrustScan Signing Service listening on {server.base_url} "
+                f"(environment={environment.value}, key_source={args.key_source})."
+            )
+            print(f"Active key ID: {provider.key_id} (algorithm={provider.algorithm}).")
+            print(
+                "This service must never be reachable from the public Internet -- "
+                "see docs/production/TRUSTSCAN_SIGNING_SERVICE.md."
+            )
+            print(f"Internal health listener: {health_server.base_url} (/healthz, /ready)")
+            print("Press Ctrl+C to stop.")
+            stop_event = threading.Event()
+
+            def request_stop(_signum: int, _frame: object) -> None:
+                stop_event.set()
+
+            signal.signal(signal.SIGINT, request_stop)
+            signal.signal(signal.SIGTERM, request_stop)
+            stop_event.wait()
+            print("TrustScan Signing Service stopped.")
+            return EXIT_SUCCESS
+        finally:
+            server.stop()
+    finally:
+        health_server.stop()
 
 
 def _callback_service_command(args: argparse.Namespace) -> int:
@@ -728,30 +904,96 @@ def _callback_service_command(args: argparse.Namespace) -> int:
         os.environ.get("WEBGUARD_CALLBACK_SERVICE_DB_CHECKOUT_TIMEOUT_SECONDS", "0.25")
     )
 
+    try:
+        health_port = _resolve_health_port("WEBGUARD_CALLBACK_SERVICE_HEALTH_PORT", DEFAULT_CALLBACK_SERVICE_HEALTH_PORT)
+    except ValueError as exc:
+        print(f"ERROR [callback_service_health_config_invalid]: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+
     pool = WebGuardPostgresPool(database_url, connection_timeout_seconds=connection_timeout_seconds)
     configure_structured_logging(service="callback-service")
     try:
+        # Constructed (not yet started) before the closures below are
+        # defined, so `receiver.is_running` is always a valid
+        # reference by the time any health probe could possibly call
+        # it -- no theoretical name-lookup race against health_server
+        # starting first.
         repository = PostgresCallbackRegistrationRepository(pool)
         rate_limiter = FixedWindowRateLimiter(requests=rate_limit_requests, window_seconds=rate_limit_window)
         receiver = CallbackHttpReceiver(repository, host=host, port=port, rate_limiter=rate_limiter)
-        receiver.start()
-        print(f"SSRF callback receiver listening on {receiver.base_url}")
-        print(
-            f"Per-source rate limit: {rate_limit_requests} requests / {rate_limit_window}s. "
-            "See docs/production/CALLBACK_SERVICE_DEPLOYMENT.md."
+
+        def callback_liveness() -> tuple[bool, str]:
+            # P1-B2 pre-commit correction: liveness must reflect the
+            # actual public callback listener's own running state, not
+            # merely "the separate health listener answered" -- a
+            # crashed or never-started CallbackHttpReceiver must not
+            # read as healthy. `is_running` is a narrow boolean
+            # accessor (never the Thread object itself); using
+            # Thread.is_alive() this way is explicitly appropriate
+            # here (a simple request-driven listener has no execution-
+            # loop "progress" concept the way worker/scheduler do).
+            return receiver.is_running, "callback_listener_not_running"
+
+        def callback_readiness() -> tuple[bool, str]:
+            # Readiness must fail whenever liveness fails.
+            if not receiver.is_running:
+                return False, "callback_listener_not_running"
+            # P1-B2 Section 11: the SAME pool object this process
+            # actually uses for observation persistence -- never a
+            # second pool. Correction from an earlier draft of this
+            # comment: this does NOT get a separate "ordinary default"
+            # timeout -- WebGuardPostgresPool.connection() never passes
+            # a per-call timeout override to the underlying
+            # ConnectionPool, so this checkout is bound by the exact
+            # same WEBGUARD_CALLBACK_SERVICE_DB_CHECKOUT_TIMEOUT_SECONDS
+            # value (0.25s default) as P1-12's own ingestion path, on
+            # this same pool. That is fine for a health probe (fast is
+            # actually desirable here) -- it was simply a documentation
+            # error before, not a code difference. P1-B2 pre-commit
+            # correction, Section 4: deliberately does NOT pass the
+            # new WEBGUARD_HEALTH_DB_CHECKOUT_TIMEOUT_SECONDS override
+            # (see worker/scheduler/serve's own dependency checks) --
+            # that would LENGTHEN this checkout beyond its already-
+            # tight 0.25s configured bound, not shorten it.
+            try:
+                pool.check_connectivity()
+            except Exception:  # noqa: BLE001 - classified uniformly as "dependency unavailable"
+                return False, "callback_dependency_unavailable"
+            return True, "ready"
+
+        # P1-B2 Section 10: a completely separate loopback listener,
+        # own socket, own thread -- CallbackHttpReceiver's own public
+        # listener (below) gains zero new routes; see
+        # tests/unit/test_callback_health.py's route-inventory proof.
+        health_server = HealthServer(
+            service="callback-service", liveness_check=callback_liveness, readiness_check=callback_readiness,
+            port=health_port,
         )
-        print("Press Ctrl+C to stop.")
-        stop_event = threading.Event()
+        health_server.start()
+        try:
+            receiver.start()
+            try:
+                print(f"SSRF callback receiver listening on {receiver.base_url}")
+                print(
+                    f"Per-source rate limit: {rate_limit_requests} requests / {rate_limit_window}s. "
+                    "See docs/production/CALLBACK_SERVICE_DEPLOYMENT.md."
+                )
+                print(f"Internal health listener: {health_server.base_url} (/healthz, /ready)")
+                print("Press Ctrl+C to stop.")
+                stop_event = threading.Event()
 
-        def request_stop(_signum: int, _frame: object) -> None:
-            stop_event.set()
+                def request_stop(_signum: int, _frame: object) -> None:
+                    stop_event.set()
 
-        signal.signal(signal.SIGINT, request_stop)
-        signal.signal(signal.SIGTERM, request_stop)
-        stop_event.wait()
-        receiver.stop()
-        print("SSRF callback receiver stopped.")
-        return EXIT_SUCCESS
+                signal.signal(signal.SIGINT, request_stop)
+                signal.signal(signal.SIGTERM, request_stop)
+                stop_event.wait()
+                print("SSRF callback receiver stopped.")
+                return EXIT_SUCCESS
+            finally:
+                receiver.stop()
+        finally:
+            health_server.stop()
     finally:
         pool.close()
 
@@ -833,6 +1075,71 @@ def _serve_command(args: argparse.Namespace) -> int:
         for cidr in os.environ.get("WEBGUARD_TRUSTED_PROXY_CIDRS", "").split(",")
         if cidr.strip()
     )
+    # P1-B2 Section 14/15: the combined serve process keeps its
+    # existing single /ready -- no extra health port -- but composes
+    # it with the embedded worker's (and, when present, scheduler's)
+    # own progress/dependency state, in this exact, fixed precedence:
+    # API dependency (service.readiness(), already evaluated first by
+    # build_handler itself) -> worker progress -> worker dependency ->
+    # scheduler progress -> scheduler dependency. Never
+    # Thread.is_alive() -- a thread can be alive and wedged; these
+    # reuse the same accessor methods/dependency-check pattern the
+    # standalone worker/scheduler commands use for their own internal
+    # health servers.
+    try:
+        worker_stale_after_seconds = _resolve_stale_seconds_override("WEBGUARD_WORKER_HEALTH_STALE_SECONDS")
+        scheduler_stale_after_seconds = _resolve_stale_seconds_override("WEBGUARD_SCHEDULER_HEALTH_STALE_SECONDS")
+        health_db_timeout = _resolve_health_db_timeout()
+    except ValueError as exc:
+        print(f"ERROR [serve_health_config_invalid]: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+    # P1-B2 pre-commit correction: bounded by the short health-specific
+    # timeout, never the pool's own ~5s ordinary default -- applies to
+    # worker/scheduler's own dependency checks below AND, separately,
+    # to the API's own service.readiness_check right here (Section 5:
+    # service.readiness() is evaluated FIRST by build_handler, before
+    # any of these additional checks run at all -- if it still used
+    # the ordinary timeout, combined serve's /ready would keep
+    # blocking for ~5s regardless of how fast the checks below are).
+    # This reassigns only the readiness-probe seam WebGuardJobService
+    # already exposes for exactly this purpose -- never touches any
+    # ordinary business-request DB operation, which never reads
+    # `readiness_check` at all.
+    dependency_check = (
+        (lambda: pool.check_connectivity(timeout_seconds=health_db_timeout)) if pool is not None
+        else (lambda: None)
+    )
+    if pool is not None:
+        service.readiness_check = dependency_check
+
+    def worker_progress_check() -> tuple[bool, str]:
+        if not worker.progress_healthy(stale_after_seconds=worker_stale_after_seconds):
+            return False, "worker_progress_stalled"
+        return True, "ready"
+
+    def worker_dependency_check() -> tuple[bool, str]:
+        try:
+            dependency_check()
+        except Exception:  # noqa: BLE001 - classified uniformly as "dependency unavailable"
+            return False, "worker_dependency_unavailable"
+        return True, "ready"
+
+    additional_readiness_checks = [worker_progress_check, worker_dependency_check]
+    if scheduler is not None:
+
+        def scheduler_progress_check() -> tuple[bool, str]:
+            if not scheduler.progress_healthy(stale_after_seconds=scheduler_stale_after_seconds):
+                return False, "scheduler_progress_stalled"
+            return True, "ready"
+
+        def scheduler_dependency_check() -> tuple[bool, str]:
+            try:
+                dependency_check()
+            except Exception:  # noqa: BLE001 - classified uniformly as "dependency unavailable"
+                return False, "scheduler_dependency_unavailable"
+            return True, "ready"
+
+        additional_readiness_checks.extend([scheduler_progress_check, scheduler_dependency_check])
     server = create_server(
         host,
         port,
@@ -845,6 +1152,7 @@ def _serve_command(args: argparse.Namespace) -> int:
         secure_cookies=secure_cookies,
         hsts_enabled=hsts_enabled,
         trusted_proxy_networks=trusted_proxy_networks,
+        additional_readiness_checks=additional_readiness_checks,
     )
 
     def request_stop(_signum: int, _frame: object) -> None:

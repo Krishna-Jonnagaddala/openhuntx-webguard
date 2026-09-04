@@ -112,6 +112,35 @@ DEFAULT_TERMINAL_PERSISTENCE_RETRY_BACKOFF_SECONDS = 1.0
 # is in the past).
 DEFAULT_HEARTBEAT_RETRY_BACKOFF_SECONDS = 1.0
 
+# P1-B2: progress-staleness bound for health/readiness (see
+# ScanJobWorker.progress_stale_after_seconds's own docstring for the
+# derivation). Overridable per-instance via
+# progress_healthy(stale_after_seconds=...); the CLI's health-server
+# wiring additionally allows an operator override via
+# WEBGUARD_WORKER_HEALTH_STALE_SECONDS (see cli.py).
+DEFAULT_PROGRESS_STALE_MULTIPLIER = 6.0
+DEFAULT_PROGRESS_STALE_FLOOR_SECONDS = 3.0
+# P1-B2 pre-commit correction: a real-outage re-measurement caught a
+# genuine bug in the derivation above -- during a REAL Postgres outage
+# (not the fake/instant DatabaseError injection the original unit
+# evidence used), run_forever()'s own DatabaseError branch is only
+# reached AFTER run_once()'s own first DB call (recover_expired_leases())
+# actually times out, which -- per this batch's explicit instruction
+# not to change worker job DB operations -- is still bound by the
+# *ordinary* WebGuardPostgresPool connection-checkout timeout (5.0s,
+# postgres_pool.DEFAULT_CONNECTION_TIMEOUT_SECONDS), not poll_seconds.
+# The true worst-case gap between two legitimate progress touches
+# during a real outage is therefore one blocked ordinary DB call plus
+# one poll_seconds backoff wait, not poll_seconds alone -- the
+# multiplier-only formula above was measured against a fake outage
+# that skipped this blocking call entirely, so it understated the real
+# gap. This constant duplicates (does not import, to keep this module
+# storage-agnostic -- SQLite-backed tests never see this path at all)
+# postgres_pool.py's own 5.0s default; a generous margin above it
+# keeps a real, correctly-surviving outage from ever spuriously
+# reporting stale/wedged.
+DEFAULT_PROGRESS_STALE_DB_OUTAGE_FLOOR_SECONDS = 7.0
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -169,7 +198,64 @@ class ScanJobWorker:
         # DatabaseError handling (a lower-severity, already-resilient
         # path) -- see the P1-B1 report's WORKER EVENTS section.
         self._in_database_outage = False
+        # P1-B2 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        # a single monotonic timestamp, touched from every code path
+        # that proves this worker's own loop is still actually doing
+        # something -- run_forever()'s own iterations (idle poll,
+        # processed-a-job, and outage-backoff, all three) AND
+        # monitor_job()'s per-cycle lease-heartbeat loop, which keeps
+        # running for the entire duration of a long executor.execute()
+        # call. That second source is what keeps a genuinely long scan
+        # from ever looking stalled just because run_forever() hasn't
+        # returned from run_once() yet -- see progress_healthy().
+        self._last_progress_monotonic = self.monotonic()
         self._validate_configuration()
+
+    def _touch_progress(self) -> None:
+        self._last_progress_monotonic = self.monotonic()
+
+    @property
+    def progress_stale_after_seconds(self) -> float:
+        """The bound `progress_healthy()` compares against. Not an
+        arbitrary guess: every progress-touching code path (the
+        idle/outage-backoff `stop_event.wait(self.poll_seconds)` calls
+        in `run_forever()`, and `monitor_job()`'s own
+        `min(self.poll_seconds, time-to-next-heartbeat)` wait) is
+        bounded above by `self.poll_seconds` under healthy operation --
+        `DEFAULT_PROGRESS_STALE_MULTIPLIER`/`_FLOOR_SECONDS` are sized
+        from that relationship plus a jitter margin measured
+        empirically in
+        `tests/unit/test_worker_health.py::ProgressStalenessEvidenceTests`.
+        But during a REAL outage, `run_once()`'s own first DB call can
+        legitimately block for up to the pool's ordinary ~5s checkout
+        timeout before `run_forever()`'s `except DatabaseError:` branch
+        is even reached to touch progress at all -- a real-outage
+        re-measurement caught this gap exceeding the healthy-path
+        bound above, so `DEFAULT_PROGRESS_STALE_DB_OUTAGE_FLOOR_SECONDS`
+        is also included as a floor, sized generously above that ~5s
+        worst case (see this module's own comment on that constant)."""
+
+        return max(
+            self.poll_seconds * DEFAULT_PROGRESS_STALE_MULTIPLIER,
+            DEFAULT_PROGRESS_STALE_FLOOR_SECONDS,
+            DEFAULT_PROGRESS_STALE_DB_OUTAGE_FLOOR_SECONDS,
+        )
+
+    def progress_healthy(self, *, stale_after_seconds: float | None = None) -> bool:
+        """Pure, local, non-raising: compares two floats. No knowledge
+        of Postgres/job-store dependency health belongs here -- that is
+        a separate, explicit check composed at the CLI/health-server
+        wiring layer (see cli.py), never conflated with "is the loop
+        itself still turning." A worker can be `progress_healthy()`
+        while `_in_database_outage` is True (the loop is correctly
+        backing off and retrying) -- that combination is exactly what
+        makes `/healthz` (liveness) stay green through a database
+        outage the worker itself already survives, while `/ready`
+        (readiness, which also checks the dependency) correctly goes
+        unhealthy."""
+
+        threshold = self.progress_stale_after_seconds if stale_after_seconds is None else stale_after_seconds
+        return (self.monotonic() - self._last_progress_monotonic) <= threshold
 
     def _validate_configuration(self) -> None:
         if not 0.01 <= self.poll_seconds <= 5.0:
@@ -304,6 +390,15 @@ class ScanJobWorker:
                 )
                 if monitor_stop.wait(wait_seconds):
                     return
+                # P1-B2: this cycle running at all -- independent of
+                # whether the cancellation-check/heartbeat-renewal
+                # inside it succeeds -- is the liveness signal for a
+                # long-running job: it proves the monitor thread is
+                # still cycling on schedule throughout the entire
+                # duration of executor.execute() below, which is
+                # exactly what keeps a genuinely long scan from ever
+                # looking like a wedged run_forever() loop.
+                self._touch_progress()
                 try:
                     if self.store.is_cancellation_requested(record.job_id):
                         token.cancel()
@@ -461,6 +556,13 @@ class ScanJobWorker:
                         log_event(service="worker",
                             event="database_outage_detected", level="error", worker_id=self.worker_id,
                         )
+                    # P1-B2: touched even on the outage-backoff path --
+                    # the loop backing off and retrying on schedule IS
+                    # legitimate progress (this is exactly what keeps
+                    # /healthz green through an outage the worker
+                    # already survives, while /ready's separate
+                    # dependency check correctly still fails).
+                    self._touch_progress()
                     if stop_event.wait(self.poll_seconds):
                         return
                     continue
@@ -469,6 +571,7 @@ class ScanJobWorker:
                     log_event(service="worker",
                         event="database_outage_recovered", level="info", worker_id=self.worker_id,
                     )
+                self._touch_progress()
                 if not processed:
                     stop_event.wait(self.poll_seconds)
         finally:

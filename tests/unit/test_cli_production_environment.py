@@ -71,13 +71,29 @@ class _FakePool:
     def close(self) -> None:
         self.closed = True
 
+    def check_connectivity(self, *, timeout_seconds: float | None = None) -> None:
+        # P1-B2: the worker/scheduler/serve commands' health-server
+        # dependency check reads this attribute (production mode only)
+        # to build its readiness closure -- never called during this
+        # suite (create_server/server.serve_forever are themselves
+        # faked, so no real HTTP request ever reaches a readiness
+        # closure here), but the attribute access itself must not
+        # raise merely because it exists on the fake. Accepts the same
+        # `timeout_seconds` keyword the real WebGuardPostgresPool does
+        # (P1-B2 pre-commit correction), unused here.
+        return None
+
 
 class _FakeProductionComponents:
     def __init__(self) -> None:
         self.worker = _FakeWorker()
         self.scheduler = _FakeScheduler()
         self.pool = _FakePool()
-        self.service = object()
+        # P1-B2 pre-commit correction: _serve_command now reassigns
+        # service.readiness_check directly (a real WebGuardJobService
+        # attribute) -- a bare object() has no __dict__ and cannot
+        # accept that assignment, unlike every other fake here.
+        self.service = SimpleNamespace()
         self.authenticator = object()
         self.session_authenticator = object()
         self.rate_limiter = object()

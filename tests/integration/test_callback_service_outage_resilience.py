@@ -140,12 +140,16 @@ class CallbackServiceOutageResilienceTests(unittest.TestCase):
         )
         return registration.token_value
 
-    def _start_receiver_subprocess(self, *, db_checkout_timeout: str = "0.25") -> subprocess.Popen:
+    def _start_receiver_subprocess(
+        self, *, db_checkout_timeout: str = "0.25", health_port: int | None = None
+    ) -> subprocess.Popen:
         env = dict(os.environ)
         env["WEBGUARD_DATABASE_URL"] = POSTGRES_TEST_DSN
         env["WEBGUARD_CALLBACK_SERVICE_HOST"] = "127.0.0.1"
         env["WEBGUARD_CALLBACK_SERVICE_PORT"] = str(self.port)
         env["WEBGUARD_CALLBACK_SERVICE_DB_CHECKOUT_TIMEOUT_SECONDS"] = db_checkout_timeout
+        if health_port is not None:
+            env["WEBGUARD_CALLBACK_SERVICE_HEALTH_PORT"] = str(health_port)
         env["PYTHONPATH"] = ":".join(
             [
                 os.path.join(REPO_ROOT, "apps", "api", "src"),
@@ -351,6 +355,65 @@ class CallbackServiceOutageResilienceTests(unittest.TestCase):
         self.assertEqual(len(exhausted), 1)
         self.assertEqual(exhausted[0]["error_code"], "callback_observation_persistence_unavailable")
         self.assertNotIn(token, "".join(json.dumps(line) for line in lines))
+
+    def test_p1b2_internal_health_reflects_a_real_outage_public_protocol_unchanged(self) -> None:
+        """P1-4/P1-B2: proves the SAME real callback-service subprocess
+        exposes an internal health listener whose /ready reflects a
+        genuine Postgres outage, while the existing public callback
+        protocol's uniform-204 response (P1-12's own invariant) is
+        completely unaffected -- the two listeners are on different
+        sockets, proven here against a real subprocess rather than
+        just by code inspection. Does not alter, and does not need to
+        re-prove, P1-12-R1's own honest-loss outcome -- that remains
+        exactly what test_p1b1_sustained_outage_logs_exhausted_in_the_real_subprocess
+        above already covers, unmodified."""
+        health_port = self._free_port()
+        token = self._register_token()
+        self._start_receiver_subprocess(health_port=health_port)
+
+        def _get(path: str):
+            conn = http.client.HTTPConnection("127.0.0.1", health_port, timeout=3)
+            try:
+                conn.request("GET", path)
+                response = conn.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                conn.close()
+
+        status, body = _get("/ready")
+        self.assertEqual(status, 200, "must be ready before the outage starts")
+        self.assertEqual(body, {"status": "ok"})
+
+        _stop_postgres()
+        try:
+            # The public callback protocol's own uniform response --
+            # P1-12's invariant -- must be completely unaffected by
+            # the internal health listener existing at all.
+            status, headers, body = self._send_callback(token, timeout=8.0)
+            self.assertEqual(status, 204)
+            self.assertEqual(headers.get("Content-Length"), "0")
+            self.assertEqual(body, b"")
+
+            # The internal listener, on its own separate socket, must
+            # now report the outage: liveness unaffected (no
+            # run_forever()-style loop exists to stall for a pure
+            # request-driven receiver), readiness correctly failing.
+            status, body = _get("/healthz")
+            self.assertEqual(status, 200)
+            status, body = _get("/ready")
+            self.assertEqual(status, 503)
+            self.assertEqual(body, {"status": "not_ready", "reason": "callback_dependency_unavailable"})
+        finally:
+            _start_postgres()
+
+        status = None
+        for _ in range(10):
+            status, body = _get("/ready")
+            if status == 200:
+                break
+            time.sleep(1)
+        self.assertEqual(status, 200, "must recover in the SAME subprocess, no restart")
+        self.assertIsNone(self._proc.poll(), "the callback-service process must have survived the whole outage")
 
 
 if __name__ == "__main__":

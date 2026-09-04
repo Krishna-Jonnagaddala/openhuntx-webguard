@@ -60,6 +60,37 @@ class _FakeStopEvent:
         self.set_called = True
 
 
+class _FakeHealthServer:
+    """P1-B2: mirrors _FakeSigningServer's own seam-substitution --
+    never binds a real socket/thread during this fast CLI-gate suite.
+    Necessary in addition to (not instead of) faking threading.Event:
+    a real HealthServer.start() constructs a real threading.Thread,
+    and Thread.__init__ itself uses threading.Event() internally for
+    its own bookkeeping -- which would otherwise pick up this test's
+    patched Event and break in an unrelated way."""
+
+    instances: list["_FakeHealthServer"] = []
+
+    def __init__(self, *, service, liveness_check, readiness_check, port) -> None:
+        self.service = service
+        self.liveness_check = liveness_check
+        self.readiness_check = readiness_check
+        self.port = port
+        self.started = False
+        self.stopped = False
+        _FakeHealthServer.instances.append(self)
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
 def _args(*, environment: str, key_source: str = "development") -> SimpleNamespace:
     return SimpleNamespace(environment=environment, key_source=key_source)
 
@@ -71,6 +102,7 @@ class SigningServiceProductionGateTests(unittest.TestCase):
 
     def setUp(self) -> None:
         _FakeSigningServer.instances.clear()
+        _FakeHealthServer.instances.clear()
         self._env_patch = patch.dict(
             "os.environ", {"WEBGUARD_SIGNING_SERVICE_BEARER_TOKEN": "test-bearer-token"}, clear=False
         )
@@ -79,8 +111,8 @@ class SigningServiceProductionGateTests(unittest.TestCase):
 
     def _run(self, args: SimpleNamespace):
         with patch.object(cli, "SigningServiceServer", _FakeSigningServer), patch.object(
-            cli.threading, "Event", return_value=_FakeStopEvent()
-        ), patch.object(cli.signal, "signal"):
+            cli, "HealthServer", _FakeHealthServer
+        ), patch.object(cli.threading, "Event", return_value=_FakeStopEvent()), patch.object(cli.signal, "signal"):
             exit_code = cli._signing_service_command(args)
         return exit_code
 

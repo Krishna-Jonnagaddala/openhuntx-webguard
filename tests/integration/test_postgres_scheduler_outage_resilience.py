@@ -668,6 +668,83 @@ print("UNEXPECTED: returned normally", flush=True)
         self.assertEqual(len(detected), 1, f"expected exactly one detected event, got {len(detected)}")
         self.assertEqual(len(recovered), 1, f"expected exactly one recovered event, got {len(recovered)}")
 
+    def test_p1b2_internal_healthz_stays_up_and_ready_flips_during_a_real_outage(self) -> None:
+        """Does not alter run_forever()'s actual outage-survival
+        outcome -- layers a real HealthServer, wired exactly the way
+        cli.py::_scheduler_command wires it, on top of the identical
+        real docker stop/start cycle the rest of this suite already
+        uses.
+
+        Pre-commit correction: samples /healthz repeatedly across a
+        real outage lasting ~9s -- longer than the corrected
+        DEFAULT_PROGRESS_STALE_DB_OUTAGE_FLOOR_SECONDS (7.0s) -- since
+        an earlier, shorter (2s) single check did not actually exercise
+        the gap a real (not fake-injected) DatabaseError from
+        list_due_schedules() can legitimately produce."""
+        import json
+        import urllib.error
+        import urllib.request
+
+        from webguard_api.health_server import HealthServer
+
+        coordinator = self._coordinator(poll_seconds=0.5)
+
+        def liveness():
+            return coordinator.progress_healthy(), "scheduler_progress_stalled"
+
+        def readiness():
+            if not coordinator.progress_healthy():
+                return False, "scheduler_progress_stalled"
+            try:
+                self.pool.check_connectivity(timeout_seconds=1.0)
+            except Exception:  # noqa: BLE001 - matches cli.py's own composition exactly
+                return False, "scheduler_dependency_unavailable"
+            return True, "ready"
+
+        health = HealthServer(service="scheduler", liveness_check=liveness, readiness_check=readiness, port=0)
+        health.start()
+        self.addCleanup(health.stop)
+
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=coordinator.run_forever, args=(stop_event,), name="p1b2-scheduler-health", daemon=True,
+        )
+        thread.start()
+        self.addCleanup(lambda: (stop_event.set(), thread.join(timeout=3.0)))
+
+        def _get(path: str):
+            try:
+                response = urllib.request.urlopen(health.base_url + path, timeout=8)
+                return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read())
+
+        status, _ = _get("ready")
+        self.assertEqual(status, 200, "must be ready before the outage starts")
+
+        _stop_postgres()
+        healthz_statuses = []
+        deadline = time.monotonic() + 9.0
+        while time.monotonic() < deadline:
+            status, _ = _get("healthz")
+            healthz_statuses.append(status)
+            time.sleep(1.0)
+        self.assertTrue(thread.is_alive())
+        self.assertTrue(
+            all(status == 200 for status in healthz_statuses),
+            f"liveness must stay healthy throughout a real ~9s outage (the loop is still turning, just slower "
+            f"than usual), got {healthz_statuses}",
+        )
+        status, body = _get("ready")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["reason"], "scheduler_dependency_unavailable")
+
+        _start_postgres()
+        time.sleep(4.0)
+        self.assertTrue(thread.is_alive())
+        status, body = _get("ready")
+        self.assertEqual(status, 200, "must recover in the SAME process, no restart")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -258,6 +258,15 @@ class SigningServiceServer:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}"
 
+    @property
+    def is_running(self) -> bool:
+        """P1-B2: narrow liveness accessor for the internal health
+        listener -- see callback_server.py::CallbackHttpReceiver's
+        identical property for the reasoning. Exposes only a boolean,
+        never the underlying `Thread` object."""
+
+        return self._thread is not None and self._thread.is_alive()
+
     def start(self) -> None:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()

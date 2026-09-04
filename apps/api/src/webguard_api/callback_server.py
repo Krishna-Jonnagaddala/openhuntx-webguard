@@ -274,6 +274,19 @@ class CallbackHttpReceiver:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}/"
 
+    @property
+    def is_running(self) -> bool:
+        """P1-B2: narrow liveness accessor for the internal health
+        listener -- never started, cleanly stopped, or (unlike a
+        worker/scheduler execution loop, where `Thread.is_alive()`
+        alone is explicitly not a valid liveness signal) an unexpected
+        crash of this simple `serve_forever()` thread are all
+        indistinguishable from "not running," which is exactly the
+        signal a health probe needs. Exposes only a boolean, never the
+        underlying `Thread` object."""
+
+        return self._thread is not None and self._thread.is_alive()
+
     def start(self) -> None:
         self._thread = threading.Thread(
             target=self._server.serve_forever, daemon=True
