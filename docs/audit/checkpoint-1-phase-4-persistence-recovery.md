@@ -1,4 +1,4 @@
-# Audit Checkpoint 1 — Phase 4: Persistence, Recovery & Authority Revalidation
+# Audit Checkpoint 1, Phase 4: Persistence, Recovery & Authority Revalidation
 
 ## Status
 
@@ -21,16 +21,16 @@ Phase 4 assessed WebGuard's persistence and recovery boundaries, including:
 
 Ten product findings were confirmed during this phase:
 
-- **P4-001 — Medium — Current job-store schema version was trusted without structural validation.**
-- **P4-002 — Low — Failed startup could mutate missing job-store schema metadata.**
-- **P4-003 — Medium — Malformed persisted job, schedule, or permit state could escape controlled storage-error boundaries.**
-- **P4-004 — Medium — IdentityStore could silently recreate missing security-critical identity/RBAC tables.**
-- **P4-005 — Low — Missing identity schema metadata could be silently recreated or accepted.**
-- **P4-006 — Medium — Malformed persisted identity state could escape controlled IdentityStore boundaries.**
-- **P4-007 — Low — Generic SQLite operational failures could escape IdentityStore mutation boundaries as raw sqlite3 errors.**
-- **P4-008 — High — Organization authorization revocation was not enforced across scheduler materialisation and worker execution boundaries.**
-- **P4-009 — Medium — Persisted scalar validation was incomplete and could accept invalid boolean or integer values.**
-- **P4-011 — Low — Dynamic SQL construction in identity schema validation triggered the static-analysis SQL-injection control.**
+- **P4-001 (Medium): Current job-store schema version was trusted without structural validation.**
+- **P4-002 (Low): Failed startup could mutate missing job-store schema metadata.**
+- **P4-003 (Medium): Malformed persisted job, schedule, or permit state could escape controlled storage-error boundaries.**
+- **P4-004 (Medium): IdentityStore could silently recreate missing security-critical identity/RBAC tables.**
+- **P4-005 (Low): Missing identity schema metadata could be silently recreated or accepted.**
+- **P4-006 (Medium): Malformed persisted identity state could escape controlled IdentityStore boundaries.**
+- **P4-007 (Low): Generic SQLite operational failures could escape IdentityStore mutation boundaries as raw sqlite3 errors.**
+- **P4-008 (High): Organization authorization revocation was not enforced across scheduler materialisation and worker execution boundaries.**
+- **P4-009 (Medium): Persisted scalar validation was incomplete and could accept invalid boolean or integer values.**
+- **P4-011 (Low): Dynamic SQL construction in identity schema validation triggered the static-analysis SQL-injection control.**
 
 All confirmed findings were remediated and regression-tested before Phase 4 closure.
 
@@ -66,7 +66,7 @@ The audit intentionally used malformed database state, direct SQLite corruption,
 
 ---
 
-## Phase 4A — Schema Migration and Recovery
+## Phase 4A: Schema Migration and Recovery
 
 Adversarial tests assessed:
 
@@ -119,7 +119,7 @@ A failed initialization path could recreate missing schema metadata while determ
 
 Startup validation was not completely side-effect free.
 
-A damaged database could be altered even though startup ultimately failed.
+A damaged database could be altered even though startup still failed.
 
 ### Remediation
 
@@ -137,7 +137,7 @@ P4-001 and P4-002 are recorded as:
 
 ---
 
-## Phase 4B — Persisted Job, Schedule and Permit Corruption
+## Phase 4B: Persisted Job, Schedule and Permit Corruption
 
 Adversarial database mutations assessed malformed:
 
@@ -187,7 +187,7 @@ P4-003 is recorded as:
 
 ---
 
-## Phase 4C — Identity Persistence Integrity
+## Phase 4C: Identity Persistence Integrity
 
 The audit assessed:
 
@@ -267,7 +267,7 @@ P4-004, P4-005 and P4-006 are recorded as:
 
 ---
 
-## Phase 4D — SQLite Lock and Crash Recovery
+## Phase 4D: SQLite Lock and Crash Recovery
 
 Failure-injection tests assessed:
 
@@ -328,7 +328,7 @@ P4-007 is recorded as:
 
 ---
 
-## Phase 4E — Authorization Revocation Across Scheduler and Worker Boundaries
+## Phase 4E: Authorization Revocation Across Scheduler and Worker Boundaries
 
 The audit tested organization authorization removal after earlier validation but before:
 
@@ -416,7 +416,7 @@ P4-008 is recorded as:
 
 ---
 
-## Phase 4F — Persisted Scalar Validation
+## Phase 4F: Persisted Scalar Validation
 
 The audit directly modified SQLite scalar values to invalid types and values.
 
@@ -486,7 +486,7 @@ P4-009 is recorded as:
 
 ---
 
-## P4-010 Investigation — SQLite ResourceWarning
+## P4-010 Investigation: SQLite ResourceWarning
 
 ### Initial observation
 
@@ -544,7 +544,7 @@ The test resource-hygiene defect was corrected.
 
 ---
 
-## Phase 4G — Static Analysis of Persistence Code
+## Phase 4G: Static Analysis of Persistence Code
 
 The repository-native security gate identified one additional persistence-layer issue after the functional audit had passed.
 
@@ -719,4 +719,4 @@ Phase 4 is therefore:
 
 Next audit area:
 
-**Checkpoint 1 — Phase 5: Secrets, Keys & Artifact Security**
+**Checkpoint 1, Phase 5: Secrets, Keys & Artifact Security**

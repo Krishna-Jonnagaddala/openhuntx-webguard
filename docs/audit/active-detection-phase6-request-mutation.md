@@ -1,11 +1,11 @@
-# Active Detection — Slice 6: Request Template & Safe Mutation Engine
+# Active Detection, Slice 6: Request Template & Safe Mutation Engine
 
 ## Status
 
 This slice adds **no new detector**. It builds a common request-template
 and parameter-mutation layer between attack-surface discovery and the two
 existing detectors (reflected-XSS, error-based SQLi), then extends both
-detectors to consume it — SQLi across all three supported transports
+detectors to consume it: SQLi across all three supported transports
 (GET query, POST form, JSON body), XSS across two (GET query/form, POST
 form; JSON deliberately excluded, see below).
 
@@ -14,7 +14,7 @@ form; JSON deliberately excluded, see below).
 ### The request-template contract (`workers/scanner/src/webguard_scanner/request_template.py`)
 
 - `RequestTemplate`: a plain, serializable description of one request
-  shape — endpoint, method, content type, the one parameter this
+  shape: endpoint, method, content type, the one parameter this
   template exists to test, and its baseline query/form/JSON values.
   Carries no secrets: `authentication_context_ref` is an opaque
   reference for a future protected runtime context to resolve, never a
@@ -32,8 +32,8 @@ form; JSON deliberately excluded, see below).
   `REQUIRES_EXPLICIT_ACTIVE_AUTHORIZATION` POST-form/JSON candidates only
   when the caller's own already-established authorization says so.
   `POTENTIALLY_STATE_CHANGING` and `UNSUPPORTED` candidates are **never**
-  projected here, regardless of the flags — see "Safety boundaries"
-  below.
+  projected here, regardless of the flags (see "Safety boundaries"
+  below).
 
 ### Supported request types
 
@@ -50,7 +50,7 @@ form; JSON deliberately excluded, see below).
 
 Path parameters, multipart forms, GraphQL variables, and XML bodies are
 explicitly designed-for (the `RequestTemplate.path_parameters` field
-exists) but not implemented — consistent with the brief's "design for,
+exists) but not implemented, consistent with the brief's "design for,
 do not necessarily implement yet."
 
 ### Parameter mutation (`mutate(template, parameter, replacement)`)
@@ -61,12 +61,12 @@ One shared mechanism for all three transports:
   re-encode. Every other query parameter is preserved unchanged.
 - **POST form**: `dict(template.form_parameters)`, overwrite one key,
   re-urlencode. Every other field is preserved unchanged.
-- **JSON body**: parse the baseline document (bounded — see below), deep
+- **JSON body**: parse the baseline document (bounded, see below), deep
   copy it, replace the value at exactly one dotted/indexed path (e.g.
   `email`, `user.email`, `items[0].name`), preserving every sibling field
   untouched (verified directly: mutating `email` in `{"email": ...,
-  "password": "baseline"}` never alters `password` —
-  `test_json_mutation_preserves_unrelated_fields`,
+  "password": "baseline"}` never alters `password`, per
+  `test_json_mutation_preserves_unrelated_fields` and
   `test_nested_json_mutation_preserves_siblings`).
 
 Mutating a parameter that doesn't exist on the template fails closed
@@ -77,7 +77,7 @@ no-oping.
 
 `AttackSurfaceCandidate.candidate_id` (Slice 5) now also incorporates
 `content_type`, per this slice's explicit identity fields (origin, path,
-method, content type, parameter location, parameter name — never a
+method, content type, parameter location, parameter name, never a
 volatile probe value). This changes computed hash values but not
 semantics: the two-part invariant (same identity for the same
 endpoint+method+content-type+location+parameter regardless of discovery
@@ -100,14 +100,14 @@ both still passing).
   depth limit, so it cannot itself recurse unboundedly.
 - `enumerate_json_parameter_paths`: deterministic, bounded leaf-path
   enumeration (`maximum_parameter_paths`, `maximum_array_index`,
-  `maximum_depth`) — verified to cap output on a document with 100 flat
+  `maximum_depth`), verified to cap output on a document with 100 flat
   fields, a document with 50 array elements, and a wide-and-deep
   (50 groups × 20 fields) document that would otherwise enumerate 1,000
   candidates (`test_does_not_recursively_explode_on_a_large_document`).
   Only `str`/`int`/`float`/`bool` leaves are addressable; `null` and any
   other type are skipped, never guessed at.
 - `parse_json_parameter_path`: a small explicit state machine (not a
-  single regex) for `"email"`, `"user.email"`, `"items[0].name"` — a
+  single regex) for `"email"`, `"user.email"`, `"items[0].name"`. A
   regex-based first attempt had a real bug where the `.` separator
   between segments wasn't itself consumed, silently producing a
   malformed-path false-negative; caught by
@@ -123,17 +123,17 @@ template's own unmutated values and records `status`, `response_length`,
 a small allowlisted header subset (`content-type`, `server`,
 `cache-control`), a SHA-256 `content_fingerprint`, and
 `elapsed_milliseconds`. Never stores a complete response body. Returns
-`None` on any request failure — a missing baseline is recorded as "no
+`None` on any request failure: a missing baseline is recorded as "no
 observation," never fabricated.
 
 This is built, tested, and exported as reusable infrastructure per the
 brief's explicit ask, but the SQLi detector's own baseline/diagnostic
-comparison does **not** call it internally — that comparison needs the
+comparison does **not** call it internally: that comparison needs the
 full response text to search for a database-error signature, which a
 fingerprint-based observation cannot provide. `execute_baseline` is
 available for a future detector whose methodology only needs to know
 "did the response change," not "what did it say." This is a deliberate
-scoping decision, not an oversight — documented here rather than forcing
+scoping decision, not an oversight, documented here rather than forcing
 an awkward fit.
 
 ## Extending the existing detectors
@@ -148,7 +148,7 @@ function (`_issue_legacy_baseline_and_diagnostic` /
 handles `RequestTemplate` items via `mutate` +
 `issue_templated_request`. The main loop dispatches on `isinstance`,
 then shares the same classification, recording, and finding-construction
-code for both — that code was already transport-agnostic (it only ever
+code for both: that code was already transport-agnostic (it only ever
 looked at response text/status), so no duplication was needed there.
 
 This design was chosen specifically so every one of the 16 pre-existing
@@ -163,19 +163,19 @@ three input transports, not three detectors
 (`sqli_get_detector`/`sqli_post_detector`/`sqli_json_detector`). The
 baseline-then-single-apostrophe-diagnostic methodology and the
 database-error-signature classification (`_classify`, `_find_signature`)
-are completely unchanged from Slice 4 — only how the two requests are
+are completely unchanged from Slice 4; only how the two requests are
 constructed and sent differs by transport.
 
 `_build_finding` and `SqliDetectorRunRecord` were changed to take an
 explicit `parameter`/`method` pair instead of assuming
-`candidate.parameter`/`"GET"` — a mechanical signature change with
+`candidate.parameter`/`"GET"`: a mechanical signature change with
 identical output for the GET case, since the legacy path still passes
 exactly `candidate.parameter` and `"GET"`.
 
 ### XSS (`xss_reflected_detector.py`): two transports, not three
 
 POST-form candidates are supported identically to SQLi. JSON bodies are
-explicitly **not** supported —
+explicitly **not** supported:
 `_issue_templated_probe` raises `RequestTemplateError("xss_json_body_not_supported", ...)`
 for any JSON-content-type template, recorded as a probe error, never
 silently skipped or crashed on. Rationale, stated directly in code and
@@ -183,9 +183,9 @@ here: reflected-XSS's evidence (attacker-controlled markup echoed
 unescaped into an HTML response) only means what it claims to mean when
 a browser would render that HTML. A JSON API response containing
 attacker input back is a different, unproven claim (it would require
-showing that response is later rendered somewhere as HTML — a DOM-XSS-
+showing that response is later rendered somewhere as HTML, a DOM-XSS-
 adjacent question this detector's methodology does not investigate).
-Feature parity with SQLi was explicitly not a goal by itself — this
+Feature parity with SQLi was explicitly not a goal by itself. This
 slice's own brief says so, and this is the concrete instance of it.
 
 ## Safety boundaries
@@ -193,7 +193,7 @@ slice's own brief says so, and this is the concrete instance of it.
 ### Representable is not probeable (requirement 5)
 
 `RequestTemplate`/`mutate` answer "can this request be built and
-mutated" — a pure, static question about shape. `to_request_templates`
+mutated", a pure, static question about shape. `to_request_templates`
 is the only place that additionally asks "does the caller assert
 authorization for this," and even there, `POTENTIALLY_STATE_CHANGING`
 and `UNSUPPORTED` candidates are never projected regardless of any flag.
@@ -210,7 +210,7 @@ slice: the bare keyword `"password"` (present since Slice 5) was
 `"reset-password"`. Reason, found empirically while investigating a
 synthetic OpenAPI login endpoint: a bare `"password"` keyword matched
 every ordinary login form's password field, permanently classifying
-login endpoints — a common and legitimate SQLi/XSS target — as
+login endpoints (a common and legitimate SQLi/XSS target) as
 `POTENTIALLY_STATE_CHANGING`, which this slice's own design makes
 un-unlockable by any permit. Login (authenticating with a password) and
 password-change (mutating a password) are different actions; only the
@@ -228,7 +228,7 @@ Covered above under "Bounded JSON handling." Every one of excessive
 nesting, huge arrays, oversized strings, malformed JSON, and unsupported
 data types has an explicit test (see "Testing" below). Duplicate JSON
 object keys are a `json.loads` standard-library behavior (last key wins)
-and are not separately handled — no ambiguity exists at the parsed-object
+and are not separately handled: no ambiguity exists at the parsed-object
 level this module operates on.
 
 ### Authorization and HTTP methods (requirements 12, 13)
@@ -236,14 +236,14 @@ level this module operates on.
 Being able to represent a POST/JSON request does not bypass any existing
 control:
 
-- **`active_checks`**: unchanged — the executor's detector-registry
+- **`active_checks`**: unchanged: the executor's detector-registry
   lookup (`ACTIVE_DETECTOR_REGISTRY[check_id]`) still only runs a
   detector the permit's `active_checks` claim names, regardless of
   transport. Proven directly:
   `test_post_candidate_not_probed_when_only_xss_authorized`.
 - **HTTP method authorization**: `TRUSTSCAN_ALLOWED_HTTP_METHODS`
   (`packages/contracts/python/src/webguard_contracts/scan_permits.py`)
-  was widened from `("GET", "HEAD")` to `("GET", "HEAD", "POST")` — an
+  was widened from `("GET", "HEAD")` to `("GET", "HEAD", "POST")`, an
   additive vocabulary extension to an existing field's accepted value
   set, not a schema-shape change (the wire field is still `tuple[str,
   ...]`); every existing GET/HEAD-only permit remains valid unchanged.
@@ -251,7 +251,7 @@ control:
   growing in Slices 3–4, and does not require the version-aware-loader
   process `docs/audit/trustscan-permit-schema-policy.md` reserves for
   actual field additions/removals. This enables, but does not by itself
-  grant, POST authorization — an operator must still explicitly request
+  grant, POST authorization: an operator must still explicitly request
   it via `--allowed-http-method POST` at permit-issuance time.
   Two enforcement layers already existed and needed no new code: `safe_http.fetch_once`
   rejects any method not in `policy.allowed_methods` (itself derived
@@ -269,18 +269,18 @@ control:
   `ActiveDetectionPolicy.maximum_probe_requests`,
   `TrustScanRuntimeSafetyEngine`'s in-flight/rate accounting, and
   `cancellation_check` all apply identically to a `RequestTemplate`
-  probe as to a `DetectionCandidate` one — they operate on the same
+  probe as to a `DetectionCandidate` one: they operate on the same
   `before_request`/`after_request` hooks and the same policy object,
   which `issue_templated_request` calls exactly like `issue_probe` does.
 - **Target scope**: `issue_templated_request` calls the same
-  `_require_same_origin`/`_build_probe_target` as `issue_probe` — an
+  `_require_same_origin`/`_build_probe_target` as `issue_probe`: an
   off-origin mutated request is rejected before any connection is
   attempted (`test_off_origin_mutated_request_is_rejected_fail_closed`).
 
 ### Evidence sanitization (requirement 14)
 
 Neither detector's `_build_finding` was changed in what it puts into
-`Evidence.summary` — still scan/authorization/permit IDs, a matched-
+`Evidence.summary`: still scan/authorization/permit IDs, a matched-
 signature *category* (never the signature text) or a marker, and the
 outcome. `FindingIdentity.parameter` legitimately carries a parameter
 *name or path* (e.g. `"user.email"`), which is allowed evidence per the
@@ -299,15 +299,15 @@ evidence.
    which silently skipped over the `.` characters between segments
    rather than treating them as syntax. `"user.email"` parsed to two
    matches at positions that didn't abut, which the position-tracking
-   check correctly flagged as malformed — meaning every nested JSON path
+   check correctly flagged as malformed, meaning every nested JSON path
    failed to parse at all. Caught immediately by
    `test_nested_json_mutation_preserves_siblings` before touching any
    detector. Fixed by rewriting as an explicit character-by-character
    state machine (see `parse_json_parameter_path`'s docstring).
 2. **Site-level discovery dropped the target's port.** While wiring
    `discover_site_attack_surface` (Slice 5 code, exercised again by this
-   slice's true-E2E tests) against a target on a non-default port — the
-   normal shape for every TLS lab fixture in this repository — the
+   slice's true-E2E tests) against a target on a non-default port (the
+   normal shape for every TLS lab fixture in this repository), the
    auxiliary-resource URL builder used
    `f"{target.scheme}://{target.hostname}/"`, omitting the port. Against
    a same-host-different-port target this fails
@@ -326,7 +326,7 @@ evidence.
    `get_template_parameter_value` lookup, not around `mutate()` itself.
    A template with unparseable JSON therefore raised out of
    `run_sqli_error_detector` entirely, discarding every other
-   candidate's results in the same run — a real, if narrow, availability
+   candidate's results in the same run: a real, if narrow, availability
    bug (one bad candidate should never take down the whole batch, the
    same principle `ActiveDetectionError` handling in the executor already
    establishes for detector-level failures). Caught by
@@ -357,26 +357,26 @@ carrying Slice 6's OpenAPI `requestBody`-example extraction) against the
 live container:
 
 - Page-level: 0 candidates (confirmed again: the root page is a pure
-  Angular SPA shell — `polyfills.js`/`scripts.js`/`main.js` external
+  Angular SPA shell: `polyfills.js`/`scripts.js`/`main.js` external
   bundles only, zero inline `<script>` content, zero server-rendered
   `<form>`/parameterised `<a href>`).
 - Site-level: `robots.txt` yields one genuine, real (non-SPA-routed)
   entry (`Disallow: /ftp`, recorded `UNSUPPORTED`, never probed).
   `sitemap.xml`, `/openapi.json`, `/swagger.json`, `/v2/api-docs` all
   return HTTP 200 with the same Angular `index.html` (an SPA catch-all
-  route), which contains no `<loc>` tags and fails JSON parsing —
+  route), which contains no `<loc>` tags and fails JSON parsing,
   correctly recorded as `malformed_openapi_document`/no candidates, not
   fabricated into false data.
 - Combined: `to_request_templates(..., allow_post=True,
   allow_json=True)` on the merged result yields **0 templates**. The
   login surface is not discoverable by this project's static/API-
-  description-based discovery, full stop — this has not changed since
+  description-based discovery, full stop. This has not changed since
   Slice 5, and this slice's expanded discovery (POST forms, real JSON
   body extraction from OpenAPI) does not change the outcome, because
   Juice Shop simply never exposes it through anything this discovery
   reads.
 
-**Representable? Yes — verified by direct construction.** A
+**Representable? Yes, verified by direct construction.** A
 `RequestTemplate` was manually constructed (not discovered) for `POST
 /rest/user/login`, `application/json`, body `{"email": "a@b.com",
 "password": "x"}`, `parameter="email"`. This is a legitimate exercise of
@@ -384,32 +384,32 @@ the representability question independent of discovery, per the brief's
 own framing.
 
 **Authorized? Mechanically available, not exercised as a full
-CLI→API→worker E2E** — since discovery would never route this candidate
+CLI→API→worker E2E**, since discovery would never route this candidate
 there anyway, running the full stack against it would only prove the
 existing method/active_checks gates again (already proven against the
 synthetic fixture), not anything new about Juice Shop.
 
-**Detectable using the current, unmodified methodology? No — verified
+**Detectable using the current, unmodified methodology? No, verified
 empirically, without inventing or attempting any authentication-bypass
 payload.** `run_sqli_error_detector` was run, completely unmodified,
 against the manually-constructed template. It sent exactly the same two
-requests it always sends — a baseline, then one single unescaped
+requests it always sends: a baseline, then one single unescaped
 apostrophe as the `email` field's value, nothing else. Result:
 `SqliDetectionOutcome.INCONCLUSIVE`, zero findings, zero probe errors.
 This is the expected, honest outcome: Juice Shop's actual login "SQL
 injection" challenge is a boolean/logic bypass (a crafted value that
 makes the query's `WHERE` clause always true), which produces a *valid,
-different* successful response, not a database error — structurally
+different* successful response, not a database error, structurally
 outside what an error-signature-based detector can see, by design of the
 detector's own conservative methodology (Slice 4's explicit choice to
 exclude boolean-differential and bypass techniques). No new or different
 payload was attempted to try to make this turn green.
 
-**Summary, exactly in the terms requirement 15 asks for:** discovered —
-no. representable — yes. authorized — mechanically available via the
+**Summary, exactly in the terms requirement 15 asks for:** discovered:
+no. representable: yes. authorized: mechanically available via the
 existing permit model, not separately re-proven end-to-end since
 discovery never surfaces this candidate. detectable using current SQLi
-methodology — no, confirmed empirically. This is recorded as a valid
+methodology: no, confirmed empirically. This is recorded as a valid
 result, not a gap to paper over.
 
 ## Testing
@@ -448,12 +448,12 @@ New test files/additions, each traced to a required item from the brief:
   `active.xss.reflected` never triggers SQLi against the same candidate.
 - `tests/integration/test_sqli_error_detector_live.py` (+4 tests, real
   sockets, real SQLite): genuine vulnerable POST-form and JSON endpoints
-  confirmed; their parameterised-safe counterparts produce no finding —
+  confirmed; their parameterised-safe counterparts produce no finding,
   extending the existing four-endpoint real-database fixture to all
   three transports.
 - `tests/unit/test_trustscan_permit_contract.py`: the one existing test
   that encoded "POST is unsafe" (`test_submission_rejects_unsafe_http_method`)
-  was updated to test `DELETE` instead — POST is now a legitimately
+  was updated to test `DELETE` instead: POST is now a legitimately
   issuable method, and the test's actual intent (unknown/unsafe methods
   are still rejected) is preserved with a still-genuinely-unsupported
   method. One new test added confirming POST is now accepted.
@@ -467,7 +467,7 @@ rejection, duplicate candidate normalization, evidence sanitization,
 baseline preservation, genuine vulnerable POST-form SQLi, genuine
 vulnerable JSON SQLi, safe controls) is covered above or was already
 covered by Slice 5's `test_attack_surface_discovery.py` (budget
-exhaustion, cancellation, duplicate candidate normalization — unchanged
+exhaustion, cancellation, duplicate candidate normalization, unchanged
 by this slice and re-run as regression).
 
 ## Regression
@@ -476,7 +476,7 @@ by this slice and re-run as regression).
   +21 Slice-5 attack-surface tests already counted there, +29 new
   request-template tests, +9 new SQLi tests, +4 new XSS tests, +3 new
   HTTP-method-authorization tests, +1 permit-contract test net after the
-  one rewritten test — see exact arithmetic in each test file above).
+  one rewritten test; see exact arithmetic in each test file above).
 - Full integration suite (`WEBGUARD_RUN_INTEGRATION=1`, Juice Shop
   container live): **29/29 passing** (25 from Slice 5, +4 new real-socket
   POST-form/JSON SQLi tests), including both true end-to-end tests.
@@ -491,7 +491,7 @@ by this slice and re-run as regression).
   (21, unchanged), `test_safe_http.py` (15, unchanged).
 - Security gates: secret scan (261 files / 6 artifacts / 551 blobs),
   static analysis (`ruff --select S`, zero findings), dependency audit
-  (6 locked packages, no advisories) — all passing.
+  (6 locked packages, no advisories), all passing.
 - `git diff --check`: clean.
 
 ## Implemented / Tested / Proven / Not Proven / Supported Request Types / Safety Boundaries / False-Positive Controls / Known Limitations / Test Counts / Security Gates / GitHub Commit / Remote Sync / Next Slice
@@ -523,7 +523,7 @@ or token value.
 
 **Not Proven:** that any newly-representable request shape (POST form,
 JSON body) has been exercised against a genuine, independently-discovered
-real-world vulnerability — the only real-world lab target available
+real-world vulnerability: the only real-world lab target available
 (Juice Shop) is empirically confirmed to expose its actual vulnerable
 endpoint through neither this nor any prior slice's discovery, for a
 documented, verified reason (SPA architecture, no static description of
@@ -535,7 +535,7 @@ types" above.
 **Safety boundaries:** representability and probeability remain distinct
 questions with no code path collapsing them; POST/JSON authorization
 requires both the permit's `active_checks` claim (which detector) and
-its `allowed_http_methods` claim (which methods) — proven independently
+its `allowed_http_methods` claim (which methods), proven independently
 gated; `POTENTIALLY_STATE_CHANGING`/`UNSUPPORTED` candidates are never
 projected to a probeable template under any authorization; every
 existing safety control (scope, budget, rate, concurrency, cancellation)
@@ -552,7 +552,7 @@ produced a false finding.
 variables, and XML bodies remain unimplemented (designed for, not built);
 JSON support for reflected-XSS is intentionally absent; JSON body
 candidate discovery depends entirely on an OpenAPI document providing a
-concrete example or schema — an endpoint with neither is discovered at
+concrete example or schema: an endpoint with neither is discovered at
 the endpoint/method level only, never at the field level; site-level
 discovery (where the OpenAPI/JSON-body extraction lives) still does not
 run in crawl mode, a Slice-5 limitation unchanged by this slice.
@@ -568,7 +568,7 @@ verification.
 **Remote sync:** recorded below.
 
 **Next slice:** per the operator's own stated priority (master scope
-document, section 46, item 5 — "add next high-value detector classes"),
+document, section 46, item 5, "add next high-value detector classes"),
 a new detector class can now be built directly on top of this transport-
 agnostic candidate/template/mutation model from the start, rather than
 needing its own GET-only special case first. Alternatively, per that same

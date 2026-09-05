@@ -169,7 +169,7 @@ export function SchedulesPage() {
                   <StatusBadge status={schedule.state} />
                 </Td>
                 <Td className="text-[var(--color-text-secondary)]">
-                  {schedule.next_run_at ? new Date(schedule.next_run_at).toLocaleString() : "—"}
+                  {schedule.next_run_at ? new Date(schedule.next_run_at).toLocaleString() : "-"}
                 </Td>
                 <Td className="text-[var(--color-text-secondary)]">
                   {schedule.last_enqueued_at ? new Date(schedule.last_enqueued_at).toLocaleString() : "never"}

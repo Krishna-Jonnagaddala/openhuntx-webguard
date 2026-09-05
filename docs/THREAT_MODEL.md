@@ -10,15 +10,15 @@ It is a living engineering document. A hosted control plane and separated runner
 
 WebGuard should preserve these properties:
 
-1. **Authorised execution** — scanner traffic occurs only when a valid permission chain exists.
-2. **Tenant isolation** — one organisation cannot read or mutate another organisation's resources.
-3. **Scope confinement** — runtime requests remain inside the authorised target/origin and network policy.
-4. **Bounded impact** — request count, rate, concurrency, response size, execution time, and retry behaviour remain bounded.
-5. **Evidence integrity** — signed permits, checkpoints, cursors, reports, and Safety Receipts cannot be silently altered without detection where cryptographic protection is defined.
-6. **Secret confidentiality** — API token secrets and signing material are not exposed through ordinary product flows.
-7. **Recoverable execution** — worker crashes do not permit stale workers to corrupt final state or cause unbounded retry.
-8. **Auditability** — security-sensitive API actions and scan execution decisions leave useful evidence.
-9. **Fail-closed ambiguity** — invalid permission, unsafe scope, or unverifiable security state blocks execution rather than broadening it.
+1. **Authorised execution**: scanner traffic occurs only when a valid permission chain exists.
+2. **Tenant isolation**: one organisation cannot read or mutate another organisation's resources.
+3. **Scope confinement**: runtime requests remain inside the authorised target/origin and network policy.
+4. **Bounded impact**: request count, rate, concurrency, response size, execution time, and retry behaviour remain bounded.
+5. **Evidence integrity**: signed permits, checkpoints, cursors, reports, and Safety Receipts cannot be silently altered without detection where cryptographic protection is defined.
+6. **Secret confidentiality**: API token secrets and signing material are not exposed through ordinary product flows.
+7. **Recoverable execution**: worker crashes do not permit stale workers to corrupt final state or cause unbounded retry.
+8. **Auditability**: security-sensitive API actions and scan execution decisions leave useful evidence.
+9. **Fail-closed ambiguity**: invalid permission, unsafe scope, or unverifiable security state blocks execution rather than broadening it.
 
 ## 3. Protected assets
 
@@ -82,7 +82,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 ## 6. Threats and controls
 
-### T1 — Unauthenticated API access
+### T1: Unauthenticated API access
 
 **Threat:** An attacker invokes protected job, schedule, permit, or audit routes without a valid token.
 
@@ -96,7 +96,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** A malicious local process can still attempt authentication and may steal a token from the operator environment. Loopback is not a sandbox.
 
-### T2 — RBAC escalation
+### T2: RBAC escalation
 
 **Threat:** An analyst/viewer performs permit issuance/revocation, audit access, or mutation beyond role.
 
@@ -109,7 +109,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** Future routes could omit a permission check. Audit Phase 2 must continue systematic route-to-permission review.
 
-### T3 — Cross-tenant object access / IDOR
+### T3: Cross-tenant object access / IDOR
 
 **Threat:** Tenant A guesses an object UUID belonging to Tenant B.
 
@@ -122,7 +122,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** Any newly added unscoped store method exposed through the API could reintroduce an IDOR path.
 
-### T4 — Stolen API token
+### T4: Stolen API token
 
 **Threat:** An attacker obtains a valid raw `wgt_...` token.
 
@@ -136,7 +136,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** Bearer possession is sufficient until token expiry/revocation. Production should use stronger identity/session controls and managed secret storage.
 
-### T5 — Forged or tampered TrustScan permit
+### T5: Forged or tampered TrustScan permit
 
 **Threat:** An attacker edits target, organisation, limits, time window, or other permit claims.
 
@@ -151,7 +151,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** Theft of the private signing key defeats permit authenticity until key response/rotation occurs.
 
-### T6 — Permit replay in another organisation or target
+### T6: Permit replay in another organisation or target
 
 **Threat:** A valid permit is reused outside its intended tenant, target, authorisation, or mode.
 
@@ -159,13 +159,13 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** Within its valid scope/window, a permit may authorise multiple bound jobs unless future policy adds one-time/nonces or usage ceilings across jobs.
 
-### T7 — Underlying authorisation changes after permit issuance
+### T7: Underlying authorisation changes after permit issuance
 
 **Threat:** A previously signed permit remains usable after the authorisation document is altered.
 
 **Controls:** Permit claims bind the authorisation SHA-256 fingerprint. Execution rejects a changed fingerprint.
 
-### T8 — Revocation or expiry during execution
+### T8: Revocation or expiry during execution
 
 **Threat:** Permission is valid at job start but revoked/expired during a crawl.
 
@@ -173,7 +173,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** A request already permitted and in flight cannot be unsent retroactively.
 
-### T9 — SSRF / internal-network access
+### T9: SSRF / internal-network access
 
 **Threat:** An attacker supplies a URL resolving to loopback, private, link-local, metadata, reserved, or ambiguous network destinations.
 
@@ -188,19 +188,19 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** DNS and network topology can change. Continued DNS-rebinding and TOCTOU analysis is required as the transport architecture evolves.
 
-### T10 — Redirect scope escape
+### T10: Redirect scope escape
 
 **Threat:** An authorised target redirects the scanner to a different host/origin.
 
 **Controls:** Safe HTTP does not follow redirects. Redirect responses are treated as bounded responses rather than navigation authority.
 
-### T11 — Crawler link escape
+### T11: Crawler link escape
 
 **Threat:** Malicious HTML contains external, protocol-relative, destructive, fragment, or unsupported links intended to expand scan scope.
 
 **Controls:** Bounded same-origin crawler normalisation, query policy, destructive-path filtering, allowed content-type discovery, link/page/depth limits, and request-boundary same-origin enforcement.
 
-### T12 — Method escalation / active testing
+### T12: Method escalation / active testing
 
 **Threat:** Scanner code sends unauthorised POST/PUT/etc. requests or active payloads.
 
@@ -208,7 +208,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** Future active checks will require a new authorisation level and threat-model revision; they must not be silently added under passive authority.
 
-### T13 — Resource exhaustion against target
+### T13: Resource exhaustion against target
 
 **Threat:** Excess request volume or concurrency affects customer availability.
 
@@ -216,7 +216,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** Even one permitted request can have unexpected impact on a fragile target. Safety limits reduce risk; they do not guarantee zero impact.
 
-### T14 — Resource exhaustion against WebGuard
+### T14: Resource exhaustion against WebGuard
 
 **Threat:** Oversized API bodies, HTTP responses, headers, crawl graphs, or queued work consume local resources.
 
@@ -224,13 +224,13 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** SQLite/single-host throughput and local disk exhaustion are not production-grade multi-tenant DoS controls.
 
-### T15 — Malicious HTTP response parsing
+### T15: Malicious HTTP response parsing
 
 **Threat:** Target returns malformed headers, duplicate content lengths, huge bodies, adversarial HTML, or unusual TLS state.
 
 **Controls:** Response-size limits, conflicting content-length rejection, bounded HTML analysis, controlled error taxonomy, and tests for malformed/adversarial cases.
 
-### T16 — Worker crash / duplicate execution
+### T16: Worker crash / duplicate execution
 
 **Threat:** Worker dies while a job is running; a second worker starts the same job while the stale worker later resumes.
 
@@ -238,13 +238,13 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** A network request already sent before a crash cannot be undone. Exactly-once network side effects are not guaranteed by queue fencing alone.
 
-### T17 — Schedule catch-up storm
+### T17: Schedule catch-up storm
 
 **Threat:** A delayed scheduler materialises many missed runs at once or duplicates a due job.
 
 **Controls:** Atomic schedule advance/job materialisation, duplicate protection, conservative one-job catch-up, and automatic blocking when permission becomes invalid.
 
-### T18 — Cursor tampering / cross-context pagination
+### T18: Cursor tampering / cross-context pagination
 
 **Threat:** Client changes pagination position, organisation, resource, or filters.
 
@@ -252,7 +252,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** Current HMAC key resides in the same local database as application state.
 
-### T19 — Database theft or modification
+### T19: Database theft or modification
 
 **Threat:** Local attacker copies or alters SQLite state, including signing material.
 
@@ -260,7 +260,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** There is no application-layer database encryption or external key custody. A host-level compromise can access both state and TrustScan signing material. This is accepted only for the current local engineering stage and is tracked as C1-008 / production work.
 
-### T20 — Artefact disclosure
+### T20: Artefact disclosure
 
 **Threat:** Reports, findings, authorisations, or Safety Receipts are exposed through permissive files, symlinks, or source control.
 
@@ -268,7 +268,7 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** Operators can still manually copy artefacts to insecure locations.
 
-### T21 — Artefact tampering
+### T21: Artefact tampering
 
 **Threat:** Stored evidence is modified after execution.
 
@@ -276,13 +276,13 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** Not every report artefact is independently signed. The future assessment ledger/remediation-receipt architecture should strengthen end-to-end evidence provenance.
 
-### T22 — Safety Receipt overclaim
+### T22: Safety Receipt overclaim
 
 **Threat:** A verifier interprets a signed Safety Receipt as proof that the target was unaffected or completely secure.
 
 **Controls:** Product/docs explicitly define the receipt as evidence of enforced/observed runtime policy, not zero-impact or security certification.
 
-### T23 — Dependency or CI substitution
+### T23: Dependency or CI substitution
 
 **Threat:** Same WebGuard commit installs different dependency versions or executes mutable CI/lab components.
 
@@ -290,13 +290,13 @@ TB8  Repository/CI -> built/tested dependency set
 
 **Residual risk:** A compromised upstream artifact with an already reviewed hash, a compromised GitHub runner, or the broader container-image transitive supply chain remain possible.
 
-### T24 — Secret leakage through development workflows
+### T24: Secret leakage through development workflows
 
 **Threat:** Tokens/private keys are pasted into commits, screenshots, logs, chat, or shell scripts.
 
 **Controls:** documented handling rules, staged-content checks during audited changes, ignored private paths, one-time token issuance, and planned automated secret scanning under C1-003.
 
-### T25 — Signing-key compromise
+### T25: Signing-key compromise
 
 **Threat:** Attacker obtains the TrustScan private key and forges permits or Safety Receipts.
 

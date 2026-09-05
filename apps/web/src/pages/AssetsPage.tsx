@@ -136,7 +136,7 @@ export function AssetsPage() {
                     {asset.url}
                   </Link>
                 </Td>
-                <Td className="text-[var(--color-text-secondary)]">{asset.label ?? "—"}</Td>
+                <Td className="text-[var(--color-text-secondary)]">{asset.label ?? "-"}</Td>
                 <Td>
                   <VerificationIndicator status={asset.verification?.status} />
                 </Td>

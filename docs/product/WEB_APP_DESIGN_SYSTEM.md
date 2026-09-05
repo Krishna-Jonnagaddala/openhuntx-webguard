@@ -3,22 +3,21 @@
 ## 1. Direction
 
 Dark-first, carbon/graphite surfaces, off-white type, controlled OpenHuntX
-red accents. A clean, technically sophisticated enterprise SaaS surface —
-not a security "gaming" UI. Explicitly avoided in every *functional* UI
+red accents. A clean, technically sophisticated enterprise SaaS surface, not a security "gaming" UI. Explicitly avoided in every *functional* UI
 element (buttons, badges, borders, inputs): neon glow, glassmorphism,
 cyberpunk decoration, matrix-style backgrounds, terminal/hacker-movie
 graphics. Every color, radius, and font in the app comes from the token set
-below (`apps/web/src/index.css`, Tailwind v4's `@theme` block) — no
+below (`apps/web/src/index.css`, Tailwind v4's `@theme` block): no
 one-off hex values in component code, with exactly one deliberate, scoped
 exception: the brand mark itself (`src/components/brand/Brand.tsx`) uses
 the OpenHuntX brand's own gradient/drop-shadow treatment on the wordmark
-and shield emblem — a logo, not a UI control, and the one place this
+and shield emblem: a logo, not a UI control, and the one place this
 document's "no decoration" rule does not apply. See
 `docs/product/OPENHUNTX_BRAND_MARK.md`.
 
 ## 2. Color tokens
 
-**Recolored to the OpenHuntX brand mark** (`docs/product/OPENHUNTX_BRAND_MARK.md`) — the token *names* and their *roles* below are unchanged from Slice 15; only the hex values moved, to the brand's own carbon-black/corporate-red palette.
+**Recolored to the OpenHuntX brand mark** (`docs/product/OPENHUNTX_BRAND_MARK.md`): the token *names* and their *roles* below are unchanged from Slice 15; only the hex values moved, to the brand's own carbon-black/corporate-red palette.
 
 | Token | Value | Use |
 |---|---|---|
@@ -37,8 +36,8 @@ document's "no decoration" rule does not apply. See
 
 Semantic status (each with a `-bg` pair for badge fills):
 `--color-success`, `--color-warning`, `--color-danger` (same value as
-accent — a deliberate, single "red" in the palette), `--color-info`.
-Success/warning/info keep their pre-existing conventional hues — the
+accent, a deliberate, single "red" in the palette), `--color-info`.
+Success/warning/info keep their pre-existing conventional hues. The
 brand mark defines no green/amber/blue, so there is nothing to recolor
 there; only `--color-danger` and the severity-critical tier share the
 brand's red, exactly as before.
@@ -49,42 +48,42 @@ Severity scale (each with a `-bg` pair): `--color-sev-critical`,
 
 ## 3. Type and shape
 
-- Sans (body): `"Archivo", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif` — self-hosted (`apps/web/public/fonts/`), a variable font (weights 100–900)
-- Mono (evidence, tokens, IDs, and the brand's own label/UI-chrome style): `"IBM Plex Mono", ui-monospace, SFMono-Regular, "Menlo", monospace` — self-hosted, weights 400/500
-- Display (`--font-display` / `font-display` utility — brand wordmark and lockup text only, never body copy): `"Aldrich", var(--font-sans)` — self-hosted, weight 400
+- Sans (body): `"Archivo", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif`, self-hosted (`apps/web/public/fonts/`), a variable font (weights 100–900)
+- Mono (evidence, tokens, IDs, and the brand's own label/UI-chrome style): `"IBM Plex Mono", ui-monospace, SFMono-Regular, "Menlo", monospace`, self-hosted, weights 400/500
+- Display (`--font-display` / `font-display` utility, brand wordmark and lockup text only, never body copy): `"Aldrich", var(--font-sans)`, self-hosted, weight 400
 - Radii: `--radius-sm` (0.25rem), `--radius-md` (0.375rem, most controls), `--radius-lg` (0.5rem, cards)
 - Base color scheme is `dark` (`html { color-scheme: dark }`); there is no
   light theme this release.
 
 All three font families are self-hosted as static `.woff2` files rather
-than loaded from Google Fonts at runtime — this app has no external
+than loaded from Google Fonts at runtime. This app has no external
 font-host dependency, and its CSP (once a serving layer sets one; see
 `docs/production/PUBLIC_EDGE_SECURITY.md` §7) never needs a
 `fonts.googleapis.com`/`fonts.gstatic.com` allowance.
 
 ## 4. Component inventory (`src/components/ui/primitives.tsx`)
 
-Every page composes from this fixed set — no page defines its own card,
+Every page composes from this fixed set. No page defines its own card,
 button, or badge styling:
 
-- `Card` — bordered surface container.
-- `PageHeader` — title, optional description, optional right-aligned actions.
-- `Button` — variants `primary` / `secondary` / `danger` / `ghost`; disabled
+- `Card`: bordered surface container.
+- `PageHeader`: title, optional description, optional right-aligned actions.
+- `Button`: variants `primary` / `secondary` / `danger` / `ghost`; disabled
   state dims to 50% opacity and blocks pointer events.
-- `EmptyState` — title, optional description, optional action.
-- `LoadingState` — `role="status"`, spinner + label.
-- `ErrorState` — `role="alert"`, renders the API's own error message.
-- `SeverityBadge` / `StatusBadge` — map a severity or status string to a
+- `EmptyState`: title, optional description, optional action.
+- `LoadingState`: `role="status"`, spinner + label.
+- `ErrorState`: `role="alert"`, renders the API's own error message.
+- `SeverityBadge` / `StatusBadge`: map a severity or status string to a
   token-driven color; both fail safe (unmapped values fall back to a
   neutral tone rather than an undefined class).
-- `Table` / `Th` / `Td` — horizontally scrollable on overflow, never the
+- `Table` / `Th` / `Td`: horizontally scrollable on overflow, never the
   page body.
-- `VisuallyHidden` — screen-reader-only text (`sr-only`).
+- `VisuallyHidden`: screen-reader-only text (`sr-only`).
 
 ## 5. Brand seam (`src/components/brand/Brand.tsx`)
 
 `OpenHuntXMark`, `OpenHuntXWordmark`, and `WebGuardLockup` are the *only*
-place any page imports a logo from — no page hard-codes an inline SVG or
+place any page imports a logo from. No page hard-codes an inline SVG or
 wordmark of its own. This seam is what let the final OpenHuntX identity
 (`docs/product/OPENHUNTX_BRAND_MARK.md`) get implemented by editing this
 one file: every consuming page (`AppShell`, `LoginPage`, `RegisterPage`,

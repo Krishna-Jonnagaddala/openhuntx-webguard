@@ -140,10 +140,10 @@ A persisted permit has immutable signed claims plus mutable revocation metadata.
 
 At a given time the permit is one of:
 
-- `pending` — before `not_before`;
-- `active` — within its validity window and not revoked;
-- `expired` — at or after `expires_at`; or
-- `revoked` — explicitly revoked.
+- `pending`: before `not_before`;
+- `active`: within its validity window and not revoked;
+- `expired`: at or after `expires_at`; or
+- `revoked`: explicitly revoked.
 
 Only an active permit can authorise execution.
 

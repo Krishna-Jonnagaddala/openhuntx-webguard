@@ -1,4 +1,4 @@
-# Audit Checkpoint 1 — Phase 6: Network Request Safety & Scanner Runtime Boundaries
+# Audit Checkpoint 1, Phase 6: Network Request Safety & Scanner Runtime Boundaries
 
 ## Status
 
@@ -22,7 +22,7 @@ audited and is carried forward under this same checkpoint.
 
 One finding has been confirmed during this phase:
 
-- **P6-001 — Medium — A connection-cleanup failure in `_perform_request` could silently replace the controlled outcome of an HTTP request, including successful responses and non-retryable policy decisions.**
+- **P6-001 (Medium): A connection-cleanup failure in `_perform_request` could silently replace the controlled outcome of an HTTP request, including successful responses and non-retryable policy decisions.**
 
 No Critical or High severity findings have been identified so far.
 
@@ -37,7 +37,7 @@ No Critical or High severity findings have been identified so far.
   `fetch_once`'s per-address exception handling, and
   `error_taxonomy.py`'s retryability classification consumed by the crawler.
 
-## Step B — Attack Surface Mapping (network boundary, partial)
+## Step B: Attack Surface Mapping (network boundary, partial)
 
 External inputs relevant to this checkpoint:
 
@@ -54,7 +54,7 @@ reporting decisions. That contract is defined by `error_taxonomy.py`
 reaches the caller changes retry behaviour and audit-trail accuracy without
 changing the underlying request outcome.
 
-## Step C — Invariant
+## Step C: Invariant
 
 **Invariant:** once `_perform_request`'s try block has produced an outcome
 (a `SafeHttpResponse` to return, or a `SafeRequestError`/transport exception
@@ -67,14 +67,14 @@ outcome.
   what happened during the request/response cycle, not by whether the
   socket happened to close cleanly afterward.
 - **When it is checked:** implicitly, by whatever code executes after
-  `_perform_request` returns/raises — in particular the crawler's
+  `_perform_request` returns/raises, in particular the crawler's
   `is_retryable_error` lookup and audit-trail recording of `exc.code`.
-- **Whether it can change afterward:** prior to remediation, yes — a
+- **Whether it can change afterward:** prior to remediation, yes: a
   `close()` failure during the `finally` block ran *after* the real
   outcome was already determined, and Python's `finally` semantics let an
   exception raised there discard a pending `return` or replace an
   in-flight exception.
-- **Whether it is revalidated at the next trust boundary:** no — the
+- **Whether it is revalidated at the next trust boundary:** no, the
   crawler consumes `exc.code` directly with no independent check that the
   code reflects the actual request outcome.
 - **Fail-open or fail-closed:** effectively fail-open with respect to
@@ -85,7 +85,7 @@ outcome.
   (`connection_failed` / `connection_interrupted`, depending on the close()
   exception's errno).
 
-## Step D — Adversarial Reproduction
+## Step D: Adversarial Reproduction
 
 ### Finding P6-001
 
@@ -117,7 +117,7 @@ replaced the real outcome:
 | Scenario | Real outcome | Observed outcome after `close()` raises |
 |---|---|---|
 | Too-many-headers policy failure | `SafeRequestError(response_headers_too_many)` | `SafeRequestError(connection_interrupted)` |
-| Successful response | `SafeHttpResponse(status=200, ...)` | `SafeRequestError(connection_interrupted)` — the response was discarded entirely |
+| Successful response | `SafeHttpResponse(status=200, ...)` | `SafeRequestError(connection_interrupted)` (the response was discarded entirely) |
 | Timeout | `SafeRequestError(connection_timeout)` | `SafeRequestError(connection_interrupted)` |
 | TLS context insecure | `SafeRequestError(tls_context_insecure)` | `SafeRequestError(connection_interrupted)` |
 | Redirect rejection | `SafeRequestError(redirect_blocked)` | `SafeRequestError(connection_interrupted)` |
@@ -127,14 +127,14 @@ Because `fetch_once` re-raises `SafeRequestError` unchanged but catches
 `OSError`/`ssl.SSLError`/`http.client.HTTPException` as a per-address
 connection failure, a `close()`-raised `OSError` was caught by the *outer*
 handler instead of the original exception (or return) reaching the caller
-at all — the original outcome was gone by the time `fetch_once` observed
+at all: the original outcome was gone by the time `fetch_once` observed
 anything.
 
 ### Security impact
 
 - `redirect_blocked`, `tls_context_insecure`, `response_body_too_large`,
   and `response_headers_too_many` are deliberately `NON_RETRYABLE` in
-  `error_taxonomy.py` — each represents a security- or safety-relevant
+  `error_taxonomy.py`: each represents a security- or safety-relevant
   decision that a request must not be repeated. A `close()` failure could
   reclassify any of them as a `RETRYABLE` network-transient code, which the
   crawler would then retry (up to `RetryPolicy.maximum_attempts`) against
@@ -144,7 +144,7 @@ anything.
   finding that must halt, not retry.
 - A successful response could be discarded outright: the body was already
   fully read and the response fully constructed before cleanup ran, yet
-  the caller received an error instead of the real result — losing scan
+  the caller received an error instead of the real result, losing scan
   data and, if retried by the crawler, causing an avoidable extra request
   against the target.
 - More broadly, the finding degraded the controlled error taxonomy this
@@ -181,13 +181,13 @@ The cleanup failure is now scoped to exactly the same exception types the
 rest of the module already treats as transport-layer failures, so
 programming errors (e.g. `AttributeError` from a genuinely broken
 connection object) are still not swallowed. The connection is discarded
-either way — cleanup best-effort suppression here does not weaken any
+either way. Cleanup best-effort suppression here does not weaken any
 existing safety property, since the socket resource is released by the OS
 regardless of whether `close()` itself reports success.
 
 ### Regression test
 
-`tests/unit/test_phase6_connection_cleanup_isolation.py` — 7 tests, one per
+`tests/unit/test_phase6_connection_cleanup_isolation.py`: 7 tests, one per
 scenario above plus an explicit check that a `redirect_blocked` outcome is
 never reclassified as retryable via `is_retryable_error`. All 7 tests were
 confirmed to fail against the pre-remediation code (`git stash` verification)
@@ -212,7 +212,7 @@ This remediation addresses the cleanup-swallowing mechanism generically for
 `_perform_request`. It does not, by itself, constitute a full audit of
 connection lifecycle, DNS/IP validation, TLS handshake behaviour, redirect
 handling, response-size enforcement, retry/backoff interaction, or
-cancellation — those remain open Phase 6 scope and are carried forward.
+cancellation. Those remain open Phase 6 scope and are carried forward.
 
 ---
 

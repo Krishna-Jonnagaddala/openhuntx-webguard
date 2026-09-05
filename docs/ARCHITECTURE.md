@@ -18,13 +18,13 @@ The current system is a local, single-host engineering foundation:
 
 The current architecture is not approved as a directly internet-exposed SaaS control plane.
 
-**Slice 12 addition**: a parallel, opt-in production persistence and signing path now exists alongside the local baseline above, not in place of it. `ProductionServiceConfig` (`apps/api/src/webguard_api/production_config.py`) is a separate, fail-closed configuration type that requires PostgreSQL and KMS-backed signing to be explicitly configured — it never silently activates from a missing setting, and the local SQLite/in-memory/local-development-signing baseline described in this section remains the default and the only thing `ServiceConfig` (the pre-existing local config type) can produce. See §7 and §8 below, and `docs/audit/production-platform-phase1-postgres-kms-tenancy.md` for the full slice.
+**Slice 12 addition**: a parallel, opt-in production persistence and signing path now exists alongside the local baseline above, not in place of it. `ProductionServiceConfig` (`apps/api/src/webguard_api/production_config.py`) is a separate, fail-closed configuration type that requires PostgreSQL and KMS-backed signing to be explicitly configured. It never silently activates from a missing setting, and the local SQLite/in-memory/local-development-signing baseline described in this section remains the default and the only thing `ServiceConfig` (the pre-existing local config type) can produce. See §7 and §8 below, and `docs/audit/production-platform-phase1-postgres-kms-tenancy.md` for the full slice.
 
-**Slice 13 addition**: the production path above is now actually reachable. `webguard-api serve`/`worker`/`scheduler` accept an explicit `--environment`/`$WEBGUARD_ENVIRONMENT` selector (`Environment` enum: `development`/`test`/`lab`/`production`, never inferred); selecting `production` builds `ProductionServiceConfig.from_environment()` and constructs the same `WebGuardJobService`/`ScanJobExecutor`/`ScanJobWorker`/`ApiTokenAuthenticator` classes the local path uses, injected with PostgreSQL-backed repositories instead of SQLite (`production_startup.py`'s `build_production_components()`) — no second service implementation. Live in production as of Slice 13: organizations/principals/memberships, targets, authorizations, scans, jobs, findings, audit events. See `docs/audit/production-platform-phase2-runtime-durable-execution.md` for the full slice, including the RLS and Redis boundary decisions as they stood then.
+**Slice 13 addition**: the production path above is now actually reachable. `webguard-api serve`/`worker`/`scheduler` accept an explicit `--environment`/`$WEBGUARD_ENVIRONMENT` selector (`Environment` enum: `development`/`test`/`lab`/`production`, never inferred); selecting `production` builds `ProductionServiceConfig.from_environment()` and constructs the same `WebGuardJobService`/`ScanJobExecutor`/`ScanJobWorker`/`ApiTokenAuthenticator` classes the local path uses, injected with PostgreSQL-backed repositories instead of SQLite (`production_startup.py`'s `build_production_components()`); there is no second service implementation. Live in production as of Slice 13: organizations/principals/memberships, targets, authorizations, scans, jobs, findings, audit events. See `docs/audit/production-platform-phase2-runtime-durable-execution.md` for the full slice, including the RLS and Redis boundary decisions as they stood then.
 
-**Slice 14 addition**: every remaining Slice-13 deferral is now live. `build_production_components()` also constructs `PostgresAuthenticationContextRepository`, `PostgresAuthorizationComparisonPlanRepository`, `PostgresReportRepository`, and a real `ScanScheduleCoordinator` (delegating through `PostgresJobRepository`'s schedule methods to one internal `PostgresScheduleRepository`) — `webguard-api scheduler --environment production` runs for real rather than failing closed, and `serve` starts a live scheduler thread in production exactly as it always has locally. Authenticated-scanning secret resolution goes through a new provider-neutral abstraction, `secret_provider.py`'s `SecretProvider` (mirroring `signing.py`'s `SigningProvider`): `LocalSecretProvider` for local/dev/lab (unchanged behavior, delegates to the in-memory repository's own secret storage) and `SecretsManagerSecretProvider` for production (AWS Secrets Manager-shaped, duck-typed client, no `boto3` package dependency) — optional and configured only when authenticated scanning is actually used (`WEBGUARD_SECRET_PROVIDER`), since most deployments never need it; when production has no provider configured, resolution fails closed at first use rather than at startup. New HTTP surface: `GET /v1/scans` + `GET /v1/scans/{id}` (scans as a first-class listable resource, not only reachable via a job's own `scan_id`), `POST /v1/findings/{id}/status` + `GET /v1/findings/{id}/events` (finding lifecycle mutation and append-only history), `POST /v1/reports` + `GET /v1/reports` + `GET /v1/reports/{id}`. See `docs/audit/production-platform-phase3-runtime-completion.md` for the full slice, including two real bugs found and fixed in this slice's own new code (a production-path gap in authentication-context registration, and a UUID-JSON-serialization bug in comparison-plan retrieval) and the updated RLS/Redis/TrustScan-signing decisions.
+**Slice 14 addition**: every remaining Slice-13 deferral is now live. `build_production_components()` also constructs `PostgresAuthenticationContextRepository`, `PostgresAuthorizationComparisonPlanRepository`, `PostgresReportRepository`, and a real `ScanScheduleCoordinator` (delegating through `PostgresJobRepository`'s schedule methods to one internal `PostgresScheduleRepository`). `webguard-api scheduler --environment production` runs for real rather than failing closed, and `serve` starts a live scheduler thread in production exactly as it always has locally. Authenticated-scanning secret resolution goes through a new provider-neutral abstraction, `secret_provider.py`'s `SecretProvider` (mirroring `signing.py`'s `SigningProvider`): `LocalSecretProvider` for local/dev/lab (unchanged behavior, delegates to the in-memory repository's own secret storage) and `SecretsManagerSecretProvider` for production (AWS Secrets Manager-shaped, duck-typed client, no `boto3` package dependency), optional and configured only when authenticated scanning is actually used (`WEBGUARD_SECRET_PROVIDER`), since most deployments never need it; when production has no provider configured, resolution fails closed at first use rather than at startup. New HTTP surface: `GET /v1/scans` + `GET /v1/scans/{id}` (scans as a first-class listable resource, not only reachable via a job's own `scan_id`), `POST /v1/findings/{id}/status` + `GET /v1/findings/{id}/events` (finding lifecycle mutation and append-only history), `POST /v1/reports` + `GET /v1/reports` + `GET /v1/reports/{id}`. See `docs/audit/production-platform-phase3-runtime-completion.md` for the full slice, including two real bugs found and fixed in this slice's own new code (a production-path gap in authentication-context registration, and a UUID-JSON-serialization bug in comparison-plan retrieval) and the updated RLS/Redis/TrustScan-signing decisions.
 
-**Slice 18 addition**: a reviewed (never applied) public-edge model now exists for the three production hostnames named throughout this document's later sections (`app.`/`api.`/`callback.openhuntx.com`) — `infra/terraform/cloudflare.tf` provisions the zone, proxied DNS records, TLS/WAF/rate-limit rulesets, and authenticated origin pulls; see `docs/production/PUBLIC_EDGE_SECURITY.md`. The API process's own loopback-only binding constraint (`production_config.py`, unchanged since before Slice 12) means this model requires a TLS-terminating reverse-proxy sidecar per host between the load balancer and the API process, not a direct LB-to-process path — stated explicitly there rather than left implicit. `http_api.py` gained trusted-proxy-aware client-IP resolution (`_resolve_client_ip`, requirement 13): `CF-Connecting-IP`/`X-Forwarded-For` are honored only when the direct TCP peer is itself inside a configured trusted CIDR set, and feed every rate-limit bucket and audit `ip_address` field; empty by default, preserving every prior deployment's exact behavior. The SSRF callback receiver (`callback_server.py`) gained an optional per-source-IP rate limit, and can now run as its own CLI subcommand (`webguard-api callback-service`) independent of the main API/worker processes. See `docs/production/CALLBACK_SERVICE_DEPLOYMENT.md`.
+**Slice 18 addition**: a reviewed (never applied) public-edge model now exists for the three production hostnames named throughout this document's later sections (`app.`/`api.`/`callback.openhuntx.com`): `infra/terraform/cloudflare.tf` provisions the zone, proxied DNS records, TLS/WAF/rate-limit rulesets, and authenticated origin pulls; see `docs/production/PUBLIC_EDGE_SECURITY.md`. The API process's own loopback-only binding constraint (`production_config.py`, unchanged since before Slice 12) means this model requires a TLS-terminating reverse-proxy sidecar per host between the load balancer and the API process, not a direct LB-to-process path (stated explicitly there rather than left implicit). `http_api.py` gained trusted-proxy-aware client-IP resolution (`_resolve_client_ip`, requirement 13): `CF-Connecting-IP`/`X-Forwarded-For` are honored only when the direct TCP peer is itself inside a configured trusted CIDR set, and feed every rate-limit bucket and audit `ip_address` field; empty by default, preserving every prior deployment's exact behavior. The SSRF callback receiver (`callback_server.py`) gained an optional per-source-IP rate limit, and can now run as its own CLI subcommand (`webguard-api callback-service`) independent of the main API/worker processes. See `docs/production/CALLBACK_SERVICE_DEPLOYMENT.md`.
 
 ## 3. Repository components
 
@@ -57,9 +57,9 @@ Scanner-side security logic including:
 - checkpoint/resume logic;
 - owned-target preflight enforcement;
 - runtime hooks used by the TrustScan safety engine; and
-- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`, `ssrf_callback_detector.py`), the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`), the request-template/mutation layer between them (`request_template.py`), the authentication-context/session-application layer that lets any of these run against an authenticated surface (`authentication.py`, `login_workflow.py`), the multi-identity authorization-comparison engine (`authorization_resource.py`, `idor_authorization_detector.py`) that IDOR/BOLA detection is built on, the authenticated crawl/resource-discovery layer (`authorization_crawl.py`, `authorization_resource_discovery.py`, `resource_graph.py`) that turns legitimate authenticated observation into resource pairs for that engine, and the controlled-callback protocol (`callback_broker.py`) SSRF detection is built on — see `docs/audit/active-detection-phase1-xss.md` through `phase10-ssrf-callback.md`.
+- permit-gated active detectors (`xss_reflected_detector.py`, `sqli_error_detector.py`, `ssrf_callback_detector.py`), the generalized attack-surface/candidate discovery model they consume (`attack_surface.py`), the request-template/mutation layer between them (`request_template.py`), the authentication-context/session-application layer that lets any of these run against an authenticated surface (`authentication.py`, `login_workflow.py`), the multi-identity authorization-comparison engine (`authorization_resource.py`, `idor_authorization_detector.py`) that IDOR/BOLA detection is built on, the authenticated crawl/resource-discovery layer (`authorization_crawl.py`, `authorization_resource_discovery.py`, `resource_graph.py`) that turns legitimate authenticated observation into resource pairs for that engine, and the controlled-callback protocol (`callback_broker.py`) SSRF detection is built on. See `docs/audit/active-detection-phase1-xss.md` through `phase10-ssrf-callback.md`.
 
-Active-detection data flow, current as of Slice 7 (single-identity detectors — XSS, SQLi):
+Active-detection data flow, current as of Slice 7 (single-identity detectors, XSS and SQLi):
 
 ```
 Discovery (attack_surface.py)
@@ -78,11 +78,11 @@ Discovery (attack_surface.py)
 
 `AuthenticationContext` metadata (organization/target/authorization
 binding, identity label, method, status) is safe to log and audit.
-Secret material (`AuthenticationMaterial` -- a bearer token, session
+Secret material (`AuthenticationMaterial`, a bearer token, session
 cookies, basic-auth credentials) is looked up separately, held only in
 memory for the duration of one request-issuance call, and is never
 attached to a `RequestTemplate`, a `NormalizedFinding`, a report, an
-audit event, or a checkpoint -- `apply_authentication` is the *only*
+audit event, or a checkpoint. `apply_authentication` is the *only*
 place headers carrying it are constructed, and it is applied
 immediately before a request is sent, never stored alongside it
 afterward. A TrustScan permit's signed `authentication_context_id` claim
@@ -97,7 +97,7 @@ target, this budget, this authentication context allowed to be used to
 send it). `RequestTemplate`/`mutate` only answer the first question; the
 TrustScan permit's `active_checks`, `allowed_http_methods`, and
 `authentication_context_id` claims, enforced by the executor and the
-runtime safety engine, answer the second — unchanged by this layer's
+runtime safety engine, answer the second, unchanged by this layer's
 existence.
 
 #### Authorization-comparison (IDOR/BOLA) data flow, added Slice 8
@@ -114,32 +114,32 @@ per-page dispatch table for this reason).
 ```
 AuthorizationComparisonPlan (authorization_comparison.py, apps/api)
    |  references: primary_context_id, secondary_context_id (two
-   |  AuthenticationContexts -- never a reinterpretation of the
+   |  AuthenticationContexts, never a reinterpretation of the
    |  single-identity authentication_context_id claim), an explicit
-   |  operator-supplied resource_scope (ResourcePairSpec list) --
+   |  operator-supplied resource_scope (ResourcePairSpec list),
    |  never a generated or enumerated identifier
    v
 _resource_pair_from_spec() (executor.py)
    -> AuthorizationResource x2 (authorization_resource.py: structural
       resource_id = SHA-256 of endpoint+method+identifier location/
-      name/value only -- never response content)
+      name/value only, never response content)
    v
 run_idor_authorization_detector() (idor_authorization_detector.py)
    -> apply_authentication() (the same Slice-7 mechanism, once per
-      identity -- baseline A->A, baseline B->B, cross A->B, cross B->A)
+      identity: baseline A->A, baseline B->B, cross A->B, cross B->A)
    -> content-fingerprint differential classification
    -> CONFIRMED / PROBABLE / INCONCLUSIVE / NOT_VULNERABLE / ERROR
    -> NormalizedFinding (CWE-639 + OWASP-API, only for CONFIRMED/PROBABLE)
 ```
 
 A permit's `authorization_comparison_plan_id` claim (schema 1.3) is a
-second, independent signed reference alongside `authentication_context_id`
-— the plan references two contexts, the permit references the plan.
+second, independent signed reference alongside `authentication_context_id`:
+the plan references two contexts, the permit references the plan.
 Both the plan and both contexts are validated (organization/target/
 authorization/active-status) at permit-issuance time and again at
 execution time. A permit can carry this claim only if `active_checks`
 also includes `active.authorization.idor`; the reverse is equally
-enforced — referencing the plan without requesting the check, or
+enforced: referencing the plan without requesting the check, or
 requesting the check without a plan, are both rejected. See
 `docs/audit/active-detection-phase8-idor-bola.md` for the full
 classification logic, false-positive controls, and safety budgets.
@@ -150,7 +150,7 @@ Resource pairs for the engine above no longer need to be entirely
 operator-supplied. When a comparison plan sets `enable_discovery`, the
 executor runs one small, bounded authenticated crawl per identity and
 turns what it legitimately observes into the same `AuthorizationResource`
-type Slice 8 already consumes — discovery is a second *source* of
+type Slice 8 already consumes. Discovery is a second *source* of
 resource pairs, not a second detector, and the classification engine
 above is completely unmodified by its existence.
 
@@ -160,20 +160,20 @@ AuthorizationComparisonPlan.enable_discovery (authorization_comparison.py)
 run_authenticated_resource_discovery_crawl() (authorization_crawl.py), once per identity
    -> crawl_same_origin() (crawler.py: authentication_material now
       threaded through the one shared apply_authentication() mechanism
-      -- same-origin/DNS/budget/rate/checkpoint/cancellation controls
+      (same-origin/DNS/budget/rate/checkpoint/cancellation controls
       all unchanged from Slice 5)
    -> ResourceDiscoverySink.visit_page() per crawled page
         -> AuthenticationHealthCriterion (login-page/expired-session
-           detection -- an unhealthy page halts discovery for that
+           detection: an unhealthy page halts discovery for that
            identity via the crawl's own CrawlCancellationToken,
            contributes zero resources, never mistaken for content)
         -> HTML-link / JSON-field extraction (authorization_resource_discovery.py),
            bounded, provenance-tagged (IdentifierProvenance), never
            generated or enumerated
    v
-AuthorizationResourceGraph (resource_graph.py) -- identity-keyed, deduplicated
+AuthorizationResourceGraph (resource_graph.py), identity-keyed, deduplicated
    v
-build_comparison_pairs() -- deterministic eligibility: distinct
+build_comparison_pairs(), deterministic eligibility: distinct
    identities, matching resource_type/method/identifier_location,
    PRIVATE_TO_OWNER on both sides, approved provenance, distinct
    identifier values, matching endpoint template
@@ -181,13 +181,13 @@ build_comparison_pairs() -- deterministic eligibility: distinct
 merged into the SAME resource_pairs list Slice 8's explicit
    resource_scope already populates
    v
-run_idor_authorization_detector() -- unchanged
+run_idor_authorization_detector(), unchanged
 ```
 
 A resource shared identically between both identities (same endpoint,
 same identifier value, because it is literally the same object) is
 excluded from comparison automatically by the "distinct identifier
-values" eligibility rule alone — no separate shared/public
+values" eligibility rule alone. No separate shared/public
 classification signal is needed for *discovered* resources to get this
 right. Discovery requests flow through the executor's own
 `before_request`/`after_request` runtime-safety hooks exactly like
@@ -203,13 +203,13 @@ SSRF (`active.ssrf.callback`, CWE-918) is architecturally distinct from
 every prior detector in this project: confirmation depends on
 something *receiving* a connection the target's own server makes, not
 on anything WebGuard's own client observes in a response. This adds a
-new component role — a receiver, not a client — that intentionally sits
+new component role (a receiver, not a client) that intentionally sits
 outside the request/response cycle every other detector operates
 within.
 
 ```
 CallbackToken/CallbackObservation/CallbackPolicy/CallbackBroker (callback_broker.py, scanner)
-   |  protocol only -- register()/wait_for_observation(), zero apps/api dependency
+   |  protocol only: register()/wait_for_observation(), zero apps/api dependency
    v
 InMemoryCallbackBroker (scanner)         CallbackRepository (callback_service.py, apps/api)
    |  self-contained default                |  multi-tenant wrapper: org/target/authorization
@@ -221,8 +221,8 @@ run_ssrf_callback_detector()             _ScanScopedCallbackBroker (executor.py)
    |  with the callback URL as the probe value
    v
 CallbackHttpReceiver (callback_server.py, apps/api)
-   |  a real, separately-startable ThreadingHTTPServer -- not embedded
-   |  in the detector -- accepting /<scan_id>/<token> and recording an
+   |  a real, separately-startable ThreadingHTTPServer (not embedded
+   |  in the detector), accepting /<scan_id>/<token> and recording an
    |  observation keyed ONLY on the token (never Host header, never
    |  source address)
    v
@@ -232,7 +232,7 @@ window only) / NOT_VULNERABLE / INCONCLUSIVE / ERROR
 ```
 
 The only destination this detector ever hands to a probe is a callback
-URL a `CallbackBroker.register()` call itself produced -- there is no
+URL a `CallbackBroker.register()` call itself produced: there is no
 code path that falls back to, or accepts, an internal address
 (127.0.0.1, RFC1918, cloud metadata) to "prove" SSRF, and this
 detector's own safety boundary is completely independent of
@@ -240,7 +240,7 @@ detector's own safety boundary is completely independent of
 WebGuard's own outbound *client* requests to the target unchanged.
 Tokens are `secrets.token_urlsafe`-generated, scan-bound,
 candidate-bound, time-limited, and bounded-use; correlation is
-token-only, never DNS/Host-dependent, which is what makes it robust to
+token-only, never DNS/Host-dependent, which is what makes it resistant to
 DNS rebinding or callback-host spoofing by construction rather than by
 policy. See
 `docs/audit/active-detection-phase10-ssrf-callback.md` for the full
@@ -262,9 +262,9 @@ The local control-plane foundation including:
 - TrustScan runtime safety orchestration;
 - TrustScan Safety Receipt persistence;
 - active-detector orchestration (`executor.py`'s `_apply_active_detection`), which runs the same authorized-detector loop against every candidate the scanner's attack-surface discovery finds, regardless of which interface (CLI or API) requested the scan; and
-- authentication-context metadata/secret storage (`authentication_contexts.py`) for authenticated scanning — deliberately in-memory only this slice, not SQLite (see its module docstring and `docs/audit/active-detection-phase7-authenticated-scanning.md` for why), so it does not yet persist across separate CLI/worker process invocations; and
-- authorization-comparison plan storage (`authorization_comparison.py`) for IDOR/BOLA scanning — a reference-only record (two authentication-context IDs plus an explicit resource scope, never a secret itself), in-memory only for the same reason as authentication-context storage, so it shares the same cross-process persistence limitation; and
-- callback registration/receiver infrastructure (`callback_service.py`, `callback_server.py`) for SSRF scanning — a multi-tenant, in-memory correlation store (tokens, not secrets) plus a real, independently-startable local HTTP receiver; not wired into `webguard-api serve`'s default startup this slice, and not yet backed by a public hostname or persistent storage (see `docs/audit/active-detection-phase10-ssrf-callback.md`'s documented production requirements).
+- authentication-context metadata/secret storage (`authentication_contexts.py`) for authenticated scanning: deliberately in-memory only this slice, not SQLite (see its module docstring and `docs/audit/active-detection-phase7-authenticated-scanning.md` for why), so it does not yet persist across separate CLI/worker process invocations; and
+- authorization-comparison plan storage (`authorization_comparison.py`) for IDOR/BOLA scanning: a reference-only record (two authentication-context IDs plus an explicit resource scope, never a secret itself), in-memory only for the same reason as authentication-context storage, so it shares the same cross-process persistence limitation; and
+- callback registration/receiver infrastructure (`callback_service.py`, `callback_server.py`) for SSRF scanning: a multi-tenant, in-memory correlation store (tokens, not secrets) plus a real, independently-startable local HTTP receiver; not wired into `webguard-api serve`'s default startup this slice, and not yet backed by a public hostname or persistent storage (see `docs/audit/active-detection-phase10-ssrf-callback.md`'s documented production requirements).
 
 ### `infra/compose`
 
@@ -400,27 +400,27 @@ The Safety Receipt records what the runtime safety engine enforced and observed.
 
 ## 6. Trust boundaries
 
-### Boundary A — operator to local API
+### Boundary A: operator to local API
 
 Untrusted input crosses into authenticated API handling. Controls include strict header/body parsing, bounded request size, Bearer authentication, RBAC, request IDs, and per-token process-local rate limiting.
 
-### Boundary B — tenant context to persistent state
+### Boundary B: tenant context to persistent state
 
 Every tenant-owned resource must be read or mutated through organisation-scoped queries or explicit ownership validation. Identifiers alone do not grant access.
 
-### Boundary C — authorisation record to TrustScan permit
+### Boundary C: authorisation record to TrustScan permit
 
 The permit does not replace the underlying authorisation. It cryptographically narrows an existing authorisation and binds to its SHA-256 fingerprint.
 
-### Boundary D — scheduler/job queue to worker
+### Boundary D: scheduler/job queue to worker
 
 A queued job is not itself permission to send traffic. The worker revalidates the authorisation and permit at execution time. Worker leases and fencing prevent stale workers from finalising state after lease recovery.
 
-### Boundary E — scanner to network
+### Boundary E: scanner to network
 
 This is the most important network safety boundary. Target validation, owned-target preflight, the runtime safety engine, and the safe HTTP client all apply before or during network execution.
 
-### Boundary F — execution to customer evidence
+### Boundary F: execution to customer evidence
 
 Reports, audits, checkpoints, permits, and Safety Receipts may reveal customer security posture. They are confidential artefacts and must not be exposed as public content by default.
 
@@ -443,21 +443,21 @@ The database is owner-only (`0600`). There is currently no application-layer dat
 
 ### Production persistence (PostgreSQL, Slice 12)
 
-A production PostgreSQL schema and a defensible subset of repository implementations now exist alongside the SQLite baseline above — SQLite is not being removed or deprecated by this addition (`docs/audit/production-platform-phase1-postgres-kms-tenancy.md` explains the scoping). Concretely:
+A production PostgreSQL schema and a defensible subset of repository implementations now exist alongside the SQLite baseline above. SQLite is not being removed or deprecated by this addition (`docs/audit/production-platform-phase1-postgres-kms-tenancy.md` explains the scoping). Concretely:
 
-- **Full schema, all entities** (`infra/postgres/migrations/`): organizations, principals, memberships (a new append-only role-assignment history not present in SQLite), API tokens, organization-authorization assignments, security audit events, targets/assets, target-verification metadata, callback registrations/observations, and — schema-only, no repository yet — jobs, schedules, scan records, findings, reports, authentication contexts, authorization-comparison plans, and crawl checkpoints.
+- **Full schema, all entities** (`infra/postgres/migrations/`): organizations, principals, memberships (a new append-only role-assignment history not present in SQLite), API tokens, organization-authorization assignments, security audit events, targets/assets, target-verification metadata, callback registrations/observations, and (schema-only, no repository yet) jobs, schedules, scan records, findings, reports, authentication contexts, authorization-comparison plans, and crawl checkpoints.
 - **Repository implementations with contract tests proven against both backends** (`postgres_identity.py`, `postgres_targets.py`, `postgres_callback_service.py`, `targets.py`): organizations/principals/tokens/authorizations/audit-events, targets, and callback registrations. Every one of these satisfies the same `Protocol` (`repository_contracts.py`) as its SQLite/in-memory counterpart.
-- **Connection pooling** (`postgres_pool.py`): `psycopg_pool`-backed, with a normalized failure taxonomy (`db_errors.py`) translating raw driver exceptions — never a connection string or SQL text reaches a caller.
+- **Connection pooling** (`postgres_pool.py`): `psycopg_pool`-backed, with a normalized failure taxonomy (`db_errors.py`) translating raw driver exceptions; a connection string or SQL text never reaches a caller.
 - **Migrations** (`scripts/run-postgres-migrations.py`): a hand-rolled, checksum-verified runner over numbered `.sql` files, matching this project's existing no-ORM convention (raw `sqlite3` elsewhere; raw `psycopg` here, not SQLAlchemy/Alembic).
 - **Deferred repositories** (jobs, schedules, scan records, findings, reports, authentication contexts, comparison plans): schema exists; Python repository classes are explicitly next-platform-slice work, not attempted this slice.
 
-None of this was wired into `webguard-api serve`'s default startup as of Slice 12 — the local SQLite/in-memory baseline remained what actually ran.
+None of this was wired into `webguard-api serve`'s default startup as of Slice 12. The local SQLite/in-memory baseline remained what actually ran.
 
 ### Production runtime wiring (Slice 13)
 
-`webguard-api serve`/`worker` now select PostgreSQL when explicitly started with `--environment production` (or `$WEBGUARD_ENVIRONMENT=production`); every other value runs the unchanged local path. Live this slice: `PostgresJobRepository` (jobs, leases, permits — atomic `SELECT ... FOR UPDATE SKIP LOCKED` claiming, proven race-free under 20 concurrent threads), `PostgresScanRepository` (one durable row per scan execution), `PostgresFindingRepository` (fingerprint-deduplicated via a single atomic `INSERT ... ON CONFLICT` statement, with an explicit `OPEN`/`CONFIRMED`/`FALSE_POSITIVE`/`ACCEPTED_RISK`/`RESOLVED`/`REOPENED` lifecycle). `webguard-api scheduler --environment production` fails closed rather than running schedule materialization against SQLite while claiming production, because schedule execution itself is not yet PostgreSQL-backed — see `docs/audit/production-platform-phase2-runtime-durable-execution.md` for the full live/deferred entity split and the reasoning behind it.
+`webguard-api serve`/`worker` now select PostgreSQL when explicitly started with `--environment production` (or `$WEBGUARD_ENVIRONMENT=production`); every other value runs the unchanged local path. Live this slice: `PostgresJobRepository` (jobs, leases, permits: atomic `SELECT ... FOR UPDATE SKIP LOCKED` claiming, proven race-free under 20 concurrent threads), `PostgresScanRepository` (one durable row per scan execution), `PostgresFindingRepository` (fingerprint-deduplicated via a single atomic `INSERT ... ON CONFLICT` statement, with an explicit `OPEN`/`CONFIRMED`/`FALSE_POSITIVE`/`ACCEPTED_RISK`/`RESOLVED`/`REOPENED` lifecycle). `webguard-api scheduler --environment production` fails closed rather than running schedule materialization against SQLite while claiming production, because schedule execution itself is not yet PostgreSQL-backed. See `docs/audit/production-platform-phase2-runtime-durable-execution.md` for the full live/deferred entity split and the reasoning behind it.
 
-**Row-level security**: still not implemented, deliberately, as of Slice 14. The connection pool (`WebGuardPostgresPool`) reuses raw connections across unrelated requests without resetting session-scoped state on checkout; adding RLS policies today, without first adding a checkout hook that sets or clears the tenant-context GUC on every connection reuse, would introduce a new cross-tenant leakage vector rather than removing one. Slice 14's own cross-repository transaction work (`docs/audit/production-platform-phase3-runtime-completion.md`) deliberately did not build that checkout hook — its invariants needed only one extra statement inside an already-open transaction, not a new connection-lifecycle mechanism — so the Slice 13 precondition remains entirely unmet. Application-layer enforcement (every repository method requires and checks `organization_id` explicitly, contract-tested per repository — seven more entities covered as of Slice 14) remains the sole tenant boundary until that checkout hook exists and is itself proven under real pool reuse.
+**Row-level security**: still not implemented, deliberately, as of Slice 14. The connection pool (`WebGuardPostgresPool`) reuses raw connections across unrelated requests without resetting session-scoped state on checkout; adding RLS policies today, without first adding a checkout hook that sets or clears the tenant-context GUC on every connection reuse, would introduce a new cross-tenant leakage vector rather than removing one. Slice 14's own cross-repository transaction work (`docs/audit/production-platform-phase3-runtime-completion.md`) deliberately did not build that checkout hook (its invariants needed only one extra statement inside an already-open transaction, not a new connection-lifecycle mechanism), so the Slice 13 precondition remains entirely unmet. Application-layer enforcement (every repository method requires and checks `organization_id` explicitly, contract-tested per repository, seven more entities covered as of Slice 14) remains the sole tenant boundary until that checkout hook exists and is itself proven under real pool reuse.
 
 ## 8. Cryptographic uses
 
@@ -477,9 +477,9 @@ Opaque cursors are HMAC-SHA256 signed, expiring, and bound to organisation, reso
 
 Both use Ed25519. A public verification-key document can be retrieved without authentication. The private seed currently resides in the owner-only SQLite service-secret store.
 
-**Signing abstraction (Slice 12)**: `TrustScanSigner` (`permits.py`) now delegates raw sign/verify operations to a provider-neutral `SigningKeyRegistry` (`signing.py`) rather than holding an Ed25519 key directly — `LocalDevelopmentSigner` (unchanged Ed25519 behavior, the only provider actually wired in today) and `KmsSigningProvider` (AWS KMS-backed, `ECDSA_SHA_256`, built and unit-tested against a duck-typed KMS client but not wired as the active signer) both satisfy the same narrow `SigningProvider` protocol (`sign`, public-key material, key ID, algorithm). Verification now resolves by key ID against a registry of active/retired/disabled keys, enabling rotation that the pre-Slice-12 single-key design could not support. **AWS KMS has no Ed25519 KeySpec** — `KmsSigningProvider` targets `ECDSA_SHA_256` as its own honestly-labeled algorithm and never claims Ed25519 compatibility; an actual algorithm migration remains a separate, explicit, not-yet-made decision (see `signing.py`'s module docstring and `docs/audit/production-platform-phase1-postgres-kms-tenancy.md`).
+**Signing abstraction (Slice 12)**: `TrustScanSigner` (`permits.py`) now delegates raw sign/verify operations to a provider-neutral `SigningKeyRegistry` (`signing.py`) rather than holding an Ed25519 key directly. `LocalDevelopmentSigner` (unchanged Ed25519 behavior, the only provider actually wired in today) and `KmsSigningProvider` (AWS KMS-backed, `ECDSA_SHA_256`, built and unit-tested against a duck-typed KMS client but not wired as the active signer) both satisfy the same narrow `SigningProvider` protocol (`sign`, public-key material, key ID, algorithm). Verification now resolves by key ID against a registry of active/retired/disabled keys, enabling rotation that the pre-Slice-12 single-key design could not support. **AWS KMS has no Ed25519 KeySpec**: `KmsSigningProvider` targets `ECDSA_SHA_256` as its own honestly-labeled algorithm and never claims Ed25519 compatibility; an actual algorithm migration remains a separate, explicit, not-yet-made decision (see `signing.py`'s module docstring and `docs/audit/production-platform-phase1-postgres-kms-tenancy.md`).
 
-**CloudHSM-backed Ed25519 signing service (Slice 14 decision, Slice 18 implementation)**: `docs/production/TRUSTSCAN_PRODUCTION_SIGNING.md`'s Option A is now implemented, preserving the exact Ed25519 permit/receipt format above with zero schema change. `CloudHsmSigningProvider` (`signing.py`) and a dedicated, narrow-interface `TrustScan Signing Service` (`signing_service.py`, run via `webguard-api signing-service`) stand between every API/worker process and CloudHSM — `WebGuard API/worker -> TrustScan Signing Service -> CloudHSM` — so no API or worker process holds direct HSM/PKCS#11 credentials (`SigningServiceClient`/`SigningServiceHttpClient` reach it over a bearer-authenticated internal HTTP call instead). `ProductionServiceConfig.signing_provider` now accepts `"kms"` or `"cloudhsm_signing_service"`. **Not deployed**: no CloudHSM cluster has been provisioned (`infra/terraform/cloudhsm.tf` is reviewed, unapplied IaC) and the PKCS#11 adapter has never run against real CloudHSM hardware or even a real PKCS#11 driver — only against a fake performing real Ed25519 cryptography (`tests/unit/test_cloudhsm_signing.py`). See `docs/production/TRUSTSCAN_SIGNING_SERVICE.md` for the full architecture, key lifecycle, and this gap stated precisely.
+**CloudHSM-backed Ed25519 signing service (Slice 14 decision, Slice 18 implementation)**: `docs/production/TRUSTSCAN_PRODUCTION_SIGNING.md`'s Option A is now implemented, preserving the exact Ed25519 permit/receipt format above with zero schema change. `CloudHsmSigningProvider` (`signing.py`) and a dedicated, narrow-interface `TrustScan Signing Service` (`signing_service.py`, run via `webguard-api signing-service`) stand between every API/worker process and CloudHSM: `WebGuard API/worker -> TrustScan Signing Service -> CloudHSM`. No API or worker process holds direct HSM/PKCS#11 credentials (`SigningServiceClient`/`SigningServiceHttpClient` reach it over a bearer-authenticated internal HTTP call instead). `ProductionServiceConfig.signing_provider` now accepts `"kms"` or `"cloudhsm_signing_service"`. **Not deployed**: no CloudHSM cluster has been provisioned (`infra/terraform/cloudhsm.tf` is reviewed, unapplied IaC) and the PKCS#11 adapter has never run against real CloudHSM hardware or even a real PKCS#11 driver, only against a fake performing real Ed25519 cryptography (`tests/unit/test_cloudhsm_signing.py`). See `docs/production/TRUSTSCAN_SIGNING_SERVICE.md` for the full architecture, key lifecycle, and this gap stated precisely.
 
 ## 9. Network safety model
 
@@ -536,11 +536,11 @@ The current architecture intentionally does not yet provide:
 - a production web dashboard;
 - customer-hosted scanner runners;
 - distributed rate limiting (Slice 18's Cloudflare edge rate-limit rules give a cross-instance-shared *outer* bound in reviewed, unapplied IaC; the application's own `FixedWindowRateLimiter` remains per-instance);
-- hosted KMS/HSM key custody actually running (the CloudHSM signing-service architecture is implemented and tested against a fake HSM — see §8 — but no cluster is provisioned and no code here has run against real hardware);
+- hosted KMS/HSM key custody actually running (the CloudHSM signing-service architecture is implemented and tested against a fake HSM, see §8, but no cluster is provisioned and no code here has run against real hardware);
 - production domain-control verification;
 - SSO/enterprise identity federation;
 - regional data-sovereignty controls;
-- a real public deployment (no Cloudflare account, DNS zone, load balancer, or CloudHSM cluster has been created — `infra/terraform/` is reviewed, unapplied IaC only); or
+- a real public deployment (no Cloudflare account, DNS zone, load balancer, or CloudHSM cluster has been created; `infra/terraform/` is reviewed, unapplied IaC only); or
 - formal high-availability/disaster-recovery architecture.
 
 Those are roadmap items, not current product claims.

@@ -61,13 +61,13 @@ export function ScanDetailPage() {
             <div className="flex justify-between">
               <dt className="text-[var(--color-text-secondary)]">Started</dt>
               <dd className="text-[var(--color-text-primary)]">
-                {scan.started_at ? new Date(scan.started_at).toLocaleString() : "—"}
+                {scan.started_at ? new Date(scan.started_at).toLocaleString() : "-"}
               </dd>
             </div>
             <div className="flex justify-between">
               <dt className="text-[var(--color-text-secondary)]">Completed</dt>
               <dd className="text-[var(--color-text-primary)]">
-                {scan.completed_at ? new Date(scan.completed_at).toLocaleString() : "—"}
+                {scan.completed_at ? new Date(scan.completed_at).toLocaleString() : "-"}
               </dd>
             </div>
             <div className="flex justify-between">

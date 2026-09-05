@@ -27,8 +27,8 @@ function VerificationPanel({ targetId }: { targetId: string }) {
       <Card className="p-4">
         <h2 className="mb-2 text-sm font-semibold text-[var(--color-text-primary)]">Ownership verification</h2>
         <p className="mb-3 text-sm text-[var(--color-text-secondary)]">
-          Prove control of this asset before requesting an authorization. WebGuard performs the check itself —
-          the app never marks an asset verified on your behalf.
+          Prove control of this asset before requesting an authorization. WebGuard performs the check itself.
+          The app never marks an asset verified on your behalf.
         </p>
         <Button variant="primary" onClick={() => start.mutate(targetId)} disabled={start.isPending}>
           {start.isPending ? "Starting…" : "Start verification"}
@@ -114,7 +114,7 @@ function StartScanPanel({ targetId }: { targetId: string }) {
       ) : !authorized ? (
         <p className="text-sm text-[var(--color-text-secondary)]">
           No active authorization currently covers this exact URL. An owner or administrator must assign one
-          before a scan can be issued — the app cannot construct or bypass this requirement.
+          before a scan can be issued. The app cannot construct or bypass this requirement.
         </p>
       ) : (
         <div>
@@ -137,8 +137,8 @@ function StartScanPanel({ targetId }: { targetId: string }) {
             </div>
           </fieldset>
           <p className="mb-3 text-xs text-[var(--color-text-tertiary)]">
-            This issues a passive-only TrustScan permit bound to your current authorization and submits a job —
-            the same authorization boundary the API enforces for every scan, regardless of how it was requested.
+            This issues a passive-only TrustScan permit bound to your current authorization and submits a job,
+            under the same authorization boundary the API enforces for every scan, regardless of how it was requested.
           </p>
           <Button variant="primary" onClick={handleStart} disabled={submit.isPending}>
             {submit.isPending ? "Starting scan…" : "Start scan"}

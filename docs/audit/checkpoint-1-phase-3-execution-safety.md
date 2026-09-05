@@ -1,4 +1,4 @@
-# Audit Checkpoint 1 — Phase 3: Execution Safety, Worker Leases & Scheduling
+# Audit Checkpoint 1, Phase 3: Execution Safety, Worker Leases & Scheduling
 
 ## Status
 
@@ -20,7 +20,7 @@ Phase 3 assessed WebGuard's execution-safety boundaries, including:
 
 One security finding was confirmed during this phase:
 
-- **P3-001 — Medium — TrustScan permit revocation was not enforced atomically at scheduler and worker-claim boundaries.**
+- **P3-001 (Medium): TrustScan permit revocation was not enforced atomically at scheduler and worker-claim boundaries.**
 
 P3-001 was remediated and regression-tested before Phase 3 closure.
 
@@ -50,7 +50,7 @@ The audit intentionally used concurrent and failure-injection tests rather than 
 
 ---
 
-## Phase 3A — Concurrency and Lease Races
+## Phase 3A: Concurrency and Lease Races
 
 Adversarial tests were added for:
 
@@ -78,7 +78,7 @@ No Phase 3A security finding was identified.
 
 ---
 
-## Phase 3B — Revocation and Cancellation Races
+## Phase 3B: Revocation and Cancellation Races
 
 Adversarial tests were added for:
 
@@ -184,7 +184,7 @@ P3-001 is therefore recorded as:
 
 ---
 
-## Phase 3C — Transaction Atomicity, Pause and Catch-Up
+## Phase 3C: Transaction Atomicity, Pause and Catch-Up
 
 Failure-injection and race tests assessed:
 
@@ -224,7 +224,7 @@ No Phase 3C security finding was identified.
 
 ---
 
-## Phase 3D — Worker Failure and Exception Safety
+## Phase 3D: Worker Failure and Exception Safety
 
 Adversarial tests assessed:
 
@@ -306,7 +306,7 @@ The isolated container and Docker network were removed after the test run.
 
 Secret scanning:
 
-**PASS — 208 repository files checked**
+**PASS (208 repository files checked)**
 
 Ruff/security checks:
 
@@ -314,7 +314,7 @@ Ruff/security checks:
 
 Dependency advisory audit:
 
-**PASS — 6 exact locked packages checked**
+**PASS (6 exact locked packages checked)**
 
 Overall WebGuard security gate:
 
@@ -327,7 +327,7 @@ Overall WebGuard security gate:
 | ID | Severity | Finding | Status |
 | --- | --- | --- | --- |
 | P3-001 | Medium | TrustScan permit revocation was not enforced atomically at scheduler and worker-claim boundaries | Remediated |
-| P3-002 | — | No additional Phase 3 finding assigned | — |
+| P3-002 | N/A | No additional Phase 3 finding assigned | N/A |
 
 Phase 3 totals:
 
@@ -361,4 +361,4 @@ WebGuard's execution path remained fail-closed under the tested worker, lease, s
 
 The Phase 3 regression tests are retained permanently to protect the corrected security invariants from future changes.
 
-**Audit Checkpoint 1 — Phase 3: COMPLETE**
+**Audit Checkpoint 1, Phase 3: COMPLETE**

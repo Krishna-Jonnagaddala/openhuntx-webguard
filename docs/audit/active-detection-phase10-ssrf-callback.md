@@ -1,4 +1,4 @@
-# Active Detection — Slice 10: Controlled SSRF Detection & Callback Infrastructure
+# Active Detection, Slice 10: Controlled SSRF Detection & Callback Infrastructure
 
 ## Status
 
@@ -6,7 +6,7 @@ This slice adds a new active detector, `active.ssrf.callback` (CWE-918,
 OWASP Top 10 2021 A10), built on a dedicated controlled-callback
 architecture rather than response-text guessing. Confirmation requires
 a genuine, out-of-band, server-side outbound request from the target
-application to a WebGuard-controlled callback destination — never a
+application to a WebGuard-controlled callback destination: never a
 target response that merely reflects, validates, or mentions a
 callback URL. This is also the first slice to require a real,
 runnable receiver component (not just a test fixture) as production
@@ -18,13 +18,13 @@ receive the target's own outbound connection.
 ### Dedicated active check (requirement 1)
 
 `active.ssrf.callback` added to `KNOWN_TRUSTSCAN_ACTIVE_CHECKS`
-(vocabulary widening, no permit schema bump — the identical, already-
+(vocabulary widening, no permit schema bump, the identical, already-
 established precedent from Slice 8's `active.authorization.idor`
 addition). It requires explicit presence in a permit's `active_checks`
 claim; there is no shared "any active check" gate beyond the existing
 `PERMIT_ISSUE_ACTIVE` RBAC permission every active check already uses
 at issuance time. An XSS-only, SQLi-only, or IDOR-only permit **never**
-authorizes SSRF — proven directly (see "Authorization negatives"
+authorizes SSRF: proven directly (see "Authorization negatives"
 below) rather than merely asserted, since `_apply_ssrf_callback_detection`
 checks for this exact string and nothing else.
 
@@ -36,11 +36,11 @@ scanner/API-layer separation:
 - **`workers/scanner/callback_broker.py`** (scanner-side, zero
   `apps/api` dependency): `CallbackToken` (opaque, high-entropy value +
   the full callback URL), `CallbackObservation` (bounded: token,
-  timestamp, method, a categorical `source_class` — never a raw source
-  IP), `CallbackPolicy` (explicit bounds — see "Safety boundaries"),
+  timestamp, method, a categorical `source_class`, never a raw source
+  IP), `CallbackPolicy` (explicit bounds, see "Safety boundaries"),
   the `CallbackBroker` protocol the detector depends on
   (`register`/`wait_for_observation`, nothing more), and
-  `InMemoryCallbackBroker` — a genuine, bounded, self-contained
+  `InMemoryCallbackBroker`: a genuine, bounded, self-contained
   default implementation usable standalone with no API-layer
   dependency at all (the same relationship `AuthenticationMaterial`
   already has to `AuthenticationContextRepository`).
@@ -49,20 +49,20 @@ scanner/API-layer separation:
   the whole process's lifetime (tokens are globally unique via
   `secrets.token_urlsafe`, so one instance safely serves every
   concurrent scan) and additionally records organization/target/
-  authorization metadata per registration for audit/lookup —
+  authorization metadata per registration for audit/lookup:
   `ScopedCallbackRegistration`. This is intentionally *not* itself
   handed to the detector: `executor.py`'s `_ScanScopedCallbackBroker`
   is a small local adapter that binds one scan's tenancy once via
   closure and satisfies the scanner's `CallbackBroker` protocol
   exactly, so the detector never needs to know tenancy exists.
-- **`apps/api/callback_server.py`**: `CallbackHttpReceiver` — a real,
+- **`apps/api/callback_server.py`**: `CallbackHttpReceiver`: a real,
   runnable `ThreadingHTTPServer`-based listener, not a test mock. It
   accepts `/<scan_id>/<token>` and calls `record_observation` on
   whatever observation sink it was given (a `CallbackRepository`, or a
-  bare `InMemoryCallbackBroker` for detector-only tests — satisfied
+  bare `InMemoryCallbackBroker` for detector-only tests, satisfied
   via a small `Protocol`, not a hard dependency on the API-layer
   class). **Not started automatically as part of `webguard-api
-  serve`** this slice — an operator or test constructs and starts one
+  serve`** this slice: an operator or test constructs and starts one
   explicitly, mirroring how the worker and scheduler are already
   independently-run components in this architecture (requirement 19's
   "separately scalable service" framing, achieved honestly rather than
@@ -83,12 +83,12 @@ touching the detector.
 
 Structurally enforced, not merely policy: the only destination value
 `run_ssrf_callback_detector` ever substitutes into a candidate
-parameter is `token.url` — the callback URL a `CallbackBroker.register()`
+parameter is `token.url`: the callback URL a `CallbackBroker.register()`
 call itself produced. There is no code path anywhere in this detector
 that constructs, accepts, or falls back to `127.0.0.1`, `localhost`,
 `169.254.169.254`, an RFC1918 address, or any other destination.
 WebGuard's own outbound-request scope protections (`scope_validator.py`,
-`safe_http.py`) are completely untouched by this slice — they still
+`safe_http.py`) are completely untouched by this slice: they still
 govern every request WebGuard's own client makes to the *target*, a
 separate boundary from what value gets embedded in a parameter the
 target's own server later chooses to act on. This distinction
@@ -102,12 +102,12 @@ that address is never internal).
 
 `is_ssrf_candidate_parameter`/`select_ssrf_candidates` filter
 `RequestTemplate`s (the existing Slice 6 discovery/mutation model,
-reused completely unmodified — GET query, POST form, and JSON string
+reused completely unmodified: GET query, POST form, and JSON string
 fields are all representable, and OpenAPI-declared JSON body fields
 already produce `RequestTemplate`s the same filter applies to) by
 parameter name against a bounded hint set: `url`, `uri`, `callback`,
 `webhook`, `image`, `avatar`, `feed`, `source`, `redirect`, `endpoint`,
-`fetch`, `import`. **This is a discovery-time filter only — never
+`fetch`, `import`. **This is a discovery-time filter only: never
 evidence.** No finding this detector produces depends in any way on
 the parameter's name; a candidate with the most suggestive possible
 name (`callback_url`) that never actually gets fetched server-side
@@ -120,7 +120,7 @@ produce a finding.
 ### Probe design (requirement 5)
 
 `run_ssrf_callback_detector` reuses, unmodified: `RequestTemplate`/
-`mutate()` (the exact Slice 6 mutation engine — only the one selected
+`mutate()` (the exact Slice 6 mutation engine: only the one selected
 parameter changes, every other field of the request is preserved
 byte-for-byte), `issue_templated_request` (the same shared transport
 already used by SQLi/XSS's POST/JSON path, including same-origin
@@ -128,7 +128,7 @@ enforcement via the existing `_require_same_origin`), `AuthenticationMaterial`
 (threaded through identically to every other detector), and
 `safe_http`/the TrustScan runtime safety engine (via
 `before_request`/`after_request` hooks, unchanged). **No separate
-network stack was created** — the only genuinely new networking code
+network stack was created**: the only genuinely new networking code
 in this entire slice is the callback *receiver* (a server, listening
 for inbound connections), never a new outbound client.
 
@@ -141,22 +141,22 @@ for IDOR (Slice 8):
   observation for this *exact* token arrived within the policy's
   primary wait window.
 - **PROBABLE**: identical, except the token-correlated observation
-  only arrived during the secondary grace window — still never
+  only arrived during the secondary grace window: still never
   guessed, just weaker timing evidence (a real callback can legitimately
   arrive late if the target's own fetch is queued/asynchronous).
 - **NOT_VULNERABLE**: the probe succeeded and no observation arrived
   even after the full wait+grace window.
 - **INCONCLUSIVE**: callback registration itself failed (the broker's
   own registration budget was exhausted), or the wait was stopped
-  early by cancellation — in both cases the test could not actually
+  early by cancellation: in both cases the test could not actually
   complete, so no claim either way is made.
 - **ERROR**: the probe request itself failed at the transport level.
 
 Correlation fields (requirement 6): scan ID, candidate endpoint/method/
 parameter, the callback token's own fingerprint, and the observation's
-timestamp/method — all recorded in the finding's evidence text (see
+timestamp/method: all recorded in the finding's evidence text (see
 "Evidence" below). **A target response containing the callback URL is
-never SSRF evidence by itself** — verified directly
+never SSRF evidence by itself**: verified directly
 (`test_reflection_of_callback_url_alone_produces_no_finding`,
 `test_response_merely_mentioning_the_callback_domain_produces_no_finding`)
 and structurally impossible by construction: the classification
@@ -166,20 +166,20 @@ function never inspects the probe response body at all, only whether
 ### Callback authenticity (requirement 7)
 
 `InMemoryCallbackBroker.register()` generates every token with
-`secrets.token_urlsafe(32)` (256 bits of entropy) — there is no code
+`secrets.token_urlsafe(32)` (256 bits of entropy): there is no code
 path that accepts a caller-supplied token value as a registration.
 Tokens are scan-bound and candidate-bound at registration
 (`CallbackToken.scan_id`/`candidate_fingerprint`), time-limited
 (`CallbackPolicy.token_ttl_seconds`, default 300s, hard-capped at one
 hour), and bounded-use (`maximum_observations_per_token`, default 5).
 An arbitrary, forged, or guessed token value is never accepted as
-proof — `record_observation` returns `False` (never raises) for any
+proof: `record_observation` returns `False` (never raises) for any
 unknown, expired, or over-quota token, verified directly
 (`test_arbitrary_user_supplied_id_is_never_accepted_as_proof`,
 `test_expired_token_is_rejected`, `test_bounded_use_rejects_beyond_maximum_observations`).
-A callback observed for a *different* token — whether from an
+A callback observed for a *different* token (whether from an
 unrelated candidate in the same scan or from an entirely different
-scan — never satisfies a waiting registration
+scan) never satisfies a waiting registration
 (`test_callback_from_wrong_token_never_confirms_this_candidate`,
 `test_callback_from_another_scans_token_never_confirms_this_one`).
 
@@ -189,12 +189,12 @@ All five explicitly required scenarios are tested: direct callback
 (CONFIRMED); the application reflects the URL only, never fetching it
 (NOT_VULNERABLE); the application validates and rejects the URL,
 returning 400, without ever fetching (NOT_VULNERABLE); the application
-genuinely fetches it (CONFIRMED — the only such case); and the
+genuinely fetches it (CONFIRMED, the only such case); and the
 callback destination itself redirects
 (`test_redirect_response_does_not_prevent_confirmation`). The last
 case is the one requiring architectural care: WebGuard's own detector
 never follows, sees, or acts on the callback receiver's response at
-all — confirmation happens the instant the inbound request *arrives*
+all: confirmation happens the instant the inbound request *arrives*
 at the receiver, before any response is even sent back. No redirect-
 to-private-network behavior was introduced anywhere: the receiver's
 own optional, test-only `respond_with_redirect` flag redirects to a
@@ -204,13 +204,13 @@ property, never to a network-reachable destination of any kind.
 ### DNS/rebinding safety (requirement 9)
 
 Correlation is based **only** on the token presented in the request
-path — never on the Host header, the source address, or any DNS
+path: never on the Host header, the source address, or any DNS
 resolution the request happened to arrive via. Verified directly
 (`test_correlation_depends_only_on_the_token_never_on_host_header`): a
 request presenting a spoofed, unrelated `Host` header is still
 correctly correlated purely by its token. This makes the local
-implementation already robust to DNS rebinding and callback-host
-spoofing by construction, independent of any DNS trust decision —
+implementation already resistant to DNS rebinding and callback-host
+spoofing by construction, independent of any DNS trust decision,
 proven locally without needing attacker-controlled DNS at all, since
 the property being tested (token-only correlation) doesn't depend on
 DNS in the first place. **Documented production requirement**: a real
@@ -237,10 +237,10 @@ content.
 
 Every finding carries `CWE-918` unconditionally and, as this project's
 second non-CWE identifier namespace (the first was `OWASP-API` for
-IDOR in Slice 8), `OWASP`/`A10:2021` — OWASP Top 10 (2021) category A10
+IDOR in Slice 8), `OWASP`/`A10:2021`: OWASP Top 10 (2021) category A10
 is literally named "Server-Side Request Forgery," a direct, well-
 justified match rather than a stretch. "Callback reflected in
-response" is never treated as confirmed SSRF — see "Confirmation
+response" is never treated as confirmed SSRF, see "Confirmation
 model" above.
 
 ## Bugs found and fixed during this slice
@@ -248,7 +248,7 @@ model" above.
 1. **A pre-existing Slice 9 bug in `resource_graph._endpoint_template`,
    surfaced by this slice's Juice Shop investigation.** The function
    computed a resource's structural endpoint template via
-   `canonical.replace(resource.identifier_value, "{identifier}", 1)` —
+   `canonical.replace(resource.identifier_value, "{identifier}", 1)`:
    a naive first-occurrence substring replacement. Juice Shop's real
    basket IDs (small integers like `11`/`12`) coincidentally matched
    digits *inside the loopback IP address itself* (`127.0.0.1`), so
@@ -263,7 +263,7 @@ model" above.
    `_endpoint_template` to split the path into segments and replace
    the identifier only when it exactly matches a whole path segment
    (searched from the end backward), never as an arbitrary substring
-   of the full URL — verified with a new regression test
+   of the full URL, verified with a new regression test
    (`test_numeric_identifier_coinciding_with_a_digit_in_the_host_is_still_eligible`)
    and by re-running the Juice Shop test, now passing. This bug
    predates this slice (introduced in Slice 9) but was only discovered
@@ -272,12 +272,12 @@ model" above.
 ## Controlled vulnerable fixture (requirement 13)
 
 Five routes, exactly as required: `/fetch-vulnerable` (genuinely
-vulnerable — the server performs a real, blocking, standard-library
+vulnerable: the server performs a real, blocking, standard-library
 outbound HTTP request to the supplied URL before responding);
 `/fetch-safe` (accepts the URL, never fetches it); `/reflect-only`
 (echoes the URL value, never fetches); `/validation-error` (always
 400, never fetches); `/generic-500` (always 500, never fetches). Only
-`/fetch-vulnerable` ever produces a CONFIRMED finding — verified
+`/fetch-vulnerable` ever produces a CONFIRMED finding: verified
 directly against all five simultaneously
 (`test_only_the_actual_fetch_produces_a_confirmed_finding`).
 
@@ -324,13 +324,13 @@ Covered, with the specific test/reasoning for each:
   `test_xss_only_permit_produces_no_ssrf_finding`,
   `test_sqli_only_permit_produces_no_ssrf_finding`) against the
   identical vulnerable fixture that, with the right permit, does
-  confirm — proving the absence is due to authorization, not fixture
+  confirm: proving the absence is due to authorization, not fixture
   behavior.
 - **IDOR-only → no SSRF**: not separately re-run through the full
   pipeline (an IDOR-authorized permit requires registering two
   authentication contexts and a comparison plan, substantially more
   setup for a check that is structurally identical to the XSS-only/
-  SQLi-only cases already proven) — the gate
+  SQLi-only cases already proven): the gate
   (`"active.ssrf.callback" not in active_checks`) does not special-case
   any particular other check, so the XSS/SQLi proofs already
   demonstrate the general property.
@@ -341,7 +341,7 @@ Covered, with the specific test/reasoning for each:
   (`test_cross_tenant_permit_use_fails`,
   `test_target_not_matching_authorization_fails`,
   `test_tampering_with_signed_active_checks_fails_verification`,
-  `test_administrator_cannot_issue_active_capability_permit`) — these
+  `test_administrator_cannot_issue_active_capability_permit`): these
   tests exercise the shared `active_checks` claim/RBAC mechanism
   generically, and `active.ssrf.callback` now being a real, known
   check ID means these protections provably apply to it identically,
@@ -356,7 +356,7 @@ One incidental, mechanical fix: two pre-existing tests
 (`test_unknown_active_check_fails_closed`,
 `test_unknown_detector_id_fails_closed`) had used the literal string
 `"active.ssrf.callback"` as their example of an *unrecognized* detector
-ID — a coincidence from before this slice implemented it for real.
+ID: a coincidence from before this slice implemented it for real.
 Updated both to use `"active.nonexistent.detector"` instead; their
 actual assertions (an unknown ID is rejected) are unchanged.
 
@@ -374,14 +374,14 @@ named parameter doesn't actually exist, caught per-candidate as
 only" is covered by construction rather than a dedicated test: since
 WebGuard's probe never executes JavaScript, a URL that would only be
 fetched by client-side code produces no server-side outbound request
-and therefore no callback — indistinguishable from, and correctly
+and therefore no callback: indistinguishable from, and correctly
 classified the same as, `/reflect-only`'s behavior.
 
 ## Timeout behavior (requirement 18)
 
 `CallbackPolicy` bounds: `maximum_wait_seconds` (default 3.0, hard-
 capped at 30.0), `grace_seconds` (default 2.0), `maximum_active_registrations`
-(default 20, enforced at registration time — a 21st concurrent
+(default 20, enforced at registration time: a 21st concurrent
 registration raises `callback_registration_limit_exceeded` before any
 probe is sent for it), `maximum_observations_per_token` (default 5).
 No worker thread ever waits indefinitely: `wait_for_observation`'s
@@ -392,8 +392,8 @@ every iteration, independent of whether a callback ever arrives.
 ## Security boundary separation (requirement 22)
 
 Verified explicitly, not just asserted: `scope_validator.py` and
-`safe_http.py` — the modules responsible for preventing WebGuard's own
-HTTP client from being pointed at an internal/private address — were
+`safe_http.py` (the modules responsible for preventing WebGuard's own
+HTTP client from being pointed at an internal/private address) were
 not modified in this slice at all (`git diff` confirms zero changes to
 either file). The new capability this slice adds is entirely
 additive: a value WebGuard embeds in a *target's own* request
@@ -417,7 +417,7 @@ callback destination reachable from inside the Juice Shop container
 callback receiver is explicitly not production/public infrastructure)
 produced a consistent `500 Error: Blocked illegal activity` response.
 Inspecting the container's own logs traced this to
-`profileImageUrlUpload.js` — Juice Shop's own, deliberate SSRF-
+`profileImageUrlUpload.js`: Juice Shop's own, deliberate SSRF-
 challenge protection, which blocks URLs that resolve to private/
 internal-looking address ranges. `host.docker.internal` resolves to a
 Docker-internal gateway address from the container's perspective, so
@@ -432,12 +432,12 @@ exploit internal network access to bypass Juice Shop's own protection
 3 already forbids this detector from becoming), and the detector was
 not modified in any way to force a finding here. A genuinely public,
 internet-routable callback destination would very plausibly pass
-Juice Shop's own blocklist check and allow full confirmation — but
+Juice Shop's own blocklist check and allow full confirmation, but
 provisioning one is explicitly out of scope for this slice
 (requirement 2: "do not provision production callback infrastructure
 yet"). **Recorded as: no compatible controlled SSRF surface was
 confirmed for Juice Shop within this slice's methodology and
-environment** — the synthetic real-network fixture remains this
+environment.** The synthetic real-network fixture remains this
 slice's validation source, exactly as the brief anticipates for this
 outcome.
 
@@ -458,13 +458,13 @@ outcome.
 - Every pre-existing discovery, request-template, authentication,
   authenticated-crawl, XSS, SQLi, IDOR/BOLA, resource-graph, permit,
   RBAC, executor, crawler, `safe_http`, and scope/SSRF-prevention test
-  file was re-run and passes — two tests needed the mechanical
+  file was re-run and passes: two tests needed the mechanical
   placeholder-string fix described above; no other file needed any
   change.
 - Security gates: secret scan (298 repository files / 6 generated
   artifacts / 653 reachable Git blobs), static analysis (`ruff
   --select S`, zero findings, no fixes needed this slice), dependency
-  audit (6 locked packages, no advisories) — all passing.
+  audit (6 locked packages, no advisories), all passing.
 - `git diff --check`: clean.
 
 ## Implemented / Tested / Proven / Not Proven / Callback Architecture / Candidate Discovery / Confirmation Model / False-Positive Controls / Safety Boundaries / CWE Mapping / Known Limitations / Test Counts / Security Gates / GitHub Commit / Remote Sync / Next Slice
@@ -488,7 +488,7 @@ covers which scenario).
 **Proven:** a real target application's real, server-side, standard-
 library outbound HTTP request to a WebGuard-controlled callback
 destination is genuinely observed over real sockets and correctly
-confirmed as CWE-918 — end to end, through the real permit/job/worker/
+confirmed as CWE-918: end to end, through the real permit/job/worker/
 executor pipeline, with the victim endpoint distinguished from four
 deliberately non-vulnerable siblings (safe, reflect-only, validation-
 error, generic-500) using the identical discovery and probe mechanism
@@ -510,7 +510,7 @@ comparison plans).
 
 **Callback architecture:** scanner-side protocol + self-contained
 in-memory implementation; API-layer multi-tenant wrapper; a real,
-separate, independently-startable local HTTP receiver — never
+separate, independently-startable local HTTP receiver, never
 embedded inside the detector itself.
 
 **Candidate discovery:** name-based filtering over the existing
@@ -520,10 +520,10 @@ representable); discovery-time only, never confirmation evidence.
 **Confirmation model:** CONFIRMED/PROBABLE distinguished only by
 callback arrival timing, both requiring exact token correlation;
 NOT_VULNERABLE/INCONCLUSIVE/ERROR distinguish "waited it out, saw
-nothing" from "registration failed" from "the probe itself failed" —
+nothing" from "registration failed" from "the probe itself failed",
 never conflated.
 
-**False-positive controls:** see the dedicated section above — eleven
+**False-positive controls:** see the dedicated section above, eleven
 distinct scenarios, all verified to produce zero findings.
 
 **Safety boundaries:** no internal-network probing, ever; token-only
@@ -534,12 +534,12 @@ slice's additions.
 
 **CWE mapping:** `CWE-918` unconditional; `OWASP`/`A10:2021` as a
 second, well-justified non-CWE namespace. `docs/CWE_COVERAGE.md`
-updated — CWE-918 now IMPLEMENTED, on the strength of real callback
+updated: CWE-918 now IMPLEMENTED, on the strength of real callback
 confirmation proven above, not merely built.
 
 **Known limitations:** see "Not Proven" above.
 
-**Test counts:** 1405 unit, 42 integration — all passing.
+**Test counts:** 1405 unit, 42 integration, all passing.
 
 **Security gates:** secret scan, static analysis, dependency audit,
 and `git diff --check` all clean, no fixes needed this slice's own new

@@ -15,7 +15,7 @@ REQUIRED_DOCUMENTS = {
     "docs/AUTHORIZATION_MODEL.md": ("# OpenHuntX WebGuard Authorisation Model", "## 15. Request-boundary enforcement"),
     "docs/DATA_CLASSIFICATION.md": ("# OpenHuntX WebGuard Data Classification and Handling", "### Restricted"),
     "docs/THREAT_MODEL.md": ("# OpenHuntX WebGuard Threat Model", "## 6. Threats and controls"),
-    "docs/ROADMAP.md": ("# OpenHuntX WebGuard Roadmap", "## Implemented foundation — through Milestone 1.32"),
+    "docs/ROADMAP.md": ("# OpenHuntX WebGuard Roadmap", "## Implemented foundation, through Milestone 1.32"),
     "THIRD_PARTY_NOTICES.md": ("# OpenHuntX WebGuard Third-Party Notices", "cryptography"),
     ".env.example": ("WEBGUARD_RUN_INTEGRATION=0", "WEBGUARD_LAB_TARGET=http://127.0.0.1:3000/"),
 }
@@ -34,8 +34,8 @@ MINIMUM_DOCUMENT_BYTES = {
 FORBIDDEN_README_MARKERS = (
     "At Milestone 1.31, the repository contains:",
     "887 unit tests",
-    "`apps/web` — future customer dashboard",
-    "`infra/zap` — future controlled ZAP automation plans",
+    "`apps/web` - future customer dashboard",
+    "`infra/zap` - future controlled ZAP automation plans",
 )
 
 SECRET_PATTERNS = (

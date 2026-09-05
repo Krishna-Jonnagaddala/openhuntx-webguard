@@ -1,4 +1,4 @@
-# Lab Validation — OWASP Juice Shop
+# Lab Validation: OWASP Juice Shop
 
 ## Status
 
@@ -9,25 +9,25 @@ Complete. This validates that WebGuard's passive detection engine produces corre
 - Target: `bkimminich/juice-shop:v20.1.1` (pinned by digest, `infra/compose/compose.lab.yml`), bound to `127.0.0.1:3000` only, hardened container (`cap_drop: ALL`, `no-new-privileges`, resource limits).
 - Started via `docker compose -f infra/compose/compose.lab.yml up -d`; healthcheck reported `healthy`.
 
-## Part 1 — Integration suite (service/API plumbing)
+## Part 1: Integration suite (service/API plumbing)
 
 ```
 WEBGUARD_RUN_INTEGRATION=1 WEBGUARD_LAB_TARGET=http://127.0.0.1:3000/ \
 python -m unittest discover -s tests/integration -p "test_*.py" -v
 ```
 
-**14/14 tests passed**, exercising the full stack against the live container: crawling, checkpoint resume, TLS-analyzer HTTPS-skip logic, HTML analyzer, professional report rendering, authenticated job submission/scheduling/pagination through the API layer, and — notably — both directions of scope enforcement: `test_commercial_policy_blocks_local_target` (confirms the scanner refuses `127.0.0.1` under normal commercial policy) and `test_lab_policy_allows_and_reaches_local_target` (confirms `--lab` mode correctly reaches it only with an explicit allowlist), plus `test_issue_bind_revoke_and_fail_closed` for TrustScan permits.
+**14/14 tests passed**, exercising the full stack against the live container: crawling, checkpoint resume, TLS-analyzer HTTPS-skip logic, HTML analyzer, professional report rendering, authenticated job submission/scheduling/pagination through the API layer, and, notably, both directions of scope enforcement: `test_commercial_policy_blocks_local_target` (confirms the scanner refuses `127.0.0.1` under normal commercial policy) and `test_lab_policy_allows_and_reaches_local_target` (confirms `--lab` mode correctly reaches it only with an explicit allowlist), plus `test_issue_bind_revoke_and_fail_closed` for TrustScan permits.
 
 This was previously documented as passing in the Phase 4/5 checkpoint docs; re-run here independently rather than trusted from documentation, per this session's own audit discipline.
 
-## Part 2 — Standalone CLI scan (actual findings)
+## Part 2: Standalone CLI scan (actual findings)
 
 ```
 webguard scan http://127.0.0.1:3000/ --lab --allow-host 127.0.0.1 \
   --crawl --crawl-max-pages 10 --crawl-max-depth 1
 ```
 
-**Result:** completed, 1 page, 3 findings, coverage 80% (8 of 40 checks correctly skipped, not silently dropped — see below).
+**Result:** completed, 1 page, 3 findings, coverage 80% (8 of 40 checks correctly skipped, not silently dropped; see below).
 
 | Finding | Severity | CWE | Evidence |
 |---|---|---|---|
@@ -43,6 +43,6 @@ All three match Juice Shop's documented, intentional misconfigurations (it is we
 
 ## Conclusion
 
-Both the plumbing (permits, scheduling, pagination, checkpoints) and the actual passive-detection output (real findings, correct CWE mapping, honest coverage accounting) are verified working against a live, known-vulnerable target — independent of and prior to any scan of a real owned site. This satisfies the "prove the scanner actually detects and correctly maps vulnerabilities" requirement before trusting the same engine's output against `internstack.in` (see `docs/audit/internstack-first-production-scan.md`).
+Both the plumbing (permits, scheduling, pagination, checkpoints) and the actual passive-detection output (real findings, correct CWE mapping, honest coverage accounting) are verified working against a live, known-vulnerable target, independent of and prior to any scan of a real owned site. This satisfies the "prove the scanner actually detects and correctly maps vulnerabilities" requirement before trusting the same engine's output against `internstack.in` (see `docs/audit/internstack-first-production-scan.md`).
 
-No active-detection findings (injection, XSS, SSRF, auth bypass, IDOR — the classes Juice Shop is actually designed to exercise) are present here because that engine does not exist yet (`docs/CWE_COVERAGE.md`, "Planned"). This lab only validates the passive engine that is currently implemented.
+No active-detection findings (injection, XSS, SSRF, auth bypass, IDOR: the classes Juice Shop is actually designed to exercise) are present here because that engine does not exist yet (`docs/CWE_COVERAGE.md`, "Planned"). This lab only validates the passive engine that is currently implemented.

@@ -1,4 +1,4 @@
-# Active Detection — Slice 7: Authenticated & Session-Aware Scanning Foundation
+# Active Detection, Slice 7: Authenticated & Session-Aware Scanning Foundation
 
 ## Status
 
@@ -7,7 +7,7 @@ authentication-context model, a single shared session/credential
 application layer, a controlled login workflow, and the TrustScan permit
 binding that lets the existing pipeline (discovery, `RequestTemplate`,
 mutation, XSS/SQLi detectors) optionally run against an authenticated
-surface — without ever embedding secrets in findings, reports, logs, or
+surface, without ever embedding secrets in findings, reports, logs, or
 serializable request templates.
 
 ## What was built
@@ -21,11 +21,11 @@ but never joined:
   `organization_id`, `target`, `authorization_id`, `identity_label`,
   `method` (`bearer_token` / `cookie_session` / `basic_auth` /
   `login_workflow`), `created_at`, `expires_at`, `revoked_at`. Contains
-  no secret material — safe to log, audit, and return over the API
+  no secret material, safe to log, audit, and return over the API
   as-is. `status_at(now)` derives `active` / `expired` / `revoked`.
 - **Secret material**: `webguard_scanner.authentication.AuthenticationMaterial`
   (bearer token, session cookies, basic-auth credentials), reused rather
-  than duplicated — it already carries its own bounds and redacted
+  than duplicated: it already carries its own bounds and redacted
   `__repr__`/`__str__` (see below). Looked up by the same ID through a
   *separate* method (`get_secret`, distinct from `get_metadata`), so a
   caller that only asked for metadata physically cannot receive secret
@@ -33,18 +33,18 @@ but never joined:
 - `require_bound(id, *, organization_id, target, authorization_id, now)`:
   the one fail-closed check used at both permit-issuance time and again
   at scan-execution time (defense in depth, the same pattern already
-  used for TrustScan permit validation itself) — verifies the context
+  used for TrustScan permit validation itself): verifies the context
   exists, is bound to exactly this organization/target/authorization,
   and is currently `active`.
 
-**Storage is deliberately in-memory only this slice** — stated directly
+**Storage is deliberately in-memory only this slice**, stated directly
 rather than left implicit, for two reasons: secret material must never
 be written to SQLite or a plain file as a stand-in for real KMS/
 encrypted-secret-manager storage (an in-memory store is honest about not
 solving that problem, rather than pretending a local file is "good
 enough for now"); and the project's own stated production sequencing
 defers a PostgreSQL-backed metadata redesign to a later, dedicated
-slice — building a throwaway SQLite schema for authentication-context
+slice: building a throwaway SQLite schema for authentication-context
 metadata now would be rework. Both `WebGuardJobService` and
 `ScanJobExecutor` accept an optional `authentication_contexts` parameter
 (defaulted to a fresh, empty, per-instance repository so every pre-
@@ -54,14 +54,14 @@ must pass the same repository instance to both. **Known limitation,
 stated plainly:** this means the repository does not survive across
 separate OS-process invocations (e.g. two separate `webguard-api`
 CLI subprocess calls) the way the SQLite-backed job/permit/identity
-stores do — see "True end-to-end test" below for exactly how this
+stores do; see "True end-to-end test" below for exactly how this
 shaped that test's scope.
 
 ### RBAC (`apps/api/src/webguard_api/auth.py`)
 
 Three new owner-only permissions:
 `AUTHENTICATION_CONTEXT_REGISTER`, `AUTHENTICATION_CONTEXT_READ`,
-`AUTHENTICATION_CONTEXT_REVOKE` — excluded from `ADMINISTRATOR`
+`AUTHENTICATION_CONTEXT_REVOKE`, excluded from `ADMINISTRATOR`
 alongside the existing `PERMIT_ISSUE_ACTIVE`, on the same reasoning:
 authenticated-scanning credentials are at least as sensitive as active/
 intrusive detection capability.
@@ -70,14 +70,14 @@ intrusive detection capability.
 
 One shared mechanism (requirement 5): `apply_authentication(url,
 material, *, now) -> extra_headers`. No detector, crawler, or discovery
-code independently constructs `Authorization`/`Cookie`/`X-Api-Key` —
+code independently constructs `Authorization`/`Cookie`/`X-Api-Key`;
 every request-issuing function (`issue_probe`, `fetch_same_origin_page`,
 `issue_templated_request`, `execute_baseline`) accepts an optional
 `authentication_material` parameter and calls this one function.
 
 - **`SessionCookie`**: `name, value, domain, port, path, secure,
-  expires_at`. Matching is **exact** — hostname *and* port, not RFC
-  6265's host-only semantics — deliberately stricter than real browser
+  expires_at`. Matching is **exact** (hostname *and* port, not RFC
+  6265's host-only semantics), deliberately stricter than real browser
   cookies, matching this project's own scheme+host+port scope model. A
   session bound to `app.example.com:443` is never sent to
   `app.example.com:8443`, a sibling subdomain, or a different scheme
@@ -90,7 +90,7 @@ every request-issuing function (`issue_probe`, `fetch_same_origin_page`,
 - **Redaction, as defense in depth** (requirement 3): both
   `SessionCookie.__repr__` and `AuthenticationMaterial.__repr__`/`__str__`
   are overridden to return a fixed `<redacted>` marker instead of the
-  real value. This does not replace correct handling elsewhere — it is
+  real value. This does not replace correct handling elsewhere: it is
   one more layer against an accidental `f"{material}"` in a log line, a
   debugger, or an uncaught-exception traceback that happens to include a
   local variable. Verified directly: exception messages, `repr()`, and
@@ -100,7 +100,7 @@ every request-issuing function (`issue_probe`, `fetch_same_origin_page`,
   and `Cookie` may be set by this mechanism. `Host`, `Content-Length`,
   `Transfer-Encoding`, `Connection`, `Forwarded`, `X-Forwarded-Host`,
   `X-Forwarded-For` are hard-blocked, checked in *two* independent
-  places — `apply_authentication` itself, and again in
+  places: `apply_authentication` itself, and again in
   `safe_http.fetch_once`'s new `extra_headers` parameter (the same
   defense-in-depth pattern used for scope/method enforcement elsewhere
   in this codebase). `extra_headers` is not a general header-injection
@@ -113,11 +113,11 @@ every request-issuing function (`issue_probe`, `fetch_same_origin_page`,
   before any connection is attempted. Every pre-existing caller passes
   nothing here and is unaffected (verified: all 15 pre-existing
   `test_safe_http.py` tests pass unmodified).
-- `allow_redirect_status: bool = False` — a narrow, explicit opt-in
+- `allow_redirect_status: bool = False`: a narrow, explicit opt-in
   letting a 3xx response through instead of raising `redirect_blocked`,
   used only by the login workflow to read a `Location` header value as a
   *string* (never to actually follow the redirect with a second
-  request). Found necessary the hard way — see "Bugs found and fixed."
+  request). Found necessary the hard way; see "Bugs found and fixed."
 
 ### Login workflow (`workers/scanner/src/webguard_scanner/login_workflow.py`)
 
@@ -125,8 +125,8 @@ every request-issuing function (`issue_probe`, `fetch_same_origin_page`,
 before_request, after_request, cancellation_check) -> LoginResult`:
 
 - Sends **exactly one** bounded request through the same
-  `safe_http.fetch_once` plumbing as every other active request —
-  same-origin enforcement, budget/rate hooks, TLS — the login target
+  `safe_http.fetch_once` plumbing as every other active request:
+  same-origin enforcement, budget/rate hooks, TLS. The login target
   must already be on the authorized target's own origin.
 - **Never assumes HTTP 200 means success** (requirement 10). Verified
   directly with a deliberately adversarial fixture that returns 200 for
@@ -135,23 +135,23 @@ before_request, after_request, cancellation_check) -> LoginResult`:
   (`test_http_200_alone_is_never_treated_as_success`).
 - Four bounded, explicit success criteria (`LoginSuccessCriterion`):
   `expected_status`, `expected_redirect_contains`, `expected_body_marker`,
-  `expected_cookie_name` — at least one is required at construction time
+  `expected_cookie_name`: at least one is required at construction time
   (`login_success_criterion_missing`, fails closed rather than defaulting
   to "any response is success").
 - On success, extracts session cookies from `Set-Cookie` response
   headers into `SessionCookie` objects (bounded, minimal parsing: name/
-  value plus `Path`/`Secure` attributes only — not a general cookie-jar
+  value plus `Path`/`Secure` attributes only, not a general cookie-jar
   implementation). `LoginResult` never carries the submitted password.
 - `LoginCredentials.__repr__` is redacted the same way
   `AuthenticationMaterial` is.
 - Cancellation is checked before the one request is issued
-  (`test_cancellation_before_login_makes_no_request` — zero requests
+  (`test_cancellation_before_login_makes_no_request`: zero requests
   attempted).
 
 **Known limitation, stated plainly (requirement 9's "budget" ask):**
 `execute_login` always issues exactly one request and relies on the
-caller's `before_request`/`after_request` hooks — the same runtime
-safety engine hooks that gate every other active request — for budget/
+caller's `before_request`/`after_request` hooks (the same runtime
+safety engine hooks that gate every other active request) for budget/
 rate accounting; it does not itself pre-check a request-count budget the
 way detector functions call `enforce_probe_budget()`, because it never
 issues more than one request regardless. This slice does not wire
@@ -168,7 +168,7 @@ genuine field addition (not a vocabulary-widening change like Slice 6's
 `allowed_http_methods`), so it goes through the process
 `docs/audit/trustscan-permit-schema-policy.md` reserves for that: schema
 version bumped 1.1 → 1.2, replace-in-place (not a version-aware loader),
-justified by the same, re-verified precondition as the 1.0 → 1.1 bump —
+justified by the same, re-verified precondition as the 1.0 → 1.1 bump:
 WebGuard has still never been deployed, so no real persisted 1.1 permit
 exists that this could invalidate. Documented in that policy file, not
 just here.
@@ -176,7 +176,7 @@ just here.
 `WebGuardJobService.issue_permit` requires `AUTHENTICATION_CONTEXT_REGISTER`
 (owner-only) when a submission sets this claim, then calls
 `require_bound` against the *submission's* organization/target/
-authorization before signing — an authenticated permit cannot be issued
+authorization before signing: an authenticated permit cannot be issued
 for a context registered under a different tenant, target, or
 authorization, and cannot be issued for an expired or revoked context.
 `ScanJobExecutor` re-validates the same binding independently at
@@ -195,12 +195,12 @@ re-fetch (`fetch_same_origin_page`), and every authorized detector call
 (`run_reflected_xss_detector`/`run_sqli_error_detector`, via
 `issue_probe`/`issue_templated_request`). This is what lets an
 authenticated discovery pass reach content an unauthenticated one
-cannot, and lets XSS/SQLi probe that content once discovered — proven
+cannot, and lets XSS/SQLi probe that content once discovered, proven
 end-to-end (see below).
 
 **Known limitation, stated plainly (requirement 11):** the *passive*
 scan step (`run_passive_header_scan`/`run_passive_crawl_scan`) is not
-authentication-aware this slice — it does not accept `extra_headers` or
+authentication-aware this slice: it does not accept `extra_headers` or
 resolved material at all. Only the active-detection discovery/probe
 pipeline applies authentication. This is why the true end-to-end test
 below targets a page whose *unauthenticated* content is deliberately
@@ -214,7 +214,7 @@ explicitly out of scope for this slice and recorded under "Not Proven."
 1. **`safe_http`'s existing redirect-blocking silently defeated the
    login workflow's redirect-based success criterion.** The first
    version of `execute_login` called `fetch_once` with no way to
-   observe a 3xx response — `_perform_request` already raises
+   observe a 3xx response: `_perform_request` already raises
    `redirect_blocked` for any 3xx-except-304 status, a real, deliberate
    safety control from before this slice. A login endpoint that
    responds with a redirect on success (a common pattern, and the one
@@ -222,7 +222,7 @@ explicitly out of scope for this slice and recorded under "Not Proven."
    probe failure, never a successful login. Caught immediately by
    `test_correct_credentials_with_redirect_criterion_succeeds`. Fixed
    with a narrow, explicit `allow_redirect_status` opt-in that lets the
-   3xx response through to be *read*, never *followed* — no second
+   3xx response through to be *read*, never *followed*: no second
    request is ever issued to the `Location` target.
 
 ## Safety boundaries
@@ -239,7 +239,7 @@ Verified directly, all in `tests/unit/test_authentication.py`:
   request (`test_secure_cookie_never_forwarded_over_downgraded_http`).
 - A redirect target on an external origin never receives the
   authenticated origin's cookie
-  (`test_redirect_to_external_origin_never_receives_cookie`) — and,
+  (`test_redirect_to_external_origin_never_receives_cookie`); and,
   independently, `safe_http` blocks *any* redirect from being followed
   at all by default (pre-existing control, re-verified unchanged:
   `test_blocks_redirect_response`), so this is defense in depth on top
@@ -252,7 +252,7 @@ Verified directly, all in `tests/unit/test_authentication.py`:
 **Not separately re-tested this slice** (per the brief's own list): DNS
 resolution changes are already covered by this project's pre-existing,
 unchanged scope-validation controls (`scope_validator.py`,
-`owned_target._public_addresses`) — Slice 7 introduces no new DNS-
+`owned_target._public_addresses`): Slice 7 introduces no new DNS-
 handling code, so no new test was added specifically for it; the
 existing scope/SSRF regression suite (re-run in full, see below)
 continues to pass unchanged.
@@ -260,7 +260,7 @@ continues to pass unchanged.
 ### Bearer/API token handling (requirement 8)
 
 Tested: valid token (`test_bearer_token_produces_authorization_header`),
-oversized token — both at the `AuthenticationMaterial` construction
+oversized token, both at the `AuthenticationMaterial` construction
 layer (`test_oversized_bearer_token_is_rejected`) and at the service
 registration layer (`test_oversized_token_is_rejected`), expired
 context (`test_require_bound_rejects_expired_context`,
@@ -275,7 +275,7 @@ by the Juice Shop investigation below (an unauthenticated request to a
 protected endpoint returns 401); a synthetic "malformed token string"
 case was not separately added, since `AuthenticationMaterial` treats any
 non-empty string within the byte limit as opaque, valid input by
-design — the *target application* is the only party that can say a
+design: the *target application* is the only party that can say a
 token is invalid, and that is exactly what the 401 response there
 demonstrates.
 
@@ -290,7 +290,7 @@ audit-event trail (`GET /v1/audit-events`) are all checked, after a real
 authenticated scan produced a real finding, to contain neither the
 session cookie's value nor the test account's password anywhere in
 their text. The audit-event trail is checked to *contain* the
-structural action name `authentication_contexts.register` — proving the
+structural action name `authentication_contexts.register`, proving the
 event was recorded at all, just never with the secret.
 
 ## Controlled lab fixture (requirement 17)
@@ -300,26 +300,26 @@ freshly-generated self-signed certificate, same pattern as the existing
 Slice 3/6 E2E fixtures) with five routes and two identities
 (`user-a`/`user-b`, distinct passwords):
 
-- `GET /public` — no authentication, nothing sensitive.
-- `GET /account` — **without** a valid session cookie: `200`, "Please
+- `GET /public`: no authentication, nothing sensitive.
+- `GET /account`: **without** a valid session cookie: `200`, "Please
   log in to view your account" (no form). **With** a valid cookie:
   `200`, "Welcome, `<identity>`!" plus a real `<form method="GET"
   action="/api/profile">`. Deliberately kept at `200` either way (not a
-  redirect) so the *passive* scan step — which does not apply
-  authentication this slice — always completes normally; the
+  redirect) so the *passive* scan step (which does not apply
+  authentication this slice) always completes normally; the
   distinction under test is entirely in what content becomes visible,
   not in status codes.
-- `GET /api/profile?q=` — authenticated only; reflects `q` unescaped
+- `GET /api/profile?q=`: authenticated only; reflects `q` unescaped
   (deliberate, bounded XSS surface for the detector) exactly when a
   valid session is present; otherwise a static "please log in" body
   with no reflection at all (so even a stray unauthenticated probe
   cannot produce a false finding here).
-- `POST /login` — validates `username`/`password` against the two
+- `POST /login`: validates `username`/`password` against the two
   fixture identities; on success, issues a session token and returns
   `302 Location: /account` with `Set-Cookie: session=...` (this is what
   exercised the `allow_redirect_status` fix above); on failure, `200`
   with an "Invalid credentials" body and no cookie.
-- `GET /logout` — invalidates the session server-side.
+- `GET /logout`: invalidates the session server-side.
 
 Proven directly against this fixture:
 - Login works, verified via the redirect-based success criterion
@@ -336,12 +336,12 @@ Proven directly against this fixture:
 **Not separately re-tested this slice:** logout/session-expiry behavior
 against the *fixture's own* server-side invalidation was exercised
 manually while building the fixture but has no dedicated automated
-test — this is recorded under "Not Proven" rather than silently assumed.
+test. This is recorded under "Not Proven" rather than silently assumed.
 Session isolation between `user-a` and `user-b` (each seeing their own
 identity label) is proven by construction (the fixture's `/account`
 route echoes whichever identity the session token maps to) but this
 slice never registers a `user-b` context or runs a second scan under it
-to observe two independent findings side by side — that comparison is
+to observe two independent findings side by side: that comparison is
 exactly the IDOR/BOLA groundwork the brief explicitly says is *not* this
 slice's job.
 
@@ -365,23 +365,23 @@ execute_login() [direct call, real socket, real TLS]
 **Scoping decision, stated explicitly rather than left implicit:**
 because the authentication-context repository is in-memory only (see
 above), it cannot survive across separate CLI subprocess invocations the
-way the SQLite-backed stores can — the pre-existing Slice 3/6 E2E tests
+way the SQLite-backed stores can: the pre-existing Slice 3/6 E2E tests
 tolerate this because *their* new state (permits, jobs) lives in the
 shared SQLite file regardless of which `main([...])` call wrote it. This
 test therefore constructs `WebGuardJobService`/`ScanJobExecutor`/
 `ScanJobWorker` directly (exactly as the pre-existing
 `test_active_checks_e2e_lab.py` already does for its own "real API + real
-worker" section — not a new pattern) and passes one shared
+worker" section, not a new pattern) and passes one shared
 `AuthenticationContextRepository` instance to both the service and the
 executor, while still using `main([...])` for the steps that only touch
 SQLite-backed state (bootstrap, authorization assignment). Every
 authentication-context-specific step (registration, authenticated permit
 issuance, job submission, result/audit retrieval) goes over **real HTTP
 against a real socket**, through the real `create_server`/`ScanJobWorker`
-objects — only the process boundary is collapsed, not the transport. The
+objects; only the process boundary is collapsed, not the transport. The
 login step itself (`execute_login`) is called directly rather than
 through a CLI command, because no `webguard-api login` command exists
-yet (see "Login workflow" above) — it is invoked exactly as an operator
+yet (see "Login workflow" above): it is invoked exactly as an operator
 would need to invoke the underlying library call today.
 
 Result: the finding is produced (`CWE-79`, path containing
@@ -394,7 +394,7 @@ the persisted owned-target audit file, and the audit-event API response.
 Investigated the pinned Juice Shop lab target's real authentication
 model, using only a fresh account created through Juice Shop's own,
 documented `POST /api/Users/` registration endpoint (an intended,
-legitimate feature of the application — not credential guessing, and not
+legitimate feature of the application, not credential guessing, and not
 one of the undocumented CTF challenge accounts).
 
 **Authenticate: yes, verified.** `execute_login` was pointed at Juice
@@ -403,7 +403,7 @@ Shop's real `POST /rest/user/login` with `expected_body_marker=
 reported `success=True`.
 
 **Retain session/token state: partially, an honest and useful gap.**
-Juice Shop's login response contains **no `Set-Cookie` header at all** —
+Juice Shop's login response contains **no `Set-Cookie` header at all**:
 its session is a JWT returned inside the JSON response body
 (`{"authentication": {"token": "..."}}`). `execute_login`'s automatic
 extraction only parses `Set-Cookie` headers, so `LoginResult.cookies`
@@ -416,7 +416,7 @@ operator would today) and wrapped in `AuthenticationMaterial(bearer_token=
 ...)`; `apply_authentication` correctly produced the `Authorization:
 Bearer ...` header, and a real protected Juice Shop endpoint
 (`GET /api/Users/24`, the registered account's own record) was confirmed
-to return `401` unauthenticated and `200` with that header attached —
+to return `401` unauthenticated and `200` with that header attached:
 direct, empirical proof that WebGuard's authentication-*application*
 layer is fully compatible with Juice Shop's real token format, even
 though the login-*extraction* layer does not yet automate pulling it out
@@ -426,14 +426,14 @@ of a JSON body.
 Juice Shop's Angular-SPA architecture (confirmed empirically in Slices
 5–6: no server-rendered forms, no real OpenAPI/sitemap documents) means
 its authenticated endpoints are not reachable by this project's static
-discovery regardless of authentication state — this is a discovery-layer
+discovery regardless of authentication state. This is a discovery-layer
 limitation, not an authentication one, and Slice 7 does not change it.
 
 **Apply normal safety boundaries: yes.** The same `safe_http.fetch_once`
 scope/method/header-allowlist protections applied identically in every
 manual probe above; no bypass was introduced or exercised.
 
-This is recorded as a valid, useful result per the brief's own framing —
+This is recorded as a valid, useful result per the brief's own framing,
 not a gap to paper over. The concrete follow-up it points to (extracting
 a bearer token from a JSON response body via an explicit
 `LoginSuccessCriterion` option, e.g. a JSON-path extractor) is noted
@@ -455,21 +455,21 @@ under "Known limitations," not silently implied to already work.
   re-run explicitly and passes **unmodified** except for the two files
   that needed a mechanical new-field update (`test_trustscan_permit_contract.py`'s
   submission fixture, `test_phase2_authentication_rbac.py`'s exhaustive
-  permission-set enumeration) — both changes are additive assertions
+  permission-set enumeration): both changes are additive assertions
   about the three new RBAC permissions and the new claim, not weakenings
   of any existing check.
 - Security gates: secret scan (270 files / 6 artifacts / 569 blobs),
-  static analysis (`ruff --select S`, two findings caught and fixed —
-  see below — then zero), dependency audit (6 locked packages, no
-  advisories) — all passing.
+  static analysis (`ruff --select S`, two findings caught and fixed,
+  see below, then zero), dependency audit (6 locked packages, no
+  advisories): all passing.
 - `git diff --check`: clean.
 
 Two static-analysis findings were caught and fixed before this slice's
 gate passed clean: `S105` (ruff's hardcoded-password heuristic
-flagging the `AuthenticationMethod.BEARER_TOKEN` enum *tag* — a string
-literal naming a method, not a credential — suppressed with a targeted
+flagging the `AuthenticationMethod.BEARER_TOKEN` enum *tag*, a string
+literal naming a method, not a credential, suppressed with a targeted
 `# noqa: S105` and a comment explaining why) and `S112` (a bare
-`except: continue` while parsing a malformed `Set-Cookie` header —
+`except: continue` while parsing a malformed `Set-Cookie` header,
 intentional and already explained by an existing `# noqa: BLE001`
 comment, extended to also cover `S112`).
 
@@ -494,7 +494,7 @@ context, failed login, oversized token, oversized cookies, cross-origin/
 cross-port/cross-scheme cookie leakage, redirect-to-external-origin
 non-forwarding, secret absence from exceptions/findings/reports/audit
 events, cancellation during login, permit without authenticated
-capability (by construction — see "Not Proven" for what wasn't
+capability (by construction, see "Not Proven" for what wasn't
 separately re-verified), and tampering with the signed
 `authentication_context_id` claim.
 
@@ -506,7 +506,7 @@ finding; credentials never appear in the resulting report, the owned-
 target audit file, or the RBAC audit-event trail; the same bearer-token
 application mechanism works against a real, independent target (Juice
 Shop) with a materially different (JWT-in-body) session model than the
-lab fixture uses (cookie-in-header) — evidence this isn't overfit to one
+lab fixture uses (cookie-in-header): evidence this isn't overfit to one
 fixture's shape.
 
 **Not Proven:** budget exhaustion mid-scan-triggered login (login isn't
@@ -528,12 +528,12 @@ deployment (in-memory only, by design, this slice).
 target/organization/authorization-bound, revocable, redacted); cookie/
 session-cookie (explicit, exact origin+port scoped); basic authentication
 (supported at the same layer, since the existing architecture's header
-mechanism accommodates it trivially — not separately lab-validated
+mechanism accommodates it trivially, not separately lab-validated
 against a real basic-auth endpoint this slice); login-workflow-derived
 sessions (the `login_workflow` method value on `AuthenticationContextRecord`
 exists and the underlying `execute_login`/cookie-extraction primitive is
 fully built and tested, but the *automatic*, permit-triggered use of a
-stored username/password to re-run a login mid-scan is not wired — the
+stored username/password to re-run a login mid-scan is not wired: the
 lab E2E test performs login as an explicit, separate step, exactly
 mirroring what a real operator would do today). OAuth automation, SAML,
 browser automation, and MFA bypass were explicitly out of scope and were
@@ -541,7 +541,7 @@ not built, per the brief's own instruction.
 
 **Secret boundaries:** `RequestTemplate.authentication_context_ref` (a
 Slice-6 field, now finally used for its intended purpose) carries only
-an ID/label — never a secret. `AuthenticationMaterial`/`SessionCookie`/
+an ID/label, never a secret. `AuthenticationMaterial`/`SessionCookie`/
 `LoginCredentials` all override `__repr__`/`__str__` to a fixed redacted
 string. Every exception message that could involve a secret was checked
 not to include it. Neither `register_authentication_context`'s HTTP
@@ -553,19 +553,19 @@ never re-displaying a password after account creation).
 stricter than RFC 6265; no automatic redirect-following anywhere in
 `safe_http` (pre-existing, re-verified); a session bound to one
 authorization/target/organization cannot be referenced by a permit
-issued under a different one (`require_bound`, checked twice — issuance
+issued under a different one (`require_bound`, checked twice: issuance
 and execution time).
 
 **Security tests:** see "Regression" and the per-file counts above; the
 full required negative-test list is covered as itemized in "Tested."
 
-**Known limitations:** see the "Not Proven" list — restated here as
+**Known limitations:** see the "Not Proven" list, restated here as
 forward-looking scope rather than gaps to be alarmed about: passive/
 crawl authentication, automatic mid-scan login, JSON-body token
 extraction, and cross-process authentication-context persistence are the
 concrete next steps if this capability needs to grow further.
 
-**Test counts:** 1278 unit, 31 integration — all passing.
+**Test counts:** 1278 unit, 31 integration, all passing.
 
 **Security gates:** secret scan, static analysis (after two fixes),
 dependency audit, and `git diff --check` all clean.

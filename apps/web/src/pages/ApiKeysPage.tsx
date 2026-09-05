@@ -41,7 +41,7 @@ export function ApiKeysPage() {
       {issuedToken ? (
         <Card className="mb-4 border-[var(--color-accent)]/50 p-4">
           <p className="mb-2 text-sm font-medium text-[var(--color-text-primary)]">
-            Your new token is shown once. Copy it now — WebGuard cannot show it to you again.
+            Your new token is shown once. Copy it now: WebGuard cannot show it to you again.
           </p>
           <div className="mb-2 flex items-center gap-2">
             <code className="flex-1 overflow-x-auto rounded bg-[var(--color-surface-raised)] px-2 py-1.5 text-xs text-[var(--color-text-primary)]">

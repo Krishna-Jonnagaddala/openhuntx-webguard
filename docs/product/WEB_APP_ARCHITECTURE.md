@@ -12,11 +12,11 @@ customer-facing surface built on top of the API contract documented in
 Browser (React SPA, apps/web)
     │  fetch, Bearer token
     ▼
-WebGuard API  (/v1/... — apps/api/src/webguard_api)
+WebGuard API  (/v1/...: apps/api/src/webguard_api)
     │
     ├── PostgreSQL (identity, targets, scans, jobs, findings, ...)
     ├── ScanJobWorker (real threads, renewable leases)
-    └── Scanner v1 (workers/scanner — unchanged, feature-frozen)
+    └── Scanner v1 (workers/scanner: unchanged, feature-frozen)
 ```
 
 There is no second backend. Every mutation the UI performs is a call to an
@@ -43,14 +43,13 @@ state covers every real need.
 
 ## 3. Authentication model (rewritten in Slice 16)
 
-The web app now authenticates with a real, server-side browser session —
-not a pasted API token. `POST /v1/auth/login` sets an `HttpOnly` `wg_session`
+The web app now authenticates with a real, server-side browser session, not a pasted API token. `POST /v1/auth/login` sets an `HttpOnly` `wg_session`
 cookie (the frontend never reads, stores, or even sees the raw session
 credential) plus a separate, non-`HttpOnly` `wg_csrf` cookie used only to
 echo an `X-CSRF-Token` header back on state-changing requests. Every
 `fetch` call in `src/lib/api.ts` sets `credentials: "include"`, so the
 browser attaches `wg_session` automatically; there is nothing for this
-codebase to store in `sessionStorage`/`localStorage`/`IndexedDB` at all —
+codebase to store in `sessionStorage`/`localStorage`/`IndexedDB` at all.
 `src/lib/auth-storage.ts` (Slice 15's interim sessionStorage-token module)
 was deleted outright, not deprecated.
 
@@ -61,11 +60,11 @@ on mount, `login()`/`register()`/`acceptInvitation()` each call their own
 global `webguard:unauthorized` event (dispatched by `api.ts` on any 401)
 still clears local state, but is now guarded so a session that was never
 established (the very first, expected 401 on a fresh visit) does not
-surface a spurious "you were signed out" message — only a 401 that
+surface a spurious "you were signed out" message. Only a 401 that
 invalidates an *already-established* session does.
 
-Full lifecycle — registration, login/logout/logout-everywhere, password
-change/reset, email verification, and invitation acceptance — is now real
+Full lifecycle (registration, login/logout/logout-everywhere, password
+change/reset, email verification, and invitation acceptance) is now real
 and documented in `docs/product/CUSTOMER_AUTH_ARCHITECTURE.md` (product
 model) and `docs/security/BROWSER_SESSION_SECURITY.md` (session/CSRF/
 cookie security design). API-token paste-based login no longer exists
@@ -77,13 +76,13 @@ self-service API-key management (Slice 15) is unaffected.
 
 `src/App.tsx` defines two branches: a public `/login` route, and everything
 else behind a `RequireAuth` gate that renders `AppShell` (`src/components/
-layout/AppShell.tsx` — top bar, sidebar, `<Outlet/>`). `RequireAuth` reads
+layout/AppShell.tsx`: top bar, sidebar, `<Outlet/>`). `RequireAuth` reads
 `useAuth().status` (`"checking" | "signed-out" | "signed-in"`) and redirects
 to `/login` for a signed-out visitor; an unknown path falls back to the
 dashboard.
 
 Pages: Dashboard, Assets, Asset detail, Scans, Scan detail, Findings,
-Finding detail, Reports, Schedules, Team, API Keys, Audit Log, Settings —
+Finding detail, Reports, Schedules, Team, API Keys, Audit Log, Settings;
 one file each under `src/pages/`, each backed by one or more hooks in
 `src/hooks/queries.ts`.
 
@@ -92,7 +91,7 @@ one file each under `src/pages/`, each backed by one or more hooks in
 `src/lib/api.ts` is the single point of contact with the API: one `request()`
 function attaches the Bearer token, builds query strings, and normalizes
 every non-2xx response into a typed `ApiError` (status, code, message,
-request ID) that pages render directly — the same error surface the API
+request ID) that pages render directly: the same error surface the API
 itself produces, never a generic frontend-invented message. Resource-scoped
 objects (`assetsApi`, `scansApi`, `findingsApi`, ...) wrap `request()` per
 route; `src/hooks/queries.ts` wraps each of those in a TanStack Query hook
@@ -105,7 +104,7 @@ in one place, organized by resource).
 requested target, the caller-selected authorization, a single permitted
 mode (`single_page` or `crawl`), GET/HEAD only, `active_checks: []`. The
 frontend never grants an authenticated-scanning context, an active check,
-or an authorization-comparison plan — those remain operator/API-only
+or an authorization-comparison plan. Those remain operator/API-only
 capabilities this UI does not expose. Every scan the UI can start goes
 through the exact same `/v1/permits` → `/v1/jobs` pair any other API client
 uses; there is no shortcut.
@@ -115,13 +114,13 @@ live (`api.ts`'s `permitsApi.issue`, `hooks/queries.ts`'s
 `useIssuePermitAndSubmitJob`/`useCreateSchedule`): a permit's `not_before`
 must be far enough in the future to still be ahead of the server's clock
 once real network/render latency has elapsed, and the caller's post-issue
-wait before submitting the job must in turn exceed that offset — get either
+wait before submitting the job must in turn exceed that offset. Get either
 one wrong and the API correctly rejects the job as "permit pending" or the
 permit issuance itself as "not_before in the past." This was tuned against
 the real, disposable production stack (§8), not guessed.
 
 `maximum_request_attempts` in the issued permit (10) is also deliberately
-kept under `OwnedTargetLimits`' own default cap (15) — a permit requesting
+kept under `OwnedTargetLimits`' own default cap (15): a permit requesting
 more than its authorization allows is rejected outright, so the UI's
 default must never assume a larger authorization than a real one might
 carry.
@@ -131,13 +130,13 @@ carry.
 `apps/api/src/webguard_api/http_api.py` accepts an explicit
 `allowed_origins` allowlist (`build_handler`/`create_server`), answers
 `OPTIONS` preflights, and echoes `Access-Control-Allow-Origin` only for a
-listed origin — no wildcard, since both `Authorization` and the new
+listed origin, never a wildcard, since both `Authorization` and the new
 `wg_session` cookie are real credentials. `cli.py`'s `serve` command reads
 `WEBGUARD_WEB_ALLOWED_ORIGINS` (comma-separated); nothing is allowed by
 default, so a production deployment must opt an origin in explicitly.
 
 Slice 16 added `Access-Control-Allow-Credentials: true` to both the actual
-response and the `OPTIONS` preflight — required for `fetch(..., {credentials:
+response and the `OPTIONS` preflight, required for `fetch(..., {credentials:
 "include"})` to work cross-origin at all, and only ever paired with a
 reflected, allowlisted origin (never `*`). See
 `docs/security/BROWSER_SESSION_SECURITY.md` §3 for the full cross-origin
@@ -155,47 +154,47 @@ context manager (real HTTP server, real worker thread, one bootstrapped
 organization/owner/token). Slice 17 extended the same pattern to object
 storage and email: `FakeS3Client` and `FakePostmarkTransport` fake only
 the AWS/Postmark network boundary, exactly like the existing
-`FakeKmsClient` does for signing -- the real
+`FakeKmsClient` does for signing: the real
 `ObjectStorageArtifactStore`/`ProductionMailProvider` code paths run
 unmodified against them, so this harness (and everything built on it)
 proves the actual production wiring, not a substitute. Three things
 consume it:
 
-- `scripts/dev/run_local_webguard_api.py` — a manual dev helper that prints
+- `scripts/dev/run_local_webguard_api.py`: a manual dev helper that prints
   a ready-to-use email/password login for exercising the frontend against a genuine
   backend during development.
-- `apps/web/e2e/global-setup.ts` — spawns
+- `apps/web/e2e/global-setup.ts`: spawns
   `tests/integration/webguard_e2e_server.py` (a thin wrapper around the
   harness plus one controlled HTTPS fixture asset) as a subprocess before
   the Playwright suite runs, and publishes its base URL / bootstrapped
   credentials / fixture target URL / a mail-sink file path into
   `process.env` for each spec to read. `apps/web/e2e/mail-sink.ts`
   reads that file to recover the exact verification/reset/invitation
-  link a browser action just caused the server to "send" -- see
+  link a browser action just caused the server to "send". See
   `registration.spec.ts`, `password-reset.spec.ts`, and
   `invitation.spec.ts`, none of which reach around the UI to poke the
   API directly.
-- `tests/integration/test_production_mode_e2e.py` / `test_production_runtime_completion_e2e.py`
-  — the backend's own production E2E proofs, now including a real
+- `tests/integration/test_production_mode_e2e.py` / `test_production_runtime_completion_e2e.py`:
+  the backend's own production E2E proofs, now including a real
   report download against the fake-S3-backed object store with a
   SHA-256 checksum assertion (Slice 17 requirement 15).
 
 The fixture asset intentionally sends no security headers, so a genuine
 *passive* `single_page` scan (the only kind the UI's Start Scan workflow
-ever requests) trips real `webguard-passive` findings — no active checks,
+ever requests) trips real `webguard-passive` findings: no active checks,
 no mocked scanner output. Its `.well-known/webguard-verification.txt`
 responder reads the live pending token straight out of the same process's
 `target_verifications` repository, so ownership verification is exercised
 for real too. The only thing patched is the "resolved address must be
 public" SSRF gate (the same one `test_production_mode_e2e.py` already
-patches) — a loopback fixture standing in for a target that would
+patches), a loopback fixture standing in for a target that would
 otherwise have to be a real public host.
 
 ## 9. What is deliberately not here
 
-- No server-side rendering, no BFF layer — a second backend was explicitly
+- No server-side rendering, no BFF layer: a second backend was explicitly
   out of scope.
 - No client-side routing guard beyond `RequireAuth`; RBAC visibility (hiding
   actions a role cannot perform) is a UX courtesy, never the security
-  boundary — the API remains authoritative and re-checks every request.
+  boundary. The API remains authoritative and re-checks every request.
 - No offline support, no service worker.

@@ -25,7 +25,7 @@ WebGuard does not claim to identify every vulnerability. Its current external sc
 
 ## Current milestone
 
-**Milestone 1.32 — TrustScan runtime safety engine and Safety Receipt v1**
+**Milestone 1.32: TrustScan runtime safety engine and Safety Receipt v1**
 
 The current implementation moves TrustScan enforcement from a pre-execution permit check to the outbound request boundary. Every scanner request is evaluated against the permit-authorised origin, HTTP method, request-attempt budget, request rate, maximum concurrency, current authorisation state, and current permit state immediately before network activity.
 
@@ -193,26 +193,26 @@ Private JSON, audit, Safety Receipt, comparison, and HTML artefacts
 
 ## Repository structure
 
-- `apps/api` — local control-plane API
-- `workers/scanner` — isolated scanner components
-- `packages/contracts` — shared API, scan, finding, and tenancy contracts
-- `infra/compose` — local infrastructure and authorised lab target
-- `docs` — product, architecture, security, roadmap, and ADR documentation
-- `scripts` — local verification and development utilities
-- `tests/unit` — deterministic unit tests
-- `tests/integration` — opt-in authorised integration tests
+- `apps/api`: local control-plane API
+- `workers/scanner`: isolated scanner components
+- `packages/contracts`: shared API, scan, finding, and tenancy contracts
+- `infra/compose`: local infrastructure and authorised lab target
+- `docs`: product, architecture, security, roadmap, and ADR documentation
+- `scripts`: local verification and development utilities
+- `tests/unit`: deterministic unit tests
+- `tests/integration`: opt-in authorised integration tests
 
 Planned components that do not yet exist in the repository are tracked in `docs/ROADMAP.md` rather than listed as current repository structure.
 
 ## Security and governance
 
-- `SECURITY.md` — vulnerability reporting, supported development baseline, and secret-handling expectations
-- `docs/ARCHITECTURE.md` — implemented architecture, persistence, cryptographic uses, and trust boundaries
-- `docs/AUTHORIZATION_MODEL.md` — layered owned-target and TrustScan permission model
-- `docs/DATA_CLASSIFICATION.md` — data sensitivity and handling requirements
-- `docs/THREAT_MODEL.md` — threats, controls, assumptions, and residual risks
-- `docs/ROADMAP.md` — implemented foundation versus planned production capabilities
-- `THIRD_PARTY_NOTICES.md` — directly referenced third-party component inventory
+- `SECURITY.md`: vulnerability reporting, supported development baseline, and secret-handling expectations
+- `docs/ARCHITECTURE.md`: implemented architecture, persistence, cryptographic uses, and trust boundaries
+- `docs/AUTHORIZATION_MODEL.md`: layered owned-target and TrustScan permission model
+- `docs/DATA_CLASSIFICATION.md`: data sensitivity and handling requirements
+- `docs/THREAT_MODEL.md`: threats, controls, assumptions, and residual risks
+- `docs/ROADMAP.md`: implemented foundation versus planned production capabilities
+- `THIRD_PARTY_NOTICES.md`: directly referenced third-party component inventory
 
 ## Requirements
 

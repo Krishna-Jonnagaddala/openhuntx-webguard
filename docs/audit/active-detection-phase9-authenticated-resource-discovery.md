@@ -1,4 +1,4 @@
-# Active Detection — Slice 9: Authenticated Crawl & Authorization Resource Discovery
+# Active Detection, Slice 9: Authenticated Crawl & Authorization Resource Discovery
 
 ## Status
 

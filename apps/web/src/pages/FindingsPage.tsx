@@ -92,7 +92,7 @@ export function FindingsPage() {
                 </Td>
                 <Td className="max-w-48 truncate text-[var(--color-text-secondary)]">{finding.asset}</Td>
                 <Td className="text-[var(--color-text-secondary)]">{finding.endpoint}</Td>
-                <Td className="text-[var(--color-text-secondary)]">{finding.cwe_id ?? "—"}</Td>
+                <Td className="text-[var(--color-text-secondary)]">{finding.cwe_id ?? "-"}</Td>
                 <Td>
                   <StatusBadge status={finding.status} />
                 </Td>

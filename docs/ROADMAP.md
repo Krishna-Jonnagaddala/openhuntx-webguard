@@ -6,11 +6,11 @@ This roadmap separates implemented capability from planned work. Planned items a
 
 ## Platform scope
 
-OpenHuntX WebGuard's end goal is a product with one shared scanner/security engine consumed by three interfaces: a web application (primary customer interface), an API (control plane), a CLI (developer/DevSecOps interface), and eventually a private-network scanning agent. **The scanner is the engine; WebGuard is the platform.** No interface may implement its own scanning or authorization logic — all of them call the same `ScanJobExecutor`, the same TrustScan permit model, the same active-detector registry.
+OpenHuntX WebGuard's end goal is a product with one shared scanner/security engine consumed by three interfaces: a web application (primary customer interface), an API (control plane), a CLI (developer/DevSecOps interface), and eventually a private-network scanning agent. **The scanner is the engine; WebGuard is the platform.** No interface may implement its own scanning or authorization logic: all of them call the same `ScanJobExecutor`, the same TrustScan permit model, the same active-detector registry.
 
-Today, only two of those interfaces exist: the `webguard-api` CLI and its local, loopback-only HTTP API (`apps/api/`). There is no web application, no hosted/multi-instance deployment, no PostgreSQL/Redis, and no enterprise agent. This is a real gap against the platform vision, not a hidden one — see `docs/audit/production-gap-matrix.md` for the full inventory and "Control-plane and runner separation" below for what a hosted control plane requires. Per the project's own stated priority, closing this gap comes *after* the current detection-engine work (candidate discovery, additional detector classes, finding/evidence stabilization), not before it — building a web frontend or a PostgreSQL migration on top of an unstable scanner contract would mean redoing that work later.
+Today, only two of those interfaces exist: the `webguard-api` CLI and its local, loopback-only HTTP API (`apps/api/`). There is no web application, no hosted/multi-instance deployment, no PostgreSQL/Redis, and no enterprise agent. This is a real gap against the platform vision, not a hidden one. See `docs/audit/production-gap-matrix.md` for the full inventory and "Control-plane and runner separation" below for what a hosted control plane requires. Per the project's own stated priority, closing this gap comes *after* the current detection-engine work (candidate discovery, additional detector classes, finding/evidence stabilization), not before it: building a web frontend or a PostgreSQL migration on top of an unstable scanner contract would mean redoing that work later.
 
-## Implemented foundation — through Milestone 1.32
+## Implemented foundation, through Milestone 1.32
 
 The current local engineering foundation includes:
 

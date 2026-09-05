@@ -1,11 +1,11 @@
-# Active Detection — Slice 8: Multi-Identity Authorization Differential Engine + IDOR/BOLA
+# Active Detection, Slice 8: Multi-Identity Authorization Differential Engine + IDOR/BOLA
 
 ## Status
 
 This slice adds one new active detector, `active.authorization.idor`
-(CWE-639, OWASP API Security Top 10 — API1:2023 Broken Object Level
+(CWE-639, OWASP API Security Top 10, API1:2023 Broken Object Level
 Authorization), built as a genuine **authorization comparison engine**
-across two controlled test identities — not a parameter fuzzer, not a
+across two controlled test identities, not a parameter fuzzer, not a
 sequential-ID brute-forcer, and not a reinterpretation of Slice 7's
 single-identity `authentication_context_id` claim. It is the first
 detector in this project confirmed against a live, real-world
@@ -21,24 +21,24 @@ fixture.
 `identifier_value`, `owning_test_identity`, `source`, `content_type`,
 `expected_access`, `owner_marker`. `resource_id` is computed in
 `__post_init__` as a SHA-256 digest of **structural fields only**
-(canonical endpoint, method, identifier location/name/value) — never
+(canonical endpoint, method, identifier location/name/value), never
 response content, mirroring the `candidate_id`/`RequestTemplate`
 fingerprinting pattern already established in Slices 5–6.
 
 `ResourceSource`: `EXPLICIT_TEST_RESOURCE`, `EXPLICIT_FIXTURE`,
-`CREATED_BY_IDENTITY`, `OBSERVED_RESPONSE`, `CONTROLLED_LAB_API` — the
+`CREATED_BY_IDENTITY`, `OBSERVED_RESPONSE`, `CONTROLLED_LAB_API`: the
 requirement that a resource identifier must originate from one of
 these controlled sources is enforced **structurally**, not just in
 documentation: `AuthorizationResource` requires a `source` value from
 this enum at construction, and there is no code path anywhere in this
 module, the detector, or the executor wiring that generates, mutates,
-or enumerates an `identifier_value` — every one is either read
+or enumerates an `identifier_value`: every one is either read
 directly from an operator-supplied `ResourcePairSpec`, or (in the
 Juice Shop investigation below) extracted from an identity's own
 authenticated JWT.
 
-`ResourceOwnership`: `PRIVATE_TO_OWNER`, `SHARED`, `PUBLIC`, `UNKNOWN`
-— the expected-access model requirement 16 calls for. A resource
+`ResourceOwnership`: `PRIVATE_TO_OWNER`, `SHARED`, `PUBLIC`, `UNKNOWN`,
+the expected-access model requirement 16 calls for. A resource
 classified `SHARED` or `PUBLIC` is unreportable by construction (see
 "Confirmation logic" below), independent of what HTTP status either
 identity receives.
@@ -52,38 +52,38 @@ cancellation_check) -> IdorDetectorRunResult`.
 
 For each `AuthorizationResourcePair` (a primary resource + a secondary
 resource, both structurally paired, never generated), issues exactly
-four requests: baseline A→A, baseline B→B, cross A→B, cross B→A — each
+four requests: baseline A→A, baseline B→B, cross A→B, cross B→A, each
 resolved through `apply_authentication()`, Slice 7's one shared
 session/credential-application mechanism. **No detector code in this
 slice constructs an `Authorization`/`Cookie` header directly.**
 
 **Confirmation logic** (`_classify`), five states:
 
-- **INCONCLUSIVE** — either identity's own baseline did not succeed or
+- **INCONCLUSIVE**: either identity's own baseline did not succeed or
   did not return HTTP 200, **or** the resource pair's
   `expected_access` is `SHARED`/`PUBLIC` (checked first, before any
-  other evaluation — a shared resource is never reachable by any
+  other evaluation; a shared resource is never reachable by any
   branch that could produce CONFIRMED or PROBABLE).
-- **ERROR** — the cross-identity request itself failed at the
-  transport level (timeout, connection refused, etc.) — distinct from
+- **ERROR**: the cross-identity request itself failed at the
+  transport level (timeout, connection refused, etc.), distinct from
   a successful HTTP response that happens to deny access.
-- **NOT_VULNERABLE** — cross-identity request returned a non-200
+- **NOT_VULNERABLE**: cross-identity request returned a non-200
   status (403/404/etc.), or returned 200 but its content fingerprint
   does not match the victim's own baseline fingerprint (a generic 200
   page, an unrelated public response) and no marker was configured or
   matched.
-- **CONFIRMED** — cross-identity request returned 200 **and** its
+- **CONFIRMED**: cross-identity request returned 200 **and** its
   content fingerprint exactly matches the victim's own baseline
   fingerprint (SHA-256 of the response body). This is the
   requirement-8 distinction made real in code: the detector does not
   merely observe 200, it establishes that the object returned is
   actually the other identity's controlled resource.
-- **PROBABLE** — reachable **only** when an operator has explicitly
+- **PROBABLE**: reachable **only** when an operator has explicitly
   configured `AuthorizationResource.owner_marker` (default: no marker
   configured) and that exact marker string is present in the
   cross-identity response body, without an exact fingerprint match.
   Never inferred from response length, timing, or any other weak
-  structural coincidence — see "Bugs found and fixed" below for why
+  structural coincidence; see "Bugs found and fixed" below for why
   this exists.
 
 Both directions of every pair are classified independently
@@ -93,7 +93,7 @@ producing its own `IdorComparisonRecord` and, only for
 
 **CWE/OWASP mapping**: every finding this detector produces carries
 exactly `ExternalIdentifier("CWE", "CWE-639")` and
-`ExternalIdentifier("OWASP-API", "API1:2023")`, unconditionally —
+`ExternalIdentifier("OWASP-API", "API1:2023")`, unconditionally.
 `CWE-862` (Missing Authorization) is **never** attached automatically.
 The detector's own evidence establishes a specific object-level bypass
 (a user-controlled key granting access to a specific other identity's
@@ -101,7 +101,7 @@ resource), not a general absence-of-authorization-check condition;
 attaching the broader CWE would overclaim what was actually observed.
 `OWASP-API` is a new identifier namespace for this project (confirmed
 via inspection of `ExternalIdentifier` that `namespace` carries no
-allow-list restriction) — the first non-CWE taxonomy this project's
+allow-list restriction), the first non-CWE taxonomy this project's
 findings use, since Broken Object Level Authorization is an
 API-specific classification with no equally precise single CWE
 equivalent.
@@ -109,7 +109,7 @@ equivalent.
 **Evidence sanitization**: finding evidence (`Evidence(summary=...)`)
 contains only the detector ID/version, scan/authorization/permit IDs,
 the two identity *labels* (never secrets), the expected-vs-observed
-authorization outcome, and the classification outcome — never a
+authorization outcome, and the classification outcome, never a
 bearer token, cookie, password, session ID, or resource content.
 Verified directly (`EvidenceSanitizationTests` in the unit suite, and
 again against a real persisted report in the true end-to-end test).
@@ -118,11 +118,11 @@ again against a real persisted report in the true end-to-end test).
 cost (`len(resource_pairs) * 4`) is checked against
 `policy.maximum_probe_requests` **before any request is issued**,
 raising the existing `ActiveDetectionError("candidate_budget_exceeded",
-...)` — reusing Slice 5/6's error class rather than inventing a new
+...)`, reusing Slice 5/6's error class rather than inventing a new
 one. `cancellation_check`, if supplied, is polled before every
 resource pair; once it returns `True`, no further pairs are compared.
 For this initial implementation, two identities and a bounded,
-operator-supplied resource-pair list are the entire scope — there is
+operator-supplied resource-pair list are the entire scope: there is
 no N×N cross-user comparison, and no code path that would produce one.
 
 ### Identity isolation
@@ -131,35 +131,35 @@ Proven directly (`IdentityIsolationTests`): fetching identity A's own
 baseline never sends identity B's token, and vice versa, by inspecting
 which bearer token was actually attached to which request path in a
 fake connection that records `sent_tokens_by_path`. Context switching
-happens in exactly one place — the two independent
+happens in exactly one place: the two independent
 `apply_authentication()` calls inside `_fetch_resource`, parameterized
 by whichever `AuthenticationMaterial` the caller passed for that
-specific fetch — never by mutating shared state.
+specific fetch, never by mutating shared state.
 
 ### Comparison-plan model and repository (`apps/api/src/webguard_api/authorization_comparison.py`)
 
 **Design decision (requirement 4):** the existing permit architecture
 was inspected first, per the brief's explicit instruction, before
 building anything. Reinterpreting the existing singular
-`authentication_context_id` claim as "a list of two" was rejected —
+`authentication_context_id` claim as "a list of two" was rejected:
 that claim's entire validation path (single `require_bound` call,
 single resolved `AuthenticationMaterial` per scan) is built around
 exactly one identity, and overloading it would either break that path
 or require threading a type-ambiguous value through it. Instead: a new,
 independent, versioned permit claim,
 `authorization_comparison_plan_id`, referencing a new record type
-(`AuthorizationComparisonPlanRecord`) that itself references — never
-embeds — the two `authentication_context_id`s it compares. Two
+(`AuthorizationComparisonPlanRecord`) that itself references, never
+embeds, the two `authentication_context_id`s it compares. Two
 independent signed references, two independent responsibilities,
 exactly the "smallest clean mechanism" the brief asked for.
 
 `AuthorizationComparisonPlanRecord`: `comparison_plan_id`,
 `organization_id`, `target`, `authorization_id`, `primary_context_id`,
 `secondary_context_id`, `permitted_active_check` (always
-`"active.authorization.idor"` — this plan type has exactly one
+`"active.authorization.idor"`, this plan type has exactly one
 purpose), `allowed_http_methods`, `resource_scope` (a tuple of
 `ResourcePairSpec`), `maximum_resources`, `maximum_comparisons`,
-`created_at`, `expires_at`, `revoked_at`. **Contains references only —
+`created_at`, `expires_at`, `revoked_at`. **Contains references only:
 no cookie, password, bearer token, or API key ever appears on this
 record or its `to_public_dict()`.**
 
@@ -171,8 +171,8 @@ merely in documentation:
   `primary_context_id == secondary_context_id`.
 - Non-empty resource scope, and both a resource-pair count bound
   (`MAXIMUM_RESOURCE_PAIRS_PER_PLAN = 10`) and a total-comparison bound
-  (`MAXIMUM_COMPARISONS_PER_PLAN = 20`, i.e. `len(resource_scope) * 2`)
-  — requirement 12's safety budgets, enforced at plan-registration
+  (`MAXIMUM_COMPARISONS_PER_PLAN = 20`, i.e. `len(resource_scope) * 2`),
+  requirement 12's safety budgets, enforced at plan-registration
   time, independent of the detector's own per-run request budget.
 - `expires_at` must be strictly in the future relative to `now`.
 
@@ -181,7 +181,7 @@ Storage is in-memory only, for the same two reasons Slice 7's
 contains secrets, and building a throwaway SQLite schema now would be
 rework given this project's planned PostgreSQL migration sequencing.
 **Known limitation, stated plainly (requirement 20):** this repository
-does not survive across separate OS-process invocations — see "True
+does not survive across separate OS-process invocations; see "True
 end-to-end test" below for how this shaped that test's scope, exactly
 mirroring Slice 7's identical scoping decision for
 `AuthenticationContextRepository`. No raw authentication secret is
@@ -191,7 +191,7 @@ ever written to SQLite to work around this.
 
 Three new owner-only permissions:
 `AUTHORIZATION_COMPARISON_REGISTER`, `AUTHORIZATION_COMPARISON_READ`,
-`AUTHORIZATION_COMPARISON_REVOKE` — excluded from `ADMINISTRATOR`,
+`AUTHORIZATION_COMPARISON_REVOKE`, excluded from `ADMINISTRATOR`,
 alongside the Slice 7 authentication-context permissions and
 `PERMIT_ISSUE_ACTIVE`, on the same reasoning: registering or revoking
 an authorization-comparison plan is at least as sensitive as issuing
@@ -200,14 +200,14 @@ an active-detection-capable permit.
 ### TrustScan permit binding (schema 1.2 → 1.3)
 
 `authorization_comparison_plan_id: str | None = None` added as a new
-signed claim on `TrustScanPermitClaims`/`TrustScanPermitSubmission` —
+signed claim on `TrustScanPermitClaims`/`TrustScanPermitSubmission`:
 a genuine field addition, following the same process
 `docs/audit/trustscan-permit-schema-policy.md` already reserves for
 that: schema version bumped 1.2 → 1.3, replace-in-place, justified by
-the same, re-verified precondition as the 1.0→1.1 and 1.1→1.2 bumps —
+the same, re-verified precondition as the 1.0→1.1 and 1.1→1.2 bumps:
 WebGuard has still never been deployed, so no real persisted 1.2
 permit exists that this could invalidate. `active.authorization.idor`
-was also added to `KNOWN_TRUSTSCAN_ACTIVE_CHECKS`'s vocabulary — a
+was also added to `KNOWN_TRUSTSCAN_ACTIVE_CHECKS`'s vocabulary: a
 widening change, not requiring its own version bump (same precedent as
 Slice 6's `allowed_http_methods` vocabulary growth). Documented in the
 schema policy file itself, not just here.
@@ -217,19 +217,19 @@ schema policy file itself, not just here.
 this claim, then:
 
 1. Calls `authorization_comparison_plans.require_bound(...)` against
-   the submission's own organization/target/authorization — a
+   the submission's own organization/target/authorization: a
    comparison plan registered under a different tenant, target, or
    authorization cannot be bound to this permit, and cannot be bound
    if expired or revoked.
 2. Additionally requires that `comparison_plan.permitted_active_check`
    (always `"active.authorization.idor"`) is present in the
-   submission's own `active_checks` — **referencing a comparison plan
+   submission's own `active_checks`: **referencing a comparison plan
    without also explicitly requesting the check it exists to run is
    rejected** (`authorization_comparison_check_not_requested`), and
    the reverse holds too: requesting `active.authorization.idor`
    without a bound comparison plan means the executor's own
    `_apply_authorization_comparison` no-ops (see below), so the
-   detector never actually runs — the check can be *authorized*
+   detector never actually runs: the check can be *authorized*
    without a plan, but never *executed* without one.
 
 `ScanJobExecutor._apply_authorization_comparison` re-validates the
@@ -241,10 +241,10 @@ was revoked or expired after permit issuance but before the scan ran.
 ### Operator-facing surface
 
 - `POST /v1/authorization-comparisons` (register), `POST
-  /v1/authorization-comparisons/{id}/revoke` — mirror the existing
+  /v1/authorization-comparisons/{id}/revoke`: mirror the existing
   authentication-context HTTP routes exactly (`http_api.py`).
 - `webguard-api permit issue --authorization-comparison-plan-id`
-  (`cli.py`) — the permit-issuance CLI path was extended; a dedicated
+  (`cli.py`): the permit-issuance CLI path was extended; a dedicated
   `authorization-comparison register` CLI subcommand was **not**
   built this slice (see "Known limitations"). Plan registration is
   fully exercised through the real HTTP API in the true end-to-end
@@ -255,13 +255,13 @@ was revoked or expired after permit issuance but before the scan ran.
 
 `_apply_authorization_comparison`: no-ops immediately (returns the
 report unchanged) unless `active.authorization.idor` is in
-`active_checks` **and** a `comparison_plan_id` claim is present — an
+`active_checks` **and** a `comparison_plan_id` claim is present: an
 XSS-only or SQLi-only permit's report is never touched by this
 function, proven directly by the permit-issuance rejection above (such
 a permit cannot legally carry a comparison-plan reference in the first
 place) and by construction (the two guard conditions are checked
 before anything else in the function body). Also no-ops for crawl-mode
-reports (`hasattr(report, "pages")`) — deferred, see "Known
+reports (`hasattr(report, "pages")`), deferred, see "Known
 limitations." Resolves both contexts' secret material and identity
 labels through the same `AuthenticationContextRepository` Slice 7
 introduced, builds `AuthorizationResourcePair`s from the plan's
@@ -276,13 +276,13 @@ report.
    `cross_primary_to_secondary.response_length ==
    baseline_secondary.response_length` when fingerprints didn't match
    exactly, to assign PROBABLE. A deliberately constructed test
-   scenario — a real 35-byte order JSON body versus a completely
-   unrelated 35-byte generic HTML page — triggered a false PROBABLE
+   scenario (a real 35-byte order JSON body versus a completely
+   unrelated 35-byte generic HTML page) triggered a false PROBABLE
    finding purely from the coincidental byte-length match, directly
    violating "generic HTTP 200 alone must not be sufficient" (caught
    by `test_generic_200_response_is_not_a_finding`). **Fixed** by
    removing the length-based fallback entirely and replacing it with
-   the explicit, opt-in `owner_marker` mechanism described above —
+   the explicit, opt-in `owner_marker` mechanism described above.
    PROBABLE is now unreachable by any inferred structural coincidence.
 2. **Baseline HTTP failure (not just transport failure) fell through
    to NOT_VULNERABLE instead of INCONCLUSIVE.** The original
@@ -298,7 +298,7 @@ report.
    evaluation.
 
 Both bugs were caught by tests written as part of this slice's own
-test-development process, before any commit — not found afterward or
+test-development process, before any commit, not found afterward or
 reported by a user.
 
 ## False-positive controls (requirement 15)
@@ -354,7 +354,7 @@ for the empty-list, XSS-only, and SQLi-only cases).
 rebinding a signed permit's `authorization_comparison_plan_id` claim
 to a different value (here, `None`) without re-signing invalidates the
 Ed25519 signature exactly like tampering with any other claim already
-does — the claim is fully covered by the existing signature, not a
+does: the claim is fully covered by the existing signature, not a
 side-channel value.
 
 ### Secrets absent from errors, reports, and audit (requirement 17)
@@ -364,10 +364,10 @@ token, revokes its context, and asserts the resulting
 `ApiServiceError.message` never contains it. The true end-to-end test
 below independently verifies both test accounts' real bearer tokens
 are absent from the entire persisted report text after a genuine
-finding was produced — the strongest form of this check, since it
+finding was produced, the strongest form of this check, since it
 inspects the actual artifact an operator would read. Audit calls
 throughout `service.py`'s new methods pass only structural
-`detail_code` strings (e.g. `resource_pairs_3`) — no code path threads
+`detail_code` strings (e.g. `resource_pairs_3`); no code path threads
 a resource_scope value or secret into an audit call.
 
 ## Controlled vulnerable fixture (requirement 14)
@@ -376,23 +376,23 @@ A purpose-built `ThreadingHTTPServer`-based HTTPS fixture
 (`tests/integration/test_idor_authorization_e2e_lab.py`) with two
 bearer-token identities (`user-a`, `user-b`) and:
 
-- `GET /api/orders/{id}` — **secure**: ownership is actually checked;
+- `GET /api/orders/{id}`, **secure**: ownership is actually checked;
   returns the real order body only when the requesting identity owns
   it, `403` otherwise, `404` for a nonexistent order.
-- `GET /api/orders-vuln/{id}` — **deliberately vulnerable**: identical
+- `GET /api/orders-vuln/{id}`, **deliberately vulnerable**: identical
   underlying data, but any authenticated identity receives the real
-  content regardless of ownership — no ownership check at all.
-- `GET /api/shared/team-document` — a resource intentionally
+  content regardless of ownership, no ownership check at all.
+- `GET /api/shared/team-document`: a resource intentionally
   accessible by both identities, configured with
   `expected_access=SHARED` in the comparison plan's `resource_scope`.
-- `GET /api/public/info` — unauthenticated, identical for everyone
+- `GET /api/public/info`: unauthenticated, identical for everyone
   (not exercised by the comparison plan itself, but present as a
   reachable false-positive control for the fixture's own consistency).
 
 Proven directly against this fixture (see the true end-to-end test
 below): the secure endpoint never produces a finding; the vulnerable
 endpoint produces a genuine CONFIRMED/CWE-639 finding in both
-directions (A can read B's real order, and B can read A's real order —
+directions (A can read B's real order, and B can read A's real order,
 the fixture's vulnerability is symmetric by construction); the shared
 endpoint never produces a finding despite both identities legitimately
 receiving 200.
@@ -422,13 +422,13 @@ register authentication-context B [real HTTP]
 `AuthorizationComparisonPlanRepository` are in-memory only, this test
 constructs `WebGuardJobService`/`ScanJobExecutor`/`ScanJobWorker`
 directly and shares one instance of each repository between the
-service and the executor — exactly Slice 7's identical scoping
+service and the executor, exactly Slice 7's identical scoping
 decision for its own authenticated-scanning E2E test, applied here for
 the same reason. Every step that references either repository (context
 registration ×2, comparison-plan registration, permit issuance with
 the comparison claim, job submission, result retrieval) goes over
 **real HTTP against a real socket**, through the real
-`create_server`/`ScanJobWorker` objects — only the process boundary is
+`create_server`/`ScanJobWorker` objects; only the process boundary is
 collapsed, not the transport.
 
 Result: exactly one CONFIRMED finding is produced per direction on the
@@ -441,20 +441,20 @@ full persisted report text.
 ## Juice Shop investigation (requirement 21)
 
 Unlike Slices 1, 4, and 6's reflected-XSS and SQL-injection
-detectors — each of which found **no reachable surface** on Juice
+detectors, each of which found **no reachable surface** on Juice
 Shop for their respective methodologies (Angular SPA, no
-server-rendered forms) — this detector's methodology (compare
+server-rendered forms), this detector's methodology (compare
 GET-accessible, per-user object responses across two identities) maps
 directly onto a real, well-known, publicly documented Juice Shop
 weakness: **viewing another user's shopping basket by ID.**
 
 Two lab accounts were created using **only** Juice Shop's own
 documented `POST /api/Users` registration endpoint and
-`POST /rest/user/login` login endpoint — no enumeration, no
+`POST /rest/user/login` login endpoint: no enumeration, no
 brute-force, no privilege escalation, and no data alteration of any
 kind. Each account's own shopping-basket ID (the JWT's `bid` claim)
 was obtained **only from that account's own authenticated login
-response** — never guessed, generated, or enumerated — matching the
+response**, never guessed, generated, or enumerated, matching the
 brief's "controlled lab API response" resource-identifier source
 exactly.
 
@@ -462,23 +462,23 @@ Manual verification (read-only GETs only) confirmed: account A's own
 basket (`GET /rest/basket/{A's own bid}` with A's token) returns 200
 with A's real basket; account B's own basket likewise; **account A's
 token against B's basket ID, and account B's token against A's basket
-ID, both return 200 with the other account's real basket content** —
+ID, both return 200 with the other account's real basket content**,
 a genuine, live, reachable authorization bypass.
 
 `tests/integration/test_idor_authorization_juice_shop_lab.py` then ran
 the actual, unmodified `run_idor_authorization_detector` function
 against this live target over a real HTTP connection, using each
 identity's real bearer token. **Result: CONFIRMED, CWE-639, exactly as
-manual verification predicted** — the detector's own content-
+manual verification predicted**: the detector's own content-
 fingerprint-based classification (not a weakened or Juice-Shop-specific
-code path — the identical function used against the synthetic fixture
+code path, the identical function used against the synthetic fixture
 and in the unit tests) independently reproduced the same conclusion a
 human tester would reach manually. The detector was not altered in any
 way to force this result; it was pointed at a real target with a real,
 independently-verifiable vulnerability and it worked.
 
 This is a materially different, and stronger, result than every prior
-slice's Juice Shop investigation could report — recorded here
+slice's Juice Shop investigation could report, recorded here
 honestly, and not overclaimed as evidence the detector is
 "generally accurate": one confirmed true positive against one known
 vulnerability on one application says the classification logic *can*
@@ -504,7 +504,7 @@ against arbitrary real applications has been measured.
   `"authorization_comparison_plan_id": None` added, the same kind of
   additive, non-weakening fix Slice 7 itself needed when *its* new
   field was introduced. No other pre-existing test file needed
-  modification for the schema bump — the CLI's own `_permit_issue_command`
+  modification for the schema bump. The CLI's own `_permit_issue_command`
   was fixed once, at the source, during development.
 - Every pre-existing authentication, attack-surface, request-template,
   XSS, SQLi, permit, RBAC, executor, `safe_http`, crawler, and
@@ -513,7 +513,7 @@ against arbitrary real applications has been measured.
 - Security gates: secret scan (278 repository files / 6 generated
   artifacts / 601 reachable Git blobs), static analysis (`ruff --select
   S`, zero findings), dependency audit (6 locked packages, no
-  advisories) — all passing, no fixes needed this slice.
+  advisories), all passing, no fixes needed this slice.
 - `git diff --check`: clean.
 
 ## Implemented / Tested / Proven / Not Proven / Identity Model / Resource Model / Authorization Differential / False-Positive Controls / Safety Boundaries / CWE/OWASP Mapping / Known Limitations / Test Counts / Security Gates / GitHub Commit / Remote Sync / Next Slice
@@ -553,34 +553,34 @@ resource is never reported despite both identities receiving 200; the
 same unmodified detector function independently reproduces a real,
 publicly known Juice Shop broken-access-control vulnerability
 (viewing another user's basket) using resource identifiers obtained
-only from each account's own authenticated session — the first
+only from each account's own authenticated session, the first
 detector in this project validated against a live application rather
 than only a synthetic fixture.
 
 **Not Proven:** authenticated crawl-mode IDOR scanning (this slice
-covers single-page scans only — crawl-mode reports pass through
+covers single-page scans only; crawl-mode reports pass through
 `_apply_authorization_comparison` unchanged, deferred exactly as
 Slices 5–6 deferred site-level discovery expansion in crawl mode);
 write-level (POST/PUT/DELETE) authorization testing (explicitly out of
-scope per the brief — read-only GET/idempotent methods only this
+scope per the brief: read-only GET/idempotent methods only this
 slice); a dedicated `authorization-comparison register` CLI
 subcommand (the HTTP route and service method exist and are fully
 tested; only the CLI convenience wrapper is missing); cross-process
 persistence of comparison plans (in-memory only, by design, same
 limitation as Slice 7's authentication contexts); PROBABLE-tier
 detection against a real application (the marker mechanism was only
-exercised against the synthetic fixture in unit tests — Juice Shop's
+exercised against the synthetic fixture in unit tests; Juice Shop's
 basket vulnerability was strong enough to hit CONFIRMED directly, so
 the marker path was not separately live-validated).
 
 **Identity model:** exactly two, explicitly registered, distinct
-`AuthenticationContext`s per comparison plan — reusing Slice 7's model
+`AuthenticationContext`s per comparison plan, reusing Slice 7's model
 unchanged, referenced by ID from a new, independent plan record. No
 N-identity generalization was built or attempted this slice, per the
 brief's own explicit scope limit.
 
 **Resource model:** `AuthorizationResource`, structurally fingerprinted
-(SHA-256 of endpoint/method/identifier-location/name/value — never
+(SHA-256 of endpoint/method/identifier-location/name/value, never
 content), sourced exclusively from one of five controlled origins
 (`ResourceSource`), carrying an explicit expected-access classification
 (`ResourceOwnership`: private/shared/public/unknown) that gates
@@ -590,7 +590,7 @@ reportability independent of observed HTTP status.
 across both identities and both directions per resource pair;
 classification requires an exact content-fingerprint match to the
 victim's own baseline for CONFIRMED, or an explicit, operator-configured
-marker match for PROBABLE — a bare HTTP 200, or any weaker structural
+marker match for PROBABLE: a bare HTTP 200, or any weaker structural
 coincidence (response length was tried and rejected), is never
 sufficient.
 
@@ -607,7 +607,7 @@ before every resource pair; double binding validation (plan and both
 contexts) at both permit-issuance and execution time; signature
 coverage over the new claim verified by a tampering test; secrets
 verified absent from errors, the persisted report, and (implicitly, by
-construction — no secret is ever passed to an audit call) the audit
+construction: no secret is ever passed to an audit call) the audit
 trail.
 
 **CWE/OWASP mapping:** `CWE-639` (Authorization Bypass Through
@@ -617,13 +617,13 @@ project's first non-CWE identifier namespace; `CWE-862` deliberately
 never attached automatically. `docs/CWE_COVERAGE.md` updated
 accordingly.
 
-**Known limitations:** see "Not Proven" — restated here as
+**Known limitations:** see "Not Proven", restated here as
 forward-looking scope: authenticated crawl-mode IDOR, write-level
 authorization testing, a CLI registration subcommand, cross-process
 plan persistence, and live PROBABLE-tier validation are the concrete
 next steps if this capability needs to grow further.
 
-**Test counts:** 1318 unit, 33 integration — all passing.
+**Test counts:** 1318 unit, 33 integration, all passing.
 
 **Security gates:** secret scan, static analysis, dependency audit,
 and `git diff --check` all clean, no fixes needed this slice.

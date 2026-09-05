@@ -125,7 +125,7 @@ function EmailVerificationCard({ email, verifiedAt }: { email: string | null; ve
     <Card className="p-4">
       <h2 className="mb-2 text-sm font-semibold text-[var(--color-text-primary)]">Email verification</h2>
       <p className="mb-2 text-sm text-[var(--color-text-secondary)]">
-        {email} — <StatusBadge status={verifiedAt ? "verified" : "pending"} />
+        {email} <StatusBadge status={verifiedAt ? "verified" : "pending"} />
       </p>
       {!verifiedAt ? (
         <>
@@ -173,7 +173,7 @@ export function SettingsPage() {
     <div>
       <PageHeader
         title="Settings"
-        description="Only genuine, currently-backed settings are shown. There is no notification-preference or scan-default configuration screen this release — see the API contract doc."
+        description="Only genuine, currently-backed settings are shown. There is no notification-preference or scan-default configuration screen this release; see the API contract doc."
       />
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card className="p-4">

@@ -1,4 +1,4 @@
-# TrustScan Permit Schema — Versioning & Backward-Compatibility Policy
+# TrustScan Permit Schema: Versioning & Backward-Compatibility Policy
 
 ## Status
 
@@ -6,15 +6,15 @@ Current schema: **1.3**. This document must be read and followed before any real
 
 ## What changed in 1.3
 
-Schema 1.2 → 1.3 added exactly one signed claim: `authorization_comparison_plan_id: str | None` (`None` by default). This binds a signed permit to a specific, separately-stored `AuthorizationComparisonPlan` (Slice 8), which itself references exactly two already-registered authentication contexts to compare -- never their secret material, and never the two context IDs directly on the permit. This is a deliberately *separate* claim from `authentication_context_id`, not a reinterpretation of it: a single-identity authenticated scan and a two-identity authorization-comparison (IDOR/BOLA) scan are different capabilities with different safety bounds, independently authorized by independent claims. Same replace-in-place treatment as 1.0 → 1.1 and 1.1 → 1.2, for the identical, re-verified reason: WebGuard has still never been deployed as a publicly hosted production service, so there is no real, persisted 1.2 permit this change could invalidate. See `docs/audit/active-detection-phase8-idor-bola.md` for the full rationale, including why the existing singular `authentication_context_id` claim was deliberately *not* reused or overloaded for this.
+Schema 1.2 → 1.3 added exactly one signed claim: `authorization_comparison_plan_id: str | None` (`None` by default). This binds a signed permit to a specific, separately-stored `AuthorizationComparisonPlan` (Slice 8), which itself references exactly two already-registered authentication contexts to compare, never their secret material, and never the two context IDs directly on the permit. This is a deliberately *separate* claim from `authentication_context_id`, not a reinterpretation of it: a single-identity authenticated scan and a two-identity authorization-comparison (IDOR/BOLA) scan are different capabilities with different safety bounds, independently authorized by independent claims. Same replace-in-place treatment as 1.0 → 1.1 and 1.1 → 1.2, for the identical, re-verified reason: WebGuard has still never been deployed as a publicly hosted production service, so there is no real, persisted 1.2 permit this change could invalidate. See `docs/audit/active-detection-phase8-idor-bola.md` for the full rationale, including why the existing singular `authentication_context_id` claim was deliberately *not* reused or overloaded for this.
 
-Also new in this slice: `"active.authorization.idor"` was added to `KNOWN_TRUSTSCAN_ACTIVE_CHECKS` -- an additive vocabulary extension (the same class of change as Slice 4's `active.sqli.error` and Slice 6's `allowed_http_methods` POST addition), not a schema-shape change, so it alone would not have required a version bump.
+Also new in this slice: `"active.authorization.idor"` was added to `KNOWN_TRUSTSCAN_ACTIVE_CHECKS`: an additive vocabulary extension (the same class of change as Slice 4's `active.sqli.error` and Slice 6's `allowed_http_methods` POST addition), not a schema-shape change, so it alone would not have required a version bump.
 
 ## What changed in 1.2
 
-Schema 1.1 → 1.2 added exactly one signed claim: `authentication_context_id: str | None` (`None` by default). This binds a signed permit to a specific, separately-stored authentication context (Slice 7) -- never the secret material itself, only its ID. Same replace-in-place treatment as 1.0 → 1.1, for the identical, re-verified reason: WebGuard has still never been deployed as a publicly hosted production service, so there is no real, persisted 1.1 permit this change could invalidate. See `docs/audit/active-detection-phase7-authenticated-scanning.md` for the full rationale.
+Schema 1.1 → 1.2 added exactly one signed claim: `authentication_context_id: str | None` (`None` by default). This binds a signed permit to a specific, separately-stored authentication context (Slice 7), never the secret material itself, only its ID. Same replace-in-place treatment as 1.0 → 1.1, for the identical, re-verified reason: WebGuard has still never been deployed as a publicly hosted production service, so there is no real, persisted 1.1 permit this change could invalidate. See `docs/audit/active-detection-phase7-authenticated-scanning.md` for the full rationale.
 
-Note: `TRUSTSCAN_ALLOWED_HTTP_METHODS` widening to include `POST` (Slice 6) did *not* require a schema bump -- that was an additive vocabulary extension to an existing field's accepted values, not a wire-shape change. Adding a new signed claim, as `authentication_context_id` does, is the kind of change this policy exists to gate.
+Note: `TRUSTSCAN_ALLOWED_HTTP_METHODS` widening to include `POST` (Slice 6) did *not* require a schema bump: that was an additive vocabulary extension to an existing field's accepted values, not a wire-shape change. Adding a new signed claim, as `authentication_context_id` does, is the kind of change this policy exists to gate.
 
 ## What changed in 1.1
 
@@ -22,24 +22,24 @@ Schema 1.0 → 1.1 added exactly one signed claim: `active_checks: tuple[str, ..
 
 ## Why 1.1 replaced 1.0 outright (and why that must not happen again casually)
 
-`load_signed_trustscan_permit_json` and `load_trustscan_permit_submission_json` (`packages/contracts/python/src/webguard_contracts/scan_permits.py`) both use `_strict_mapping`, which requires an **exact** field set — there is no concept of an optional wire field, and no version-conditional parsing. Consequently, when 1.1 added `active_checks`, the only two options were:
+`load_signed_trustscan_permit_json` and `load_trustscan_permit_submission_json` (`packages/contracts/python/src/webguard_contracts/scan_permits.py`) both use `_strict_mapping`, which requires an **exact** field set: there is no concept of an optional wire field, and no version-conditional parsing. Consequently, when 1.1 added `active_checks`, the only two options were:
 
-1. Make every permit document (old and new) satisfy the same, expanded required-field set — i.e., stop supporting 1.0 documents at all, or
+1. Make every permit document (old and new) satisfy the same, expanded required-field set (i.e., stop supporting 1.0 documents at all), or
 2. Build a version-aware loader that requires different field sets depending on `schema_version`.
 
-This project took option (1): `CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION` moved from `"1.0"` to `"1.1"`, and `SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS` was changed from `("1.0",)` to `("1.1",)` — 1.0 is no longer loadable at all.
+This project took option (1): `CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION` moved from `"1.0"` to `"1.1"`, and `SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS` was changed from `("1.0",)` to `("1.1",)`: 1.0 is no longer loadable at all.
 
 **This was only acceptable because it is true, verified, and stated here explicitly: WebGuard has never been deployed as a publicly hosted production service** (README: "Private commercial product under active development... not yet a publicly hosted production service"). There is no real, deployed 1.0 permit anywhere that this change could invalidate. This was a deliberate, reviewed engineering decision for a pre-production system, not an oversight, and it is recorded here so a future contributor does not repeat it by accident once that assumption stops being true.
 
 ## The policy going forward
 
-**Before WebGuard is deployed anywhere a real, persisted permit could outlive a code deployment** (i.e., before "real production deployment" in the sense the Definition of Done documents require), the next schema change to `TrustScanPermitClaims` — whatever it is — **must not** repeat the 1.0→1.1 replace-in-place approach. Instead it must do one of:
+**Before WebGuard is deployed anywhere a real, persisted permit could outlive a code deployment** (i.e., before "real production deployment" in the sense the Definition of Done documents require), the next schema change to `TrustScanPermitClaims` (whatever it is) **must not** repeat the 1.0→1.1 replace-in-place approach. Instead it must do one of:
 
 - **Build a version-aware loader.** `load_signed_trustscan_permit_json` would need to branch its required-field set (and corresponding `TrustScanPermitClaims` construction) on `schema_version`, so both the old and new schema can be read. `SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS` would list both versions during the transition.
-- **Or provide an explicit, tested migration** that re-signs every persisted permit under the new schema at deploy time (only possible because the signing key is available at deploy time; it is not possible to "migrate" a permit after the fact without re-signing it, since any claims change invalidates the existing signature — see the tampering test in `test_active_checks_permit_control.py` for exactly why).
+- **Or provide an explicit, tested migration** that re-signs every persisted permit under the new schema at deploy time (only possible because the signing key is available at deploy time; it is not possible to "migrate" a permit after the fact without re-signing it, since any claims change invalidates the existing signature; see the tampering test in `test_active_checks_permit_control.py` for exactly why).
 - **Or, at minimum, explicitly accept and document** that old permits become unloadable/unusable after the upgrade, with a plan for what happens to any permit that was `active`/`pending` at cutover (does it need to be reissued? does the operator need advance notice?). Silent breakage is not acceptable once real permits exist.
 
-Whichever approach is chosen, it must be decided *before* the schema changes, not discovered afterward — this document exists specifically so that decision isn't skipped.
+Whichever approach is chosen, it must be decided *before* the schema changes, not discovered afterward. This document exists specifically so that decision isn't skipped.
 
 ## What does NOT require a schema bump
 
@@ -47,6 +47,6 @@ Nothing else in the permit contract has non-versioned wire flexibility either (s
 
 ## Verification that this policy is currently satisfied
 
-- `CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.3"`, `SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.3",)` — single supported version, consistent, no partial support gap.
+- `CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.3"`, `SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.3",)`: single supported version, consistent, no partial support gap.
 - No persisted 1.0, 1.1, or 1.2 permits exist in this repository's test fixtures, lab environment, or (to the best of this audit's knowledge) anywhere else, since the product has never been deployed.
-- The safety-receipt contract (`TrustScanSafetyReceiptClaims`, schema `"1.0"`, unchanged this slice) was deliberately **not** touched, since its existing fields already account for active-probe activity without needing new ones (see the orchestration audit doc) — so this policy does not currently apply to it, but would under the identical reasoning if it ever needs a field added.
+- The safety-receipt contract (`TrustScanSafetyReceiptClaims`, schema `"1.0"`, unchanged this slice) was deliberately **not** touched, since its existing fields already account for active-probe activity without needing new ones (see the orchestration audit doc), so this policy does not currently apply to it, but would under the identical reasoning if it ever needs a field added.

@@ -7,7 +7,7 @@ import { ApiError } from "../lib/api";
 const STATUS_OPTIONS = ["queued", "running", "completed", "completed_with_errors", "failed", "cancelled"];
 
 function duration(started: string | null, completed: string | null): string {
-  if (!started) return "—";
+  if (!started) return "-";
   const end = completed ? new Date(completed).getTime() : Date.now();
   const seconds = Math.max(0, Math.round((end - new Date(started).getTime()) / 1000));
   if (seconds < 60) return `${seconds}s`;
@@ -71,7 +71,7 @@ export function ScansPage() {
                 </Td>
                 <Td className="text-[var(--color-text-secondary)]">{scan.finding_count}</Td>
                 <Td className="text-[var(--color-text-secondary)]">
-                  {scan.started_at ? new Date(scan.started_at).toLocaleString() : "—"}
+                  {scan.started_at ? new Date(scan.started_at).toLocaleString() : "-"}
                 </Td>
                 <Td className="text-[var(--color-text-secondary)]">{duration(scan.started_at, scan.completed_at)}</Td>
               </tr>

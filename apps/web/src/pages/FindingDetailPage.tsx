@@ -62,13 +62,13 @@ export function FindingDetailPage() {
             <dt className="text-[var(--color-text-secondary)]">Confidence</dt>
             <dd className="text-[var(--color-text-primary)] capitalize">{finding.confidence}</dd>
             <dt className="text-[var(--color-text-secondary)]">CWE</dt>
-            <dd className="text-[var(--color-text-primary)]">{finding.cwe_id ?? "—"}</dd>
+            <dd className="text-[var(--color-text-primary)]">{finding.cwe_id ?? "-"}</dd>
             <dt className="text-[var(--color-text-secondary)]">OWASP</dt>
-            <dd className="text-[var(--color-text-primary)]">{finding.owasp_category ?? "—"}</dd>
+            <dd className="text-[var(--color-text-primary)]">{finding.owasp_category ?? "-"}</dd>
             <dt className="text-[var(--color-text-secondary)]">Method</dt>
             <dd className="text-[var(--color-text-primary)]">{finding.http_method}</dd>
             <dt className="text-[var(--color-text-secondary)]">Parameter</dt>
-            <dd className="text-[var(--color-text-primary)]">{finding.parameter ?? "—"}</dd>
+            <dd className="text-[var(--color-text-primary)]">{finding.parameter ?? "-"}</dd>
             <dt className="text-[var(--color-text-secondary)]">First seen</dt>
             <dd className="text-[var(--color-text-primary)]">{new Date(finding.first_seen_at).toLocaleString()}</dd>
             <dt className="text-[var(--color-text-secondary)]">Last seen</dt>

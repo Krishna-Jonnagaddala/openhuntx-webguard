@@ -151,7 +151,7 @@ export function TeamPage() {
                     {isSelf ? <span className="ml-1 text-xs text-[var(--color-text-tertiary)]">(you)</span> : null}
                   </Td>
                   <Td className="text-[var(--color-text-secondary)]">
-                    {member.email ?? "—"}
+                    {member.email ?? "-"}
                     {member.email && !member.email_verified_at ? (
                       <span className="ml-1">
                         <StatusBadge status="pending" />

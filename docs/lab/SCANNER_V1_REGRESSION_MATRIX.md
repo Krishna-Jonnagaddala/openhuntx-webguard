@@ -18,10 +18,10 @@ Fixtures: purpose-built `ThreadingHTTPServer` handlers per analyzer, in each ana
 | Insecure/missing cookie flags | `web.cookies.*` (7 families) |
 | Permissive CORS | `web.cors.*` (5 families) |
 | Server/framework version disclosure | `web.disclosure.*` (6 families) |
-| Directory listing, mixed content, password over HTTP, sensitive HTML comments | `web.html.*` (9 families, one — `meta_refresh` — with no CWE tag) |
+| Directory listing, mixed content, password over HTTP, sensitive HTML comments | `web.html.*` (9 families, one of which, `meta_refresh`, carries no CWE tag) |
 | TLS certificate/chain/cipher/protocol weaknesses | `web.tls.*` (7 families) |
 
-**Executed checks**: all `DEFAULT_PASSIVE_ANALYZERS`, every scan. **Skipped checks**: TLS checks skip cleanly for HTTP-only targets (`test_tls_analyzer_lab.py::test_http_juice_shop_skips_https_only_tls_checks`) — recorded as skipped-with-reason, not silently absent. **Unsupported**: none within this fixture's own scope.
+**Executed checks**: all `DEFAULT_PASSIVE_ANALYZERS`, every scan. **Skipped checks**: TLS checks skip cleanly for HTTP-only targets (`test_tls_analyzer_lab.py::test_http_juice_shop_skips_https_only_tls_checks`), recorded as skipped-with-reason, not silently absent. **Unsupported**: none within this fixture's own scope.
 
 ## 2. Reflected-XSS fixture
 
@@ -40,20 +40,20 @@ Fixture: `tests/integration/test_active_checks_e2e_lab.py`'s `_ReflectedXssFixtu
 
 ## 3. SQLi fixture
 
-Fixture: `tests/integration/test_sqli_error_detector_live.py` — real in-memory SQLite behind 8 routes across 3 transports (GET/POST-form/JSON) × (vulnerable/safe) + `/broken` (generic 500) + `/about` (static database-shaped text).
+Fixture: `tests/integration/test_sqli_error_detector_live.py`, real in-memory SQLite behind 8 routes across 3 transports (GET/POST-form/JSON) × (vulnerable/safe) + `/broken` (generic 500) + `/about` (static database-shaped text).
 
 | Route | Expected outcome |
 |---|---|
 | `/vulnerable*` (all 3 transports) | CONFIRMED, CWE-89 |
 | `/safe*` (all 3 transports, parameterized query) | No finding |
 | `/broken` (generic 500, no SQL involved) | INCONCLUSIVE, no finding |
-| `/about` (static text mentioning a DB error phrase, unconditionally) | INCONCLUSIVE, no finding — the same phrase appears whether or not the probe was sent |
+| `/about` (static text mentioning a DB error phrase, unconditionally) | INCONCLUSIVE, no finding (the same phrase appears whether or not the probe was sent) |
 
-**Executed**: `active.sqli.error` only. **Skipped**: XSS/IDOR/SSRF. **Unsupported**: boolean-blind/time-based/UNION/data-extraction techniques — no code path exists for any of them.
+**Executed**: `active.sqli.error` only. **Skipped**: XSS/IDOR/SSRF. **Unsupported**: boolean-blind/time-based/UNION/data-extraction techniques: no code path exists for any of them.
 
 ## 4. Authenticated fixture
 
-Fixture: `tests/integration/test_authenticated_scanning_e2e_lab.py` — two identities, `/public`, `/account` (login-gated), `/api/profile?q=` (authenticated-only reflection point), `/login`, `/logout`.
+Fixture: `tests/integration/test_authenticated_scanning_e2e_lab.py`, two identities, `/public`, `/account` (login-gated), `/api/profile?q=` (authenticated-only reflection point), `/login`, `/logout`.
 
 | Scenario | Expected outcome |
 |---|---|
@@ -67,14 +67,14 @@ Fixture: `tests/integration/test_authenticated_scanning_e2e_lab.py` — two iden
 
 ## 5. IDOR fixture
 
-Fixtures: `tests/integration/test_idor_authorization_e2e_lab.py` (explicit resource_scope) and `tests/integration/test_authenticated_resource_discovery_e2e_lab.py` (discovery-based) — two identities, secure `/documents/{id}` (ownership-checked), vulnerable `/orders/{id}` (no ownership check), `/shared/team-doc`, `/public/info`, an out-of-scope external link, a duplicate resource reference, `/account/expired`.
+Fixtures: `tests/integration/test_idor_authorization_e2e_lab.py` (explicit resource_scope) and `tests/integration/test_authenticated_resource_discovery_e2e_lab.py` (discovery-based), two identities, secure `/documents/{id}` (ownership-checked), vulnerable `/orders/{id}` (no ownership check), `/shared/team-doc`, `/public/info`, an out-of-scope external link, a duplicate resource reference, `/account/expired`.
 
 | Route/scenario | Expected outcome |
 |---|---|
 | `/orders/{own-id}` (baseline, either identity) | 200, own content |
-| `/orders/{other-identity's-id}` (cross-access) | CONFIRMED, CWE-639 + OWASP-API API1:2023 — the vulnerable endpoint |
-| `/documents/{other-identity's-id}` (cross-access) | 403, no finding — the secure endpoint |
-| `/shared/team-doc` (both identities) | No finding — identical value for both, excluded by the distinct-identifier-value eligibility rule alone |
+| `/orders/{other-identity's-id}` (cross-access) | CONFIRMED, CWE-639 + OWASP-API API1:2023 (the vulnerable endpoint) |
+| `/documents/{other-identity's-id}` (cross-access) | 403, no finding (the secure endpoint) |
+| `/shared/team-doc` (both identities) | No finding (identical value for both, excluded by the distinct-identifier-value eligibility rule alone) |
 | `/public/info` | No finding (public, unauthenticated) |
 | Out-of-scope external link in authenticated HTML | Never becomes a resource (rejected twice: crawler never follows it; discovery independently re-checks origin) |
 | Duplicate resource reference on one page | Deduplicated by structural resource ID, not double-reported |
@@ -84,27 +84,27 @@ Fixtures: `tests/integration/test_idor_authorization_e2e_lab.py` (explicit resou
 
 ## 6. SSRF callback fixture
 
-Fixture: `tests/integration/test_ssrf_callback_detector_live.py` / `test_ssrf_callback_e2e_lab.py` — `/fetch-vulnerable` (real outbound fetch), `/fetch-safe`, `/reflect-only`, `/validation-error`, `/generic-500`.
+Fixture: `tests/integration/test_ssrf_callback_detector_live.py` / `test_ssrf_callback_e2e_lab.py`, `/fetch-vulnerable` (real outbound fetch), `/fetch-safe`, `/reflect-only`, `/validation-error`, `/generic-500`.
 
 | Route | Expected outcome |
 |---|---|
-| `/fetch-vulnerable` | CONFIRMED, CWE-918 + OWASP A10:2021 — real callback observed over a real socket |
-| `/fetch-safe` | No finding — accepts the URL, never fetches |
-| `/reflect-only` | No finding — echoes the URL, never fetches (the core false-positive control) |
-| `/validation-error` | No finding — 400, never fetches |
-| `/generic-500` | No finding — 500, never fetches |
+| `/fetch-vulnerable` | CONFIRMED, CWE-918 + OWASP A10:2021 (real callback observed over a real socket) |
+| `/fetch-safe` | No finding (accepts the URL, never fetches) |
+| `/reflect-only` | No finding (echoes the URL, never fetches; the core false-positive control) |
+| `/validation-error` | No finding (400, never fetches) |
+| `/generic-500` | No finding (500, never fetches) |
 
-**Executed**: `active.ssrf.callback` only, proven independently not authorized by passive/XSS-only/SQLi-only permits against this identical fixture. **Skipped**: IDOR-only (not separately re-run through the full pipeline — the gate is structurally identical to the XSS/SQLi cases already proven; see `docs/audit/active-detection-phase10-ssrf-callback.md`). **Unsupported**: internal-network destinations (structurally impossible), blind/timing-based SSRF, a public callback service.
+**Executed**: `active.ssrf.callback` only, proven independently not authorized by passive/XSS-only/SQLi-only permits against this identical fixture. **Skipped**: IDOR-only (not separately re-run through the full pipeline: the gate is structurally identical to the XSS/SQLi cases already proven; see `docs/audit/active-detection-phase10-ssrf-callback.md`). **Unsupported**: internal-network destinations (structurally impossible), blind/timing-based SSRF, a public callback service.
 
 ## 7. OWASP Juice Shop (real-world lab target)
 
-Investigated across Slices 1, 4, 6, 8, 9, 10 — using only Juice Shop's own documented registration/login endpoints, never enumeration/brute-force/privilege-escalation/data-alteration.
+Investigated across Slices 1, 4, 6, 8, 9, 10, using only Juice Shop's own documented registration/login endpoints, never enumeration/brute-force/privilege-escalation/data-alteration.
 
 | Detection class | Result | Why |
 |---|---|---|
-| Reflected XSS | No compatible surface found | Angular SPA — the documented reflected/DOM-XSS challenge renders client-side; no server-side raw-HTML reflection point exists for this detector's methodology |
+| Reflected XSS | No compatible surface found | Angular SPA: the documented reflected/DOM-XSS challenge renders client-side; no server-side raw-HTML reflection point exists for this detector's methodology |
 | SQL injection | No compatible surface found | The real login-bypass challenge is a silent boolean/auth-bypass, not an error condition, and is a POST-JSON endpoint with no discoverable server-rendered form |
 | IDOR/BOLA | **CONFIRMED against the real basket-access weakness** | Both via direct JWT-payload inspection (Slice 8) and via legitimate discovery from the login response's own `bid` field (Slice 9) |
 | SSRF | No compatible surface confirmed | The real profile-image-URL-fetch feature exists and does perform a server-side fetch, but Juice Shop's own SSRF-challenge protection blocks this project's local-only (non-public) callback destination; testing past that boundary would require either internal-network probing (forbidden by design) or production callback infrastructure (out of scope this slice) |
 
-Juice Shop is the only target where this project has ever confirmed a genuine finding against a real, independently-known vulnerability rather than a fixture this project built and controls — a materially stronger validation signal than any synthetic fixture alone, precisely because two of the four active detectors found nothing there (an honestly-reported absence, not a detector failure).
+Juice Shop is the only target where this project has ever confirmed a genuine finding against a real, independently-known vulnerability rather than a fixture this project built and controls. That is a materially stronger validation signal than any synthetic fixture alone, precisely because two of the four active detectors found nothing there (an honestly-reported absence, not a detector failure).
