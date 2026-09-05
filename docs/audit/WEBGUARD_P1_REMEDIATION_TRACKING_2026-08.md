@@ -35,7 +35,9 @@ post-audit findings are discovered during that work.
 
 **CLOSED BASELINE P1: P1-4.** P1-4 was the baseline audit's process health/readiness gap — no liveness or readiness signal for `api`/`worker`/`scheduler`/`callback-service`/`signing-service`, so an operator (or an orchestrator) had no way to detect a stalled process or a lost database dependency short of watching for silence. Closed by the P1-B2 batch below.
 
-**CURRENT OPEN BASELINE P1: 6** (P1-1, P1-2, P1-6 through P1-9 — P1-5, P1-3, and P1-4 closed, as above).
+**CLOSED BASELINE P1: P1-1.** P1-1 was the baseline audit's repository-level tenant-isolation gap (line 290 of the baseline audit): `authentication_contexts`, `authorization_comparison_plans`, and `browser_sessions` had zero tenant/principal enforcement at the SQL/repository layer, with correctness depending entirely on `service.py` checking first. Closed by the P1-C1 batch below.
+
+**CURRENT OPEN BASELINE P1: 5** (P1-2, P1-6 through P1-9; P1-1, P1-3, P1-4, and P1-5 closed, as above).
 
 ### P1-3 — Structured logging / operational log stream
 
@@ -153,6 +155,68 @@ Reuses P1-B1's `log_event`/`configure_structured_logging` directly — no second
 3. LOCAL-DEVELOPMENT UX LIMITATION (P1-3) — unchanged, non-security.
 4. P1-12-R1 remains functionally open — health makes it observable, does not close it.
 5. Four new loopback-only listening sockets (worker/scheduler/callback/signing, when run standalone) — more surface even at zero-auth-zero-secret-body; a deliberate, reviewed trade-off, not an oversight.
+
+### P1-1: Repository-level tenant isolation
+
+**Remediation commit**: `fa94d7c` (*fix(tenancy): enforce repository-level tenant isolation*).
+
+**STATUS: CLOSED.**
+
+#### ORIGINAL WEAKNESS
+
+Repository authorization was mostly tenant-aware already: most reads and writes carried an atomic `WHERE ... AND organization_id = %s` predicate. But several secondary-resource and mutation paths still depended on the caller (almost always `service.py`) having already validated tenant ownership, rather than the repository method enforcing it independently. That is a defense-in-depth gap, not evidence that an arbitrary client-supplied `organization_id` was ever trusted by the HTTP layer: nothing found here was reachable by sending a forged tenant ID over the wire. The risk was a missing second layer, not a broken first one.
+
+Confirmed live, by direct code reading and real-Postgres reproduction, not assumed from the baseline audit's language alone:
+
+- `revoke_session` took no ownership parameter at all. Any authenticated principal who obtained another principal's `session_id` could revoke that session.
+- `authentication_contexts.get_metadata`/`revoke` and `authorization_comparison.get`/`revoke` fetched a record by ID first, then compared `organization_id` in Python. The one caller-facing HTTP endpoint using each pair (`revoke_authentication_context`, `revoke_authorization_comparison_plan`) did its own service-layer check before calling them, but the repository methods themselves had no independent backstop.
+- `postgres_jobs.py`'s `get_scoped`, the primary tenant-facing job lookup used by nearly every job-reading endpoint, ran two separate unscoped queries and compared the result in Python rather than a single atomically-scoped query.
+- `get_scan_permit_scoped` had the identical two-step shape.
+- `job_permits`, `job_safety_receipts`, and `schedule_permits` carry no `organization_id` column of their own (they are pure ID-to-ID binding tables). `service.py`'s enrichment lookups (`_public`, `_schedule_public`, the job-result endpoint) called the fully unscoped versions of these lookups directly, relying only on already having fetched an org-scoped parent record first.
+- `update_principal_role`/`set_principal_active` did call `get_principal_scoped` internally before mutating, so this one was never a bare service-layer-only check, but the `UPDATE` statement's own predicate didn't repeat `organization_id`. Correct only because `organization_id` is never mutated on `principals`, not because the write was self-scoped.
+
+#### FIX
+
+Every one of the above now enforces tenant ownership atomically inside the repository's own SQL predicate, in both backends (PostgreSQL and the SQLite/in-memory equivalents):
+
+- `revoke_session(session_id, *, principal_id, now)`: `UPDATE browser_sessions SET revoked_at = %s WHERE session_id = %s AND principal_id = %s AND revoked_at IS NULL`. A wrong-principal call is a silent no-op, identical to revoking a session that never existed.
+- New `get_metadata_scoped`/`revoke_scoped` (authentication contexts) and `get_scoped`/`revoke_scoped` (authorization comparison plans), each a single atomically-scoped query. `service.py`'s two HTTP-facing revoke endpoints now call these instead of the unscoped pair. The original unscoped `get_metadata`/`revoke`/`get`/`revoke` methods stay, used only internally (`create()`'s own post-insert fetch, `require_bound()`'s defense-in-depth mismatch check against an already-trusted reference), never by a caller-supplied ID from an HTTP request.
+- `postgres_jobs.py::get_scoped` and `get_scan_permit_scoped` are now single atomically-scoped queries.
+- New `get_job_permit_binding_scoped`, `get_schedule_permit_binding_scoped` (joining to `scan_jobs`/`job_scopes` and `scan_schedules`, the authoritative organization relations, since the binding tables themselves have no organization column). `service.py`'s enrichment paths now use these exclusively. The unscoped originals remain, used only by the worker's own idempotency/re-validation checks (`executor.py`) and the scheduler's own due-schedule loop (`scheduler.py`), both already operating on a job or schedule they hold through a system, not a customer, path.
+- `get_job_safety_receipt` (unscoped) had no remaining caller anywhere once its one service-facing use moved to `get_job_safety_receipt_scoped`, and was removed outright, from both backends and the `JobRepository` protocol, rather than kept around for symmetry. Its five test callers were migrated to the scoped method.
+- `update_principal_role`/`set_principal_active`: the `UPDATE` predicate now carries `organization_id` directly (`WHERE principal_id = %s AND organization_id = %s`) in both backends, so the mutation is self-scoped and doesn't rely on a separate preceding call or on `organization_id` staying immutable forever.
+
+`organization_id_for_job(job_id)` was investigated as a possible sixth case (a bare `job_id` lookup returning tenant data) and an early pass in this batch misclassified it as dead code. It is not: it's wired into `ScanJobExecutor` as `organization_resolver` in both the production (`production_startup.py`) and CLI (`cli.py`) executor-construction paths, and determines whether report/audit/safety-receipt artifacts are written under a per-organization path or a flat one. It is called only by the worker on a job it is actively executing, never with a caller-supplied ID, and was left unchanged. The methodology gap that produced the original misclassification (grepping for `method_name(` rather than also checking for the method passed as a bare callback reference) was then used to re-check every other method in scope; nothing else was affected.
+
+#### FINAL UNSCOPED-METHOD AUDIT
+
+Every repository method that takes a bare resource ID without `organization_id`/`principal_id` in its own signature was classified into one of: system control-plane (lease-fenced worker/scheduler operations, or a demonstrated non-customer caller like the two permit-binding lookups above), token-capability (the callback token or an identity/reset token is itself the authorization), global identity (principal/organization self-lookups, called only with a server-derived ID), operator-only (the CLI's own `revoke_token`, run with direct database trust, not an `AuthContext`), or test-harness-only (a parallel, non-lease-fenced job-lifecycle API used by over thirty unit test files, never referenced by `service.py`). Zero methods remained classified as reachable from a customer/tenant-facing path without independent scoping.
+
+#### CI
+
+The real-Postgres tenant-isolation suite (`tests/integration/test_postgres_tenant_isolation_slice13.py`, extended from 7 to 14 test methods) and the session-repository suite (`tests/integration/test_postgres_sessions.py`) were never actually executed by CI before this batch: the `authorised-lab-integration` job never set `WEBGUARD_POSTGRES_TEST_DSN`, and `postgresql-integration` only ran `tests/contract` plus one explicitly named module. Both are now named explicitly in the `postgresql-integration` job's test step, which already carries the required environment variables.
+
+A broader gap remains and is intentionally not fixed here: `postgresql-integration` still does not run several other real-Postgres/real-subprocess suites (`test_postgres_worker_outage_resilience.py`, `test_postgres_scheduler_outage_resilience.py`, `test_postgres_worker_crash_recovery.py`, `test_callback_service_outage_resilience.py`, and the production E2E family) in CI itself, though all of them pass locally (see VERIFICATION EVIDENCE below). That is a separate, larger CI-coverage question, not a P1-1 blocker.
+
+#### VERIFICATION EVIDENCE
+
+- Backend unit: **1777/1777 pass**.
+- Backend contract (fresh disposable Postgres): **59/59 pass**.
+- Tenant-isolation and session suites, real Postgres: **23/23 pass**, including new cross-tenant coverage for every fix above (reads and mutations, wrong-tenant always fails exactly like a nonexistent resource, never a distinguishable existence oracle, correct-tenant access still succeeds immediately afterward).
+- P1-10 worker outage suite, real Postgres, dedicated disposable container: **14/14 pass**.
+- P1-11 scheduler outage suite, same container, run serially after P1-10: **19/19 pass**.
+- P1-12 callback outage suite, same container, run serially after P1-11: **7/7 pass**.
+- Full backend integration (fresh disposable Postgres and Juice Shop, broad discovery): **132 discovered, 92 executed, 92 passed, 40 skipped, 0 failed, 0 errors**. The 40 skips are exactly the three outage suites above, gated on the disposable-container environment variables they don't have when run inside the broad discovery pass, not a broader gap; all three were separately run to completion above.
+- Secret scan / Ruff `--select S` / dependency audit / `git diff --check`: all **PASS**.
+- `.github/workflows/ci.yml`'s new lines parsed and confirmed with Ruby's `Psych` (a real YAML parser, not a visual read) to sit inside the correct job and inherit `WEBGUARD_RUN_INTEGRATION`/`WEBGUARD_POSTGRES_TEST_DSN`.
+
+#### REMAINING LIMITATIONS
+
+1. Callback registration cross-org behavior (`postgres_callback_service.py`) was confirmed correct by code reading (an existing, already-atomic `WHERE token_value = %s AND organization_id = %s` predicate); it did not get a new dedicated cross-tenant test in this batch, since it was not itself a fix.
+2. The non-leased `claim_next`/`fail`/`finish_result`/`cancel_running` test-harness API family is real and heavily used, but undocumented at its own definition site as intentionally test-only; a future reader could mistake it for a live gap the way this batch's own audit initially did.
+3. The broader CI-coverage gap named above (several real-Postgres/subprocess suites not merge-gating) remains open.
+
+This closes P1-1 only. It does not close P1-2: nothing here is database-enforced. It remains application-selected SQL, now provably correct at every reachable entry point and continuously re-verified by CI going forward, exactly as it was before, just with the second layer P1-2 (row-level security) would add still not built.
 
 ## POST-AUDIT P1 FINDING
 
@@ -507,8 +571,8 @@ Production SSRF evidence preserved from this remediation's E2E proofs:
 ## CURRENT P1 ACCOUNTING
 
 - BASELINE P1 AT AUDIT: 9 (P1-1 through P1-9 — immutable historical count, never altered)
-- CLOSED BASELINE P1: P1-3, P1-4, P1-5 (see BASELINE P1 FINDINGS above)
-- CURRENT OPEN BASELINE P1: 6 (P1-1, P1-2, P1-6, P1-7, P1-8, P1-9)
+- CLOSED BASELINE P1: P1-1, P1-3, P1-4, P1-5 (see BASELINE P1 FINDINGS above)
+- CURRENT OPEN BASELINE P1: 5 (P1-2, P1-6, P1-7, P1-8, P1-9)
 - CLOSED POST-AUDIT: P1-10, P1-11
 - PARTIAL / OPEN POST-AUDIT: P1-12 (P1-12-R1 sustained-outage residual open within it — not a separate finding ID; operationally observable via `callback_observation_persistence_exhausted` and, since P1-B2, via `readiness_failed`, not functionally solved)
-- CURRENT OPEN P1 TOTAL: 7
+- CURRENT OPEN P1 TOTAL: 6
