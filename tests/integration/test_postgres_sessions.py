@@ -97,6 +97,41 @@ class PostgresSessionRepositoryTests(unittest.TestCase):
     def test_get_session_returns_none_for_unknown_id(self) -> None:
         self.assertIsNone(self.sessions.get_session("00000000-0000-0000-0000-000000000000"))
 
+    def test_revoke_session_by_another_principal_is_a_silent_no_op(self) -> None:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        ``revoke_session`` used to accept only ``session_id``, with no
+        ownership check at all -- any authenticated principal could
+        revoke any other principal's session by guessing/observing its
+        ID. It is now scoped to ``session_id AND principal_id`` in one
+        atomic SQL predicate. A wrong-principal revoke attempt must be
+        indistinguishable from revoking a nonexistent session: no
+        exception, and the real session stays fully usable."""
+
+        now = datetime.now(timezone.utc)
+        victim_session = self.sessions.create_session(self.principal_id, self.organization_id, now=now)
+        attacker = self.identity.create_principal(
+            self.organization_id, "Attacker", principal_type=PrincipalType.USER,
+            role=OrganizationRole.VIEWER, now=now,
+        )
+
+        # Silent no-op: no exception, identical to revoking an unknown ID.
+        self.sessions.revoke_session(
+            victim_session.record.session_id, principal_id=attacker.principal_id, now=now
+        )
+
+        # The victim's session must still be fully usable.
+        record = self.sessions.authenticate_session(victim_session.session_token, now=now)
+        self.assertIsNone(record.revoked_at)
+
+        # The legitimate owner can still revoke their own session.
+        self.sessions.revoke_session(
+            victim_session.record.session_id, principal_id=self.principal_id, now=now
+        )
+        from webguard_api.identity import IdentityStoreError
+
+        with self.assertRaises(IdentityStoreError):
+            self.sessions.authenticate_session(victim_session.session_token, now=now)
+
     def test_list_sessions_for_principal_only_returns_that_principals_sessions(self) -> None:
         now = datetime.now(timezone.utc)
         other_owner = self.identity.create_principal(

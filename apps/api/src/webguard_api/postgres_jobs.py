@@ -192,10 +192,26 @@ class PostgresJobRepository:
     def get_scan_permit_scoped(
         self, permit_id: str, organization_id: str
     ) -> PersistedTrustScanPermit:
-        record = self.get_scan_permit(permit_id)
-        if record.permit.claims.organization_id != organization_id:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        atomically scoped by ``organization_id`` in the SQL predicate
+        itself, not a two-step unscoped fetch plus Python-level compare
+        -- ``permit_id`` reaches this method directly from a caller-
+        supplied HTTP path parameter (see ``service.py``'s
+        ``_permit_record``)."""
+
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT permit_id, organization_id, authorization_id, authorization_sha256,
+                       target, issued_by, issued_at, not_before, expires_at, permit_sha256,
+                       signing_key_id, document_json, revoked_at, revoked_by
+                FROM scan_permits WHERE permit_id = %s AND organization_id = %s
+                """,
+                (permit_id, organization_id),
+            ).fetchone()
+        if row is None:
             raise JobStoreError("trustscan_permit_not_found", "TrustScan permit was not found.")
-        return record
+        return self._permit_from_row(row)
 
     def revoke_scan_permit_scoped(
         self, permit_id: str, organization_id: str, *, revoked_by: str, now: datetime
@@ -220,10 +236,38 @@ class PostgresJobRepository:
         return self.get_scan_permit(permit_id)
 
     def get_job_permit_binding(self, job_id: str) -> tuple[str, str] | None:
+        """Unscoped -- retained for internal/system callers that already
+        hold an independently-verified ``job_id`` (see
+        ``get_job_permit_binding_scoped`` for the customer/service-facing
+        equivalent, which is what ``service.py`` must use)."""
+
         with self._pool.connection() as connection:
             row = connection.execute(
                 "SELECT permit_id, permit_sha256 FROM job_permits WHERE job_id = %s",
                 (job_id,),
+            ).fetchone()
+        return None if row is None else (str(row[0]), row[1])
+
+    def get_job_permit_binding_scoped(
+        self, job_id: str, organization_id: str
+    ) -> tuple[str, str] | None:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        ``job_permits`` carries no ``organization_id`` column of its own
+        (it is a pure ``job_id -> permit_id`` binding table), so tenant
+        scope can only be proven by joining to ``scan_jobs`` -- the
+        authoritative job/organization relation -- inside this one
+        query, rather than trusting that whatever record the caller
+        already fetched actually corresponds to this same job_id."""
+
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT binding.permit_id, binding.permit_sha256
+                FROM job_permits AS binding
+                JOIN scan_jobs AS jobs ON jobs.job_id = binding.job_id
+                WHERE binding.job_id = %s AND jobs.organization_id = %s
+                """,
+                (job_id, organization_id),
             ).fetchone()
         return None if row is None else (str(row[0]), row[1])
 
@@ -252,6 +296,11 @@ class PostgresJobRepository:
     def get_schedule_permit_binding(self, schedule_id: str) -> tuple[str, str] | None:
         return self._schedules.get_schedule_permit_binding(schedule_id)
 
+    def get_schedule_permit_binding_scoped(
+        self, schedule_id: str, organization_id: str
+    ) -> tuple[str, str] | None:
+        return self._schedules.get_schedule_permit_binding_scoped(schedule_id, organization_id)
+
     def list_due_schedules(self, *args, **kwargs):
         return self._schedules.list_due_schedules(*args, **kwargs)
 
@@ -261,11 +310,22 @@ class PostgresJobRepository:
     def block_due_schedule(self, *args, **kwargs):
         return self._schedules.block_due_schedule(*args, **kwargs)
 
-    def get_job_safety_receipt(self, job_id: str) -> tuple[str, str] | None:
+    def get_job_safety_receipt_scoped(
+        self, job_id: str, organization_id: str
+    ) -> tuple[str, str] | None:
+        """P1-C1: ``job_safety_receipts`` carries no ``organization_id``
+        column of its own -- mirrors ``get_job_permit_binding_scoped``'s
+        join-to-``scan_jobs`` rationale exactly."""
+
         with self._pool.connection() as connection:
             row = connection.execute(
-                "SELECT receipt_ref, receipt_sha256 FROM job_safety_receipts WHERE job_id = %s",
-                (job_id,),
+                """
+                SELECT receipt.receipt_ref, receipt.receipt_sha256
+                FROM job_safety_receipts AS receipt
+                JOIN scan_jobs AS jobs ON jobs.job_id = receipt.job_id
+                WHERE receipt.job_id = %s AND jobs.organization_id = %s
+                """,
+                (job_id, organization_id),
             ).fetchone()
         return None if row is None else (row[0], row[1])
 
@@ -449,11 +509,23 @@ class PostgresJobRepository:
         return str(row[0]), str(row[1])
 
     def get_scoped(self, job_id: str, organization_id: str) -> ScanJobRecord:
-        record = self.get(job_id)
-        scope = self.get_scope(job_id)
-        if scope is None or scope[0] != organization_id:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        atomically scoped by ``organization_id`` in the SQL predicate
+        itself, not two separate unscoped fetches plus a Python-level
+        compare -- this is the primary tenant-facing job lookup
+        (``service.py`` calls it directly with a caller-supplied
+        ``job_id``, and every ``_scoped`` mutation below it, e.g.
+        ``request_cancellation_scoped``, relies on it failing closed)."""
+
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                f"SELECT {self._RECORD_COLUMNS} FROM scan_jobs "  # noqa: S608
+                "WHERE job_id = %s AND organization_id = %s",
+                (job_id, organization_id),
+            ).fetchone()
+        if row is None:
             raise JobStoreError("job_not_found", "Scan job was not found.")
-        return record
+        return self._record_from_row(row)
 
     def organization_id_for_job(self, job_id: str) -> str | None:
         scope = self.get_scope(job_id)

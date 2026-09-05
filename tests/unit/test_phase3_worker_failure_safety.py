@@ -123,7 +123,7 @@ class Phase3WorkerFailureSafetyTests(unittest.TestCase):
             persisted.error_message or "",
         )
         self.assertIsNone(
-            self.store.get_job_safety_receipt(record.job_id)
+            self.store.get_job_safety_receipt_scoped(record.job_id, ORG_ID)
         )
 
     def test_controlled_execution_error_preserves_code_and_receipt_metadata(
@@ -163,7 +163,7 @@ class Phase3WorkerFailureSafetyTests(unittest.TestCase):
             "trustscan_runtime_circuit_open",
         )
         self.assertEqual(
-            self.store.get_job_safety_receipt(record.job_id),
+            self.store.get_job_safety_receipt_scoped(record.job_id, ORG_ID),
             (
                 receipt_ref,
                 receipt_sha256,
@@ -243,7 +243,7 @@ class Phase3WorkerFailureSafetyTests(unittest.TestCase):
         self.assertTrue(persisted.cancellation_requested)
         self.assertIsNone(persisted.error_code)
         self.assertIsNone(
-            self.store.get_job_safety_receipt(record.job_id)
+            self.store.get_job_safety_receipt_scoped(record.job_id, ORG_ID)
         )
 
     def test_lease_loss_during_execution_prevents_stale_success_commit(

@@ -231,10 +231,21 @@ class PostgresIdentityRepository:
     def update_principal_role(
         self, principal_id: str, *, organization_id: str, role: OrganizationRole, now: datetime
     ) -> Principal:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        ``get_principal_scoped`` already fails closed before this method
+        ever reaches the mutation, and ``organization_id`` is never
+        updated anywhere on ``principals`` (immutable post-creation, like
+        ``scan_jobs.organization_id``), so there was never a TOCTOU
+        window in practice -- but the ``UPDATE`` predicate itself now
+        also carries ``organization_id`` directly, so this mutation is
+        atomically self-scoped and does not rely on a separate
+        preceding call or on that invariant holding forever."""
+
         principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
         with self._pool.connection() as connection:
             connection.execute(
-                "UPDATE principals SET role = %s WHERE principal_id = %s", (role.value, principal_id)
+                "UPDATE principals SET role = %s WHERE principal_id = %s AND organization_id = %s",
+                (role.value, principal_id, organization_id),
             )
         return Principal(
             principal_id=principal.principal_id,
@@ -252,10 +263,14 @@ class PostgresIdentityRepository:
     def set_principal_active(
         self, principal_id: str, *, organization_id: str, active: bool, now: datetime
     ) -> Principal:
+        """P1-C1: mirrors ``update_principal_role``'s atomic-mutation
+        fix -- see that method's docstring."""
+
         principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
         with self._pool.connection() as connection:
             connection.execute(
-                "UPDATE principals SET active = %s WHERE principal_id = %s", (active, principal_id)
+                "UPDATE principals SET active = %s WHERE principal_id = %s AND organization_id = %s",
+                (active, principal_id, organization_id),
             )
         return Principal(
             principal_id=principal.principal_id,

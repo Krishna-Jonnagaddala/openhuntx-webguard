@@ -279,12 +279,14 @@ class CustomerAuthTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "session_expired")
 
     def test_revoked_session_is_rejected(self) -> None:
-        _, jar, _ = self.register("revoked-directly@x.example")
+        _, jar, register_payload = self.register("revoked-directly@x.example")
         status, _, session_payload = self.request(
             "GET", "/v1/auth/session", headers={"Cookie": f"wg_session={jar['wg_session']}"}
         )
         self.assertEqual(status, 200)
-        self.sessions.revoke_session(session_payload["token_id"], now=NOW)
+        self.sessions.revoke_session(
+            session_payload["token_id"], principal_id=register_payload["principal_id"], now=NOW
+        )
         status, _, payload = self.request(
             "GET", "/v1/auth/session", headers={"Cookie": f"wg_session={jar['wg_session']}"}
         )

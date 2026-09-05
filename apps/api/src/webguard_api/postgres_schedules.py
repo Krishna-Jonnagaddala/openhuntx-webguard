@@ -307,10 +307,35 @@ class PostgresScheduleRepository:
         )
 
     def get_schedule_permit_binding(self, schedule_id: str) -> tuple[str, str] | None:
+        """Unscoped -- retained for internal/system callers; see
+        ``get_schedule_permit_binding_scoped`` for the customer/
+        service-facing equivalent."""
+
         with self._pool.connection() as connection:
             row = connection.execute(
                 "SELECT permit_id, permit_sha256 FROM schedule_permits WHERE schedule_id = %s",
                 (schedule_id,),
+            ).fetchone()
+        return None if row is None else (str(row[0]), row[1])
+
+    def get_schedule_permit_binding_scoped(
+        self, schedule_id: str, organization_id: str
+    ) -> tuple[str, str] | None:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        ``schedule_permits`` carries no ``organization_id`` column of its
+        own, so tenant scope is proven by joining to ``scan_schedules``
+        -- the authoritative schedule/organization relation -- inside
+        this one query."""
+
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT binding.permit_id, binding.permit_sha256
+                FROM schedule_permits AS binding
+                JOIN scan_schedules AS schedules ON schedules.schedule_id = binding.schedule_id
+                WHERE binding.schedule_id = %s AND schedules.organization_id = %s
+                """,
+                (schedule_id, organization_id),
             ).fetchone()
         return None if row is None else (str(row[0]), row[1])
 

@@ -174,10 +174,13 @@ class InMemorySessionRepository:
             state = self._sessions.get(session_id)
             return None if state is None else state.record
 
-    def revoke_session(self, session_id: str, *, now: datetime) -> None:
+    def revoke_session(self, session_id: str, *, principal_id: str, now: datetime) -> None:
+        """P1-C1: mirrors PostgresSessionRepository.revoke_session's own
+        ownership scope exactly -- see that method's docstring."""
+
         with self._lock:
             state = self._sessions.get(session_id)
-            if state is None or state.record.revoked_at is not None:
+            if state is None or state.record.principal_id != principal_id or state.record.revoked_at is not None:
                 return
             record = state.record
             state.record = BrowserSessionRecord(
@@ -206,7 +209,7 @@ class InMemorySessionRepository:
                 and sid != except_session_id
             ]
         for sid in targets:
-            self.revoke_session(sid, now=now)
+            self.revoke_session(sid, principal_id=principal_id, now=now)
         return len(targets)
 
     def list_sessions_for_principal(self, principal_id: str) -> tuple[BrowserSessionRecord, ...]:

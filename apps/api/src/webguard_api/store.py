@@ -957,13 +957,29 @@ class ScanJobStore:
     def get_scan_permit_scoped(
         self, permit_id: str, organization_id: str
     ) -> PersistedTrustScanPermit:
-        record = self.get_scan_permit(permit_id)
-        if record.permit.claims.organization_id != organization_id:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        mirrors ``PostgresJobRepository.get_scan_permit_scoped``'s own
+        atomic-scoping fix -- see that method's docstring."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM scan_permits WHERE permit_id = ? AND organization_id = ?",
+                (permit_id, organization_id),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "trustscan_permit_read_failed",
+                "Unable to read the TrustScan permit.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
             raise JobStoreError(
                 "trustscan_permit_not_found",
                 "TrustScan permit was not found.",
             )
-        return record
+        return self._permit_from_row(row)
 
     def revoke_scan_permit_scoped(
         self,
@@ -1020,6 +1036,11 @@ class ScanJobStore:
             connection.close()
 
     def get_job_permit_binding(self, job_id: str) -> tuple[str, str] | None:
+        """Unscoped -- retained for internal/system callers that already
+        hold an independently-verified ``job_id`` (see
+        ``get_job_permit_binding_scoped`` for the customer/service-facing
+        equivalent, which is what ``service.py`` must use)."""
+
         connection = self._connect()
         try:
             row = connection.execute(
@@ -1037,12 +1058,54 @@ class ScanJobStore:
             return None
         return row["permit_id"], row["permit_sha256"]
 
-    def get_job_safety_receipt(self, job_id: str) -> tuple[str, str] | None:
+    def get_job_permit_binding_scoped(
+        self, job_id: str, organization_id: str
+    ) -> tuple[str, str] | None:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        mirrors ``PostgresJobRepository.get_job_permit_binding_scoped``
+        exactly -- ``job_permits`` has no ``organization_id`` of its own,
+        so tenant scope is proven by joining to ``job_scopes`` (the
+        authoritative job/organization relation in this backend) inside
+        one query."""
+
         connection = self._connect()
         try:
             row = connection.execute(
-                "SELECT receipt_ref, receipt_sha256 FROM job_safety_receipts WHERE job_id = ?",
-                (job_id,),
+                """
+                SELECT binding.permit_id, binding.permit_sha256
+                FROM job_permits AS binding
+                JOIN job_scopes AS scope ON scope.job_id = binding.job_id
+                WHERE binding.job_id = ? AND scope.organization_id = ?
+                """,
+                (job_id, organization_id),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "trustscan_job_binding_read_failed",
+                "Unable to read TrustScan job permit binding.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return row["permit_id"], row["permit_sha256"]
+
+    def get_job_safety_receipt_scoped(
+        self, job_id: str, organization_id: str
+    ) -> tuple[str, str] | None:
+        """P1-C1: mirrors ``get_job_permit_binding_scoped``'s
+        join-to-``job_scopes`` rationale exactly."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT receipt.receipt_ref, receipt.receipt_sha256
+                FROM job_safety_receipts AS receipt
+                JOIN job_scopes AS scope ON scope.job_id = receipt.job_id
+                WHERE receipt.job_id = ? AND scope.organization_id = ?
+                """,
+                (job_id, organization_id),
             ).fetchone()
         except sqlite3.Error as exc:
             raise JobStoreError("job_store_read_failed", "Unable to read TrustScan safety-receipt metadata.") from exc
@@ -1053,11 +1116,45 @@ class ScanJobStore:
         return row["receipt_ref"], row["receipt_sha256"]
 
     def get_schedule_permit_binding(self, schedule_id: str) -> tuple[str, str] | None:
+        """Unscoped -- retained for internal/system callers; see
+        ``get_schedule_permit_binding_scoped`` for the customer/
+        service-facing equivalent."""
+
         connection = self._connect()
         try:
             row = connection.execute(
                 "SELECT permit_id, permit_sha256 FROM schedule_permits WHERE schedule_id = ?",
                 (schedule_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "trustscan_schedule_binding_read_failed",
+                "Unable to read TrustScan schedule permit binding.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return row["permit_id"], row["permit_sha256"]
+
+    def get_schedule_permit_binding_scoped(
+        self, schedule_id: str, organization_id: str
+    ) -> tuple[str, str] | None:
+        """P1-C1: ``schedule_permits`` has no ``organization_id`` of its
+        own -- tenant scope is proven by joining to ``scan_schedules``
+        (which carries ``organization_id`` directly in this backend,
+        unlike jobs) inside one query."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT binding.permit_id, binding.permit_sha256
+                FROM schedule_permits AS binding
+                JOIN scan_schedules AS schedules ON schedules.schedule_id = binding.schedule_id
+                WHERE binding.schedule_id = ? AND schedules.organization_id = ?
+                """,
+                (schedule_id, organization_id),
             ).fetchone()
         except sqlite3.Error as exc:
             raise JobStoreError(
@@ -1444,11 +1541,35 @@ class ScanJobStore:
         return row["organization_id"], row["submitted_by"]
 
     def get_scoped(self, job_id: str, organization_id: str) -> ScanJobRecord:
-        record = self.get(job_id)
-        scope = self.get_scope(job_id)
-        if scope is None or scope[0] != organization_id:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        atomically scoped by ``organization_id`` via the same
+        ``scan_jobs``/``job_scopes`` join ``list_jobs_scoped_page``
+        already uses, not two separate unscoped fetches plus a
+        Python-level compare -- this is the primary tenant-facing job
+        lookup (``service.py`` calls it directly with a caller-supplied
+        ``job_id``, and every ``_scoped`` mutation below it, e.g.
+        ``request_cancellation_scoped``, relies on it failing closed)."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT jobs.* FROM scan_jobs AS jobs
+                JOIN job_scopes AS scope ON scope.job_id = jobs.job_id
+                WHERE jobs.job_id = ? AND scope.organization_id = ?
+                """,
+                (job_id, organization_id),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "job_store_read_failed",
+                "Unable to read scan-job metadata.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
             raise JobStoreError("job_not_found", "Scan job was not found.")
-        return record
+        return self._record_from_row(row)
 
     def list_jobs_scoped_page(
         self,

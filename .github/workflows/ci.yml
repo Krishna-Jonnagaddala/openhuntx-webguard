@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   unit-tests:
-    name: Unit tests — Python ${{ matrix.python-version }}
+    name: "Unit tests: Python ${{ matrix.python-version }}"
     runs-on: ubuntu-24.04
 
     strategy:
@@ -274,6 +274,8 @@ jobs:
             -p 'test_*.py' \
             -v
           python -m unittest tests.integration.test_postgres_connection_pool -v
+          python -m unittest tests.integration.test_postgres_tenant_isolation_slice13 -v
+          python -m unittest tests.integration.test_postgres_sessions -v
 
       - name: Stop isolated PostgreSQL
         if: always()

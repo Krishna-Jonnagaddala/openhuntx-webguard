@@ -341,7 +341,13 @@ class WebGuardJobService:
         payload = record.to_public_dict()
         payload["organization_id"] = context.organization_id
         try:
-            binding = self.store.get_job_permit_binding(record.job_id)
+            # P1-C1: scoped independently inside the repository (a join
+            # to scan_jobs/job_scopes, the authoritative job/organization
+            # relation) -- not merely because `record` already came from
+            # an org-scoped fetch.
+            binding = self.store.get_job_permit_binding_scoped(
+                record.job_id, context.organization_id
+            )
         except JobStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=500) from exc
         payload["trustscan_permit"] = (
@@ -351,10 +357,12 @@ class WebGuardJobService:
         )
         return payload
 
-    def _schedule_public(self, record) -> dict:
+    def _schedule_public(self, record, context: AuthContext) -> dict:
         payload = record.to_public_dict()
         try:
-            binding = self.store.get_schedule_permit_binding(record.schedule_id)
+            binding = self.store.get_schedule_permit_binding_scoped(
+                record.schedule_id, context.organization_id
+            )
         except JobStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=500) from exc
         payload["trustscan_permit"] = (
@@ -921,16 +929,16 @@ class WebGuardJobService:
             resource_id=authentication_context_id,
         )
         try:
-            record = self.authentication_contexts.get_metadata(
-                authentication_context_id
-            )
-            if record.organization_id != context.organization_id:
-                raise AuthenticationContextError(
-                    "authentication_context_not_found",
-                    "No authentication context matches the requested ID.",
-                )
-            record = self.authentication_contexts.revoke(
-                authentication_context_id, now=self.clock()
+            # P1-C1: the organization scope is enforced inside the
+            # repository's own SQL/lookup predicate (see
+            # ``revoke_scoped``'s docstring), not by a Python-level
+            # compare against an unscoped fetch -- a caller-supplied ID
+            # belonging to another organization is indistinguishable
+            # from one that never existed.
+            record = self.authentication_contexts.revoke_scoped(
+                authentication_context_id,
+                organization_id=context.organization_id,
+                now=self.clock(),
             )
         except AuthenticationContextError as exc:
             status = 404 if exc.code == "authentication_context_not_found" else 400
@@ -1092,14 +1100,14 @@ class WebGuardJobService:
             resource_id=comparison_plan_id,
         )
         try:
-            record = self.authorization_comparison_plans.get(comparison_plan_id)
-            if record.organization_id != context.organization_id:
-                raise AuthorizationComparisonError(
-                    "authorization_comparison_plan_not_found",
-                    "No authorization-comparison plan matches the requested ID.",
-                )
-            record = self.authorization_comparison_plans.revoke(
-                comparison_plan_id, now=self.clock()
+            # P1-C1: mirrors revoke_authentication_context's own fix --
+            # organization scope is enforced inside the repository's SQL/
+            # lookup predicate, not by a Python-level compare against an
+            # unscoped fetch.
+            record = self.authorization_comparison_plans.revoke_scoped(
+                comparison_plan_id,
+                organization_id=context.organization_id,
+                now=self.clock(),
             )
         except AuthorizationComparisonError as exc:
             status = (
@@ -1792,8 +1800,12 @@ class WebGuardJobService:
             outcome=AuditOutcome.SUCCEEDED,
         )
         try:
-            permit_binding = self.store.get_job_permit_binding(job_id)
-            safety_receipt = self.store.get_job_safety_receipt(job_id)
+            permit_binding = self.store.get_job_permit_binding_scoped(
+                job_id, context.organization_id
+            )
+            safety_receipt = self.store.get_job_safety_receipt_scoped(
+                job_id, context.organization_id
+            )
         except JobStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=500) from exc
         return {
@@ -1934,7 +1946,7 @@ class WebGuardJobService:
             resource_id=record.schedule_id,
             outcome=AuditOutcome.SUCCEEDED,
         )
-        return self._schedule_public(record)
+        return self._schedule_public(record, context)
 
     def list_schedules(
         self,
@@ -1987,7 +1999,7 @@ class WebGuardJobService:
             outcome=AuditOutcome.SUCCEEDED,
         )
         return {
-            "schedules": [self._schedule_public(schedule) for schedule in schedules],
+            "schedules": [self._schedule_public(schedule, context) for schedule in schedules],
             "page": self._page_payload(page.limit, next_cursor),
         }
 
@@ -2022,7 +2034,7 @@ class WebGuardJobService:
             resource_id=schedule_id,
             outcome=AuditOutcome.SUCCEEDED,
         )
-        return self._schedule_public(record)
+        return self._schedule_public(record, context)
 
     def pause_schedule(
         self,
@@ -2095,7 +2107,7 @@ class WebGuardJobService:
             resource_id=schedule_id,
             outcome=AuditOutcome.SUCCEEDED,
         )
-        return self._schedule_public(record)
+        return self._schedule_public(record, context)
 
     def me(self, context: AuthContext, *, request_id: str) -> dict:
         self._audit(
@@ -2298,7 +2310,7 @@ class WebGuardJobService:
         return context, issued
 
     def logout(self, context: AuthContext, *, request_id: str) -> None:
-        self.sessions.revoke_session(context.token_id, now=self.clock())
+        self.sessions.revoke_session(context.token_id, principal_id=context.principal_id, now=self.clock())
         self._audit(
             context, request_id=request_id, action="auth.logout", resource_type="session",
             resource_id=context.token_id, outcome=AuditOutcome.SUCCEEDED,

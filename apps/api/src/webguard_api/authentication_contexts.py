@@ -167,6 +167,59 @@ class AuthenticationContextRepository:
             )
         return record
 
+    def get_metadata_scoped(
+        self, authentication_context_id: str, *, organization_id: str
+    ) -> AuthenticationContextRecord:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        atomically scoped by ``organization_id`` -- a wrong-org lookup and
+        a nonexistent ID raise the identical ``authentication_context_not_found``
+        error, never a distinguishable existence oracle. Prefer this over
+        ``get_metadata`` for any caller-supplied ID reaching this repository
+        from an authenticated HTTP request; ``get_metadata`` itself remains
+        for internal same-record fetches (``create``/``revoke``'s own
+        post-write read) and ``require_bound``'s defense-in-depth mismatch
+        reporting, where the ID already comes from a trusted, previously
+        org-validated reference (a permit or comparison plan), not directly
+        from an untrusted caller."""
+
+        with self._lock:
+            record = self._metadata.get(authentication_context_id)
+        if record is None or record.organization_id != organization_id:
+            raise AuthenticationContextError(
+                "authentication_context_not_found",
+                "No authentication context matches the requested ID.",
+            )
+        return record
+
+    def revoke_scoped(
+        self, authentication_context_id: str, *, organization_id: str, now: datetime
+    ) -> AuthenticationContextRecord:
+        """P1-C1: mirrors ``get_metadata_scoped``'s ownership scope --
+        see that method's docstring."""
+
+        with self._lock:
+            record = self._metadata.get(authentication_context_id)
+            if record is None or record.organization_id != organization_id:
+                raise AuthenticationContextError(
+                    "authentication_context_not_found",
+                    "No authentication context matches the requested ID.",
+                )
+            if record.revoked_at is None:
+                record = AuthenticationContextRecord(
+                    authentication_context_id=record.authentication_context_id,
+                    organization_id=record.organization_id,
+                    target=record.target,
+                    authorization_id=record.authorization_id,
+                    identity_label=record.identity_label,
+                    method=record.method,
+                    created_at=record.created_at,
+                    expires_at=record.expires_at,
+                    revoked_at=now,
+                    secret_reference_id=record.secret_reference_id,
+                )
+                self._metadata[authentication_context_id] = record
+        return record
+
     def get_secret(self, authentication_context_id: str) -> AuthenticationMaterial:
         with self._lock:
             secret = self._secrets.get(authentication_context_id)

@@ -278,6 +278,62 @@ class AuthorizationComparisonPlanRepository:
                 self._plans[comparison_plan_id] = record
         return record
 
+    def get_scoped(
+        self, comparison_plan_id: str, *, organization_id: str
+    ) -> AuthorizationComparisonPlanRecord:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        atomically scoped by ``organization_id`` -- mirrors
+        ``AuthenticationContextRepository.get_metadata_scoped``'s
+        rationale exactly. Prefer this over ``get`` for any
+        caller-supplied ID reaching this repository from an
+        authenticated HTTP request; ``get`` itself remains for internal
+        same-record fetches and ``require_bound``'s defense-in-depth
+        mismatch reporting."""
+
+        with self._lock:
+            record = self._plans.get(comparison_plan_id)
+        if record is None or record.organization_id != organization_id:
+            raise AuthorizationComparisonError(
+                "authorization_comparison_plan_not_found",
+                "No authorization-comparison plan matches the requested ID.",
+            )
+        return record
+
+    def revoke_scoped(
+        self, comparison_plan_id: str, *, organization_id: str, now: datetime
+    ) -> AuthorizationComparisonPlanRecord:
+        """P1-C1: mirrors ``get_scoped``'s ownership scope -- see that
+        method's docstring."""
+
+        with self._lock:
+            record = self._plans.get(comparison_plan_id)
+            if record is None or record.organization_id != organization_id:
+                raise AuthorizationComparisonError(
+                    "authorization_comparison_plan_not_found",
+                    "No authorization-comparison plan matches the requested ID.",
+                )
+            if record.revoked_at is None:
+                record = AuthorizationComparisonPlanRecord(
+                    comparison_plan_id=record.comparison_plan_id,
+                    organization_id=record.organization_id,
+                    target=record.target,
+                    authorization_id=record.authorization_id,
+                    primary_context_id=record.primary_context_id,
+                    secondary_context_id=record.secondary_context_id,
+                    permitted_active_check=record.permitted_active_check,
+                    allowed_http_methods=record.allowed_http_methods,
+                    resource_scope=record.resource_scope,
+                    maximum_resources=record.maximum_resources,
+                    maximum_comparisons=record.maximum_comparisons,
+                    created_at=record.created_at,
+                    expires_at=record.expires_at,
+                    revoked_at=now,
+                    enable_discovery=record.enable_discovery,
+                    discovery_login_page_marker=record.discovery_login_page_marker,
+                )
+                self._plans[comparison_plan_id] = record
+        return record
+
     def require_bound(
         self,
         comparison_plan_id: str,

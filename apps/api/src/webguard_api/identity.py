@@ -1015,12 +1015,16 @@ class IdentityStore:
     def update_principal_role(
         self, principal_id: str, *, organization_id: str, role: OrganizationRole, now: datetime
     ) -> Principal:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        mirrors ``PostgresIdentityRepository.update_principal_role``'s
+        atomic-mutation fix -- see that method's docstring."""
+
         principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
         connection = self._connect()
         try:
             connection.execute(
-                "UPDATE principals SET role = ? WHERE principal_id = ?",
-                (role.value, principal_id),
+                "UPDATE principals SET role = ? WHERE principal_id = ? AND organization_id = ?",
+                (role.value, principal_id, organization_id),
             )
         except sqlite3.Error as exc:
             raise IdentityStoreError(
@@ -1044,12 +1048,15 @@ class IdentityStore:
     def set_principal_active(
         self, principal_id: str, *, organization_id: str, active: bool, now: datetime
     ) -> Principal:
+        """P1-C1: mirrors ``update_principal_role``'s atomic-mutation
+        fix -- see that method's docstring."""
+
         principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
         connection = self._connect()
         try:
             connection.execute(
-                "UPDATE principals SET active = ? WHERE principal_id = ?",
-                (1 if active else 0, principal_id),
+                "UPDATE principals SET active = ? WHERE principal_id = ? AND organization_id = ?",
+                (1 if active else 0, principal_id, organization_id),
             )
         except sqlite3.Error as exc:
             raise IdentityStoreError(

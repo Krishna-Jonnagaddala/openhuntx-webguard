@@ -149,6 +149,54 @@ class PostgresAuthorizationComparisonPlanRepository:
                 )
         return self.get(comparison_plan_id)
 
+    def get_scoped(
+        self, comparison_plan_id: str, *, organization_id: str
+    ) -> AuthorizationComparisonPlanRecord:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        atomically scoped by ``organization_id`` in the SQL predicate
+        itself -- mirrors ``PostgresAuthenticationContextRepository
+        .get_metadata_scoped``'s rationale exactly. Prefer this over
+        ``get`` for any caller-supplied ID reaching this repository from
+        an authenticated HTTP request; ``get`` itself remains for
+        internal same-record fetches and ``require_bound``'s
+        defense-in-depth mismatch reporting."""
+
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                f"SELECT {_COLUMNS} FROM authorization_comparison_plans "  # noqa: S608
+                "WHERE comparison_plan_id = %s AND organization_id = %s",
+                (comparison_plan_id, organization_id),
+            ).fetchone()
+        if row is None:
+            raise AuthorizationComparisonError(
+                "authorization_comparison_plan_not_found", "No authorization-comparison plan matches the requested ID."
+            )
+        return self._record_from_row(row)
+
+    def revoke_scoped(
+        self, comparison_plan_id: str, *, organization_id: str, now: datetime
+    ) -> AuthorizationComparisonPlanRecord:
+        """P1-C1: mirrors ``get_scoped``'s ownership scope -- see that
+        method's docstring."""
+
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "SELECT revoked_at FROM authorization_comparison_plans "
+                "WHERE comparison_plan_id = %s AND organization_id = %s",
+                (comparison_plan_id, organization_id),
+            ).fetchone()
+            if row is None:
+                raise AuthorizationComparisonError(
+                    "authorization_comparison_plan_not_found", "No authorization-comparison plan matches the requested ID."
+                )
+            if row[0] is None:
+                connection.execute(
+                    "UPDATE authorization_comparison_plans SET revoked_at = %s "
+                    "WHERE comparison_plan_id = %s AND organization_id = %s",
+                    (now, comparison_plan_id, organization_id),
+                )
+        return self.get_scoped(comparison_plan_id, organization_id=organization_id)
+
     def require_bound(
         self,
         comparison_plan_id: str,

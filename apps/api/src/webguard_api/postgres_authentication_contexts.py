@@ -126,6 +126,58 @@ class PostgresAuthenticationContextRepository:
                 )
         return self.get_metadata(authentication_context_id)
 
+    def get_metadata_scoped(
+        self, authentication_context_id: str, *, organization_id: str
+    ) -> AuthenticationContextRecord:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        atomically scoped by ``organization_id`` in the SQL predicate
+        itself -- a wrong-org lookup and a nonexistent ID raise the
+        identical ``authentication_context_not_found`` error, never a
+        distinguishable existence oracle. Prefer this over ``get_metadata``
+        for any caller-supplied ID reaching this repository from an
+        authenticated HTTP request; ``get_metadata`` itself remains for
+        internal same-record fetches (``create``/``revoke``'s own
+        post-write read) and ``require_bound``'s defense-in-depth mismatch
+        reporting, where the ID already comes from a trusted, previously
+        org-validated reference (a permit or comparison plan), not
+        directly from an untrusted caller."""
+
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                f"SELECT {_COLUMNS} FROM authentication_contexts "  # noqa: S608
+                "WHERE authentication_context_id = %s AND organization_id = %s",
+                (authentication_context_id, organization_id),
+            ).fetchone()
+        if row is None:
+            raise AuthenticationContextError(
+                "authentication_context_not_found", "No authentication context matches the requested ID."
+            )
+        return self._record_from_row(row)
+
+    def revoke_scoped(
+        self, authentication_context_id: str, *, organization_id: str, now: datetime
+    ) -> AuthenticationContextRecord:
+        """P1-C1: mirrors ``get_metadata_scoped``'s ownership scope --
+        see that method's docstring."""
+
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "SELECT revoked_at FROM authentication_contexts "
+                "WHERE authentication_context_id = %s AND organization_id = %s",
+                (authentication_context_id, organization_id),
+            ).fetchone()
+            if row is None:
+                raise AuthenticationContextError(
+                    "authentication_context_not_found", "No authentication context matches the requested ID."
+                )
+            if row[0] is None:
+                connection.execute(
+                    "UPDATE authentication_contexts SET revoked_at = %s "
+                    "WHERE authentication_context_id = %s AND organization_id = %s",
+                    (now, authentication_context_id, organization_id),
+                )
+        return self.get_metadata_scoped(authentication_context_id, organization_id=organization_id)
+
     def require_bound(
         self,
         authentication_context_id: str,

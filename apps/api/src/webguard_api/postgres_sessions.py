@@ -152,11 +152,26 @@ class PostgresSessionRepository:
             ).fetchone()
         return None if row is None else _record_from_row(row)
 
-    def revoke_session(self, session_id: str, *, now: datetime) -> None:
+    def revoke_session(self, session_id: str, *, principal_id: str, now: datetime) -> None:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        ``principal_id`` is the narrowest valid ownership scope for a
+        browser session -- a session belongs to exactly one principal
+        (see ``browser_sessions``' own schema), and nothing in this
+        codebase has an "admin force-revoke another principal's
+        session" concept, so there is no reason to scope any wider
+        (e.g. by organization_id, which would let any principal in the
+        same org revoke a teammate's session). A caller-supplied
+        ``session_id`` that does not actually belong to ``principal_id``
+        matches zero rows and is silently a no-op -- identical
+        behavior to a session that never existed, never a
+        distinguishable error that would let a caller probe for valid
+        session IDs belonging to someone else."""
+
         with self._pool.connection() as connection:
             connection.execute(
-                "UPDATE browser_sessions SET revoked_at = %s WHERE session_id = %s AND revoked_at IS NULL",
-                (now, session_id),
+                "UPDATE browser_sessions SET revoked_at = %s "
+                "WHERE session_id = %s AND principal_id = %s AND revoked_at IS NULL",
+                (now, session_id, principal_id),
             )
 
     def revoke_all_sessions_for_principal(
