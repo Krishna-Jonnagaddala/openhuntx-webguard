@@ -277,6 +277,7 @@ jobs:
           python -m unittest tests.integration.test_postgres_tenant_context_helper -v
           python -m unittest tests.integration.test_postgres_tenant_role_bootstrap -v
           python -m unittest tests.integration.test_postgres_tenant_acl_bootstrap -v
+          python -m unittest tests.integration.test_postgres_function_owner_acl_bootstrap -v
           python -m unittest tests.integration.test_postgres_tenant_isolation_slice13 -v
           python -m unittest tests.integration.test_postgres_sessions -v
 
