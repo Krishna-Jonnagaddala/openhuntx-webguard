@@ -65,6 +65,15 @@ class SigningServiceStructuredEventTests(unittest.TestCase):
         try:
             status, body = self._post_sign(b"a secret-shaped message payload")
         finally:
+            # SigningServiceServer.stop() calls the underlying
+            # ThreadingHTTPServer's server_close(), which (stdlib
+            # default, not overridden here) blocks until every
+            # per-connection handler thread it spawned has finished --
+            # this request's handler included. That is what makes the
+            # plain, immediate buffer check below correct: by the time
+            # stop() returns, sign_request_completed has either already
+            # been written or never will be, so there is nothing to
+            # poll for and no way for a duplicate to arrive later.
             self.server.stop()
         self.assertEqual(status, 200)
 
