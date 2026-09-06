@@ -4,6 +4,15 @@ pool, concurrent reads/writes, and no leaked connections after
 repeated borrow/release cycles. Requires a real database
 (`WEBGUARD_RUN_INTEGRATION=1` and a reachable
 `WEBGUARD_POSTGRES_TEST_DSN`).
+
+`TenantContextPoolTests` below covers P1-2's tenant-context plumbing
+(docs/audit/WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md) -- tenant_connection()
+and set_tenant_context() -- against a real backend connection, proving
+the actual transaction-local GUC and pool-reuse behavior a fake
+connection object cannot stand in for. This is plumbing-only proof:
+no row-level-security policy exists yet, and these tests make no
+tenant-isolation claim beyond "the GUC this future policy will read is
+set and cleared correctly."
 """
 
 from __future__ import annotations
@@ -136,6 +145,154 @@ class PostgresConnectionPoolTests(unittest.TestCase):
                 (organization_ids,),
             ).fetchone()[0]
         self.assertEqual(count, len(organization_ids))
+
+
+@unittest.skipUnless(
+    RUN_POSTGRES_TESTS,
+    "Set WEBGUARD_RUN_INTEGRATION=1 and WEBGUARD_POSTGRES_TEST_DSN to run this PostgreSQL integration test.",
+)
+class TenantContextPoolTests(unittest.TestCase):
+    """Pool size deliberately 1 throughout this class -- every test
+    below depends on the SAME physical backend connection being reused
+    across separate borrows, which is exactly the scenario a future
+    row-level-security policy's safety depends on: a pooled connection
+    must never carry one tenant's context into the next borrower.
+    """
+
+    def setUp(self) -> None:
+        from webguard_api.postgres_pool import TENANT_CONTEXT_GUC, WebGuardPostgresPool
+
+        self.guc = TENANT_CONTEXT_GUC
+        self.pool = WebGuardPostgresPool(POSTGRES_TEST_DSN, minimum_connections=1, maximum_connections=1)
+        self.addCleanup(self.pool.close)
+
+    def _current_guc_value(self, connection) -> str:
+        return connection.execute("SELECT current_setting(%s, true)", (self.guc,)).fetchone()[0]
+
+    def _backend_pid(self, connection) -> int:
+        return connection.execute("SELECT pg_backend_pid()").fetchone()[0]
+
+    def test_tenant_connection_sets_the_guc_to_the_given_organization(self) -> None:
+        org_a = str(uuid4())
+        with self.pool.tenant_connection(org_a) as connection:
+            self.assertEqual(self._current_guc_value(connection), org_a)
+
+    def test_no_context_after_tenant_connection_on_the_same_physical_connection(self) -> None:
+        """Proves the security property directly: a previous tenant's
+        UUID must not remain active on the next plain borrow. Does not
+        assert whether PostgreSQL represents the reverted GUC as NULL
+        or an empty string -- only that it is not the prior tenant's
+        value."""
+
+        org_a = str(uuid4())
+        with self.pool.tenant_connection(org_a) as connection:
+            pid_a = self._backend_pid(connection)
+
+        with self.pool.connection() as connection:
+            raw_value = self._current_guc_value(connection)
+            pid_after = self._backend_pid(connection)
+
+        self.assertNotEqual(raw_value, org_a, "the previous tenant's UUID must not remain active")
+        self.assertEqual(pid_after, pid_a, "pool size 1 must reuse the same physical backend connection")
+
+    def test_tenant_a_then_tenant_b_on_the_same_physical_connection(self) -> None:
+        org_a = str(uuid4())
+        org_b = str(uuid4())
+
+        with self.pool.tenant_connection(org_a) as connection:
+            pid_a = self._backend_pid(connection)
+
+        with self.pool.tenant_connection(org_b) as connection:
+            raw_value = self._current_guc_value(connection)
+            pid_b = self._backend_pid(connection)
+
+        self.assertEqual(raw_value, org_b)
+        self.assertNotEqual(raw_value, org_a, "tenant A's context must not leak into tenant B's borrow")
+        self.assertEqual(pid_b, pid_a, "pool size 1 must reuse the same physical backend connection")
+
+    def test_rollback_then_tenant_b_on_the_same_physical_connection(self) -> None:
+        org_a = str(uuid4())
+        org_b = str(uuid4())
+
+        with self.pool.tenant_connection(org_a) as connection:
+            pid_before = self._backend_pid(connection)
+
+        with self.assertRaises(RuntimeError):
+            with self.pool.tenant_connection(org_a) as connection:
+                connection.execute("SELECT 1")
+                raise RuntimeError("simulated failure mid-transaction")
+
+        with self.pool.connection() as connection:
+            raw_value_after_rollback = self._current_guc_value(connection)
+
+        with self.pool.tenant_connection(org_b) as connection:
+            raw_value_b = self._current_guc_value(connection)
+            pid_after = self._backend_pid(connection)
+
+        self.assertNotEqual(
+            raw_value_after_rollback, org_a, "a rolled-back tenant context must not remain active"
+        )
+        self.assertEqual(raw_value_b, org_b)
+        self.assertEqual(pid_after, pid_before, "pool size 1 must reuse the same physical backend connection")
+
+    def test_set_tenant_context_binds_late_in_an_existing_transaction(self) -> None:
+        """Proves the second primitive: the trusted organization
+        becoming known partway through an already-open transaction
+        (the shape authenticate_token/authenticate_session/
+        consume_identity_token will eventually need -- not wired to
+        any of them in this change)."""
+
+        from webguard_api.postgres_pool import set_tenant_context
+
+        org_a = str(uuid4())
+        with self.pool.connection() as connection:
+            pid_start = self._backend_pid(connection)
+            self.assertNotEqual(
+                self._current_guc_value(connection), org_a, "no tenant context should exist yet"
+            )
+
+            set_tenant_context(connection, org_a)
+
+            self.assertEqual(self._current_guc_value(connection), org_a)
+            self.assertEqual(self._backend_pid(connection), pid_start, "must be the same connection, not a new one")
+
+            connection.execute("SELECT 1")
+            self.assertEqual(
+                self._current_guc_value(connection), org_a, "context must persist for the rest of the transaction"
+            )
+
+        with self.pool.connection() as connection:
+            self.assertNotEqual(
+                self._current_guc_value(connection), org_a, "context must not survive past the transaction's end"
+            )
+
+    def test_tenant_context_survives_a_nested_transaction_savepoint(self) -> None:
+        """Mirrors the actual nested-transaction pattern this codebase
+        uses today (postgres_identity.py's create_principal,
+        postgres_jobs.py's claim/lease paths: `with connection.transaction():`
+        inside an already-borrowed connection) -- not an invented
+        nesting shape."""
+
+        org_a = str(uuid4())
+        with self.pool.tenant_connection(org_a) as connection:
+            self.assertEqual(self._current_guc_value(connection), org_a)
+            with connection.transaction():
+                connection.execute("SELECT 1")
+                self.assertEqual(
+                    self._current_guc_value(connection), org_a, "context must hold inside a savepoint"
+                )
+            self.assertEqual(
+                self._current_guc_value(connection), org_a, "context must hold after a savepoint completes"
+            )
+
+    def test_invalid_organization_id_fails_before_any_sql_and_before_borrowing(self) -> None:
+        initial_available = self.pool.statistics["pool_available"]
+        with self.assertRaises(ValueError):
+            with self.pool.tenant_connection("definitely-not-a-uuid"):
+                pass  # pragma: no cover - must never be reached
+        self.assertEqual(
+            self.pool.statistics["pool_available"], initial_available, "no connection should have been borrowed"
+        )
 
 
 if __name__ == "__main__":
