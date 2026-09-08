@@ -74,6 +74,17 @@ ALL_TABLES = [
 
 COMMANDS = ("SELECT", "INSERT", "UPDATE", "DELETE")
 
+# P1-2 Phase-D correction: identity_tokens and password_credentials
+# each carry a narrow column-level SELECT grant on top of the
+# table-level INSERT/UPDATE already covered by EXPECTED_GRANTS above.
+# has_table_privilege never reports these as table-level SELECT (proven
+# empirically and asserted below), so they need their own inventory,
+# separate from the matrix in test_positive_and_negative_privilege_matrix_matches_exactly.
+IDENTITY_TOKENS_REQUIRED_SELECT_COLUMNS = {"token_id", "principal_id", "purpose", "used_at"}
+IDENTITY_TOKENS_DENIED_SELECT_COLUMNS = {"secret_hash", "organization_id", "created_at", "expires_at"}
+PASSWORD_CREDENTIALS_REQUIRED_SELECT_COLUMNS = {"principal_id"}
+PASSWORD_CREDENTIALS_DENIED_SELECT_COLUMNS = {"password_hash", "algorithm", "created_at", "updated_at"}
+
 # The complete, intended privilege matrix -- every role/table/command
 # combination not listed here is expected to be FALSE. Built directly
 # from infra/postgres/bootstrap/tenant_isolation_acl.sql; the test
@@ -167,6 +178,27 @@ class TenantIsolationAclBootstrapTests(unittest.TestCase):
     def _apply_acl_only(self) -> None:
         with self._connect() as connection:
             connection.execute(self.acl_sql)
+
+    def _column_privilege_snapshot(self, connection) -> dict[str, bool]:
+        """Every column named in the required/denied sets above, for
+        api_tenant_data, on both corrected tables. Used to prove the
+        second ACL run changes none of them, alongside the existing
+        table-level snapshot."""
+
+        columns_by_table = {
+            "identity_tokens": IDENTITY_TOKENS_REQUIRED_SELECT_COLUMNS | IDENTITY_TOKENS_DENIED_SELECT_COLUMNS,
+            "password_credentials": (
+                PASSWORD_CREDENTIALS_REQUIRED_SELECT_COLUMNS | PASSWORD_CREDENTIALS_DENIED_SELECT_COLUMNS
+            ),
+        }
+        snapshot: dict[str, bool] = {}
+        for table, columns in columns_by_table.items():
+            for column in columns:
+                key = f"{table}.{column}"
+                snapshot[key] = connection.execute(
+                    "SELECT has_column_privilege('api_tenant_data', %s, %s, 'SELECT')", (table, column)
+                ).fetchone()[0]
+        return snapshot
 
     def _all_actual_privileges(self, connection) -> dict[str, dict[str, set[str]]]:
         """One catalog query covering every role/table/command
@@ -289,13 +321,146 @@ class TenantIsolationAclBootstrapTests(unittest.TestCase):
     def test_acl_bootstrap_is_safe_to_run_a_second_time(self) -> None:
         with self._connect() as connection:
             before = self._all_actual_privileges(connection)
+            before_columns = self._column_privilege_snapshot(connection)
 
         self._apply_acl_only()  # second run
 
         with self._connect() as connection:
             after = self._all_actual_privileges(connection)
+            after_columns = self._column_privilege_snapshot(connection)
 
         self.assertEqual(before, after, "a second ACL bootstrap run must change nothing")
+        self.assertEqual(
+            before_columns, after_columns, "a second ACL bootstrap run must change no column-level grant either"
+        )
+
+    # -- P1-2 Phase-D correction: column-level SELECT inventory -------------
+
+    def test_identity_tokens_and_password_credentials_column_privilege_inventory(self) -> None:
+        """has_table_privilege must stay FALSE for both tables (the
+        table-level matrix above already proves this, this test proves
+        it again alongside the column-level facts so both live
+        together), while has_column_privilege must be TRUE for exactly
+        the four/one columns each statement's WHERE clause or
+        conflict-target/DO-UPDATE-SET clause actually needs, and FALSE
+        for every other column -- in particular password_hash and
+        secret_hash, never granted under any name."""
+
+        with self._connect() as connection:
+            self.assertFalse(
+                connection.execute(
+                    "SELECT has_table_privilege('api_tenant_data', 'identity_tokens', 'SELECT')"
+                ).fetchone()[0],
+                "api_tenant_data must not have table-level SELECT on identity_tokens",
+            )
+            self.assertFalse(
+                connection.execute(
+                    "SELECT has_table_privilege('api_tenant_data', 'password_credentials', 'SELECT')"
+                ).fetchone()[0],
+                "api_tenant_data must not have table-level SELECT on password_credentials",
+            )
+
+            for column in IDENTITY_TOKENS_REQUIRED_SELECT_COLUMNS:
+                self.assertTrue(
+                    connection.execute(
+                        "SELECT has_column_privilege('api_tenant_data', 'identity_tokens', %s, 'SELECT')",
+                        (column,),
+                    ).fetchone()[0],
+                    f"api_tenant_data must have column SELECT on identity_tokens.{column}",
+                )
+            for column in IDENTITY_TOKENS_DENIED_SELECT_COLUMNS:
+                self.assertFalse(
+                    connection.execute(
+                        "SELECT has_column_privilege('api_tenant_data', 'identity_tokens', %s, 'SELECT')",
+                        (column,),
+                    ).fetchone()[0],
+                    f"api_tenant_data must not have column SELECT on identity_tokens.{column}",
+                )
+            for column in PASSWORD_CREDENTIALS_REQUIRED_SELECT_COLUMNS:
+                self.assertTrue(
+                    connection.execute(
+                        "SELECT has_column_privilege('api_tenant_data', 'password_credentials', %s, 'SELECT')",
+                        (column,),
+                    ).fetchone()[0],
+                    f"api_tenant_data must have column SELECT on password_credentials.{column}",
+                )
+            for column in PASSWORD_CREDENTIALS_DENIED_SELECT_COLUMNS:
+                self.assertFalse(
+                    connection.execute(
+                        "SELECT has_column_privilege('api_tenant_data', 'password_credentials', %s, 'SELECT')",
+                        (column,),
+                    ).fetchone()[0],
+                    f"api_tenant_data must not have column SELECT on password_credentials.{column}",
+                )
+
+    def test_password_hash_direct_select_denied(self) -> None:
+        """A LOGIN role granted nothing beyond api_tenant_data's own
+        privileges must be unable to read password_hash directly, by
+        column name or via `SELECT *` -- proving the column grant
+        really is scoped to principal_id alone, not just documented as
+        such."""
+
+        with self._connect() as connection:
+            connection.autocommit = True
+            connection.execute('DROP ROLE IF EXISTS "test_pwd_select_probe"')
+            connection.execute(
+                'CREATE ROLE "test_pwd_select_probe" LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB '
+                'IN ROLE "api_tenant_data" PASSWORD \'test-caller-password\''
+            )
+        try:
+            import psycopg
+
+            with psycopg.connect(
+                POSTGRES_TEST_DSN, user="test_pwd_select_probe", password="test-caller-password"
+            ) as probe_connection:
+                try:
+                    with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                        probe_connection.execute("SELECT password_hash FROM password_credentials LIMIT 1")
+                finally:
+                    probe_connection.rollback()
+                try:
+                    with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                        probe_connection.execute("SELECT * FROM password_credentials LIMIT 1")
+                finally:
+                    probe_connection.rollback()
+        finally:
+            with self._connect() as connection:
+                connection.autocommit = True
+                connection.execute('DROP ROLE IF EXISTS "test_pwd_select_probe"')
+
+    def test_identity_tokens_secret_hash_direct_select_denied(self) -> None:
+        """Same proof as test_password_hash_direct_select_denied, for
+        identity_tokens.secret_hash: the narrow four-column grant must
+        not let a caller reach the token secret by name or via
+        `SELECT *`."""
+
+        with self._connect() as connection:
+            connection.autocommit = True
+            connection.execute('DROP ROLE IF EXISTS "test_token_select_probe"')
+            connection.execute(
+                'CREATE ROLE "test_token_select_probe" LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB '
+                'IN ROLE "api_tenant_data" PASSWORD \'test-caller-password\''
+            )
+        try:
+            import psycopg
+
+            with psycopg.connect(
+                POSTGRES_TEST_DSN, user="test_token_select_probe", password="test-caller-password"
+            ) as probe_connection:
+                try:
+                    with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                        probe_connection.execute("SELECT secret_hash FROM identity_tokens LIMIT 1")
+                finally:
+                    probe_connection.rollback()
+                try:
+                    with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                        probe_connection.execute("SELECT * FROM identity_tokens LIMIT 1")
+                finally:
+                    probe_connection.rollback()
+        finally:
+            with self._connect() as connection:
+                connection.autocommit = True
+                connection.execute('DROP ROLE IF EXISTS "test_token_select_probe"')
 
     # -- Section 18: inherited-privilege proof (optional, extra rigor) ------
 

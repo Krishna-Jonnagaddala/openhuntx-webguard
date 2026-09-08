@@ -313,18 +313,38 @@ class PostgresIdentityRepository:
             )
 
     def set_password_hash(self, principal_id: str, *, algorithm: str, password_hash: str, now: datetime) -> None:
+        # Two statements, one transaction (this method's own connection
+        # checkout is the transaction boundary, unchanged): INSERT ...
+        # ON CONFLICT DO NOTHING first, then a conditional UPDATE only
+        # if the insert did not apply. Not a single ON CONFLICT DO
+        # UPDATE: that shape's DO UPDATE SET clause would have to
+        # reference EXCLUDED.password_hash, and PostgreSQL requires
+        # SELECT privilege on any target-table column a DO UPDATE
+        # clause references this way -- which would force api_tenant_data
+        # to hold direct SELECT on the password hash column just to
+        # write it. This shape's UPDATE assigns caller-supplied
+        # parameters directly, never EXCLUDED or the row's own existing
+        # values, so it only ever needs SELECT on principal_id (the
+        # WHERE-clause column) -- see tenant_isolation_acl.sql's own
+        # comment on this grant for the full empirical trace.
         with self._pool.connection() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT INTO password_credentials (principal_id, algorithm, password_hash, created_at, updated_at)
                 VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (principal_id) DO UPDATE SET
-                    algorithm = EXCLUDED.algorithm,
-                    password_hash = EXCLUDED.password_hash,
-                    updated_at = EXCLUDED.updated_at
+                ON CONFLICT (principal_id) DO NOTHING
                 """,
                 (principal_id, algorithm, password_hash, now, now),
             )
+            if cursor.rowcount == 0:
+                connection.execute(
+                    """
+                    UPDATE password_credentials
+                    SET algorithm = %s, password_hash = %s, updated_at = %s
+                    WHERE principal_id = %s
+                    """,
+                    (algorithm, password_hash, now, principal_id),
+                )
 
     def get_password_hash(self, principal_id: str) -> str | None:
         with self._pool.connection() as connection:

@@ -10,7 +10,7 @@
 -- process specifically, for api_tenant_data -- not merely "some
 -- repository method exists that a caller somewhere invokes"),
 -- re-verified against the current source directly, not assumed from
--- an earlier design pass. Three corrections worth recording here
+-- an earlier design pass. Four corrections worth recording here
 -- rather than silently folding in:
 --
 -- `target_verifications` DOES have live API callers today
@@ -41,6 +41,30 @@
 -- directly from several API-serve-reachable methods (permit issuance,
 -- authentication-context/authorization-comparison-plan registration,
 -- job submission, schedule creation, and asset display).
+--
+-- `identity_tokens` and `password_credentials` were originally
+-- granted INSERT/UPDATE with no SELECT at all, on the theory that a
+-- future identity-resolver function owner would own every read these
+-- tables need. That theory did not account for PostgreSQL requiring
+-- SELECT privilege on any column an UPDATE's WHERE clause reads, or
+-- that an INSERT ... ON CONFLICT DO UPDATE requires SELECT on its
+-- conflict-target column and on every column its DO UPDATE SET clause
+-- references via EXCLUDED -- both confirmed empirically, and both
+-- true independent of RLS entirely. Re-tracing the actual current SQL
+-- (postgres_identity.py's consume_identity_token,
+-- invalidate_identity_tokens, and set_password_hash) found this
+-- ordinary role's own writes could not succeed under the original
+-- no-SELECT grant. The correction is narrow column-level SELECT on
+-- exactly the columns each statement's WHERE clause (or, for
+-- password_credentials, conflict-target/DO-UPDATE-SET clause)
+-- demonstrably requires -- proven empirically, one column at a time,
+-- rather than granted for convenience -- never table-level SELECT,
+-- and never on a column with sensitive content. password_credentials'
+-- original single-statement upsert would have forced SELECT on
+-- password_hash itself to satisfy this same rule; set_password_hash
+-- was rewritten instead (see its own grant below) so this role's
+-- required SELECT surface on that table stays exactly
+-- `principal_id`, never the hash.
 --
 -- No privilege here is a substitute for row-level security. A role
 -- with SELECT on a tenant table and no RLS policy enabled can see
@@ -103,17 +127,55 @@ GRANT SELECT, INSERT, UPDATE ON authentication_contexts TO api_tenant_data;
 GRANT SELECT, INSERT, UPDATE ON authorization_comparison_plans TO api_tenant_data;
 GRANT SELECT, INSERT, UPDATE ON scan_permits TO api_tenant_data;
 GRANT SELECT ON job_safety_receipts TO api_tenant_data;
--- No SELECT: password_credentials' only read (get_password_hash, for
--- login) is inherently pre-authentication -- a future identity
--- function owner's resolver domain, not this role's. The only
--- operation this role performs on this table is the upsert in
--- set_password_hash, which needs INSERT and UPDATE (for its
--- ON CONFLICT DO UPDATE branch), never a SELECT.
+-- No whole-row SELECT: password_credentials' own read
+-- (get_password_hash, for login) is inherently pre-authentication --
+-- a future identity function owner's resolver domain, not this
+-- role's. But PostgreSQL requires SELECT privilege on any column an
+-- INSERT ... ON CONFLICT DO UPDATE references, on the conflict target
+-- column AND on every column the DO UPDATE SET clause reads (even via
+-- EXCLUDED, the proposed row, not the existing one) -- confirmed
+-- empirically, and true regardless of whether a conflict actually
+-- occurs at runtime (PostgreSQL checks this at parse time against the
+-- statement's shape). set_password_hash's original single-statement
+-- upsert (`... DO UPDATE SET algorithm = EXCLUDED.algorithm,
+-- password_hash = EXCLUDED.password_hash, updated_at =
+-- EXCLUDED.updated_at`) would therefore have forced SELECT on
+-- password_hash itself to satisfy this role's own write -- direct
+-- read access to a credential hash by an ordinary tenant-scoped role,
+-- which is exactly what routing password reads through a privileged
+-- resolver exists to avoid needing. set_password_hash was rewritten
+-- (P1-2 Phase-D correction) to two statements inside the same
+-- transaction -- `INSERT ... ON CONFLICT (principal_id) DO NOTHING`
+-- then, only if that inserted nothing, a plain `UPDATE ... WHERE
+-- principal_id = %s` whose SET clause assigns caller-supplied
+-- parameters directly, never EXCLUDED or the table's own existing
+-- values -- so only the conflict-target/WHERE column, principal_id,
+-- ever needs SELECT. Proven empirically (six-way concurrent race on
+-- both the fresh-row and existing-row paths, transaction rollback on
+-- both paths, created_at preservation) to be semantically equivalent
+-- to the original single-statement upsert in every observable way.
 GRANT INSERT, UPDATE ON password_credentials TO api_tenant_data;
--- No SELECT: identity_tokens' only read (consume_identity_token) is
--- the same pre-authentication case -- there is no other read of this
--- table anywhere in the current codebase.
+GRANT SELECT (principal_id) ON password_credentials TO api_tenant_data;
+-- No whole-row SELECT: identity_tokens' own read
+-- (consume_identity_token's initial lookup) is the same pre-
+-- authentication case, a future resolver's domain. But both
+-- consume_identity_token's `UPDATE identity_tokens SET used_at = %s
+-- WHERE token_id = %s` and invalidate_identity_tokens's `UPDATE
+-- identity_tokens SET used_at = %s WHERE principal_id = %s AND
+-- purpose = %s AND used_at IS NULL` reference columns in their own
+-- WHERE clauses, and PostgreSQL requires SELECT on any column an
+-- UPDATE's WHERE clause reads (the same rule already established
+-- elsewhere in this file for recover_expired_leases' SELECT-alongside-
+-- UPDATE requirement on scan_records) -- confirmed empirically,
+-- independent of RLS entirely. token_id, principal_id, purpose, and
+-- used_at are the exact four columns referenced across both
+-- statements' WHERE clauses, each proven individually necessary
+-- (removing any one reproduces the failure) and together sufficient;
+-- no other column, in particular not secret_hash, is ever referenced
+-- by either statement's WHERE clause, so none of the rest needs
+-- SELECT.
 GRANT INSERT, UPDATE ON identity_tokens TO api_tenant_data;
+GRANT SELECT (token_id, principal_id, purpose, used_at) ON identity_tokens TO api_tenant_data;
 GRANT SELECT, INSERT, UPDATE ON browser_sessions TO api_tenant_data;
 GRANT SELECT, INSERT, DELETE ON auth_rate_limit_events TO api_tenant_data;
 
