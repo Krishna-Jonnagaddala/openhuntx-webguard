@@ -280,6 +280,7 @@ jobs:
           python -m unittest tests.integration.test_postgres_identity_credentials_write_shape -v
           python -m unittest tests.integration.test_postgres_function_owner_acl_bootstrap -v
           python -m unittest tests.integration.test_postgres_control_functions -v
+          python -m unittest tests.integration.test_postgres_rls_policies -v
           python -m unittest tests.integration.test_postgres_tenant_isolation_slice13 -v
           python -m unittest tests.integration.test_postgres_sessions -v
 
