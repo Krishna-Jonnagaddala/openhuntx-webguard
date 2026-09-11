@@ -26,7 +26,7 @@ from .authorization_comparison import (
     AuthorizationComparisonPlanStatus,
     ResourcePairSpec,
 )
-from .postgres_pool import WebGuardPostgresPool
+from .postgres_pool import API_TENANT_DATA_ROLE, WebGuardPostgresPool
 
 _COLUMNS = (
     "comparison_plan_id, organization_id, target, authorization_id, primary_context_id, "
@@ -37,6 +37,19 @@ _COLUMNS = (
 
 
 class PostgresAuthorizationComparisonPlanRepository:
+    """P1-2 Phase H: mirrors PostgresAuthenticationContextRepository's
+    shape exactly. api_tenant_data has the full SELECT, INSERT, UPDATE
+    this table needs. create, get_scoped, and revoke_scoped all take
+    organization_id and run under api_tenant_data via tenant_connection,
+    setting real tenant context. get and revoke take no organization_id
+    at all (create/revoke's own post-write re-reads, and require_bound's
+    trusted-reference fetch, called from both executor.py and
+    service.py), so they run under api_tenant_data via
+    role_scoped_connection instead: the role narrows, but no
+    tenant-context GUC can be set without an organization_id to set it
+    to. See that sibling class's own docstring for the full reasoning;
+    this is the same open limitation, not repeated in full here."""
+
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
 
@@ -100,7 +113,7 @@ class PostgresAuthorizationComparisonPlanRepository:
                 "expires_at must be later than the current time.",
             )
         plan_id = str(uuid4())
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 """
                 INSERT INTO authorization_comparison_plans (
@@ -121,7 +134,7 @@ class PostgresAuthorizationComparisonPlanRepository:
         return self.get(plan_id)
 
     def get(self, comparison_plan_id: str) -> AuthorizationComparisonPlanRecord:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"SELECT {_COLUMNS} FROM authorization_comparison_plans WHERE comparison_plan_id = %s",  # noqa: S608
                 (comparison_plan_id,),
@@ -133,7 +146,7 @@ class PostgresAuthorizationComparisonPlanRepository:
         return self._record_from_row(row)
 
     def revoke(self, comparison_plan_id: str, *, now: datetime) -> AuthorizationComparisonPlanRecord:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 "SELECT revoked_at FROM authorization_comparison_plans WHERE comparison_plan_id = %s",
                 (comparison_plan_id,),
@@ -161,7 +174,7 @@ class PostgresAuthorizationComparisonPlanRepository:
         internal same-record fetches and ``require_bound``'s
         defense-in-depth mismatch reporting."""
 
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"SELECT {_COLUMNS} FROM authorization_comparison_plans "  # noqa: S608
                 "WHERE comparison_plan_id = %s AND organization_id = %s",
@@ -179,7 +192,7 @@ class PostgresAuthorizationComparisonPlanRepository:
         """P1-C1: mirrors ``get_scoped``'s ownership scope -- see that
         method's docstring."""
 
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 "SELECT revoked_at FROM authorization_comparison_plans "
                 "WHERE comparison_plan_id = %s AND organization_id = %s",
