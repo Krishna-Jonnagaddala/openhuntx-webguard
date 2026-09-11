@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: fb044e8ba441b4f327db7c57150cdb6a093fd6a5
+Commit: acabe55c29fbf46d7932cb6c5741212d5768d8c9
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -529,6 +529,26 @@ Converts all 5 `postgres_authorization_comparison.py` methods, mirroring `postgr
 **Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence including the 14-test tenant-isolation suite (both comparison-plan cross-tenant tests unmodified) and both production E2E files, and the full 1799-test unit suite (clean on 3 of 4 runs; see note above).
 
 This closes the tenant-context-setting conversion for the two files with the "no-org-parameter, called from both processes" shape. Remaining Phase H tenant-context-setting work: the ordinary methods within `postgres_identity.py`, `postgres_jobs.py`, `postgres_schedules.py`, `postgres_sessions.py`, and `postgres_callback_service.py`/`postgres_callback_broker.py` (the ones not already converted to a control function in PRs #30-#35).
+
+## Phase H conversion: postgres_identity.py (2026-09-11)
+
+Converts the 21 methods in `postgres_identity.py` not already handled by PRs #30-#31 (`authenticate_token`, `get_principal_by_email`, both control-function conversions, untouched here) or already documented as blocked (`get_password_hash`, `consume_identity_token`, still raw SQL on the unrestricted connection, docstrings unchanged).
+
+Most of the file has real `organization_id` somewhere: `get_organization`, `list_principals`, `update_principal_role`, `set_principal_active`, `create_identity_token`, `authorization_is_assigned`, `list_assigned_authorization_ids`, `record_audit_event`, `list_audit_events_page` all take it as a direct parameter and run under `api_tenant_data` via `tenant_connection`. `create_organization`, `create_principal`, and `create_token` don't take one as a plain parameter but generate or resolve one before their own write (`create_organization` generates the new org's own id up front; `create_principal` receives it directly; `create_token` resolves it from `get_principal(principal_id).organization_id`), so each also runs under `tenant_connection` scoped to that value.
+
+A second cluster has no `organization_id` anywhere in its own signature: `get_principal`, `set_principal_email_verified`, `touch_last_login`, `set_password_hash`, `invalidate_identity_tokens`, `list_tokens_for_principal`, and `revoke_token_owned`. Each of these runs under `api_tenant_data` via `role_scoped_connection`, the same role-only treatment `postgres_authentication_contexts.py`'s `get_metadata`/`revoke` use. `invalidate_identity_tokens` is a notable case: `tenant_isolation_acl.sql`'s own header comment names this exact method as the reason `api_tenant_data` was granted `SELECT (token_id, principal_id, purpose, used_at)` on `identity_tokens`, so unlike `consume_identity_token` (which needs `created_at` and `organization_id` too, and stays blocked), this one was already anticipated to run under the restricted role and converts cleanly.
+
+`revoke_token` and `assign_authorization` stay on the unrestricted connection: grep against `service.py` and `cli.py` confirms neither has a caller in the API serve process, only `cli.py`'s own `token revoke` and `authorization assign` operator subcommands, matching the classification `tenant_isolation_acl.sql` already recorded for `assign_authorization`'s missing `INSERT` grant.
+
+`authorization_is_assigned` is reachable from two different processes: `service.py` (5 call sites) and `scheduler.py`'s `run_once` loop (1 call site). `api_tenant_data` and `scheduler_tenant_data` carry the identical `SELECT` grant on `organization_authorizations`, so this runs under `api_tenant_data` and works the same way regardless of which process calls it, the same shared-SELECT reasoning `postgres_scans.py`'s `get_scan_scoped` already established for its own worker/API split.
+
+Three test files exercised `create_organization`, `create_principal`, or `set_password_hash` without the tenant-isolation bootstrap: `test_callback_service_outage_resilience.py` and `test_postgres_scheduler_outage_resilience.py` (both real-Docker-outage suites, not run locally, fixed for consistency the same way `test_postgres_worker_outage_resilience.py` was in an earlier PR) got the standard fixture added. `test_postgres_identity_credentials_write_shape.py` needed no change: its pool connects as a disposable LOGIN role created `IN ROLE "api_tenant_data"` directly, so `SET LOCAL ROLE` succeeds without the `webguard`-membership chain `tenant_isolation_runtime_grant.sql` provides, and it never touches `webguard_control` at all; ran unmodified and passed.
+
+**A transient test-infrastructure note, not a code finding**: `test_production_ssrf_callback_e2e.py`'s `test_no_fabricated_confirmation_when_persistence_never_recovers` failed once with "job did not complete in time" (a 60-second real-scan completion timeout), then passed cleanly on two immediate re-runs. This test's own execution path (a worker running a real SSRF probe against a real callback receiver) never reaches `postgres_identity.py`; this PR's change touches identity/organization/audit repository methods only, so the timeout is consistent with the same real-socket timing flake category already flagged earlier in this session, not a regression from this change.
+
+**Proven against real disposable Postgres**: `test_identity_repository_contract.py` (22/22, both SQLite and Postgres backends), the full contract suite, the full Postgres integration sequence including `test_postgres_identity_credentials_write_shape.py`'s 12-test ACL-shape suite (unmodified, still passing), both production E2E files, and the full 1799-test unit suite.
+
+This closes the ordinary-method tenant-context-setting conversion for `postgres_identity.py`. Remaining Phase H tenant-context-setting work: `postgres_jobs.py`, `postgres_schedules.py`, `postgres_sessions.py`, and `postgres_callback_service.py`/`postgres_callback_broker.py`.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 

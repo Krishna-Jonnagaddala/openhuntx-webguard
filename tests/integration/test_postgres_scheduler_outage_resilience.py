@@ -41,6 +41,29 @@ CONTAINER = os.environ.get("WEBGUARD_P1_11_POSTGRES_CONTAINER")
 RUN_OUTAGE_TESTS = RUN_INTEGRATION and bool(POSTGRES_TEST_DSN) and bool(CONTAINER)
 NOW = datetime.now(timezone.utc)
 
+# P1-2 Phase H: create_organization, create_principal, and
+# authorization_is_assigned (reached here through
+# ScanScheduleCoordinator.run_once) now run under api_tenant_data (see
+# postgres_identity.py's own class docstring), so this test needs the
+# same role/ACL/function/runtime-grant bootstrap
+# tests/contract/test_identity_repository_contract.py's own setUpClass
+# applies, in the same order.
+_BOOTSTRAP_DIR = Path(__file__).resolve().parent.parent.parent / "infra" / "postgres" / "bootstrap"
+_ROLES_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_roles.sql"
+_TENANT_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_acl.sql"
+_FUNCTION_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_function_acl.sql"
+_CONTROL_FUNCTIONS_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_control_functions.sql"
+_RUNTIME_GRANT_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_runtime_grant.sql"
+_ALL_BOOTSTRAP_ROLES = (
+    "api_tenant_data",
+    "worker_tenant_data",
+    "scheduler_tenant_data",
+    "identity_function_owner",
+    "worker_function_owner",
+    "scheduler_function_owner",
+    "callback_function_owner",
+)
+
 
 def _docker(*args: str) -> None:
     subprocess.run(["docker", *args], check=False, capture_output=True)
@@ -74,6 +97,33 @@ def _start_postgres() -> None:
     "tests are allowed to docker stop/start) to run this suite.",
 )
 class PostgresSchedulerOutageResilienceTests(unittest.TestCase):
+    @classmethod
+    def _connect(cls):
+        import psycopg
+
+        return psycopg.connect(POSTGRES_TEST_DSN)
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        for sql_path in (
+            _ROLES_SQL_PATH,
+            _TENANT_ACL_SQL_PATH,
+            _FUNCTION_ACL_SQL_PATH,
+            _CONTROL_FUNCTIONS_SQL_PATH,
+            _RUNTIME_GRANT_SQL_PATH,
+        ):
+            with cls._connect() as connection:
+                connection.execute(sql_path.read_text(encoding="utf-8"))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        with cls._connect() as connection:
+            connection.autocommit = True
+            connection.execute("DROP SCHEMA IF EXISTS webguard_control CASCADE")
+            for role in _ALL_BOOTSTRAP_ROLES:
+                connection.execute(f'DROP OWNED BY "{role}"')
+                connection.execute(f'DROP ROLE IF EXISTS "{role}"')
+
     def setUp(self) -> None:
         from webguard_api.authorizations import AuthorizationRepository
         from webguard_api.permits import TrustScanSigner

@@ -52,7 +52,25 @@ class PostgresIdentityRepository:
     ``IdentityStore``'s behavior and error codes; the only intended
     difference is durability across a restart and safety under
     concurrent writers across multiple hosts (SQLite's single-file
-    design supports neither)."""
+    design supports neither).
+
+    P1-2 Phase H: every ordinary method that carries its own
+    organization_id, resolves one, or generates a fresh one before its
+    own write, runs under api_tenant_data via tenant_connection. A
+    cluster of methods carries no organization_id in their own
+    signature at all: get_principal, set_principal_email_verified,
+    touch_last_login, set_password_hash, invalidate_identity_tokens,
+    list_tokens_for_principal, and revoke_token_owned. Each of these
+    runs under api_tenant_data via role_scoped_connection instead,
+    the same role-only, no-tenant-context treatment
+    PostgresAuthenticationContextRepository's get_metadata and revoke
+    use, and for the same reason: there is no organization_id at that
+    call site to set the GUC to. get_password_hash and
+    consume_identity_token are the two exceptions already documented
+    below as a genuine, unclosed Phase H gap and are not touched here.
+    revoke_token and assign_authorization have no live caller anywhere
+    in the API serve process (cli.py's operator subcommands are their
+    only callers), so both stay on the unrestricted connection."""
 
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
@@ -67,7 +85,7 @@ class PostgresIdentityRepository:
             created_at=now,
         )
         try:
-            with self._pool.connection() as connection:
+            with self._pool.tenant_connection(value.organization_id, role=API_TENANT_DATA_ROLE) as connection:
                 connection.execute(
                     """
                     INSERT INTO organizations (organization_id, name, name_key, status, created_at)
@@ -89,7 +107,7 @@ class PostgresIdentityRepository:
         return value
 
     def get_organization(self, organization_id: str) -> Organization:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 """
                 SELECT organization_id, name, status, created_at
@@ -136,7 +154,7 @@ class PostgresIdentityRepository:
             email=email,
         )
         try:
-            with self._pool.connection() as connection:
+            with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
                 with connection.transaction():
                     connection.execute(
                         """
@@ -182,7 +200,7 @@ class PostgresIdentityRepository:
         return value
 
     def get_principal(self, principal_id: str) -> Principal:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals WHERE principal_id = %s",  # noqa: S608
                 (principal_id,),
@@ -241,7 +259,7 @@ class PostgresIdentityRepository:
         return principal
 
     def list_principals(self, organization_id: str) -> tuple[Principal, ...]:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
                 f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals WHERE organization_id = %s ORDER BY created_at",  # noqa: S608
                 (organization_id,),
@@ -262,7 +280,7 @@ class PostgresIdentityRepository:
         preceding call or on that invariant holding forever."""
 
         principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 "UPDATE principals SET role = %s WHERE principal_id = %s AND organization_id = %s",
                 (role.value, principal_id, organization_id),
@@ -287,7 +305,7 @@ class PostgresIdentityRepository:
         fix -- see that method's docstring."""
 
         principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 "UPDATE principals SET active = %s WHERE principal_id = %s AND organization_id = %s",
                 (active, principal_id, organization_id),
@@ -307,7 +325,7 @@ class PostgresIdentityRepository:
 
     def set_principal_email_verified(self, principal_id: str, *, now: datetime) -> Principal:
         principal = self.get_principal(principal_id)
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 "UPDATE principals SET email_verified_at = %s WHERE principal_id = %s",
                 (now, principal_id),
@@ -326,7 +344,7 @@ class PostgresIdentityRepository:
         )
 
     def touch_last_login(self, principal_id: str, *, now: datetime) -> None:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 "UPDATE principals SET last_login_at = %s WHERE principal_id = %s",
                 (now, principal_id),
@@ -347,7 +365,7 @@ class PostgresIdentityRepository:
         # values, so it only ever needs SELECT on principal_id (the
         # WHERE-clause column) -- see tenant_isolation_acl.sql's own
         # comment on this grant for the full empirical trace.
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO password_credentials (principal_id, algorithm, password_hash, created_at, updated_at)
@@ -405,7 +423,7 @@ class PostgresIdentityRepository:
         secret = secrets.token_urlsafe(32)
         raw = f"{IDENTITY_TOKEN_PREFIX}_{token_id}_{secret}"
         expires_at = now + ttl
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 """
                 INSERT INTO identity_tokens
@@ -487,9 +505,15 @@ class PostgresIdentityRepository:
         """Mark every still-usable token of this purpose for this
         principal as used, without needing its secret -- used when a new
         token supersedes an older, still-pending one (e.g. requesting a
-        second password reset invalidates the first)."""
+        second password reset invalidates the first). P1-2 Phase H:
+        principal_id, purpose, and used_at are exactly the columns
+        tenant_isolation_acl.sql grants api_tenant_data SELECT on for
+        identity_tokens (proven necessary for this statement's own
+        WHERE clause), so this runs under api_tenant_data via
+        role_scoped_connection, unlike consume_identity_token, which
+        also needs created_at and organization_id and stays blocked."""
 
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 """
                 UPDATE identity_tokens SET used_at = %s
@@ -499,7 +523,7 @@ class PostgresIdentityRepository:
             )
 
     def list_tokens_for_principal(self, principal_id: str) -> tuple[ApiTokenMetadata, ...]:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
                 """
                 SELECT token_id, organization_id, principal_id, label,
@@ -523,7 +547,7 @@ class PostgresIdentityRepository:
         )
 
     def revoke_token_owned(self, token_id: str, *, principal_id: str, now: datetime) -> ApiTokenMetadata:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 """
                 SELECT token_id, organization_id, principal_id, label,
@@ -589,7 +613,9 @@ class PostgresIdentityRepository:
             expires_at=now + timedelta(days=validity_days),
         )
         try:
-            with self._pool.connection() as connection:
+            with self._pool.tenant_connection(
+                metadata.organization_id, role=API_TENANT_DATA_ROLE
+            ) as connection:
                 connection.execute(
                     """
                     INSERT INTO api_tokens
@@ -707,6 +733,12 @@ class PostgresIdentityRepository:
         return updated, principal, organization
 
     def revoke_token(self, token_id: str, *, now: datetime) -> ApiTokenMetadata:
+        """P1-2 Phase H: unlike revoke_token_owned, this method has no
+        caller anywhere in service.py, only cli.py's operator
+        `token revoke` subcommand. The API serve process never reaches
+        it, so it stays on the unrestricted connection rather than
+        being narrowed to api_tenant_data."""
+
         with self._pool.connection() as connection:
             row = connection.execute(
                 """
@@ -746,6 +778,14 @@ class PostgresIdentityRepository:
         assigned_by: str,
         now: datetime,
     ) -> None:
+        """P1-2 Phase H: tenant_isolation_acl.sql's own header records
+        why organization_authorizations has no INSERT grant for
+        api_tenant_data: this method's only caller anywhere in this
+        codebase is cli.py's `authorization assign` operator
+        subcommand, never the API serve process. It stays on the
+        unrestricted connection rather than being narrowed to a role
+        that could not actually run its INSERT."""
+
         principal = self.get_principal(assigned_by)
         if principal.organization_id != organization_id:
             raise IdentityStoreError(
@@ -764,7 +804,16 @@ class PostgresIdentityRepository:
             )
 
     def authorization_is_assigned(self, organization_id: str, authorization_id: str) -> bool:
-        with self._pool.connection() as connection:
+        """P1-2 Phase H: called from both service.py (the API serve
+        process) and scheduler.py's own run_once loop. api_tenant_data
+        and scheduler_tenant_data carry the identical SELECT grant on
+        organization_authorizations, so this runs under
+        api_tenant_data and works the same way regardless of which
+        process calls it, the same shared-SELECT reasoning
+        PostgresScanRepository's get_scan_scoped documents for its own
+        worker/API split."""
+
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 """
                 SELECT 1 FROM organization_authorizations
@@ -775,7 +824,7 @@ class PostgresIdentityRepository:
             return row is not None
 
     def list_assigned_authorization_ids(self, organization_id: str) -> tuple[str, ...]:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
                 "SELECT authorization_id FROM organization_authorizations WHERE organization_id = %s",
                 (organization_id,),
@@ -786,7 +835,7 @@ class PostgresIdentityRepository:
         if not isinstance(event, SecurityAuditEvent):
             raise IdentityStoreError("audit_event_invalid", "event must be a SecurityAuditEvent.")
         try:
-            with self._pool.connection() as connection:
+            with self._pool.tenant_connection(event.organization_id, role=API_TENANT_DATA_ROLE) as connection:
                 connection.execute(
                     """
                     INSERT INTO security_audit_events
@@ -846,7 +895,7 @@ class PostgresIdentityRepository:
             clauses.append("(occurred_at < %s OR (occurred_at = %s AND event_id < %s))")
             parameters.extend((after[0], after[0], after[1]))
         parameters.append(limit + 1)
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
                 f"""
                 SELECT event_id, request_id, organization_id, principal_id, token_id,
