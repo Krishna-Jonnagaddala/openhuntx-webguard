@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 0b8398a44e749a3795053e1117f4a3f34f519bb2
+Commit: f4d1d46e233b67cf8e53af7d8bf00ff661381569
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -425,6 +425,20 @@ That constraint turned out to be a clean fit: all three control functions' own `
 **Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence including the concurrent-claim atomicity test and the crash-recovery suite (9/9), the production-realistic `build_production_components` E2E (4/4), and the full 1799-test unit suite. Adversarial check: under `worker_tenant_data`, a raw `SELECT job_id FROM scan_jobs` fails with `permission denied`; `webguard_control.claim_next_job` under the identical restricted connection succeeds cleanly.
 
 Remaining Phase H worker/scheduler conversion work: `_terminal_update` (via `finish_result_leased`/`fail_leased`/`cancel_running_leased`) and its safety-receipt issuance path, `postgres_schedules.py`'s three cross-tenant scheduler functions, and `postgres_callback_service.py`'s callback resolver. None started.
+
+## Phase H conversion: fourth slice, terminal_transition and safety-receipt issuance (2026-09-11)
+
+Converted `_terminal_update` (the shared implementation behind `finish_result`, `finish_result_leased`, `fail_leased`, `cancel_running_leased`, and `cancel_running`) to run entirely through `webguard_control.terminal_transition` under `worker_tenant_data`. This is the method that issues safety receipts, the signed proof artifact this project's whole safety model rests on, so it got the same careful, line-by-line comparison against the SQL function as every prior conversion, not a faster pass because the pattern was already proven three times before.
+
+The function's own SQL comment documents one visible behavioral reordering worth restating here: the original Python validated the safety-receipt format (path-traversal check, hex-digest check) at the very end, right before the `INSERT`, after the lease/CAS work had already succeeded. The function validates that format up front, before touching the row at all. Both orderings are observably identical, since a failure either way aborts the whole invocation with zero writes (one Postgres transaction, one Python `with` block whose exception triggers a full rollback). Phase F's own review already reasoned through this when the function was built; this conversion just relies on that existing reasoning rather than re-litigating it.
+
+`terminal_transition` reports twelve distinct non-success outcomes plus `ok` through its own `outcome` column (a SQL function cannot raise Python's `JobStoreError` subclasses). Mapped each to its exact original error code and message: `not_found`, `invalid_state`, `lease_required`, `lease_expired`, `transition_conflict`, `safety_receipt_reference_invalid`, `safety_receipt_digest_invalid`, and a `lease_lost` catch-all covering the three outcomes (`lease_lost` itself, `worker_id_invalid`, `receipt_metadata_invalid`, `lease_credentials_invalid`) that are unreachable from this call site because Python already validates the identical conditions before ever reaching the database.
+
+With this conversion, `_require_active_lease` (the helper `renew_lease`'s own earlier conversion had already stopped calling) had no callers left at all. Deleted it rather than leave dead code behind, and corrected the module's own docstring, which still named it as the concurrency model's lease-validation mechanism.
+
+**Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence including the crash-recovery suite and the `build_production_components` E2E, and the full 1799-test unit suite, all unchanged in behavior. Adversarial check: a raw `INSERT` into `job_safety_receipts` fails under `worker_tenant_data` with permission denied; `webguard_control.terminal_transition` succeeds under the identical restricted connection and correctly reports `not_found` for an unknown job.
+
+This closes out every method in `postgres_jobs.py` that has a Phase F control-function counterpart. Remaining Phase H worker/scheduler conversion work: `postgres_schedules.py`'s three cross-tenant scheduler functions (`list_due_schedules`, `enqueue_due_schedule`, `block_due_schedule`) and `postgres_callback_service.py`'s callback resolver (`record_observation`).
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
