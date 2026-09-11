@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 6a83d867974477e37686bfd9fc63a07dec4568d2
+Commit: 806a6506ee476830ba489cef8ab94c7d2cd9bad6
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -495,6 +495,14 @@ Converts all 3 `postgres_reports.py` methods to `tenant_connection(organization_
 Existing coverage in `test_postgres_tenant_isolation_slice13.py`'s `test_reports_cross_tenant_read_fails_closed` already exercises all three methods (a real `create_report` including its own internal `get_report_scoped` re-read, then cross-tenant negative checks on `get_report_scoped` and `list_reports_scoped_page`) and passed unmodified.
 
 **Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence, both production E2E files, and the full 1799-test unit suite.
+
+## Phase H conversion: postgres_scans.py (2026-09-11)
+
+Converts all 5 `postgres_scans.py` methods. Same split pattern as `postgres_findings.py`: `api_tenant_data` has only `SELECT` on `scan_records`; `worker_tenant_data` has `SELECT, INSERT, UPDATE`. `create_scan` and `complete_scan`, called only from `executor.py`, run under `worker_tenant_data`. `get_scan_scoped`, `list_scans_scoped`, and `list_scans_scoped_page` run under `api_tenant_data`: a plain `SELECT`, already granted to both roles, so it reads correctly regardless of which role inserted the row. `get_scan_scoped` specifically has two callers (`service.py`, and `create_scan`'s own internal post-write re-read from the worker) and works under `api_tenant_data` for both, since the grant only depends on the reading role, not the writing one. `list_scans_scoped` itself has zero production callers (only test callers), converted anyway for consistency.
+
+`PostgresScanRepositoryContractTests` in `test_job_scan_finding_repository_contract.py` had no tenant-isolation bootstrap before this change (only the sibling `PostgresJobRepositoryContractTests` got it in #32); added the same fixture.
+
+**Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence including the crash-recovery suite, both production E2E files, and the full 1799-test unit suite.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
