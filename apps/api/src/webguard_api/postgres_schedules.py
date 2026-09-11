@@ -61,7 +61,7 @@ from webguard_contracts import (
 )
 
 from .db_errors import DatabaseIntegrityError
-from .postgres_pool import WebGuardPostgresPool
+from .postgres_pool import SCHEDULER_TENANT_DATA_ROLE, WebGuardPostgresPool
 from .store import JobStoreError
 
 _COLUMNS = (
@@ -342,17 +342,18 @@ class PostgresScheduleRepository:
     # -- occurrence materialization (requirements 3-4) ------------------
 
     def list_due_schedules(self, *, now: datetime, limit: int = 100) -> tuple[ScanScheduleRecord, ...]:
+        """P1-2 Phase H: cross-tenant by design (polls every
+        organization's due schedules at once). scheduler_tenant_data
+        has no table-level grant on scan_schedules at all, so this
+        runs entirely through webguard_control.list_due_schedules,
+        whose return columns exactly match this method's own SELECT."""
+
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
             raise JobStoreError("schedule_batch_limit_invalid", "Schedule batch limit must be from 1 to 1000.")
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(SCHEDULER_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
-                f"""
-                SELECT {_COLUMNS} FROM scan_schedules
-                WHERE state = %s AND next_run_at <= %s
-                ORDER BY next_run_at, schedule_id
-                LIMIT %s
-                """,  # noqa: S608
-                (ScanScheduleState.ACTIVE.value, now, limit),
+                "SELECT * FROM webguard_control.list_due_schedules(%s, %s)",
+                (now, limit),
             ).fetchall()
         return tuple(self._record_from_row(row) for row in rows)
 
@@ -383,7 +384,26 @@ class PostgresScheduleRepository:
         was concurrently modified, disabled, not yet due, or its
         authorization/permit binding no longer checks out; the caller
         (``ScanScheduleCoordinator``) treats that as "raced" or "blocked"
-        exactly as it already does for the SQLite backend."""
+        exactly as it already does for the SQLite backend.
+
+        P1-2 Phase H gap, not yet closed: webguard_control.enqueue_due_schedule
+        exists and reproduces this method's exact sequence, but its own
+        RETURNS TABLE is a deliberately minimized 8-column summary
+        (outcome, schedule_id, schedule_state, schedule_revision,
+        schedule_next_run_at, job_id, job_state, job_submitted_at),
+        enough for this method's own live caller (scheduler.py's
+        run_once, which only ever reads the returned job record's
+        job_id) but not enough to reconstruct the full
+        ScanScheduleRecord/ScanJobRecord this method's own contract
+        promises. scheduler_tenant_data has no table-level grant on
+        scan_schedules, scan_jobs, schedule_permits, or job_permits at
+        all, so there is no ordinary-refetch fallback to fill the
+        remaining fields the way authenticate_token's does. Closing
+        this needs either widening the function's own return columns
+        (a change to Phase F's already-reviewed SQL) or narrowing this
+        method's own return contract to match what its one real caller
+        actually uses, both real design decisions, not a wiring change
+        made unilaterally here."""
 
         with self._pool.connection() as connection:
             row = connection.execute(
@@ -502,23 +522,17 @@ class PostgresScheduleRepository:
     def block_due_schedule(
         self, schedule_id: str, *, expected_revision: int, error_code: str, now: datetime
     ) -> ScanScheduleRecord | None:
-        with self._pool.connection() as connection:
-            updated = connection.execute(
-                """
-                UPDATE scan_schedules
-                SET state = %s, updated_at = %s, revision = revision + 1,
-                    last_error_code = %s, last_error_at = %s
-                WHERE schedule_id = %s AND revision = %s AND state = %s
-                """,
-                (
-                    ScanScheduleState.PAUSED.value, now, error_code, now,
-                    schedule_id, expected_revision, ScanScheduleState.ACTIVE.value,
-                ),
-            )
-            if updated.rowcount != 1:
-                return None
+        """P1-2 Phase H: mirrors list_due_schedules's shape. Runs
+        entirely through webguard_control.block_due_schedule, whose
+        return columns exactly match this method's own SELECT. A lost
+        CAS (concurrently modified, already inactive) returns zero
+        rows, matching this method's existing None-on-lost-race
+        contract."""
+
+        with self._pool.role_scoped_connection(SCHEDULER_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                f"SELECT {_COLUMNS} FROM scan_schedules WHERE schedule_id = %s", (schedule_id,)  # noqa: S608
+                "SELECT * FROM webguard_control.block_due_schedule(%s, %s, %s, %s)",
+                (schedule_id, expected_revision, error_code, now),
             ).fetchone()
         return None if row is None else self._record_from_row(row)
 
