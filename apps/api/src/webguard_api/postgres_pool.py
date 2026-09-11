@@ -50,6 +50,20 @@ DEFAULT_CONNECTION_TIMEOUT_SECONDS = 5.0
 # the exact name without repeating a string literal at each call site.
 TENANT_CONTEXT_GUC = "webguard.current_organization_id"
 
+# P1-2 Phase H: the three NOLOGIN roles tenant_isolation_roles.sql
+# creates and tenant_isolation_runtime_grant.sql grants "webguard"
+# membership in. Fixed here as the only names role_scoped_connection
+# will ever interpolate into a SET LOCAL ROLE statement -- Postgres
+# has no parameterized form for a role identifier, so this frozenset
+# is what stands in for a bind parameter: a caller cannot reach the
+# interpolation with anything other than one of these three literals.
+API_TENANT_DATA_ROLE = "api_tenant_data"
+WORKER_TENANT_DATA_ROLE = "worker_tenant_data"
+SCHEDULER_TENANT_DATA_ROLE = "scheduler_tenant_data"
+_RUNTIME_ROLES = frozenset(
+    {API_TENANT_DATA_ROLE, WORKER_TENANT_DATA_ROLE, SCHEDULER_TENANT_DATA_ROLE}
+)
+
 
 def _canonical_organization_id(organization_id: str | uuid.UUID) -> str:
     """Validates ``organization_id`` as a real UUID and returns its
@@ -199,6 +213,49 @@ class WebGuardPostgresPool:
             set_tenant_context(connection, tenant_id)
             yield connection
 
+    @contextmanager
+    def role_scoped_connection(
+        self, role: str, *, timeout_seconds: float | None = None
+    ) -> Iterator[psycopg.Connection]:
+        """Like :meth:`connection`, but immediately runs ``SET LOCAL
+        ROLE`` to ``role`` before the caller ever sees the connection --
+        for a pre-auth resolver (no organization is known yet, so
+        :meth:`tenant_connection` doesn't apply) that still needs to
+        run as something narrower than whatever role
+        ``WEBGUARD_DATABASE_URL`` actually connects as.
+
+        ``role`` must be one of :data:`API_TENANT_DATA_ROLE`,
+        :data:`WORKER_TENANT_DATA_ROLE`, or
+        :data:`SCHEDULER_TENANT_DATA_ROLE` -- checked before this
+        method ever borrows a connection or builds a SQL string, since
+        Postgres has no parameterized form for ``SET ROLE`` and this
+        check is what stands in for one. Anything else raises
+        ``ValueError`` in Python, the same defensive shape
+        :func:`_canonical_organization_id` already uses for
+        ``organization_id``.
+
+        Requires the connecting role to already hold membership in
+        ``role`` -- granted once, for a real deployment, by
+        ``infra/postgres/bootstrap/tenant_isolation_runtime_grant.sql``.
+        Without that grant, ``SET LOCAL ROLE`` raises
+        ``psycopg.errors.InsufficientPrivilege``, normalized like any
+        other driver error by :meth:`connection`.
+
+        ``SET LOCAL`` scopes the role switch to the current
+        transaction, exactly like :func:`set_tenant_context`'s GUC --
+        it reverts on its own the instant this method's own ``with``
+        block (via :meth:`connection`) ends, whether by commit or
+        rollback. Combine with :func:`set_tenant_context` on the same
+        connection, once an organization becomes known partway through
+        the transaction, for a pre-auth-resolve-then-scoped-read flow.
+        """
+
+        if role not in _RUNTIME_ROLES:
+            raise ValueError(f"role must be one of {sorted(_RUNTIME_ROLES)}, got {role!r}.")
+        with self.connection(timeout_seconds=timeout_seconds) as connection:
+            connection.execute(f'SET LOCAL ROLE "{role}"')
+            yield connection
+
     def check_connectivity(self, *, timeout_seconds: float | None = None) -> None:
         """Used by the readiness endpoint (requirement 14) -- a cheap
         round trip proving the pool can actually reach the database
@@ -235,10 +292,13 @@ class WebGuardPostgresPool:
 
 
 __all__ = [
+    "API_TENANT_DATA_ROLE",
     "DEFAULT_CONNECTION_TIMEOUT_SECONDS",
     "DEFAULT_MAXIMUM_CONNECTIONS",
     "DEFAULT_MINIMUM_CONNECTIONS",
+    "SCHEDULER_TENANT_DATA_ROLE",
     "TENANT_CONTEXT_GUC",
+    "WORKER_TENANT_DATA_ROLE",
     "WebGuardPostgresPool",
     "set_tenant_context",
 ]

@@ -28,6 +28,31 @@ POSTGRES_TEST_DSN = os.environ.get("WEBGUARD_POSTGRES_TEST_DSN")
 RUN_POSTGRES_TESTS = RUN_INTEGRATION and bool(POSTGRES_TEST_DSN)
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
 
+# P1-2 Phase H: authenticate_token() now runs its pre-auth resolve
+# step under api_tenant_data (see postgres_pool.py's
+# role_scoped_connection and postgres_identity.py's authenticate_token),
+# so this contract test's PostgreSQL side needs the same role/ACL/
+# control-function/runtime-grant bootstrap test_postgres_control_functions.py
+# applies for its own tests -- without it, SET LOCAL ROLE fails with
+# "role \"api_tenant_data\" does not exist" the first time any test
+# here calls authenticate_token. The SQLite side needs none of this;
+# it never touches a database role at all.
+_BOOTSTRAP_DIR = Path(__file__).resolve().parent.parent.parent / "infra" / "postgres" / "bootstrap"
+_ROLES_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_roles.sql"
+_TENANT_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_acl.sql"
+_FUNCTION_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_function_acl.sql"
+_CONTROL_FUNCTIONS_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_control_functions.sql"
+_RUNTIME_GRANT_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_runtime_grant.sql"
+_ALL_BOOTSTRAP_ROLES = (
+    "api_tenant_data",
+    "worker_tenant_data",
+    "scheduler_tenant_data",
+    "identity_function_owner",
+    "worker_function_owner",
+    "scheduler_function_owner",
+    "callback_function_owner",
+)
+
 
 class IdentityRepositoryContractMixin:
     """Subclasses provide `make_repository()`. Every test method here
@@ -223,6 +248,38 @@ class SqliteIdentityRepositoryContractTests(IdentityRepositoryContractMixin, uni
     "Set WEBGUARD_RUN_INTEGRATION=1 and WEBGUARD_POSTGRES_TEST_DSN to run this PostgreSQL contract test.",
 )
 class PostgresIdentityRepositoryContractTests(IdentityRepositoryContractMixin, unittest.TestCase):
+    @classmethod
+    def _connect(cls):
+        import psycopg
+
+        return psycopg.connect(POSTGRES_TEST_DSN)
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Same file-per-connection sequencing test_postgres_control_functions.py's
+        # own _apply_full_bootstrap uses -- each file gets its own
+        # transaction, committed on that `with` block's clean exit,
+        # before the next file (which may depend on the previous one
+        # having actually committed) runs.
+        for sql_path in (
+            _ROLES_SQL_PATH,
+            _TENANT_ACL_SQL_PATH,
+            _FUNCTION_ACL_SQL_PATH,
+            _CONTROL_FUNCTIONS_SQL_PATH,
+            _RUNTIME_GRANT_SQL_PATH,
+        ):
+            with cls._connect() as connection:
+                connection.execute(sql_path.read_text(encoding="utf-8"))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        with cls._connect() as connection:
+            connection.autocommit = True
+            connection.execute("DROP SCHEMA IF EXISTS webguard_control CASCADE")
+            for role in _ALL_BOOTSTRAP_ROLES:
+                connection.execute(f'DROP OWNED BY "{role}"')
+                connection.execute(f'DROP ROLE IF EXISTS "{role}"')
+
     def setUp(self) -> None:
         from webguard_api.postgres_pool import WebGuardPostgresPool
 
