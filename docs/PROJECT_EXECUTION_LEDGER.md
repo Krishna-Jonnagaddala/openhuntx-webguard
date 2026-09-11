@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 2ffa016e4c8d0e677876480cd8ae56321b7d8ef6
+Commit: 16faaffd95140c4f47d83d56a062f90e91d0749b
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -565,6 +565,20 @@ Two new gaps, not previously documented: `get_job_permit_binding`'s only callers
 **Proven against real disposable Postgres**: the full contract suite (`test_job_scan_finding_repository_contract.py`'s 8 Postgres-backed job/permit tests among its 17), the full Postgres integration regression sequence, both production E2E files, `test_production_ssrf_callback_e2e.py` clean, and the full 1799-test unit suite.
 
 This closes the ordinary-method tenant-context-setting conversion for `postgres_jobs.py`'s own methods (its schedule-delegate thin wrappers forward to `postgres_schedules.py`, not converted here). Remaining Phase H tenant-context-setting work: `postgres_schedules.py`, `postgres_sessions.py`, and `postgres_callback_service.py`/`postgres_callback_broker.py`.
+
+## Phase H conversion: postgres_schedules.py, a third instance of the worker/scheduler-only gap (2026-09-11)
+
+Converts the ordinary methods in `postgres_schedules.py` not already handled by an earlier PR (`list_due_schedules`, `block_due_schedule`, both control-function conversions) or already documented as blocked (`enqueue_due_schedule`, untouched).
+
+`scan_schedules` and `schedule_permits` have no `scheduler_tenant_data` grant at all in `tenant_isolation_acl.sql`; only `api_tenant_data` can touch them, the same restriction `list_due_schedules`'s and `block_due_schedule`'s own docstrings already document. `create_schedule`, `get_schedule_scoped`, `list_schedules_scoped_page`, `_set_schedule_state` (the internal helper behind `pause_schedule_scoped`/`resume_schedule_scoped`), and `get_schedule_permit_binding_scoped` all take a real `organization_id` and now run under `api_tenant_data` via `tenant_connection`. `list_schedules_scoped` has zero production callers (only `tests/unit/test_schedule_store.py`, against the SQLite backend), converted anyway for consistency, matching `postgres_scans.py`'s `list_scans_scoped` precedent.
+
+`get_schedule_permit_binding` is a third instance of the worker/scheduler-only gap shape found in the previous two PRs: grep confirms its only caller anywhere in this codebase is `scheduler.py`, but `schedule_permits` has no `scheduler_tenant_data` grant, so no role is both this method's true caller and actually able to run the query. Stays on the unrestricted connection with a docstring naming `postgres_jobs.py`'s `get_job_permit_binding` as the same pattern.
+
+**Proven against real disposable Postgres**: `test_postgres_schedule_repository_wiring.py` (5/5, including `create_schedule` via its own setup helper), the 14-test `test_postgres_tenant_isolation_slice13.py` suite (including its schedule cross-tenant and secondary-enrichment-lookup cases), the full contract suite, the full Postgres integration regression sequence, both production E2E files, `test_production_ssrf_callback_e2e.py` (one transient timing flake unrelated to this change, clean on retry, same category flagged in the two prior PRs), and the full 1799-test unit suite.
+
+This closes the ordinary-method tenant-context-setting conversion for `postgres_schedules.py`. Remaining Phase H tenant-context-setting work: `postgres_sessions.py` and `postgres_callback_service.py`/`postgres_callback_broker.py`.
+
+**A billing gap, not a code gap**: GitHub Actions CI for this repository briefly failed every job, on PR #44 and this PR alike, with "recent account payments have failed or your spending limit needs to be increased," an account-level billing issue rather than a code or test failure. The user resolved it directly; PR #44 re-ran green and merged, and this PR (rebased on that merge) follows the same path.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
