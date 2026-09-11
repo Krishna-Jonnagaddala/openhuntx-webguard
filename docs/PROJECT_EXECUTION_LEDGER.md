@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 806a6506ee476830ba489cef8ab94c7d2cd9bad6
+Commit: 3a390e26ba40a2a1ddc7a2a7480f6a712d3ba387
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -503,6 +503,14 @@ Converts all 5 `postgres_scans.py` methods. Same split pattern as `postgres_find
 `PostgresScanRepositoryContractTests` in `test_job_scan_finding_repository_contract.py` had no tenant-isolation bootstrap before this change (only the sibling `PostgresJobRepositoryContractTests` got it in #32); added the same fixture.
 
 **Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence including the crash-recovery suite, both production E2E files, and the full 1799-test unit suite.
+
+## Phase H conversion: postgres_target_verification.py (2026-09-11)
+
+Converts all 4 `postgres_target_verification.py` methods to `tenant_connection(organization_id, role=API_TENANT_DATA_ROLE)`. `api_tenant_data` has the full `SELECT, INSERT, UPDATE` `target_verifications` needs; every method's only caller is `service.py`, confirmed by grep. The simplest, most uniform conversion in this arc so far: one role, every method, no split.
+
+`test_postgres_target_verification.py`'s own dedicated test class had no tenant-isolation bootstrap; added the same fixture every other file in this arc already has. Its two existing tests (the regression coverage for the `get_current`/`expected_token` bug this file's own docstring documents) passed unmodified.
+
+**Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence, both production E2E files, and the full 1799-test unit suite.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
