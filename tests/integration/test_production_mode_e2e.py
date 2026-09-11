@@ -66,6 +66,30 @@ RUN_INTEGRATION = os.environ.get("WEBGUARD_RUN_INTEGRATION") == "1"
 POSTGRES_TEST_DSN = os.environ.get("WEBGUARD_POSTGRES_TEST_DSN")
 RUN_PRODUCTION_E2E = RUN_INTEGRATION and bool(POSTGRES_TEST_DSN)
 
+# P1-2 Phase H: create_target and record_finding now run under
+# api_tenant_data/worker_tenant_data respectively (see postgres_pool.py's
+# tenant_connection and postgres_targets.py/postgres_findings.py's own
+# methods), so this real build_production_components-backed E2E needs
+# the same role/ACL/function/runtime-grant bootstrap
+# tests/contract/test_identity_repository_contract.py's own setUpClass
+# applies, in the same order: exactly what a real deployment must also
+# apply before this code ever runs against it.
+_BOOTSTRAP_DIR = Path(__file__).resolve().parent.parent.parent / "infra" / "postgres" / "bootstrap"
+_ROLES_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_roles.sql"
+_TENANT_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_acl.sql"
+_FUNCTION_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_function_acl.sql"
+_CONTROL_FUNCTIONS_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_control_functions.sql"
+_RUNTIME_GRANT_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_runtime_grant.sql"
+_ALL_BOOTSTRAP_ROLES = (
+    "api_tenant_data",
+    "worker_tenant_data",
+    "scheduler_tenant_data",
+    "identity_function_owner",
+    "worker_function_owner",
+    "scheduler_function_owner",
+    "callback_function_owner",
+)
+
 _REAL_CREATE_DEFAULT_CONTEXT = ssl.create_default_context
 
 
@@ -218,7 +242,35 @@ def _extract(pattern: str, text: str) -> str:
 )
 class ProductionModeEndToEndTests(unittest.TestCase):
     @classmethod
+    def _admin_connect(cls):
+        import psycopg
+
+        return psycopg.connect(POSTGRES_TEST_DSN)
+
+    @classmethod
+    def _apply_tenant_isolation_bootstrap(cls) -> None:
+        for sql_path in (
+            _ROLES_SQL_PATH,
+            _TENANT_ACL_SQL_PATH,
+            _FUNCTION_ACL_SQL_PATH,
+            _CONTROL_FUNCTIONS_SQL_PATH,
+            _RUNTIME_GRANT_SQL_PATH,
+        ):
+            with cls._admin_connect() as connection:
+                connection.execute(sql_path.read_text(encoding="utf-8"))
+
+    @classmethod
+    def _drop_tenant_isolation_bootstrap(cls) -> None:
+        with cls._admin_connect() as connection:
+            connection.autocommit = True
+            connection.execute("DROP SCHEMA IF EXISTS webguard_control CASCADE")
+            for role in _ALL_BOOTSTRAP_ROLES:
+                connection.execute(f'DROP OWNED BY "{role}"')
+                connection.execute(f'DROP ROLE IF EXISTS "{role}"')
+
+    @classmethod
     def setUpClass(cls) -> None:
+        cls._apply_tenant_isolation_bootstrap()
         cls.certificate_directory = TemporaryDirectory()
         cls.certificate_path = _generate_self_signed_certificate(Path(cls.certificate_directory.name))
         cls.fixture_server = ThreadingHTTPServer(("127.0.0.1", 0), _ReflectedXssFixtureHandler)
@@ -236,6 +288,7 @@ class ProductionModeEndToEndTests(unittest.TestCase):
         cls.fixture_server.server_close()
         cls.fixture_thread.join(timeout=5)
         cls.certificate_directory.cleanup()
+        cls._drop_tenant_isolation_bootstrap()
 
     def _validated_target(self) -> ValidatedTarget:
         return ValidatedTarget(

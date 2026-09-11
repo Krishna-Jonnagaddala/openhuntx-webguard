@@ -28,7 +28,7 @@ from .finding_store import (
     FindingStoreError,
     assert_valid_transition,
 )
-from .postgres_pool import WebGuardPostgresPool
+from .postgres_pool import API_TENANT_DATA_ROLE, WORKER_TENANT_DATA_ROLE, WebGuardPostgresPool
 
 _COLUMNS = (
     "finding_id, organization_id, scan_id, fingerprint, check_id, scanner_version, "
@@ -39,6 +39,13 @@ _COLUMNS = (
 
 
 class PostgresFindingRepository:
+    """P1-2 Phase H: every method here is ordinary and already
+    tenant-scoped. record_finding runs under worker_tenant_data (its
+    only caller is executor.py, and api_tenant_data has no INSERT on
+    findings at all, only SELECT/UPDATE, so it could not run there
+    regardless); the other four methods, called only from service.py,
+    run under api_tenant_data."""
+
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
 
@@ -99,7 +106,7 @@ class PostgresFindingRepository:
         references: tuple[str, ...] = (),
     ) -> FindingRecord:
         finding_id = str(uuid4())
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=WORKER_TENANT_DATA_ROLE) as connection:
             existing = connection.execute(
                 "SELECT status FROM findings WHERE organization_id = %s AND fingerprint = %s",
                 (organization_id, fingerprint),
@@ -180,7 +187,7 @@ class PostgresFindingRepository:
         return record
 
     def get_finding_scoped(self, finding_id: str, *, organization_id: str) -> FindingRecord:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"SELECT {_COLUMNS} FROM findings WHERE finding_id = %s AND organization_id = %s",  # noqa: S608
                 (finding_id, organization_id),
@@ -222,7 +229,7 @@ class PostgresFindingRepository:
             clauses.append("(last_seen_at < %s OR (last_seen_at = %s AND finding_id::text < %s))")
             parameters.extend((after[0], after[0], after[1]))
         parameters.append(limit + 1)
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
                 f"""
                 SELECT {_COLUMNS} FROM findings
@@ -245,7 +252,7 @@ class PostgresFindingRepository:
         reason: str | None = None,
         changed_by: str | None = None,
     ) -> FindingRecord:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 "SELECT status FROM findings WHERE finding_id = %s AND organization_id = %s",
                 (finding_id, organization_id),
@@ -285,7 +292,7 @@ class PostgresFindingRepository:
     def list_events_scoped(
         self, finding_id: str, *, organization_id: str
     ) -> tuple[FindingEventRecord, ...]:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             exists = connection.execute(
                 "SELECT 1 FROM findings WHERE finding_id = %s AND organization_id = %s",
                 (finding_id, organization_id),
