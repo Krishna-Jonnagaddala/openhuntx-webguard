@@ -7,13 +7,32 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 871a2208167d7689fa9263993d3c9e0ddd2a929c
+Commit: 5df6f1d94ae66767d2d1953f3e1ba30d264ea57d
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
   docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md's own "CURRENT P1
   ACCOUNTING" section directly, not the mandate's paraphrase of it.
 ```
+
+## Test-quality findings (not P1/audit items, recorded for continuity)
+
+**Flaky test fixed, 2026-09-11**: `tests/unit/test_customer_auth.py`'s
+`test_no_json_response_ever_contains_the_raw_session_or_csrf_secret`
+extracted the session secret with `rsplit("_", 1)[-1]` instead of the
+production parser's own `split("_", 2)[-1]` (`identity.py`'s
+`_parse_prefixed_secret`). Since the secret is `token_urlsafe(32)`
+output and its base64url alphabet legitimately includes `_`, this
+could (and once did, live on `main`, CI run `34592378065`, Python
+3.13.14 only) extract a single trailing character as the "secret" and
+then fail because that character coincidentally appeared inside a
+randomly generated UUID elsewhere in the same JSON response. Fixed in
+PR #21 to match the production parser exactly, which makes it
+mathematically impossible to cut into the secret regardless of its
+content (not merely less likely) -- verified with 30 repeated runs.
+Recorded here because it explains a real red `main` CI run that had
+nothing to do with the PR that triggered it (PR #20, doc-only), so a
+future session doesn't waste time re-diagnosing it.
 
 ## Requirement rows
 
@@ -105,6 +124,8 @@ The 5 Pre-auth methods are the concrete list Phase H's "narrow functions for pre
 | Phase A-G (tenant isolation) | `af5cb58` through `da5da85`, this session |
 | P1-6 fix | PR #17 merged as `c4132e5` |
 | Ledger docs established | PR #18 merged as `871a220` |
-| P1-7 fix | PR #19, branch `fix/p1-7-signature-algorithm`, commit `ae5ea72`, CI pending |
+| P1-7 fix | PR #19 merged as `47da741` |
+| Phase H identity classification | PR #20 merged as `5df6f1d` |
+| Flaky test fix (`test_customer_auth.py`) | PR #21, branch `fix/flaky-session-secret-extraction`, commit `7fc07e4`, CI pending |
 
 1.25/1.26/1.27 milestone claims are carried forward from the mandate as-supplied; this session did not independently re-derive their exact commits. Flagged here rather than silently treated as verified.
