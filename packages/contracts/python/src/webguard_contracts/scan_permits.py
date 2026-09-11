@@ -19,6 +19,19 @@ CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.3"
 SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.3",)
 TRUSTSCAN_PERMIT_TYPE = "trustscan_scan_permit"
 TRUSTSCAN_SIGNATURE_ALGORITHM = "Ed25519"
+# P1-7 (docs/audit/WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md): every
+# provider actually wired as TrustScan's active signer today
+# (LocalDevelopmentSigner, CloudHsmSigningProvider/SigningServiceClient)
+# is Ed25519. KmsSigningProvider (ECDSA_SHA_256) is a real, tested
+# provider class -- see webguard_api.signing's own module docstring on
+# why it is never wired as active -- but nothing in this contract
+# should reject it outright if a future caller does wire it: the
+# signature is verified against whichever algorithm the signing key
+# was actually registered under (webguard_api.signing.SigningKeyRegistry),
+# never against this self-reported field, so accepting a second,
+# honestly-labeled algorithm here does not change what a permit's
+# signature must cryptographically satisfy to verify.
+SUPPORTED_TRUSTSCAN_SIGNATURE_ALGORITHMS = ("Ed25519", "ECDSA_SHA_256")
 MAXIMUM_TRUSTSCAN_PERMIT_DOCUMENT_BYTES = 128 * 1024
 MAXIMUM_TRUSTSCAN_PERMIT_VALIDITY_DAYS = 90
 MINIMUM_TRUSTSCAN_REQUESTS_PER_SECOND = 0.2
@@ -576,7 +589,14 @@ class TrustScanPermitClaims:
 
 @dataclass(frozen=True, slots=True)
 class SignedTrustScanPermit:
-    """One Ed25519-signed TrustScan permit document."""
+    """One signed TrustScan permit document. ``signature_algorithm``
+    self-reports which of ``SUPPORTED_TRUSTSCAN_SIGNATURE_ALGORITHMS``
+    produced ``signature`` -- every provider actually wired as
+    TrustScan's active signer today produces Ed25519, but this field
+    exists so that self-report stays true if that ever changes; the
+    signature is verified against the signing key's own registered
+    algorithm (webguard_api.signing.SigningKeyRegistry), never against
+    this field."""
 
     claims: TrustScanPermitClaims
     signing_key_id: str
@@ -601,10 +621,10 @@ class SignedTrustScanPermit:
                 "trustscan_permit_schema_unsupported",
                 "TrustScan permit schema_version is unsupported.",
             )
-        if self.signature_algorithm != TRUSTSCAN_SIGNATURE_ALGORITHM:
+        if self.signature_algorithm not in SUPPORTED_TRUSTSCAN_SIGNATURE_ALGORITHMS:
             raise TrustScanPermitValidationError(
                 "trustscan_permit_signature_algorithm_invalid",
-                "TrustScan permit signature algorithm must be Ed25519.",
+                "TrustScan permit signature algorithm is not supported.",
             )
         if not isinstance(self.signing_key_id, str) or not _KEY_ID.fullmatch(self.signing_key_id):
             raise TrustScanPermitValidationError(

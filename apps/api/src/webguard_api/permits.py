@@ -135,6 +135,7 @@ class TrustScanSigner:
             claims=claims,
             signing_key_id=self._registry.active.key_id,
             signature=_b64url_encode(signature),
+            signature_algorithm=self._registry.active.algorithm,
         )
 
     def verify(self, permit: SignedTrustScanPermit) -> None:
@@ -164,6 +165,7 @@ class TrustScanSigner:
             claims=claims,
             signing_key_id=self._registry.active.key_id,
             signature=_b64url_encode(signature),
+            signature_algorithm=self._registry.active.algorithm,
         )
 
     def verify_safety_receipt(
