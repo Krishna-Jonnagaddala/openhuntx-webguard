@@ -16,9 +16,12 @@ those three classes are now typed against).
 Concurrency model (requirement 3-4): identical to the SQLite design's
 proven approach -- optimistic concurrency via a ``revision`` counter,
 plus a fenced worker lease (``worker_id`` + ``lease_token`` +
-``lease_expires_at``) that every terminal transition must present and
-that ``_require_active_lease`` validates before any write. The one
-adaptation for Postgres: claiming the next queued job uses
+``lease_expires_at``) that every terminal transition must present.
+``renew_lease`` and ``_terminal_update`` validate it before any write
+(P1-2 Phase H: now inside ``webguard_control.renew_lease``/
+``terminal_transition`` themselves, run under ``worker_tenant_data``,
+not in this class's own Python). The one adaptation for Postgres:
+claiming the next queued job uses
 ``SELECT ... FOR UPDATE SKIP LOCKED`` (a real Postgres queue idiom)
 so concurrent workers never even attempt to claim a job another
 worker's transaction is already looking at, rather than relying purely
@@ -677,17 +680,6 @@ class PostgresJobRepository:
             attempt_count=row[22],
         )
 
-    @staticmethod
-    def _require_active_lease(state: str, row_worker_id, row_lease_token, lease_expires_at, *, worker_id, lease_token, now) -> None:
-        if (
-            state != ScanJobState.RUNNING.value
-            or row_worker_id != worker_id
-            or row_lease_token != lease_token
-        ):
-            raise JobStoreError("job_lease_lost", "The worker lease is no longer current.")
-        if lease_expires_at is None or lease_expires_at.astimezone(timezone.utc) <= now.astimezone(timezone.utc):
-            raise JobStoreError("job_lease_expired", "The worker lease has expired.")
-
     def renew_lease(
         self, job_id: str, *, worker_id: str, lease_token: str, now: datetime, lease_seconds: float
     ) -> LeasedScanJob:
@@ -757,6 +749,20 @@ class PostgresJobRepository:
         safety_receipt_ref: str | None = None,
         safety_receipt_sha256: str | None = None,
     ) -> ScanJobRecord:
+        """P1-2 Phase H: mirrors claim_next_leased's shape. Runs
+        entirely through webguard_control.terminal_transition, an
+        exact reproduction of this method's own validation/lease/CAS/
+        safety-receipt sequence, including the scan_records
+        reconciliation and the receipt INSERT, all in the one
+        transaction the function itself runs as. The function's own
+        SQL comment addresses the one visible reordering (it validates
+        the safety-receipt format before the lease/CAS work, where
+        this method used to validate it after): both orderings are
+        observably identical, since a failure either way aborts with
+        zero writes. Reports which outcome it hit through its own
+        outcome column, since a SQL function can't raise the many
+        distinct JobStoreError codes this method raises."""
+
         if (safety_receipt_ref is None) != (safety_receipt_sha256 is None):
             raise JobStoreError(
                 "trustscan_safety_receipt_metadata_invalid",
@@ -768,113 +774,52 @@ class PostgresJobRepository:
             )
         effective_worker_id = None if worker_id is None else _worker_id(worker_id)
         timestamp = _ts(now)
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(WORKER_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                "SELECT state, worker_id, lease_token, lease_expires_at, revision FROM scan_jobs WHERE job_id = %s",
-                (job_id,),
+                "SELECT * FROM webguard_control.terminal_transition"
+                "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    job_id, state.value, timestamp, effective_worker_id, lease_token,
+                    scan_id, None if result_status is None else result_status.value,
+                    report_ref, audit_ref, error_code, error_message,
+                    safety_receipt_ref, safety_receipt_sha256,
+                ),
             ).fetchone()
-            if row is None:
-                raise JobStoreError("job_not_found", "Scan job was not found.")
-            row_state, row_worker_id, row_lease_token, lease_expires_at, revision = row
-            if row_state != ScanJobState.RUNNING.value:
-                raise JobStoreError(
-                    "job_state_transition_invalid", "Only running jobs can enter a terminal worker state."
-                )
-            if row_lease_token is not None:
-                if effective_worker_id is None or lease_token is None:
-                    raise JobStoreError(
-                        "job_lease_required", "A current worker lease is required for this transition."
-                    )
-                self._require_active_lease(
-                    row_state, row_worker_id, row_lease_token, lease_expires_at,
-                    worker_id=effective_worker_id, lease_token=lease_token, now=now,
-                )
-            elif effective_worker_id is not None:
-                raise JobStoreError("job_lease_lost", "The worker lease is no longer current.")
-
-            lease_predicate = ""
-            parameters: list[object] = [
-                state.value, timestamp, timestamp, revision + 1, scan_id,
-                None if result_status is None else result_status.value,
-                report_ref, audit_ref, error_code, error_message,
-                job_id, ScanJobState.RUNNING.value, revision,
-            ]
-            if effective_worker_id is not None:
-                lease_predicate = " AND worker_id = %s AND lease_token = %s"
-                parameters.extend([effective_worker_id, lease_token])
-            updated = connection.execute(
-                f"""
-                UPDATE scan_jobs
-                SET state = %s, completed_at = %s, updated_at = %s, revision = %s,
-                    scan_id = %s, result_status = %s, report_ref = %s, audit_ref = %s,
-                    error_code = %s, error_message = %s, worker_id = NULL,
-                    lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL
-                WHERE job_id = %s AND state = %s AND revision = %s{lease_predicate}
-                """,  # noqa: S608
-                tuple(parameters),
+        outcome = row[0]
+        if outcome == "ok":
+            return self._record_from_row(row[1:20])
+        if outcome == "not_found":
+            raise JobStoreError("job_not_found", "Scan job was not found.")
+        if outcome == "invalid_state":
+            raise JobStoreError(
+                "job_state_transition_invalid", "Only running jobs can enter a terminal worker state."
             )
-            if updated.rowcount != 1:
-                code = "job_lease_lost" if effective_worker_id is not None else "job_state_transition_conflict"
-                message = (
-                    "The worker lease is no longer current."
-                    if effective_worker_id is not None
-                    else "The scan-job state changed before the transition completed."
-                )
-                raise JobStoreError(code, message)
-            # Slice 14 requirement 7-8: a job reaching FAILED or
-            # CANCELLED must not leave an associated scan record stuck
-            # incomplete forever (crash consistency: "cancellation state
-            # cannot disagree across job and scan," "no scan should
-            # remain permanently orphaned"). This runs in the SAME
-            # transaction as the job's own terminal write above, so the
-            # two either both commit or both roll back -- true atomicity
-            # for this specific, bounded pair, achieved by writing one
-            # extra statement against a table this repository already
-            # has pool access to, not by introducing a cross-repository
-            # transaction abstraction (see the audit doc's reasoning for
-            # why that would be disproportionate for this invariant).
-            # A SUCCEEDED job needs no reconciliation here: the
-            # executor's own `complete_scan()` call already runs, in a
-            # separate short transaction, before this method is ever
-            # invoked -- see worker.py's call order.
-            if state in (ScanJobState.FAILED, ScanJobState.CANCELLED):
-                connection.execute(
-                    """
-                    UPDATE scan_records
-                    SET status = %s, completed_at = COALESCE(completed_at, %s)
-                    WHERE job_id = %s AND completed_at IS NULL
-                    """,
-                    (state.value, timestamp, job_id),
-                )
-            if safety_receipt_ref is not None:
-                if (
-                    not isinstance(safety_receipt_ref, str)
-                    or not safety_receipt_ref
-                    or safety_receipt_ref.startswith("/")
-                    or ".." in safety_receipt_ref.split("/")
-                ):
-                    raise JobStoreError(
-                        "trustscan_safety_receipt_reference_invalid",
-                        "Safety receipt reference must be a safe relative path.",
-                    )
-                if (
-                    not isinstance(safety_receipt_sha256, str)
-                    or len(safety_receipt_sha256) != 64
-                    or any(c not in "0123456789abcdef" for c in safety_receipt_sha256)
-                ):
-                    raise JobStoreError(
-                        "trustscan_safety_receipt_digest_invalid",
-                        "Safety receipt digest must be a lower-case SHA-256 value.",
-                    )
-                connection.execute(
-                    "INSERT INTO job_safety_receipts (job_id, receipt_ref, receipt_sha256, created_at) "
-                    "VALUES (%s, %s, %s, %s)",
-                    (job_id, safety_receipt_ref, safety_receipt_sha256, timestamp),
-                )
-            updated_row = connection.execute(
-                f"SELECT {self._RECORD_COLUMNS} FROM scan_jobs WHERE job_id = %s", (job_id,)  # noqa: S608
-            ).fetchone()
-        return self._record_from_row(updated_row)
+        if outcome == "lease_required":
+            raise JobStoreError("job_lease_required", "A current worker lease is required for this transition.")
+        if outcome == "lease_expired":
+            raise JobStoreError("job_lease_expired", "The worker lease has expired.")
+        if outcome == "transition_conflict":
+            raise JobStoreError(
+                "job_state_transition_conflict", "The scan-job state changed before the transition completed."
+            )
+        if outcome == "safety_receipt_reference_invalid":
+            raise JobStoreError(
+                "trustscan_safety_receipt_reference_invalid",
+                "Safety receipt reference must be a safe relative path.",
+            )
+        if outcome == "safety_receipt_digest_invalid":
+            raise JobStoreError(
+                "trustscan_safety_receipt_digest_invalid",
+                "Safety receipt digest must be a lower-case SHA-256 value.",
+            )
+        # lease_lost, worker_id_invalid, receipt_metadata_invalid, and
+        # lease_credentials_invalid are the remaining outcomes: the
+        # last three are unreachable from this call site since Python
+        # already validated the identical conditions above before ever
+        # reaching the database, and lease_lost is the correct code
+        # for every remaining case (identity mismatch or a lost CAS
+        # race under a supplied lease).
+        raise JobStoreError("job_lease_lost", "The worker lease is no longer current.")
 
     def finish_result(
         self,
