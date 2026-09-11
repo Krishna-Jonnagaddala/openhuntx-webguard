@@ -21,6 +21,7 @@ import os
 import threading
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 RUN_INTEGRATION = os.environ.get("WEBGUARD_RUN_INTEGRATION") == "1"
@@ -289,6 +290,95 @@ class TenantContextPoolTests(unittest.TestCase):
         initial_available = self.pool.statistics["pool_available"]
         with self.assertRaises(ValueError):
             with self.pool.tenant_connection("definitely-not-a-uuid"):
+                pass  # pragma: no cover - must never be reached
+        self.assertEqual(
+            self.pool.statistics["pool_available"], initial_available, "no connection should have been borrowed"
+        )
+
+
+# P1-2 Phase H: proves tenant_connection's optional role parameter,
+# added when postgres_targets.py became the first ordinary-method file
+# converted to run under a restricted role. Needs the same role
+# bootstrap every control-function conversion in this project already
+# applies, since role_scoped_connection's own SET LOCAL ROLE requires
+# the role to actually exist and webguard to hold membership in it.
+_BOOTSTRAP_DIR = Path(__file__).resolve().parent.parent.parent / "infra" / "postgres" / "bootstrap"
+_ROLES_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_roles.sql"
+_TENANT_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_acl.sql"
+_FUNCTION_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_function_acl.sql"
+_CONTROL_FUNCTIONS_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_control_functions.sql"
+_RUNTIME_GRANT_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_runtime_grant.sql"
+_ALL_BOOTSTRAP_ROLES = (
+    "api_tenant_data",
+    "worker_tenant_data",
+    "scheduler_tenant_data",
+    "identity_function_owner",
+    "worker_function_owner",
+    "scheduler_function_owner",
+    "callback_function_owner",
+)
+
+
+@unittest.skipUnless(
+    RUN_POSTGRES_TESTS,
+    "Set WEBGUARD_RUN_INTEGRATION=1 and WEBGUARD_POSTGRES_TEST_DSN to run this PostgreSQL integration test.",
+)
+class TenantConnectionRoleTests(unittest.TestCase):
+    @classmethod
+    def _admin_connect(cls):
+        import psycopg
+
+        return psycopg.connect(POSTGRES_TEST_DSN)
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        for sql_path in (
+            _ROLES_SQL_PATH,
+            _TENANT_ACL_SQL_PATH,
+            _FUNCTION_ACL_SQL_PATH,
+            _CONTROL_FUNCTIONS_SQL_PATH,
+            _RUNTIME_GRANT_SQL_PATH,
+        ):
+            with cls._admin_connect() as connection:
+                connection.execute(sql_path.read_text(encoding="utf-8"))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        with cls._admin_connect() as connection:
+            connection.autocommit = True
+            connection.execute("DROP SCHEMA IF EXISTS webguard_control CASCADE")
+            for role in _ALL_BOOTSTRAP_ROLES:
+                connection.execute(f'DROP OWNED BY "{role}"')
+                connection.execute(f'DROP ROLE IF EXISTS "{role}"')
+
+    def setUp(self) -> None:
+        from webguard_api.postgres_pool import API_TENANT_DATA_ROLE, TENANT_CONTEXT_GUC, WebGuardPostgresPool
+
+        self.role = API_TENANT_DATA_ROLE
+        self.guc = TENANT_CONTEXT_GUC
+        self.pool = WebGuardPostgresPool(POSTGRES_TEST_DSN, minimum_connections=1, maximum_connections=1)
+        self.addCleanup(self.pool.close)
+
+    def test_tenant_connection_with_role_switches_both_role_and_guc(self) -> None:
+        org_id = str(uuid4())
+        with self.pool.tenant_connection(org_id, role=self.role) as connection:
+            current_user = connection.execute("SELECT current_user").fetchone()[0]
+            guc_value = connection.execute("SELECT current_setting(%s, true)", (self.guc,)).fetchone()[0]
+        self.assertEqual(current_user, self.role)
+        self.assertEqual(guc_value, org_id)
+
+    def test_tenant_connection_role_reverts_after_the_transaction(self) -> None:
+        org_id = str(uuid4())
+        with self.pool.tenant_connection(org_id, role=self.role) as connection:
+            pass
+        with self.pool.connection() as connection:
+            current_user = connection.execute("SELECT current_user").fetchone()[0]
+        self.assertNotEqual(current_user, self.role, "the role switch must not outlive its own transaction")
+
+    def test_tenant_connection_rejects_an_unknown_role_before_borrowing(self) -> None:
+        initial_available = self.pool.statistics["pool_available"]
+        with self.assertRaises(ValueError):
+            with self.pool.tenant_connection(str(uuid4()), role="not_a_real_role"):
                 pass  # pragma: no cover - must never be reached
         self.assertEqual(
             self.pool.statistics["pool_available"], initial_available, "no connection should have been borrowed"
