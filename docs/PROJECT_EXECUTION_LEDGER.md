@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 398e818bcb79f2e8e9366daf2171c7dbee2d07f5
+Commit: fe50b656f86dde9769ee09a0d59868b26f68fb5d
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -477,6 +477,16 @@ All 6 `postgres_targets.py` methods now call `self._pool.tenant_connection(organ
 **Proven against real disposable Postgres**: full contract suite (63/63, all 6 `PostgresTargetRepositoryContractTests` unmodified in behavior), the extended connection-pool suite (16/16, up from 13), full Postgres integration sequence, and the full 1799-test unit suite.
 
 This is the template for the remaining ordinary-method conversions: `postgres_findings.py`, `postgres_reports.py`, `postgres_scans.py`, `postgres_target_verification.py`, `postgres_authentication_contexts.py`, `postgres_authorization_comparison.py` (all fully ordinary, no control-function counterpart), plus the remaining ordinary methods within `postgres_identity.py`, `postgres_jobs.py`, `postgres_schedules.py`, `postgres_sessions.py`, and `postgres_callback_service.py`/`postgres_callback_broker.py` (whichever methods in those five files weren't already converted to a control function in the prior six PRs). None of that has started beyond this one file.
+
+## Phase H conversion: postgres_findings.py, and a regression found in the previous PR (2026-09-11)
+
+Converts all 5 `postgres_findings.py` methods to `tenant_connection(organization_id, role=...)`. Not uniform: `record_finding`'s only caller is `executor.py` (the worker), and `api_tenant_data` has no `INSERT` on `findings` at all, only `SELECT`/`UPDATE` (`worker_tenant_data` has all three), so it runs under `worker_tenant_data`. The other four (`get_finding_scoped`, `list_findings_scoped_page`, `update_status`, `list_events_scoped`), called only from `service.py`, run under `api_tenant_data`. Verified both claims by grepping actual call sites, not assumed from the method names.
+
+**Regression found from the previous PR (#36), not this one**: running the broader local test sweep for this PR turned up two test files that `postgres_targets.py`'s conversion in #36 silently broke, neither of which is part of the CI-gated sequence so neither showed up as a CI failure: `tests/integration/test_production_mode_e2e.py` and `tests/integration/test_production_ssrf_callback_e2e.py`, both of which call `components.targets.create_target(...)` through a real `build_production_components` assembly with no tenant-isolation bootstrap applied. Fixed both with the same bootstrap fixture every other file in this arc already has. This is the second time in this arc a real regression surfaced only because a test file was run manually rather than assumed safe by CI passing (the first was PR #31's Playwright discovery); recorded here as a reminder that "CI is green" is not the same claim as "every test file in this repository still passes," and a broader local sweep after any tenant-isolation-adjacent change is worth doing even when CI itself would not catch the gap.
+
+Also extended `test_postgres_tenant_isolation_slice13.py`'s existing findings cross-tenant test with `list_events_scoped` coverage (a real status transition, then a cross-tenant read correctly fails closed, then the owning organization's own read returns the recorded event). This method had zero real-Postgres test coverage anywhere before this change.
+
+**Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence, both newly-fixed production E2E files (`test_production_mode_e2e.py` 1/1, `test_production_ssrf_callback_e2e.py` 4/4), and the full 1799-test unit suite.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 

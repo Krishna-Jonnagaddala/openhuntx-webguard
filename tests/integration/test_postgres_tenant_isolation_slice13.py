@@ -210,6 +210,19 @@ class Slice13TenantIsolationTests(unittest.TestCase):
             findings.list_findings_scoped_page(self.org_b.organization_id, limit=10)[0], ()
         )
 
+        real_status_change = findings.update_status(
+            finding.finding_id, organization_id=self.org_a.organization_id,
+            new_status=FindingStatus.CONFIRMED, now=NOW,
+        )
+        self.assertEqual(real_status_change.status, FindingStatus.CONFIRMED)
+        with self.assertRaises(FindingStoreError) as cross_events:
+            findings.list_events_scoped(finding.finding_id, organization_id=self.org_b.organization_id)
+        self.assertEqual(cross_events.exception.code, "finding_not_found")
+        own_events = findings.list_events_scoped(finding.finding_id, organization_id=self.org_a.organization_id)
+        self.assertEqual(len(own_events), 1)
+        self.assertEqual(own_events[0].previous_status, FindingStatus.OPEN)
+        self.assertEqual(own_events[0].new_status, FindingStatus.CONFIRMED)
+
     def test_schedules_cross_tenant_read_pause_resume_fail_closed(self) -> None:
         from webguard_api.postgres_schedules import PostgresScheduleRepository
         from webguard_api.store import JobStoreError

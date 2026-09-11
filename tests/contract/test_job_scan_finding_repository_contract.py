@@ -453,6 +453,33 @@ class InMemoryFindingRepositoryContractTests(FindingRepositoryContractMixin, uni
     RUN_POSTGRES_TESTS, "Set WEBGUARD_RUN_INTEGRATION=1 and WEBGUARD_POSTGRES_TEST_DSN to run this PostgreSQL contract test."
 )
 class PostgresFindingRepositoryContractTests(FindingRepositoryContractMixin, unittest.TestCase):
+    @classmethod
+    def _connect(cls):
+        import psycopg
+
+        return psycopg.connect(POSTGRES_TEST_DSN)
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        for sql_path in (
+            _ROLES_SQL_PATH,
+            _TENANT_ACL_SQL_PATH,
+            _FUNCTION_ACL_SQL_PATH,
+            _CONTROL_FUNCTIONS_SQL_PATH,
+            _RUNTIME_GRANT_SQL_PATH,
+        ):
+            with cls._connect() as connection:
+                connection.execute(sql_path.read_text(encoding="utf-8"))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        with cls._connect() as connection:
+            connection.autocommit = True
+            connection.execute("DROP SCHEMA IF EXISTS webguard_control CASCADE")
+            for role in _ALL_BOOTSTRAP_ROLES:
+                connection.execute(f'DROP OWNED BY "{role}"')
+                connection.execute(f'DROP ROLE IF EXISTS "{role}"')
+
     def setUp(self) -> None:
         from webguard_api.postgres_pool import WebGuardPostgresPool
         from webguard_api.postgres_identity import PostgresIdentityRepository
