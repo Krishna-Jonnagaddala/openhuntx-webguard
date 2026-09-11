@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from .identity import IdentityStoreError, _hash_secret, _parse_prefixed_secret, _verify_secret
-from .postgres_pool import WebGuardPostgresPool
+from .postgres_pool import API_TENANT_DATA_ROLE, WebGuardPostgresPool, set_tenant_context
 from .sessions import (
     ASSURANCE_LEVEL_PASSWORD,
     DEFAULT_ABSOLUTE_TIMEOUT,
@@ -110,38 +110,76 @@ class PostgresSessionRepository:
         csrf_header: str | None = None,
         require_csrf: bool = False,
     ) -> BrowserSessionRecord:
+        """P1-2 Phase H: mirrors authenticate_token's shape. Resolves
+        under api_tenant_data via webguard_control.resolve_browser_session
+        (no tenant known from a bare session id/secret), then reads
+        the three fields the resolver deliberately omits (issued_at,
+        user_agent, ip_address) and runs the last_used_at/
+        idle_expires_at write, both as ordinary, now-tenant-scoped
+        queries once organization_id is known."""
+
         session_id, secret = _parse_prefixed_secret(
             token, prefix=SESSION_TOKEN_PREFIX, error_code="session_invalid"
         )
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                f"SELECT {_COLUMNS} FROM browser_sessions WHERE session_id = %s",  # noqa: S608
+                "SELECT * FROM webguard_control.resolve_browser_session(%s)",
                 (session_id,),
             ).fetchone()
-            if row is None or not _verify_secret(secret, row[3]):
+            if row is None or not _verify_secret(secret, row[1]):
                 raise IdentityStoreError("session_invalid", "Session is invalid.")
-            record = _record_from_row(row)
-            if not record.is_usable(now=now):
+            (
+                _resolved_session_id,
+                _secret_hash,
+                csrf_hash,
+                assurance_level,
+                idle_expires_at,
+                absolute_expires_at,
+                session_revoked_at,
+                principal_id,
+                _principal_display_name,
+                _principal_role,
+                _principal_active,
+                organization_id,
+                _organization_name,
+                _organization_status,
+            ) = row
+            absolute_expires_at_utc = absolute_expires_at.astimezone(timezone.utc)
+            now_utc = now.astimezone(timezone.utc)
+            usable = (
+                session_revoked_at is None
+                and now_utc < idle_expires_at.astimezone(timezone.utc)
+                and now_utc < absolute_expires_at_utc
+            )
+            if not usable:
                 raise IdentityStoreError("session_expired", "Session has expired or was revoked.")
-            if require_csrf and (csrf_header is None or not _verify_secret(csrf_header, row[4])):
+            if require_csrf and (csrf_header is None or not _verify_secret(csrf_header, csrf_hash)):
                 raise IdentityStoreError("csrf_token_invalid", "CSRF token is missing or invalid.")
-            new_idle_expires_at = min(now + idle_ttl, record.absolute_expires_at)
+            new_idle_expires_at = min(now + idle_ttl, absolute_expires_at_utc)
+
+            set_tenant_context(connection, organization_id)
+            extra = connection.execute(
+                "SELECT issued_at, user_agent, ip_address FROM browser_sessions "
+                "WHERE session_id = %s AND organization_id = %s",
+                (session_id, organization_id),
+            ).fetchone()
             connection.execute(
-                "UPDATE browser_sessions SET last_used_at = %s, idle_expires_at = %s WHERE session_id = %s",
-                (now, new_idle_expires_at, session_id),
+                "UPDATE browser_sessions SET last_used_at = %s, idle_expires_at = %s "
+                "WHERE session_id = %s AND organization_id = %s",
+                (now, new_idle_expires_at, session_id, organization_id),
             )
         return BrowserSessionRecord(
-            session_id=record.session_id,
-            principal_id=record.principal_id,
-            organization_id=record.organization_id,
-            assurance_level=record.assurance_level,
-            issued_at=record.issued_at,
+            session_id=str(session_id),
+            principal_id=str(principal_id),
+            organization_id=str(organization_id),
+            assurance_level=assurance_level,
+            issued_at=extra[0].astimezone(timezone.utc),
             idle_expires_at=new_idle_expires_at,
-            absolute_expires_at=record.absolute_expires_at,
+            absolute_expires_at=absolute_expires_at_utc,
             last_used_at=now,
-            revoked_at=record.revoked_at,
-            user_agent=record.user_agent,
-            ip_address=record.ip_address,
+            revoked_at=None,
+            user_agent=extra[1],
+            ip_address=extra[2],
         )
 
     def get_session(self, session_id: str) -> BrowserSessionRecord | None:
