@@ -31,7 +31,7 @@ a conditional update.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from webguard_contracts import (
@@ -46,7 +46,7 @@ from webguard_contracts import (
 
 from .db_errors import DatabaseIntegrityError
 from .permits import PersistedTrustScanPermit
-from .postgres_pool import WebGuardPostgresPool
+from .postgres_pool import WORKER_TENANT_DATA_ROLE, WebGuardPostgresPool
 from .postgres_schedules import PostgresScheduleRepository
 from .store import JobStoreError, LeasedScanJob, LeaseRecoverySummary
 
@@ -499,6 +499,22 @@ class PostgresJobRepository:
         return self._record_from_row(row)
 
     def get_scope(self, job_id: str) -> tuple[str, str] | None:
+        """P1-2 Phase H gap, not yet closed: webguard_control.resolve_job_organization
+        exists and is exactly what this method's own current live
+        caller (executor.py, which only ever reads the organization_id
+        half) needs, but this method's own contract also returns
+        submitted_by, which that function does not. worker_tenant_data
+        has zero table-level grant on scan_jobs at all (unlike
+        api_tenant_data's identity tables, there is no ordinary
+        tenant-scoped refetch available here either), so there is no
+        way to resolve submitted_by under the restricted role today.
+        This raw query works only because every WebGuard process still
+        runs as webguard, unrestricted. organization_id_for_job (the
+        one caller that only needs the scalar this function already
+        returns) could convert standalone without this constraint, but
+        has no external caller of its own to prove the conversion
+        against."""
+
         with self._pool.connection() as connection:
             row = connection.execute(
                 "SELECT organization_id, submitted_by FROM scan_jobs WHERE job_id = %s",
@@ -632,99 +648,33 @@ class PostgresJobRepository:
     def claim_next_leased(
         self, *, now: datetime, worker_id: str, lease_seconds: float
     ) -> LeasedScanJob | None:
+        """P1-2 Phase H: worker_tenant_data has no table-level grant on
+        scan_jobs at all. This method is intentionally cross-tenant
+        (a worker claims the next queued job for ANY organization), so
+        it now runs entirely through webguard_control.claim_next_job,
+        an exact reproduction of this method's own predicate/CAS/
+        lease-issuance sequence (down to the identity_ready predicate's
+        exact shape). The function generates its own lease_token and
+        lease_expires_at server-side rather than accepting ones
+        computed here, and its return columns cover this method's full
+        contract, so no follow-up query is needed."""
+
         effective_worker_id = _worker_id(worker_id)
         duration = float(lease_seconds) if lease_seconds else DEFAULT_LEASE_SECONDS
         timestamp = _ts(now)
-        expires_at = timestamp + timedelta(seconds=duration)
-        lease_token = str(uuid4())
-        with self._pool.connection() as connection:
-            with connection.transaction():
-                # Mirrors ScanJobStore._select_claimable_row's
-                # "identity_ready" predicate exactly: a job whose
-                # authorization is no longer assigned to its
-                # organization (revoked/reassigned after submission),
-                # or whose bound permit is revoked/expired/not-yet-
-                # active, or whose bound permit is already driving
-                # another RUNNING job, must never be claimed -- this is
-                # a real safety property (defense against a stale
-                # queued job outliving the authorization/permit that
-                # justified accepting it), not an incidental ordering
-                # detail.
-                row = connection.execute(
-                    """
-                    SELECT jobs.job_id, jobs.revision
-                    FROM scan_jobs AS jobs
-                    LEFT JOIN job_permits AS binding
-                      ON binding.job_id = jobs.job_id
-                    WHERE jobs.state = %(queued)s
-                      AND jobs.cancellation_requested = FALSE
-                      AND (
-                        jobs.organization_id IS NULL
-                        OR EXISTS (
-                            SELECT 1 FROM organization_authorizations AS assignment
-                            WHERE assignment.organization_id = jobs.organization_id
-                              AND assignment.authorization_id = jobs.authorization_id
-                        )
-                      )
-                      AND (
-                        binding.permit_id IS NULL
-                        OR (
-                            EXISTS (
-                                SELECT 1 FROM scan_permits AS permit
-                                WHERE permit.permit_id = binding.permit_id
-                                  AND permit.permit_sha256 = binding.permit_sha256
-                                  AND permit.revoked_at IS NULL
-                                  AND permit.not_before <= %(timestamp)s
-                                  AND %(timestamp)s < permit.expires_at
-                            )
-                            AND NOT EXISTS (
-                                SELECT 1 FROM scan_jobs AS running
-                                JOIN job_permits AS running_binding
-                                  ON running_binding.job_id = running.job_id
-                                WHERE running.state = %(running)s
-                                  AND running_binding.permit_id = binding.permit_id
-                            )
-                        )
-                      )
-                    ORDER BY jobs.submitted_at, jobs.job_id
-                    LIMIT 1
-                    FOR UPDATE OF jobs SKIP LOCKED
-                    """,
-                    {
-                        "queued": ScanJobState.QUEUED.value,
-                        "running": ScanJobState.RUNNING.value,
-                        "timestamp": timestamp,
-                    },
-                ).fetchone()
-                if row is None:
-                    return None
-                job_id, revision = row
-                updated = connection.execute(
-                    """
-                    UPDATE scan_jobs
-                    SET state = %s, started_at = %s, updated_at = %s, revision = %s,
-                        worker_id = %s, lease_token = %s, lease_expires_at = %s,
-                        heartbeat_at = %s, attempt_count = attempt_count + 1
-                    WHERE job_id = %s AND state = %s AND revision = %s
-                    """,
-                    (
-                        ScanJobState.RUNNING.value, timestamp, timestamp, revision + 1,
-                        effective_worker_id, lease_token, expires_at, timestamp,
-                        job_id, ScanJobState.QUEUED.value, revision,
-                    ),
-                )
-                if updated.rowcount != 1:
-                    return None
-                claimed = connection.execute(
-                    f"SELECT {self._RECORD_COLUMNS}, attempt_count FROM scan_jobs WHERE job_id = %s",  # noqa: S608
-                    (job_id,),
-                ).fetchone()
+        with self._pool.role_scoped_connection(WORKER_TENANT_DATA_ROLE) as connection:
+            row = connection.execute(
+                "SELECT * FROM webguard_control.claim_next_job(%s, %s::numeric, %s)",
+                (effective_worker_id, duration, timestamp),
+            ).fetchone()
+        if row is None:
+            return None
         return self._lease_from_row(
-            claimed[:-1],
-            worker_id=effective_worker_id,
-            lease_token=lease_token,
-            lease_expires_at=expires_at,
-            attempt_count=claimed[-1],
+            row[:19],
+            worker_id=row[19],
+            lease_token=row[20],
+            lease_expires_at=row[21],
+            attempt_count=row[22],
         )
 
     @staticmethod
@@ -741,122 +691,53 @@ class PostgresJobRepository:
     def renew_lease(
         self, job_id: str, *, worker_id: str, lease_token: str, now: datetime, lease_seconds: float
     ) -> LeasedScanJob:
+        """P1-2 Phase H: mirrors claim_next_leased's shape. Runs
+        entirely through webguard_control.renew_lease, which
+        reproduces this method's own lease-validation sequence exactly
+        and reports which outcome it hit (not_found, lease_lost,
+        lease_expired, ok) through its own outcome column, since a
+        single null-vs-not-null return can't disambiguate the three
+        distinct error codes this method raises."""
+
         effective_worker_id = _worker_id(worker_id)
         duration = float(lease_seconds) if lease_seconds else DEFAULT_LEASE_SECONDS
         timestamp = _ts(now)
-        expires_at = timestamp + timedelta(seconds=duration)
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(WORKER_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                "SELECT state, worker_id, lease_token, lease_expires_at, revision, attempt_count "
-                "FROM scan_jobs WHERE job_id = %s",
-                (job_id,),
+                "SELECT * FROM webguard_control.renew_lease(%s, %s, %s, %s, %s::numeric)",
+                (job_id, effective_worker_id, lease_token, timestamp, duration),
             ).fetchone()
-            if row is None:
-                raise JobStoreError("job_not_found", "Scan job was not found.")
-            state, row_worker_id, row_lease_token, lease_expires_at, revision, attempt_count = row
-            self._require_active_lease(
-                state, row_worker_id, row_lease_token, lease_expires_at,
-                worker_id=effective_worker_id, lease_token=lease_token, now=now,
-            )
-            updated = connection.execute(
-                """
-                UPDATE scan_jobs
-                SET heartbeat_at = %s, lease_expires_at = %s, updated_at = %s, revision = %s
-                WHERE job_id = %s AND state = %s AND revision = %s
-                    AND worker_id = %s AND lease_token = %s
-                """,
-                (
-                    timestamp, expires_at, timestamp, revision + 1, job_id,
-                    ScanJobState.RUNNING.value, revision, effective_worker_id, lease_token,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise JobStoreError("job_lease_lost", "The worker lease is no longer current.")
-            renewed = connection.execute(
-                f"SELECT {self._RECORD_COLUMNS}, attempt_count FROM scan_jobs WHERE job_id = %s",  # noqa: S608
-                (job_id,),
-            ).fetchone()
+        outcome = row[0]
+        if outcome == "not_found":
+            raise JobStoreError("job_not_found", "Scan job was not found.")
+        if outcome in ("lease_lost", "worker_id_invalid"):
+            raise JobStoreError("job_lease_lost", "The worker lease is no longer current.")
+        if outcome == "lease_expired":
+            raise JobStoreError("job_lease_expired", "The worker lease has expired.")
         return self._lease_from_row(
-            renewed[:-1],
-            worker_id=effective_worker_id,
-            lease_token=lease_token,
-            lease_expires_at=expires_at,
-            attempt_count=renewed[-1],
+            row[1:20],
+            worker_id=row[20],
+            lease_token=row[21],
+            lease_expires_at=row[22],
+            attempt_count=row[23],
         )
 
     def recover_expired_leases(self, *, now: datetime, maximum_attempts: int) -> LeaseRecoverySummary:
+        """P1-2 Phase H: cross-tenant by design (sweeps every
+        organization's expired leases at once), mirrors
+        claim_next_leased's shape. Runs entirely through
+        webguard_control.recover_expired_leases, an exact reproduction
+        of this method's own per-row cancel/fail/requeue branching,
+        including the scan_records status touch-up."""
+
         limit = int(maximum_attempts) if maximum_attempts else DEFAULT_MAXIMUM_ATTEMPTS
         timestamp = _ts(now)
-        requeued = cancelled = failed = 0
-        with self._pool.connection() as connection:
-            with connection.transaction():
-                rows = connection.execute(
-                    """
-                    SELECT job_id, revision, lease_token, cancellation_requested, attempt_count
-                    FROM scan_jobs
-                    WHERE state = %s AND lease_expires_at IS NOT NULL AND lease_expires_at <= %s
-                    ORDER BY lease_expires_at, job_id
-                    FOR UPDATE SKIP LOCKED
-                    """,
-                    (ScanJobState.RUNNING.value, timestamp),
-                ).fetchall()
-                for job_id, revision, lease_token, cancellation_requested, attempt_count in rows:
-                    common = (job_id, ScanJobState.RUNNING.value, revision, lease_token)
-                    if cancellation_requested:
-                        result = connection.execute(
-                            """
-                            UPDATE scan_jobs
-                            SET state = %s, completed_at = %s, updated_at = %s, revision = revision + 1,
-                                worker_id = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL
-                            WHERE job_id = %s AND state = %s AND revision = %s AND lease_token = %s
-                            """,
-                            (ScanJobState.CANCELLED.value, timestamp, timestamp, *common),
-                        )
-                        cancelled += result.rowcount
-                        if result.rowcount:
-                            connection.execute(
-                                """
-                                UPDATE scan_records SET status = %s, completed_at = COALESCE(completed_at, %s)
-                                WHERE job_id = %s AND completed_at IS NULL
-                                """,
-                                (ScanJobState.CANCELLED.value, timestamp, job_id),
-                            )
-                    elif attempt_count >= limit:
-                        result = connection.execute(
-                            """
-                            UPDATE scan_jobs
-                            SET state = %s, completed_at = %s, updated_at = %s, revision = revision + 1,
-                                worker_id = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
-                                error_code = %s, error_message = %s
-                            WHERE job_id = %s AND state = %s AND revision = %s AND lease_token = %s
-                            """,
-                            (
-                                ScanJobState.FAILED.value, timestamp, timestamp,
-                                "worker_lease_attempts_exhausted",
-                                "The scan job exceeded the permitted worker recovery attempts.",
-                                *common,
-                            ),
-                        )
-                        failed += result.rowcount
-                        if result.rowcount:
-                            connection.execute(
-                                """
-                                UPDATE scan_records SET status = %s, completed_at = COALESCE(completed_at, %s)
-                                WHERE job_id = %s AND completed_at IS NULL
-                                """,
-                                (ScanJobState.FAILED.value, timestamp, job_id),
-                            )
-                    else:
-                        result = connection.execute(
-                            """
-                            UPDATE scan_jobs
-                            SET state = %s, started_at = NULL, updated_at = %s, revision = revision + 1,
-                                worker_id = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL
-                            WHERE job_id = %s AND state = %s AND revision = %s AND lease_token = %s
-                            """,
-                            (ScanJobState.QUEUED.value, timestamp, *common),
-                        )
-                        requeued += result.rowcount
+        with self._pool.role_scoped_connection(WORKER_TENANT_DATA_ROLE) as connection:
+            row = connection.execute(
+                "SELECT * FROM webguard_control.recover_expired_leases(%s, %s)",
+                (timestamp, limit),
+            ).fetchone()
+        requeued, cancelled, failed = row
         return LeaseRecoverySummary(requeued=requeued, cancelled=cancelled, failed=failed)
 
     def _terminal_update(

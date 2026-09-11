@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 7c61a8a69661fa91e162abf1598edf5d65be0e8e
+Commit: 0b8398a44e749a3795053e1117f4a3f34f519bb2
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -409,6 +409,22 @@ This is not just a CI gap. It is real, and it generalizes: **any environment run
 Fixed in CI: added an "Apply tenant-isolation runtime bootstrap" step to the Playwright E2E job, applying the same five files in the same order `tests/contract/test_identity_repository_contract.py`'s own `setUpClass` already does. Verified by reproducing the exact failure locally (`get_principal_by_email` against an unbootstrapped database raises; against a bootstrapped one, it returns cleanly) before and after the fix.
 
 Not fixed, and not something to fix unilaterally: this ordering constraint needs to be part of whatever process eventually deploys this code to a real environment. Recorded here in the strongest terms this ledger uses, since two merged PRs (#30, #31) already carry this property and a future session or a human deploying `main` needs to see this before doing so, not discover it from a production incident.
+
+## Phase H conversion: third slice, postgres_jobs.py's worker-lease methods (2026-09-11)
+
+Converted `claim_next_leased`, `renew_lease`, and `recover_expired_leases` to run entirely through their existing `webguard_control` functions under `worker_tenant_data`. Different shape from the identity conversions: `worker_tenant_data` has zero table-level grant on `scan_jobs` at all (confirmed by reading `tenant_isolation_acl.sql`'s own worker section), so there is no "resolve via function, then ordinary refetch" fallback available here the way there was for `principals`/`organizations`. Every one of these three methods now has to go through its control function completely, for every field, not just the pre-tenant-context part.
+
+That constraint turned out to be a clean fit: all three control functions' own `RETURNS TABLE` shapes already cover each Python method's full contract (`claim_next_job` returns the exact 19 `ScanJobRecord` fields plus `worker_id`/`lease_token`/`lease_expires_at`/`attempt_count`; `renew_lease` adds an `outcome` discriminator column since a SQL function can't raise three distinct `JobStoreError` codes the way Python can; `recover_expired_leases` returns the exact `(requeued, cancelled, failed)` triple). No follow-up query was needed for any of the three, unlike every identity-layer conversion so far.
+
+**One real bug caught by testing against actual Postgres, not assumed correct from reading the SQL**: `claim_next_job`/`renew_lease` both take `p_lease_seconds numeric`. Passing a Python `float` sends it to Postgres as `double precision`, and Postgres does not implicitly cast `double precision` to `numeric` for function-overload resolution, so the first real test run failed with `UndefinedFunction: function webguard_control.claim_next_job(unknown, double precision, timestamp with time zone) does not exist`. Fixed by adding an explicit `::numeric` cast in the call site's own SQL text, matching the exact convention `tests/integration/test_postgres_control_functions.py` already uses for these same two functions.
+
+**Not converted, `get_scope` (and `organization_id_for_job`, its own thin wrapper)**: `resolve_job_organization` exists and covers exactly what `get_scope`'s one live caller (`executor.py`) actually reads (`organization_id` alone), but `get_scope`'s own contract also returns `submitted_by`, which the function does not, and there is no ordinary-grant fallback to fill that gap the way `authenticate_token`'s follow-up query could. Documented in the method's own docstring. `organization_id_for_job` itself has zero external callers anywhere in the repository, so converting it standalone would have no caller to prove the conversion against.
+
+**Test infrastructure**: none of `tests/contract/test_job_scan_finding_repository_contract.py`, `tests/integration/test_postgres_tenant_isolation_slice13.py`, `tests/integration/test_postgres_worker_crash_recovery.py`, `tests/integration/test_postgres_worker_outage_resilience.py`, or `tests/integration/test_production_runtime_completion_e2e.py` applied the tenant-isolation bootstrap before this change, since none of them previously needed it. All five now do, in `setUpClass`, matching the identical pattern from the previous two PRs. `test_postgres_worker_outage_resilience.py` (real `docker stop`/`start` against a named container) was fixed for consistency but not run locally, to avoid disrupting a real running container; its underlying mechanism (`claim_next_leased` + `recover_expired_leases` interacting under simulated failure) is already proven by `test_postgres_worker_crash_recovery.py`'s 9 passing tests, which exercise the same code path without the container-lifecycle risk.
+
+**Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence including the concurrent-claim atomicity test and the crash-recovery suite (9/9), the production-realistic `build_production_components` E2E (4/4), and the full 1799-test unit suite. Adversarial check: under `worker_tenant_data`, a raw `SELECT job_id FROM scan_jobs` fails with `permission denied`; `webguard_control.claim_next_job` under the identical restricted connection succeeds cleanly.
+
+Remaining Phase H worker/scheduler conversion work: `_terminal_update` (via `finish_result_leased`/`fail_leased`/`cancel_running_leased`) and its safety-receipt issuance path, `postgres_schedules.py`'s three cross-tenant scheduler functions, and `postgres_callback_service.py`'s callback resolver. None started.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
