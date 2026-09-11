@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from .postgres_pool import WebGuardPostgresPool
+from .postgres_pool import API_TENANT_DATA_ROLE, WebGuardPostgresPool
 from .report_store import ReportRecord, ReportStoreError
 
 _COLUMNS = (
@@ -21,6 +21,11 @@ _COLUMNS = (
 
 
 class PostgresReportRepository:
+    """P1-2 Phase H: every method here is ordinary and already
+    tenant-scoped, called only from service.py/http_api.py, so each
+    runs under api_tenant_data. reports has no Phase F control-function
+    counterpart because none is needed here."""
+
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
 
@@ -53,7 +58,7 @@ class PostgresReportRepository:
         completed_at: datetime | None = None,
     ) -> ReportRecord:
         effective_id = str(uuid4()) if report_id is None else report_id
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 """
                 INSERT INTO reports (
@@ -69,7 +74,7 @@ class PostgresReportRepository:
         return self.get_report_scoped(effective_id, organization_id=organization_id)
 
     def get_report_scoped(self, report_id: str, *, organization_id: str) -> ReportRecord:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"SELECT {_COLUMNS} FROM reports WHERE report_id = %s AND organization_id = %s",  # noqa: S608
                 (report_id, organization_id),
@@ -95,7 +100,7 @@ class PostgresReportRepository:
             clauses.append("(created_at < %s OR (created_at = %s AND report_id::text < %s))")
             parameters.extend((after[0], after[0], after[1]))
         parameters.append(limit + 1)
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
                 f"""
                 SELECT {_COLUMNS} FROM reports

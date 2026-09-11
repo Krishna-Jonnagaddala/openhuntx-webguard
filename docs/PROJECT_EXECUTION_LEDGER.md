@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: fe50b656f86dde9769ee09a0d59868b26f68fb5d
+Commit: 6a83d867974477e37686bfd9fc63a07dec4568d2
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -487,6 +487,14 @@ Converts all 5 `postgres_findings.py` methods to `tenant_connection(organization
 Also extended `test_postgres_tenant_isolation_slice13.py`'s existing findings cross-tenant test with `list_events_scoped` coverage (a real status transition, then a cross-tenant read correctly fails closed, then the owning organization's own read returns the recorded event). This method had zero real-Postgres test coverage anywhere before this change.
 
 **Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence, both newly-fixed production E2E files (`test_production_mode_e2e.py` 1/1, `test_production_ssrf_callback_e2e.py` 4/4), and the full 1799-test unit suite.
+
+## Phase H conversion: postgres_reports.py (2026-09-11)
+
+Converts all 3 `postgres_reports.py` methods to `tenant_connection(organization_id, role=API_TENANT_DATA_ROLE)`. `api_tenant_data` has exactly `SELECT, INSERT` on `reports`, matching all three methods (`create_report`'s INSERT, `get_report_scoped`/`list_reports_scoped_page`'s SELECT; no UPDATE needed since nothing here ever updates a report row). All three methods' only callers are `service.py`/`http_api.py`, confirmed by grep, so `api_tenant_data` is correct throughout.
+
+Existing coverage in `test_postgres_tenant_isolation_slice13.py`'s `test_reports_cross_tenant_read_fails_closed` already exercises all three methods (a real `create_report` including its own internal `get_report_scoped` re-read, then cross-tenant negative checks on `get_report_scoped` and `list_reports_scoped_page`) and passed unmodified.
+
+**Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence, both production E2E files, and the full 1799-test unit suite.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
