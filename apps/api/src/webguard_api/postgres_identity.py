@@ -192,12 +192,32 @@ class PostgresIdentityRepository:
         return self._principal_from_row(row)
 
     def get_principal_by_email(self, email: str) -> Principal | None:
-        with self._pool.connection() as connection:
+        """P1-2 Phase H: mirrors authenticate_token's shape. No
+        organization is known from an email address alone, so the
+        resolve step runs under api_tenant_data via
+        webguard_control.resolve_principal_by_email, then the full
+        principal row (every field this method's own callers need,
+        including ones the resolver deliberately omits: principal_type,
+        created_at, email, email_verified_at, last_login_at) is read
+        as an ordinary, now-tenant-scoped query once organization_id
+        is known."""
+
+        normalized_email = email.strip().casefold()
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals WHERE email = %s",  # noqa: S608
-                (email.strip().casefold(),),
+                "SELECT * FROM webguard_control.resolve_principal_by_email(%s)",
+                (normalized_email,),
             ).fetchone()
-        return None if row is None else self._principal_from_row(row)
+            if row is None:
+                return None
+            principal_id, organization_id = row[0], row[5]
+            set_tenant_context(connection, organization_id)
+            principal_row = connection.execute(
+                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals "  # noqa: S608
+                "WHERE principal_id = %s AND organization_id = %s",
+                (str(principal_id), organization_id),
+            ).fetchone()
+        return None if principal_row is None else self._principal_from_row(principal_row)
 
     @staticmethod
     def _principal_from_row(row: tuple) -> Principal:
@@ -347,6 +367,24 @@ class PostgresIdentityRepository:
                 )
 
     def get_password_hash(self, principal_id: str) -> str | None:
+        """P1-2 Phase H gap, not yet closed: unlike get_principal_by_email
+        (which the same login() caller uses right before this one and
+        which now resolves through webguard_control.resolve_principal_by_email),
+        this method has no control-function counterpart. Phase F's 13
+        functions are keyed by token, session, or email, none by a
+        bare principal_id, and this method's second caller
+        (service.py's change_password, using context.principal_id from
+        an already-authenticated session, not an email) could not use
+        resolve_principal_by_email even if this one did. api_tenant_data
+        has zero SELECT granted on password_credentials at all (Phase
+        D's own correction), so this raw query only works today because
+        every WebGuard process still runs as webguard, unrestricted; it
+        will fail outright, for both callers, the moment either process
+        actually runs this query under api_tenant_data. Closing this
+        needs a new principal_id-keyed SECURITY DEFINER function with
+        the same design scrutiny Phase F's other 13 got, not a
+        unilateral addition here."""
+
         with self._pool.connection() as connection:
             row = connection.execute(
                 "SELECT password_hash FROM password_credentials WHERE principal_id = %s",
@@ -389,6 +427,25 @@ class PostgresIdentityRepository:
     def consume_identity_token(
         self, token: object, *, purpose: IdentityTokenPurpose, now: datetime
     ) -> IdentityTokenRecord:
+        """P1-2 Phase H gap, not yet closed: webguard_control.resolve_identity_token
+        exists and correctly resolves everything this method validates
+        against (purpose, used_at, expires_at, secret_hash), but the
+        pattern that converted authenticate_token and
+        get_principal_by_email (resolve via the function, then an
+        ordinary tenant-scoped query for whatever the function
+        deliberately omits) does not extend here. tenant_isolation_acl.sql
+        grants api_tenant_data only a 4-column SELECT on identity_tokens
+        (token_id, principal_id, purpose, used_at): no created_at, and
+        no organization_id, so there is no ordinary query under this
+        role that can either read created_at back or scope the
+        post-resolution UPDATE by organization_id the way
+        authenticate_token's last_used_at write now does. This raw
+        query works today only because every WebGuard process still
+        runs as webguard, unrestricted; closing this gap needs
+        resolve_identity_token's own RETURNS TABLE extended to include
+        created_at (a change to Phase F's already-reviewed SQL, not a
+        wiring change), not a unilateral addition here."""
+
         token_id, secret = _parse_prefixed_secret(
             token, prefix=IDENTITY_TOKEN_PREFIX, error_code="identity_token_invalid"
         )
