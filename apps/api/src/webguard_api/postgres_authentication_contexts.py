@@ -26,7 +26,7 @@ from .authentication_contexts import (
     AuthenticationContextStatus,
     AuthenticationMethod,
 )
-from .postgres_pool import WebGuardPostgresPool
+from .postgres_pool import API_TENANT_DATA_ROLE, WebGuardPostgresPool
 
 _COLUMNS = (
     "authentication_context_id, organization_id, target, authorization_id, "
@@ -35,6 +35,24 @@ _COLUMNS = (
 
 
 class PostgresAuthenticationContextRepository:
+    """P1-2 Phase H: api_tenant_data has the full SELECT, INSERT,
+    UPDATE authentication_contexts needs. create, get_metadata_scoped,
+    and revoke_scoped all take organization_id and run under
+    api_tenant_data via tenant_connection, setting real tenant context.
+    get_metadata and revoke take no organization_id at all (by design:
+    they serve create/revoke's own post-write re-reads and
+    require_bound's trusted-reference fetch, called from both
+    executor.py and service.py, neither of which has resolved a single
+    org to scope by at that call site), so they run under
+    api_tenant_data via role_scoped_connection instead: the role
+    narrows, but no tenant-context GUC can be set without an
+    organization_id to set it to. This is a real, open limitation, not
+    a stopgap awaiting a trivial fix: closing it needs either a
+    resolver (this table's own SECURITY DEFINER function, matching the
+    pre-auth pattern Phase F already used elsewhere) or accepting that
+    RLS cannot be forced on this table while these two methods stay
+    reachable in their current unscoped form."""
+
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
 
@@ -82,7 +100,7 @@ class PostgresAuthenticationContextRepository:
                 "expires_at must be later than the current time.",
             )
         effective_id = str(uuid4()) if authentication_context_id is None else authentication_context_id
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 """
                 INSERT INTO authentication_contexts (
@@ -98,7 +116,7 @@ class PostgresAuthenticationContextRepository:
         return self.get_metadata(effective_id)
 
     def get_metadata(self, authentication_context_id: str) -> AuthenticationContextRecord:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"SELECT {_COLUMNS} FROM authentication_contexts WHERE authentication_context_id = %s",  # noqa: S608
                 (authentication_context_id,),
@@ -110,7 +128,7 @@ class PostgresAuthenticationContextRepository:
         return self._record_from_row(row)
 
     def revoke(self, authentication_context_id: str, *, now: datetime) -> AuthenticationContextRecord:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 "SELECT revoked_at FROM authentication_contexts WHERE authentication_context_id = %s",
                 (authentication_context_id,),
@@ -142,7 +160,7 @@ class PostgresAuthenticationContextRepository:
         org-validated reference (a permit or comparison plan), not
         directly from an untrusted caller."""
 
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"SELECT {_COLUMNS} FROM authentication_contexts "  # noqa: S608
                 "WHERE authentication_context_id = %s AND organization_id = %s",
@@ -160,7 +178,7 @@ class PostgresAuthenticationContextRepository:
         """P1-C1: mirrors ``get_metadata_scoped``'s ownership scope --
         see that method's docstring."""
 
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 "SELECT revoked_at FROM authentication_contexts "
                 "WHERE authentication_context_id = %s AND organization_id = %s",

@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 3a390e26ba40a2a1ddc7a2a7480f6a712d3ba387
+Commit: a6d568019f2cc234c76d9df80d293953e2d69d7f
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -511,6 +511,14 @@ Converts all 4 `postgres_target_verification.py` methods to `tenant_connection(o
 `test_postgres_target_verification.py`'s own dedicated test class had no tenant-isolation bootstrap; added the same fixture every other file in this arc already has. Its two existing tests (the regression coverage for the `get_current`/`expected_token` bug this file's own docstring documents) passed unmodified.
 
 **Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence, both production E2E files, and the full 1799-test unit suite.
+
+## Phase H conversion: postgres_authentication_contexts.py, a new kind of gap (2026-09-11)
+
+Converts all 5 `postgres_authentication_contexts.py` methods (`revoke`'s own dead-code status, found during classification, is unchanged). `api_tenant_data` has the full `SELECT, INSERT, UPDATE` this table needs. `create`, `get_metadata_scoped`, and `revoke_scoped` all take `organization_id` and now run under `api_tenant_data` via `tenant_connection`, setting real tenant context.
+
+`get_metadata` and `revoke` are different: neither takes an `organization_id` parameter at all, by design (they serve `create`/`revoke`'s own post-write re-reads and `require_bound`'s trusted-reference fetch, and `require_bound` is called from both `executor.py` and `service.py`, neither of which has a single resolved organization to hand this method at that call site). There is no way to call `tenant_connection` here since there's no tenant to set context to. Both now run under `api_tenant_data` via `role_scoped_connection` instead: the role narrows (real, verifiable progress, confirmed by the full 14-test cross-tenant suite passing unmodified, including both `require_bound` cases), but no tenant-context GUC gets set. This is a genuine, open limitation documented in the class's own docstring, not a stopgap: closing it fully needs either a `SECURITY DEFINER` resolver for this table (matching the pre-auth pattern Phase F already used for identity/session lookups) or accepting that RLS cannot be forced on `authentication_contexts` while `get_metadata`/`revoke` stay reachable in their current unscoped form. Different in kind from every other gap found in this arc so far (`get_password_hash`, `consume_identity_token`, `get_scope`, `enqueue_due_schedule`): those were blocked by missing SQL functions or ACL columns; this one is blocked by the method's own signature having no tenant to scope by, a structural property of how `require_bound` is used across two different process types.
+
+**Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence including the 14-test tenant-isolation suite (both `require_bound` cross-tenant tests unmodified in behavior) and both production E2E files, and the full 1799-test unit suite.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
