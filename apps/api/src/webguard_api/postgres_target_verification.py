@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 from uuid import uuid4
 
-from .postgres_pool import WebGuardPostgresPool
+from .postgres_pool import API_TENANT_DATA_ROLE, WebGuardPostgresPool
 from .target_verification import (
     VERIFICATION_TOKEN_TTL,
     TargetVerificationError,
@@ -29,6 +29,11 @@ _COLUMNS = "verification_id, target_id, organization_id, method, status, evidenc
 
 
 class PostgresTargetVerificationRepository:
+    """P1-2 Phase H: every method here is ordinary and already
+    tenant-scoped, called only from service.py, so each runs under
+    api_tenant_data. target_verifications has no Phase F
+    control-function counterpart because none is needed here."""
+
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
 
@@ -53,7 +58,7 @@ class PostgresTargetVerificationRepository:
         token = secrets.token_urlsafe(24)
         expires_at = now + VERIFICATION_TOKEN_TTL
         verification_id = str(uuid4())
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 """
                 INSERT INTO target_verifications
@@ -74,7 +79,7 @@ class PostgresTargetVerificationRepository:
         )
 
     def get_current(self, target_id: str, *, organization_id: str) -> TargetVerificationRecord | None:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"""
                 SELECT {_COLUMNS} FROM target_verifications
@@ -109,7 +114,7 @@ class PostgresTargetVerificationRepository:
         from its own ``evidence`` placeholder -- the only place it is
         recoverable from, since it was never stored as a real column."""
 
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 "SELECT status, evidence FROM target_verifications WHERE verification_id = %s AND organization_id = %s",
                 (verification_id, organization_id),
@@ -130,7 +135,7 @@ class PostgresTargetVerificationRepository:
         now: datetime,
     ) -> TargetVerificationRecord:
         status = VerificationStatus.VERIFIED if matched else VerificationStatus.FAILED
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"""
                 UPDATE target_verifications SET status = %s, evidence = %s, checked_at = %s
