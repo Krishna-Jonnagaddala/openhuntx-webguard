@@ -126,6 +126,83 @@ class IdentityRepositoryContractMixin:
             repo.authenticate_token(issued.token, now=NOW + timedelta(minutes=3))
         self.assertEqual(caught.exception.code, "api_token_revoked")
 
+    def test_get_principal_by_email_matches_and_returns_none_for_unknown(self) -> None:
+        repo = self.make_repository()
+        org = repo.create_organization("Acme", now=NOW, organization_id=str(uuid4()))
+        principal = repo.create_principal(
+            org.organization_id,
+            "Alice",
+            principal_type=PrincipalType.USER,
+            role=OrganizationRole.OWNER,
+            now=NOW,
+            principal_id=str(uuid4()),
+            email="Alice@Example.com",
+        )
+        fetched = repo.get_principal_by_email("  alice@example.com  ")
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.principal_id, principal.principal_id)
+        self.assertEqual(fetched.organization_id, org.organization_id)
+        self.assertEqual(fetched.email, "alice@example.com")
+
+        self.assertIsNone(repo.get_principal_by_email("nobody@example.com"))
+
+    def test_consume_identity_token_lifecycle(self) -> None:
+        from webguard_api.identity import IdentityTokenPurpose
+
+        repo = self.make_repository()
+        org = repo.create_organization("Acme", now=NOW, organization_id=str(uuid4()))
+        principal = repo.create_principal(
+            org.organization_id,
+            "Alice",
+            principal_type=PrincipalType.USER,
+            role=OrganizationRole.OWNER,
+            now=NOW,
+            principal_id=str(uuid4()),
+        )
+        issued = repo.create_identity_token(
+            principal.principal_id,
+            org.organization_id,
+            purpose=IdentityTokenPurpose.PASSWORD_RESET,
+            ttl=timedelta(hours=1),
+            now=NOW,
+        )
+
+        with self.assertRaises(IdentityStoreError) as caught:
+            repo.consume_identity_token(
+                issued.token, purpose=IdentityTokenPurpose.EMAIL_VERIFICATION, now=NOW
+            )
+        self.assertEqual(caught.exception.code, "identity_token_invalid")
+
+        forged = issued.token[:-4] + "xxxx"
+        with self.assertRaises(IdentityStoreError) as caught:
+            repo.consume_identity_token(
+                forged, purpose=IdentityTokenPurpose.PASSWORD_RESET, now=NOW
+            )
+        self.assertEqual(caught.exception.code, "identity_token_invalid")
+
+        with self.assertRaises(IdentityStoreError) as caught:
+            repo.consume_identity_token(
+                issued.token,
+                purpose=IdentityTokenPurpose.PASSWORD_RESET,
+                now=NOW + timedelta(hours=2),
+            )
+        self.assertEqual(caught.exception.code, "identity_token_expired")
+
+        record = repo.consume_identity_token(
+            issued.token, purpose=IdentityTokenPurpose.PASSWORD_RESET, now=NOW + timedelta(minutes=5)
+        )
+        self.assertEqual(record.token_id, issued.record.token_id)
+        self.assertEqual(record.principal_id, principal.principal_id)
+        self.assertEqual(record.organization_id, org.organization_id)
+        self.assertEqual(record.created_at, issued.record.created_at)
+        self.assertIsNotNone(record.used_at)
+
+        with self.assertRaises(IdentityStoreError) as caught:
+            repo.consume_identity_token(
+                issued.token, purpose=IdentityTokenPurpose.PASSWORD_RESET, now=NOW + timedelta(minutes=6)
+            )
+        self.assertEqual(caught.exception.code, "identity_token_used")
+
     def test_wrong_secret_is_rejected(self) -> None:
         repo = self.make_repository()
         org = repo.create_organization("Acme", now=NOW, organization_id=str(uuid4()))
