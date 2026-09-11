@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 57cde621203461f5e2adb051e54ec39da6c1139b
+Commit: f088b5bff13a57e600fbfc83b93c47ba6c80ff70
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -360,6 +360,29 @@ What remains open going into the actual Phase H *conversion* work (rewiring thes
 4. **RLS+FORCE activation in a real, non-disposable environment with evidence** — the actual runtime proof P1-2 needs, which cannot happen inside a worktree or CI's disposable test database alone.
 
 Item 1 and 2 are genuinely large, multi-file, multi-PR engineering work — not something this ledger can mark VERIFIED by documentation alone. This closes the classification/inventory half of Phase H; the conversion half starts from this document.
+
+## Phase H conversion: runtime role-switching mechanism + first rewired method (2026-09-11)
+
+Before this, "convert an ordinary/pre-auth method" read like a Python-only rewiring task. It isn't. Tracing the actual runtime path found that `api_tenant_data`/`worker_tenant_data`/`scheduler_tenant_data` are `NOLOGIN` roles by design (`tenant_isolation_roles.sql`), and no file anywhere granted the real application role membership into them. Every WebGuard process today connects and queries as one role: `webguard`, the literal username `infra/terraform/postgres.tf` provisions on RDS (`username = "webguard"`) and the same name CI's `WEBGUARD_DATABASE_URL`/`WEBGUARD_POSTGRES_TEST_DSN` use. Since Phase G's own RLS-policy file documents that a table's owner bypasses RLS unless `FORCE ROW LEVEL SECURITY` is also applied, and no policy exists for the literal role name `webguard`, enabling RLS while every query still ran as `webguard` would either do nothing (no FORCE) or break every query outright (FORCE, zero matching policy, default-deny). RLS enforcement is not reachable by editing repository methods alone: it needs the live process to actually assume a restricted role for the query it's running.
+
+This was surfaced to the user directly rather than designed and shipped silently, since it's a foundational decision about how the running service authenticates to Postgres with app-wide blast radius if done wrong. Decision: build and prove the mechanism against the disposable CI/dev Postgres sandbox only; applying it to any real, deployed database is a separate, explicit step for later.
+
+**What was built:**
+
+- `infra/postgres/bootstrap/tenant_isolation_runtime_grant.sql`: `GRANT api_tenant_data TO webguard;` (plus the worker/scheduler equivalents). Membership only, never LOGIN/SUPERUSER, never a revocation of anything `webguard` already has. It adds one option (the ability to voluntarily `SET ROLE` into a narrower identity for one query), consistent with how every other tenant-isolation bootstrap file in this project has worked: SQL only, applied and torn down inside a disposable test database, never touching a real environment.
+- `postgres_pool.py`'s `role_scoped_connection(role)`: runs `SET LOCAL ROLE` (transaction-scoped, auto-reverting, same lifecycle as `set_tenant_context`'s GUC) after validating `role` against a fixed three-value set. `SET ROLE` has no parameterized form, so this validation is what stands in for a bind parameter, matching `_canonical_organization_id`'s existing defensive shape in the same file.
+- `postgres_identity.py`'s `authenticate_token` rewired: the pre-auth resolve step (token id and secret only, no tenant known yet) now runs under `api_tenant_data` and calls `webguard_control.resolve_api_token` instead of three raw `SELECT`s. The moment the control function resolves a real `organization_id`, the rest of the method (the full principal/organization reads and the `last_used_at` write) runs as an ordinary, now-tenant-scoped query on the same connection via `set_tenant_context`. This is the pattern `resolve_identity_token`'s own SQL comment already prescribed for this class of method. Public return contract (`tuple[ApiTokenMetadata, Principal, Organization]`, every field populated with real data, none fabricated) is unchanged: `resolve_api_token` deliberately omits `label`/`created_at` (Section 13 output minimization, per its own comment), so those two fields are fetched with one small additional tenant-scoped query rather than left blank or guessed.
+- `tests/contract/test_identity_repository_contract.py`'s Postgres fixture now applies the full role/ACL/function-ACL/control-function/runtime-grant bootstrap in `setUpClass` (mirroring `test_postgres_control_functions.py`'s own `_apply_full_bootstrap`/`_drop_bootstrap_roles` pattern exactly). Without it, `SET LOCAL ROLE api_tenant_data` fails the first time this suite's existing `authenticate_token` test cases run.
+
+**What was proven, against the real disposable CI/dev Postgres (not mocked):**
+
+- The full existing contract-test suite (59 tests across `tests/contract`), the full existing Postgres integration sequence (`test_postgres_connection_pool` through `test_postgres_sessions`, matching `.github/workflows/ci.yml`'s own order exactly), and the full 1799-test unit suite all pass unmodified in behavior. `authenticate_token`'s observable contract (return values, error codes, error ordering) is unchanged for every existing test case, including the two that exercise it directly (`test_token_issue_authenticate_and_revoke_lifecycle`, `test_wrong_secret_is_rejected`).
+- After the runtime grant is applied, `SET LOCAL ROLE api_tenant_data` succeeds and `current_user` genuinely changes (verified directly: `current_user=api_tenant_data, session_user=webguard`).
+- Under that role, a raw `SELECT password_hash FROM password_credentials` (the withheld-by-design table `get_password_hash` still needs a resolver for) fails with `InsufficientPrivilege: permission denied for table password_credentials`, proving the restricted role is genuinely restricted, not restricted in name only.
+
+**What was not, and could not honestly be, proven here**: whether the runtime grant is load-bearing. In this project's CI/dev sandbox, `webguard` is the official Postgres Docker image's `POSTGRES_USER`, which is a true superuser, and a Postgres superuser can `SET ROLE` to any role regardless of membership grants. Testing "does `SET ROLE api_tenant_data` fail before the grant is applied" in this sandbox returns "no, it already works," which is accurate but not representative: AWS RDS's master user is `rds_superuser`, not a literal `SUPERUSER`, and does not carry this bypass. The grant is real, necessary infrastructure for an actual deployment; this sandbox's own elevated test role just can't be used to adversarially demonstrate that necessity. Recorded here precisely rather than glossed over.
+
+**Deliberately not done in this slice**: RLS is not enabled or forced on any table (still separate, later, explicit work per P1-2's own acceptance criteria). The runtime grant has not been applied to any real environment. The other two pre-auth resolvers approved alongside this one (`get_principal_by_email`+`get_password_hash` -> `resolve_principal_by_email`, `consume_identity_token` -> `resolve_identity_token`) are follow-up work using this same now-proven mechanism, not yet done.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 

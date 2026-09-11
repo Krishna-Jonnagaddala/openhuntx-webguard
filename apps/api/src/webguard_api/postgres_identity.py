@@ -44,7 +44,7 @@ from .identity import (
     _token_parts,
     _verify_secret,
 )
-from .postgres_pool import WebGuardPostgresPool
+from .postgres_pool import API_TENANT_DATA_ROLE, WebGuardPostgresPool, set_tenant_context
 
 
 class PostgresIdentityRepository:
@@ -558,44 +558,73 @@ class PostgresIdentityRepository:
     def authenticate_token(
         self, token: object, *, now: datetime
     ) -> tuple[ApiTokenMetadata, Principal, Organization]:
+        """P1-2 Phase H: the token-id/secret pair alone can't carry a
+        tenant context yet, so this pre-auth step runs under
+        ``api_tenant_data`` (see ``postgres_pool.py``'s
+        ``role_scoped_connection``) and resolves through
+        ``webguard_control.resolve_api_token`` -- the ``SECURITY
+        DEFINER`` function that already replicates this method's exact
+        revoked/expired/principal/organization logic (see
+        ``infra/postgres/bootstrap/tenant_isolation_control_functions.sql``'s
+        own comment on it) without needing a tenant context that
+        doesn't exist yet. The moment ``organization_id`` comes back
+        resolved and validated, the rest of this method -- the full
+        principal/organization reads and the ``last_used_at`` write --
+        runs as an ordinary, now-tenant-scoped query on the same
+        connection, via ``set_tenant_context``, exactly the pattern
+        ``resolve_identity_token``'s own SQL comment describes for
+        this whole class of method."""
+
         token_id, secret = _token_parts(token)
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                """
-                SELECT token_id, organization_id, principal_id, label, secret_hash,
-                       created_at, expires_at, revoked_at, last_used_at
-                FROM api_tokens WHERE token_id = %s
-                """,
+                "SELECT * FROM webguard_control.resolve_api_token(%s)",
                 (token_id,),
             ).fetchone()
-            if row is None or not _verify_secret(secret, row[4]):
+            if row is None or not _verify_secret(secret, row[1]):
                 raise IdentityStoreError("api_token_invalid", "API token is invalid.")
-            metadata = ApiTokenMetadata(
-                token_id=str(row[0]),
-                organization_id=str(row[1]),
-                principal_id=str(row[2]),
-                label=row[3],
-                created_at=row[5].astimezone(timezone.utc),
-                expires_at=row[6].astimezone(timezone.utc),
-                revoked_at=row[7].astimezone(timezone.utc) if row[7] else None,
-                last_used_at=row[8].astimezone(timezone.utc) if row[8] else None,
-            )
-            if metadata.revoked_at is not None:
+            (
+                _resolved_token_id,
+                _secret_hash,
+                token_revoked_at,
+                token_expires_at,
+                principal_id,
+                _principal_display_name,
+                _principal_role,
+                principal_active,
+                organization_id,
+                _organization_name,
+                organization_status,
+            ) = row
+            if token_revoked_at is not None:
                 raise IdentityStoreError("api_token_revoked", "API token has been revoked.")
-            if now.astimezone(timezone.utc) >= metadata.expires_at:
+            if now.astimezone(timezone.utc) >= token_expires_at.astimezone(timezone.utc):
                 raise IdentityStoreError("api_token_expired", "API token has expired.")
+            if principal_id is None or organization_id is None:
+                raise IdentityStoreError("api_token_invalid", "API token is invalid.")
+            if not principal_active:
+                raise IdentityStoreError("principal_disabled", "Principal is disabled.")
+            if organization_status != OrganizationStatus.ACTIVE.value:
+                raise IdentityStoreError("organization_disabled", "Organization is disabled.")
+
+            set_tenant_context(connection, organization_id)
+            token_row = connection.execute(
+                "SELECT label, created_at FROM api_tokens WHERE token_id = %s AND organization_id = %s",
+                (token_id, organization_id),
+            ).fetchone()
             principal_row = connection.execute(
-                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals WHERE principal_id = %s",  # noqa: S608
-                (metadata.principal_id,),
+                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals "  # noqa: S608
+                "WHERE principal_id = %s AND organization_id = %s",
+                (str(principal_id), organization_id),
             ).fetchone()
             organization_row = connection.execute(
                 """
                 SELECT organization_id, name, status, created_at
                 FROM organizations WHERE organization_id = %s
                 """,
-                (metadata.organization_id,),
+                (organization_id,),
             ).fetchone()
-            if principal_row is None or organization_row is None:
+            if token_row is None or principal_row is None or organization_row is None:
                 raise IdentityStoreError("api_token_invalid", "API token is invalid.")
             principal = self._principal_from_row(principal_row)
             organization = Organization(
@@ -604,22 +633,18 @@ class PostgresIdentityRepository:
                 status=OrganizationStatus(organization_row[2]),
                 created_at=organization_row[3].astimezone(timezone.utc),
             )
-            if not principal.active:
-                raise IdentityStoreError("principal_disabled", "Principal is disabled.")
-            if organization.status is not OrganizationStatus.ACTIVE:
-                raise IdentityStoreError("organization_disabled", "Organization is disabled.")
             connection.execute(
-                "UPDATE api_tokens SET last_used_at = %s WHERE token_id = %s",
-                (now, token_id),
+                "UPDATE api_tokens SET last_used_at = %s WHERE token_id = %s AND organization_id = %s",
+                (now, token_id, organization_id),
             )
         updated = ApiTokenMetadata(
-            token_id=metadata.token_id,
-            organization_id=metadata.organization_id,
-            principal_id=metadata.principal_id,
-            label=metadata.label,
-            created_at=metadata.created_at,
-            expires_at=metadata.expires_at,
-            revoked_at=metadata.revoked_at,
+            token_id=str(token_id),
+            organization_id=str(organization_id),
+            principal_id=str(principal_id),
+            label=token_row[0],
+            created_at=token_row[1].astimezone(timezone.utc),
+            expires_at=token_expires_at.astimezone(timezone.utc),
+            revoked_at=token_revoked_at.astimezone(timezone.utc) if token_revoked_at else None,
             last_used_at=now,
         )
         return updated, principal, organization
