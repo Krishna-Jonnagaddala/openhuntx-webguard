@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: bcb80d117f6a31dfdbc8b8f09784b8bd05c1af93
+Commit: f77d3651f62b442be97b4f33d7020ad4d094e1bf
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -45,7 +45,7 @@ future session doesn't waste time re-diagnosing it.
 | P1-8 | Baseline audit | Backup/restore never tested against any environment | NOT_STARTED | Terraform toggles exist; no EFS/persistent-volume resource | none | requires an actual applied environment | deferred to staging | Real backup/restore exercise, integrity verified, RTO/RPO measured |
 | P1-9 | Baseline audit | CloudHSM PKCS#11 `EC_POINT` encoding unverified against real hardware | BLOCKED_EXTERNAL | `kms` path is the tested fallback; CloudHSM code exists, unexercised | none against real hardware | real CloudHSM module/hardware access | N/A until hardware available | Genuine hardware validation of key extraction, identity, signing, independent verification |
 | P1-12-R1 | Post-audit residual | Sustained callback-service PostgreSQL outage can lose durable SSRF evidence (proven: yields false NOT_VULNERABLE, not INCONCLUSIVE) | DEFERRED_WITH_REASON | `callback_server.py`, `postgres_callback_service.py` | Proven residual: `test_no_fabricated_confirmation_when_persistence_never_recovers` | requires an explicit secondary-durability architecture decision (not a bug fix) | future architecture slice | Durable secondary store or documented, accepted, explicitly-surfaced limitation |
-| Phase H | Mandate §7 | Convert ordinary PostgreSQL repository callers to set tenant context before query; classify pre-auth/cross-tenant/callback paths separately | IN_PROGRESS (6 of 13 files classified; major scope correction found, see below) | 13 `postgres_*.py` repository files, ~115 public methods enumerated 2026-09-11; `postgres_identity.py` (25), `postgres_jobs.py` (30), `postgres_schedules.py` (11), `postgres_sessions.py` (6), `postgres_callback_service.py` (4), `postgres_callback_broker.py` (5) fully classified 2026-09-11 (see below) | none yet — classification in progress, conversion not started | P1-2 closure depends on this | multi-session | Every ordinary tenant-data method sets context before query; adversarial cross-tenant test passes under real runtime credentials |
+| Phase H | Mandate §7 | Convert ordinary PostgreSQL repository callers to set tenant context before query; classify pre-auth/cross-tenant/callback paths separately | IN_PROGRESS (7 of 13 files classified; major scope correction found, see below) | 13 `postgres_*.py` repository files, ~115 public methods enumerated 2026-09-11; `postgres_identity.py` (25), `postgres_jobs.py` (30), `postgres_schedules.py` (11), `postgres_sessions.py` (6), `postgres_callback_service.py` (4), `postgres_callback_broker.py` (5), `postgres_targets.py` (6) fully classified 2026-09-11 (see below) | none yet — classification in progress, conversion not started | P1-2 closure depends on this | multi-session | Every ordinary tenant-data method sets context before query; adversarial cross-tenant test passes under real runtime credentials |
 
 ## Phase H: repository inventory (discovery, 2026-09-11)
 
@@ -235,7 +235,22 @@ Both files together, since `PostgresCallbackBroker` (the broker) is a thin adapt
 
 **Summary for these two files**: 6 Ordinary (3 genuinely new SQL in the repository, 3 delegates in the broker; zero defense-in-depth gaps — `revoke_registration`'s atomic `UPDATE ... RETURNING` and `wait_for_observation`'s check-before-poll pattern are both already the correct shape), 2 Callback token resolution (1 genuinely new in the repository, already covered by a tested control function; 1 delegate in the broker), 1 property/no-op, 1 private helper not independently classifiable.
 
-All 13 `webguard_control` functions Phase F built are now fully accounted for across their 5 confirmed source files (`postgres_identity.py` ×3, `postgres_sessions.py` ×1, `postgres_jobs.py` ×5, `postgres_schedules.py` ×3, `postgres_callback_service.py` ×1). 6 of 13 repository files are classified. The remaining 7 (`postgres_authentication_contexts.py`, `postgres_authorization_comparison.py`, `postgres_findings.py`, `postgres_reports.py`, `postgres_scans.py`, `postgres_target_verification.py`, `postgres_targets.py`) had no entry in Phase F's function list — the working hypothesis is that they are genuinely-ordinary tenant-data files needing only the "set tenant context before query" treatment, no resolver. Unconfirmed until each is actually read; do not treat this as settled.
+All 13 `webguard_control` functions Phase F built are now fully accounted for across their 5 confirmed source files (`postgres_identity.py` ×3, `postgres_sessions.py` ×1, `postgres_jobs.py` ×5, `postgres_schedules.py` ×3, `postgres_callback_service.py` ×1). The remaining 7 files with no entry in Phase F's function list (`postgres_authentication_contexts.py`, `postgres_authorization_comparison.py`, `postgres_findings.py`, `postgres_reports.py`, `postgres_scans.py`, `postgres_target_verification.py`, `postgres_targets.py`) were hypothesized to be genuinely-ordinary tenant-data files needing only the "set tenant context before query" treatment, no resolver — `postgres_targets.py` (below) is the first of the 7 actually checked, and confirms it.
+
+## Phase H: `postgres_targets.py` classification (complete, 2026-09-11)
+
+`PostgresTargetRepository`, 6 public methods. First confirmation of the "genuinely ordinary, no resolver needed" hypothesis for the 7 files with no Phase F control-function counterpart.
+
+| Method | Tables | Tenant source | Classification | Note |
+|---|---|---|---|---|
+| `create_target` | targets | `organization_id` param (embedded) | Ordinary (self-tenant registration variant) | |
+| `get_target` | targets | `organization_id` param | Ordinary | Already SQL-scoped |
+| `list_targets` | targets | `organization_id` param | Ordinary | Already SQL-scoped |
+| `list_targets_scoped_page` | targets | `organization_id` param | Ordinary | Already SQL-scoped |
+| `update_target` | targets | `organization_id` param | Ordinary | Atomic single-statement `UPDATE ... RETURNING`, same clean shape as `postgres_callback_service.py`'s `revoke_registration` |
+| `archive_target` | targets | `organization_id` param | Ordinary | Same atomic `UPDATE ... RETURNING` shape |
+
+**Summary for this file**: 6 Ordinary, 0 exceptions of any kind — every method takes `organization_id` as an explicit parameter and uses it directly in its own SQL predicate. Zero pre-auth, zero cross-tenant, zero unscoped methods, zero flagged gaps. This is the simplest file classified so far and the first genuine confirmation that a file absent from Phase F's control-function list really does need nothing more than the tenant-context-setting treatment — 6 of 7 remaining files to check before treating that as settled project-wide.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
