@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: a6d568019f2cc234c76d9df80d293953e2d69d7f
+Commit: fb044e8ba441b4f327db7c57150cdb6a093fd6a5
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -519,6 +519,16 @@ Converts all 5 `postgres_authentication_contexts.py` methods (`revoke`'s own dea
 `get_metadata` and `revoke` are different: neither takes an `organization_id` parameter at all, by design (they serve `create`/`revoke`'s own post-write re-reads and `require_bound`'s trusted-reference fetch, and `require_bound` is called from both `executor.py` and `service.py`, neither of which has a single resolved organization to hand this method at that call site). There is no way to call `tenant_connection` here since there's no tenant to set context to. Both now run under `api_tenant_data` via `role_scoped_connection` instead: the role narrows (real, verifiable progress, confirmed by the full 14-test cross-tenant suite passing unmodified, including both `require_bound` cases), but no tenant-context GUC gets set. This is a genuine, open limitation documented in the class's own docstring, not a stopgap: closing it fully needs either a `SECURITY DEFINER` resolver for this table (matching the pre-auth pattern Phase F already used for identity/session lookups) or accepting that RLS cannot be forced on `authentication_contexts` while `get_metadata`/`revoke` stay reachable in their current unscoped form. Different in kind from every other gap found in this arc so far (`get_password_hash`, `consume_identity_token`, `get_scope`, `enqueue_due_schedule`): those were blocked by missing SQL functions or ACL columns; this one is blocked by the method's own signature having no tenant to scope by, a structural property of how `require_bound` is used across two different process types.
 
 **Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence including the 14-test tenant-isolation suite (both `require_bound` cross-tenant tests unmodified in behavior) and both production E2E files, and the full 1799-test unit suite.
+
+## Phase H conversion: postgres_authorization_comparison.py (2026-09-11)
+
+Converts all 5 `postgres_authorization_comparison.py` methods, mirroring `postgres_authentication_contexts.py`'s conversion exactly: `create`, `get_scoped`, `revoke_scoped` take `organization_id` and run under `api_tenant_data` via `tenant_connection`; `get` and `revoke` take no `organization_id` at all (the same `require_bound`-from-both-processes shape) and run under `api_tenant_data` via `role_scoped_connection`, role-only, no tenant context. Same open limitation as the sibling class, not repeated in full in this file's own docstring since it references that one directly.
+
+**A transient test-infrastructure note, not a code finding**: while verifying this change, the full 1799-test unit suite raised a `ConnectionResetError` inside a real-socket HTTP send on the first run, and appeared to repeat on an immediate second run before three subsequent clean runs (including one with corrected output redirection) all passed with zero errors. This PR's change touches only Postgres connection role-scoping, nothing related to sockets or HTTP, and the failure was not reproducible across a majority of runs; consistent with the real-socket E2E flake category already flagged for separate investigation earlier in this session (`test_authenticated_scanning_e2e_lab.py`).
+
+**Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence including the 14-test tenant-isolation suite (both comparison-plan cross-tenant tests unmodified) and both production E2E files, and the full 1799-test unit suite (clean on 3 of 4 runs; see note above).
+
+This closes the tenant-context-setting conversion for the two files with the "no-org-parameter, called from both processes" shape. Remaining Phase H tenant-context-setting work: the ordinary methods within `postgres_identity.py`, `postgres_jobs.py`, `postgres_schedules.py`, `postgres_sessions.py`, and `postgres_callback_service.py`/`postgres_callback_broker.py` (the ones not already converted to a control function in PRs #30-#35).
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
