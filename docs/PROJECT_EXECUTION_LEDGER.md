@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: f77d3651f62b442be97b4f33d7020ad4d094e1bf
+Commit: 57cde621203461f5e2adb051e54ec39da6c1139b
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -45,7 +45,7 @@ future session doesn't waste time re-diagnosing it.
 | P1-8 | Baseline audit | Backup/restore never tested against any environment | NOT_STARTED | Terraform toggles exist; no EFS/persistent-volume resource | none | requires an actual applied environment | deferred to staging | Real backup/restore exercise, integrity verified, RTO/RPO measured |
 | P1-9 | Baseline audit | CloudHSM PKCS#11 `EC_POINT` encoding unverified against real hardware | BLOCKED_EXTERNAL | `kms` path is the tested fallback; CloudHSM code exists, unexercised | none against real hardware | real CloudHSM module/hardware access | N/A until hardware available | Genuine hardware validation of key extraction, identity, signing, independent verification |
 | P1-12-R1 | Post-audit residual | Sustained callback-service PostgreSQL outage can lose durable SSRF evidence (proven: yields false NOT_VULNERABLE, not INCONCLUSIVE) | DEFERRED_WITH_REASON | `callback_server.py`, `postgres_callback_service.py` | Proven residual: `test_no_fabricated_confirmation_when_persistence_never_recovers` | requires an explicit secondary-durability architecture decision (not a bug fix) | future architecture slice | Durable secondary store or documented, accepted, explicitly-surfaced limitation |
-| Phase H | Mandate §7 | Convert ordinary PostgreSQL repository callers to set tenant context before query; classify pre-auth/cross-tenant/callback paths separately | IN_PROGRESS (7 of 13 files classified; major scope correction found, see below) | 13 `postgres_*.py` repository files, ~115 public methods enumerated 2026-09-11; `postgres_identity.py` (25), `postgres_jobs.py` (30), `postgres_schedules.py` (11), `postgres_sessions.py` (6), `postgres_callback_service.py` (4), `postgres_callback_broker.py` (5), `postgres_targets.py` (6) fully classified 2026-09-11 (see below) | none yet — classification in progress, conversion not started | P1-2 closure depends on this | multi-session | Every ordinary tenant-data method sets context before query; adversarial cross-tenant test passes under real runtime credentials |
+| Phase H | Mandate §7 | Convert ordinary PostgreSQL repository callers to set tenant context before query; classify pre-auth/cross-tenant/callback paths separately | IN_PROGRESS (classification/inventory sub-phase complete: 13 of 13 files classified; conversion sub-phase not started) | 13 `postgres_*.py` repository files, ~115 public methods, all classified 2026-09-11: `postgres_identity.py` (25), `postgres_jobs.py` (30), `postgres_schedules.py` (11), `postgres_sessions.py` (6), `postgres_callback_service.py` (4), `postgres_callback_broker.py` (5), `postgres_targets.py` (6), `postgres_authentication_contexts.py` (6), `postgres_authorization_comparison.py` (6), `postgres_findings.py` (5), `postgres_reports.py` (3), `postgres_scans.py` (5), `postgres_target_verification.py` (4) — see "Phase H classification: all 13 repository files complete" below for the full tally and open items | none yet for the conversion sub-phase; classification is documentation-only | P1-2 closure depends on this | multi-session | Every ordinary tenant-data method sets context before query; adversarial cross-tenant test passes under real runtime credentials |
 
 ## Phase H: repository inventory (discovery, 2026-09-11)
 
@@ -251,6 +251,115 @@ All 13 `webguard_control` functions Phase F built are now fully accounted for ac
 | `archive_target` | targets | `organization_id` param | Ordinary | Same atomic `UPDATE ... RETURNING` shape |
 
 **Summary for this file**: 6 Ordinary, 0 exceptions of any kind — every method takes `organization_id` as an explicit parameter and uses it directly in its own SQL predicate. Zero pre-auth, zero cross-tenant, zero unscoped methods, zero flagged gaps. This is the simplest file classified so far and the first genuine confirmation that a file absent from Phase F's control-function list really does need nothing more than the tenant-context-setting treatment — 6 of 7 remaining files to check before treating that as settled project-wide.
+
+## Phase H: `postgres_authentication_contexts.py` classification (complete, 2026-09-11)
+
+`PostgresAuthenticationContextRepository`, 6 public methods. Second of the 7 files with no Phase F control-function counterpart.
+
+| Method | Tables | Tenant source | Classification | Note |
+|---|---|---|---|---|
+| `create` | authentication_contexts | `organization_id` param (embedded) | Ordinary (self-tenant registration variant) | Returns `self.get_metadata(effective_id)` — an unscoped post-write read of the row it just inserted itself, not a caller-supplied ID |
+| `get_metadata` | authentication_contexts | **none** — unscoped by ID alone | Ordinary, but callers must be trusted (see note) | Verified against every actual caller in the repository: `apps/api/src/webguard_api/*.py` has exactly 3 bare `.get_metadata(` call sites, all inside this same class (`create`'s and `revoke`'s own post-write re-reads, and `require_bound`'s initial fetch). No external file calls this method directly |
+| `revoke` | authentication_contexts | **none** — unscoped by ID alone | Dead code externally | A repo-wide grep for `.revoke(` (excluding `revoke_scoped`/`revoke_session`/`revoke_token`/`revoke_registration`/`revoke_all`/`revoke_scan_permit`) found zero callers anywhere in `apps/api/src/webguard_api/`. `revoke_authentication_context` in `service.py` calls `revoke_scoped`, not this method. Not a gap since nothing reaches it, but worth flagging as removable if a future cleanup pass wants to shrink this class's public surface |
+| `get_metadata_scoped` | authentication_contexts | `organization_id` param | Ordinary | Already SQL-scoped (P1-C1): a wrong-org lookup and a nonexistent ID raise the identical `authentication_context_not_found` error, verified by reading the method's own predicate directly (`WHERE authentication_context_id = %s AND organization_id = %s`) |
+| `revoke_scoped` | authentication_contexts | `organization_id` param | Ordinary | Same atomic-predicate shape as `get_metadata_scoped`; its own re-read after the `UPDATE` calls `get_metadata_scoped`, not the bare method |
+| `require_bound` | authentication_contexts | `organization_id` param, checked in Python after an unscoped `get_metadata` read | Ordinary, but **see finding below** | The docstrings on this file's own `get_metadata_scoped`/`revoke_scoped` claim `require_bound`'s callers only ever pass "a trusted, previously org-validated reference (a permit or comparison plan), not directly from an untrusted caller." Verified against the actual call sites: that claim is false for two of them. See "Finding: `require_bound`'s cross-tenant ID-existence oracle" below |
+
+**Summary for this file**: 4 Ordinary with correct SQL-level scoping (`create`, `get_metadata_scoped`, `revoke_scoped`, and `get_metadata`/`revoke`'s own internal self-reads), 1 externally-dead method (`revoke`, zero real callers), 1 method (`require_bound`) whose safety rests on a documented assumption about its callers that does not hold at two real call sites — not a defense-in-depth gap in this file's own code, but a documentation-accuracy problem this classification pass caught by checking the claim against actual callers instead of trusting the docstring.
+
+## Phase H: `postgres_authorization_comparison.py` classification (complete, 2026-09-11)
+
+`PostgresAuthorizationComparisonPlanRepository`, 6 public methods. Same shape as `postgres_authentication_contexts.py` in every respect — `create`/`get`/`revoke`/`get_scoped`/`revoke_scoped`/`require_bound`, with `get_scoped`'s and `revoke_scoped`'s own docstrings citing `PostgresAuthenticationContextRepository`'s docstrings directly rather than restating them.
+
+| Method | Tables | Tenant source | Classification | Note |
+|---|---|---|---|---|
+| `create` | authorization_comparison_plans | `organization_id` param (embedded) | Ordinary (self-tenant registration variant) | |
+| `get` | authorization_comparison_plans | **none** | Ordinary, but callers must be trusted (see note) | Same 3-internal-caller pattern as `postgres_authentication_contexts.py`'s `get_metadata`: `create`'s and `revoke`'s own post-write re-reads, and `require_bound`'s initial fetch |
+| `revoke` | authorization_comparison_plans | **none** | Dead code externally | Same verification: `revoke_authorization_comparison_plan` in `service.py` calls `revoke_scoped`, not this method. Zero external callers found |
+| `get_scoped` | authorization_comparison_plans | `organization_id` param | Ordinary | Already SQL-scoped (P1-C1) |
+| `revoke_scoped` | authorization_comparison_plans | `organization_id` param | Ordinary | Same atomic-predicate shape |
+| `require_bound` | authorization_comparison_plans | `organization_id` param, checked in Python after an unscoped `get` read | Ordinary, but **see finding below** | One of the two directly-untrusted call sites for this pattern (`issue_permit`'s `submission.authorization_comparison_plan_id`) reaches this exact method |
+
+**Summary for this file**: identical shape to `postgres_authentication_contexts.py` — 4 correctly SQL-scoped Ordinary methods, 1 externally-dead method, 1 method carrying the same require_bound finding below. This file's own module docstring is also stale: it says "Status: POSTGRES_REPOSITORY_READY, LIVE_RUNTIME_WIRING_DEFERRED... this class is not part of this slice's live execution path," but `production_startup.py`'s own module docstring lists "authorization comparison plans" under "Live as of this slice," and `build_production_components` constructs and wires `PostgresAuthorizationComparisonPlanRepository` directly into `WebGuardJobService`. Corrected in this PR since the classification work is what surfaced it.
+
+Both files now bring the confirmed-ordinary count (files absent from Phase F's control-function list, needing only tenant-context-setting, no resolver) to 3 of 7: `postgres_targets.py`, `postgres_authentication_contexts.py`, `postgres_authorization_comparison.py`. 4 remain unchecked: `postgres_findings.py`, `postgres_reports.py`, `postgres_scans.py`, `postgres_target_verification.py`.
+
+## Finding: `require_bound`'s cross-tenant ID-existence oracle (2026-09-11)
+
+Both `PostgresAuthenticationContextRepository.require_bound` and `PostgresAuthorizationComparisonPlanRepository.require_bound` fetch a record by ID with no organization predicate (`get_metadata`/`get`), then compare `record.organization_id` against the caller's `organization_id` in Python, raising a distinct error code for "not found" versus "found, wrong org." The docstrings on the neighboring `get_metadata_scoped`/`get_scoped` methods justify this by claiming `require_bound` is only ever reached with "a trusted, previously org-validated reference (a permit or comparison plan), not directly from an untrusted caller." Checked against the actual call sites, that claim holds for one of three and not the other two:
+
+- `service.py`'s `issue_permit` calls `authentication_contexts.require_bound(submission.authentication_context_id, ...)` and `authorization_comparison_plans.require_bound(submission.authorization_comparison_plan_id, ...)` with IDs read straight out of `load_trustscan_permit_submission_json(body)` — the caller's own HTTP request body. Untrusted.
+- `service.py`'s `register_authorization_comparison_plan` calls `authentication_contexts.require_bound(context_id, ...)` for both `body["primary_context_id"]` and `body["secondary_context_id"]` — also straight from the request body. Untrusted.
+- `executor.py`'s `_apply_authorization_comparison` calls both `require_bound` methods with IDs read from an already-registered `AuthorizationComparisonPlanRecord` (`plan.primary_context_id`, `plan.secondary_context_id`, and `comparison_plan_id` itself bound to a signed permit claim). This one matches the docstring's claim.
+
+Practical effect: any authenticated principal, from any organization, can submit an arbitrary UUID as `authentication_context_id`, `authorization_comparison_plan_id`, `primary_context_id`, or `secondary_context_id` in a permit-issuance or comparison-plan-registration request and learn, from the returned error code, whether that UUID exists as a real row in *any* organization's data, not just their own (`..._not_found` vs. `..._organization_mismatch`) — the exact "distinguishable existence oracle" `get_metadata_scoped`'s own docstring says the P1-C1 fix was built to prevent, reappearing at a call site that fix didn't cover.
+
+This is not the same severity as a true IDOR: `authentication_context_id` and `comparison_plan_id` are `uuid4()` values (122 bits of random entropy), so an attacker has nothing to enumerate against without already possessing a candidate ID from some other source — the same non-enumerability argument this codebase already relies on for `postgres_callback_service.py`'s token-based lookups. It is real, though: it means an attacker who obtains a context or plan ID belonging to another tenant (leaked in a log line, a support ticket, a URL, a referrer header) can confirm cross-tenant existence and active/expired/revoked status of that specific record without ever authenticating as that tenant, which a fully SQL-scoped predicate would prevent outright regardless of how the ID was obtained.
+
+Not fixed in this PR: changing `require_bound`'s error semantics or its callers' exception handling is a runtime-behavior change, not a documentation fix, and deserves its own PR with its own test coverage (matching how every other P1-C1-style fix in this codebase shipped with a dedicated regression test proving the two error paths become indistinguishable). Recorded here, honestly, rather than folded into a docs-only PR or left for a future session to rediscover from scratch.
+
+## Phase H: `postgres_findings.py`, `postgres_reports.py`, `postgres_scans.py`, `postgres_target_verification.py` classification (complete, 2026-09-11)
+
+The last four files with no Phase F control-function counterpart. All four confirm the "genuinely ordinary" hypothesis with zero exceptions — no pre-auth method, no cross-tenant method, no unscoped write.
+
+### `postgres_findings.py` — `PostgresFindingRepository`, 5 methods
+
+| Method | Tables | Tenant source | Classification | Note |
+|---|---|---|---|---|
+| `record_finding` | findings, finding_events | `organization_id` param (embedded) | Ordinary | Atomic `INSERT ... ON CONFLICT (organization_id, fingerprint) DO UPDATE`, so the tenant-scoped uniqueness constraint itself prevents cross-tenant collision, not just the predicate |
+| `get_finding_scoped` | findings | `organization_id` param | Ordinary | Already SQL-scoped |
+| `list_findings_scoped_page` | findings | `organization_id` param | Ordinary | Already SQL-scoped |
+| `update_status` | findings, finding_events | `organization_id` param | Ordinary | The idempotent no-op branch (`new_status is current_status`) re-reads by `finding_id` alone with no organization predicate — safe because that ID was already proven to belong to this organization by the scoped `SELECT` three lines above, in the same connection, same transaction; not a separate untrusted lookup |
+| `list_events_scoped` | findings (existence check), finding_events | `organization_id` param | Ordinary | Existence check against `findings` is scoped before reading `finding_events`, which has no `organization_id` column of its own |
+
+### `postgres_reports.py` — `PostgresReportRepository`, 3 methods
+
+| Method | Tables | Tenant source | Classification | Note |
+|---|---|---|---|---|
+| `create_report` | reports | `organization_id` param (embedded) | Ordinary | Returns `self.get_report_scoped(...)`, not an unscoped read |
+| `get_report_scoped` | reports | `organization_id` param | Ordinary | Already SQL-scoped |
+| `list_reports_scoped_page` | reports | `organization_id` param | Ordinary | Already SQL-scoped |
+
+### `postgres_scans.py` — `PostgresScanRepository`, 5 methods
+
+| Method | Tables | Tenant source | Classification | Note |
+|---|---|---|---|---|
+| `create_scan` | scan_records | `organization_id` param (embedded) | Ordinary | Returns `self.get_scan_scoped(...)`, not an unscoped read |
+| `complete_scan` | scan_records | `organization_id` param | Ordinary | Atomic `UPDATE ... RETURNING`, same shape as `postgres_targets.py`'s `update_target` |
+| `get_scan_scoped` | scan_records | `organization_id` param | Ordinary | Already SQL-scoped |
+| `list_scans_scoped` | scan_records | `organization_id` param | Ordinary | Already SQL-scoped |
+| `list_scans_scoped_page` | scan_records | `organization_id` param | Ordinary | Already SQL-scoped |
+
+### `postgres_target_verification.py` — `PostgresTargetVerificationRepository`, 4 methods
+
+| Method | Tables | Tenant source | Classification | Note |
+|---|---|---|---|---|
+| `initiate` | target_verifications | `organization_id` param (embedded) | Ordinary | The verification token itself is never persisted as a real column (design predates and is unrelated to tenant scoping — see file's own module docstring); stored only as an `evidence` placeholder string |
+| `get_current` | target_verifications | `organization_id` param | Ordinary | Already SQL-scoped; returns `None` rather than raising when nothing matches, a deliberate "is there a current verification" query shape, not a scoping difference from the other methods |
+| `get_pending_token` | target_verifications | `organization_id` param | Ordinary | Already SQL-scoped |
+| `record_result` | target_verifications | `organization_id` param | Ordinary | Atomic `UPDATE ... RETURNING` |
+
+**Summary for these four files**: 17 Ordinary methods, 0 exceptions of any kind. Every method that reads or writes takes `organization_id` explicitly and uses it directly in its own SQL predicate; every write that returns a record does so through either an atomic `UPDATE ... RETURNING` or a scoped re-read of a row it just inserted itself.
+
+## Phase H classification: all 13 repository files complete (2026-09-11)
+
+Final tally across all 13 `postgres_*.py` files (~115 public methods, ~105 distinct once schedule delegates are excluded):
+
+- **6 files needed and already have a Phase F control-function counterpart**: `postgres_identity.py` (3 resolvers), `postgres_sessions.py` (1 resolver), `postgres_jobs.py` (5 cross-tenant worker-control functions), `postgres_schedules.py` (3 cross-tenant scheduler-control functions), `postgres_callback_service.py` (1 callback-token resolver). All 13 `webguard_control` functions Phase F built are accounted for against a named source method — none left over, none missing a match.
+- **7 files are genuinely ordinary, no resolver needed**: `postgres_targets.py`, `postgres_authentication_contexts.py`, `postgres_authorization_comparison.py`, `postgres_findings.py`, `postgres_reports.py`, `postgres_scans.py`, `postgres_target_verification.py`. Every method in every one of these takes `organization_id` (or, for `postgres_sessions.py`'s deliberately principal-scoped subset, `principal_id`) as an explicit parameter and uses it directly in its own SQL predicate.
+- **`postgres_callback_broker.py`** is a thin adapter over `postgres_callback_service.py`, classified alongside it, contributing no new SQL of its own beyond `wait_for_observation`'s check-before-poll pattern.
+
+What remains open going into the actual Phase H *conversion* work (rewiring these repositories to run under a real non-superuser role and set tenant context before every query, per Mandate §7):
+
+1. **Rewire the 6 pre-auth/cross-tenant/callback methods** listed under "Major finding" above to call their matching `webguard_control` function instead of raw SQL, then adversarially prove each swap is behaviorally identical under real runtime credentials (same errors, same concurrency guarantees, same return shape).
+2. **Add tenant-context-setting to every Ordinary method** across all 13 files before its query runs, so RLS (already defined, dormant since Phase A-G) actually activates instead of running under a role that bypasses it.
+3. **Three concrete, already-identified gaps to fix, none newly discovered by this final pass**:
+   - `postgres_jobs.py`'s `request_cancellation` lacks the atomic `organization_id` predicate its own `_scoped` wrapper implies (defense-in-depth only, not exploitable today, but inconsistent with the fix already applied to `postgres_identity.py`'s `update_principal_role`/`set_principal_active` and `postgres_schedules.py`'s `_set_schedule_state`).
+   - `require_bound`'s cross-tenant ID-existence oracle on `postgres_authentication_contexts.py` and `postgres_authorization_comparison.py` (documented above), which needs its own PR with dedicated regression tests, not a bundled fix.
+   - A handful of self-scoped methods with no `organization_id` parameter at all (`postgres_identity.py`'s `set_principal_email_verified`/`touch_last_login`/`list_tokens_for_principal`, `postgres_sessions.py`'s `get_session`) need a signature review to accept and use an org/principal identifier for context-setting, even though none of them has a live scoping gap today.
+4. **RLS+FORCE activation in a real, non-disposable environment with evidence** — the actual runtime proof P1-2 needs, which cannot happen inside a worktree or CI's disposable test database alone.
+
+Item 1 and 2 are genuinely large, multi-file, multi-PR engineering work — not something this ledger can mark VERIFIED by documentation alone. This closes the classification/inventory half of Phase H; the conversion half starts from this document.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 

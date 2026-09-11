@@ -1,12 +1,12 @@
 """PostgreSQL-backed authorization-comparison-plan repository (Slice
-13 requirement 10).
+13 requirement 10; live-wired into the production runtime in Slice 14
+requirement 1, alongside ``postgres_authentication_contexts.py`` --
+see ``production_startup.py``'s module docstring and
+``build_production_components``).
 
-Status: POSTGRES_REPOSITORY_READY, LIVE_RUNTIME_WIRING_DEFERRED. Closes
-the cross-process limitation the in-memory
+Closes the cross-process limitation the in-memory
 ``AuthorizationComparisonPlanRepository`` has always documented (a
-plan registered by one process is invisible to another) for whichever
-future slice wires IDOR/BOLA workflows into the production runtime --
-this class is not part of this slice's live execution path. No
+plan registered by one process is invisible to another). No
 credential material belongs here, and none is ever accepted: every
 field mirrors ``AuthorizationComparisonPlanRecord`` exactly (target,
 authorization, identity *references* by ID, resource/discovery policy,
