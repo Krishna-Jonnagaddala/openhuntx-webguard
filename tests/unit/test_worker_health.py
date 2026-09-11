@@ -259,8 +259,17 @@ class ProgressStalenessEvidenceTests(unittest.TestCase):
         that actually governs /ready is already proven deterministically,
         with no real time involved, by ProgressStalenessFakeClockTests.
         """
+        # sleep_seconds=1.2 against heartbeat_seconds=0.1 gives roughly
+        # 1.0s of margin between "3 touches nominally done" (~0.2-0.3s)
+        # and "job finishes" (1.2s) -- observed live on GitHub Actions
+        # (run 34598201214, Python 3.14.6 only, other three Python
+        # versions in the same run unaffected): the original 0.4s
+        # duration gave only ~0.1-0.2s of margin, and a busy runner
+        # delayed the monitor thread's own touch cadence past that,
+        # exactly the class of flake this test's own docstring already
+        # warned a tight margin could produce.
         record, _ = self.store.submit(_request("evidence-long-job"))
-        executor = _SlowExecutor(sleep_seconds=0.4)
+        executor = _SlowExecutor(sleep_seconds=1.2)
         worker = ScanJobWorker(
             store=self.store, executor=executor, worker_id="evidence-long-job-worker",
             lease_seconds=30, heartbeat_seconds=0.1, poll_seconds=0.05,
