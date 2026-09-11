@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: f4d1d46e233b67cf8e53af7d8bf00ff661381569
+Commit: 88dd4927d0960ea516f72242986f1dd995bc08a3
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -439,6 +439,18 @@ With this conversion, `_require_active_lease` (the helper `renew_lease`'s own ea
 **Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence including the crash-recovery suite and the `build_production_components` E2E, and the full 1799-test unit suite, all unchanged in behavior. Adversarial check: a raw `INSERT` into `job_safety_receipts` fails under `worker_tenant_data` with permission denied; `webguard_control.terminal_transition` succeeds under the identical restricted connection and correctly reports `not_found` for an unknown job.
 
 This closes out every method in `postgres_jobs.py` that has a Phase F control-function counterpart. Remaining Phase H worker/scheduler conversion work: `postgres_schedules.py`'s three cross-tenant scheduler functions (`list_due_schedules`, `enqueue_due_schedule`, `block_due_schedule`) and `postgres_callback_service.py`'s callback resolver (`record_observation`).
+
+## Phase H conversion: fifth slice, postgres_schedules.py's scheduler functions (2026-09-11)
+
+Converted `list_due_schedules` and `block_due_schedule` to run entirely through their existing `webguard_control` functions under `scheduler_tenant_data`, which (like `worker_tenant_data` on `scan_jobs`) has zero table-level grant on `scan_schedules` at all. Both functions' return columns match `_COLUMNS` exactly, so both converted cleanly with no follow-up query, the same shape as `postgres_jobs.py`'s `claim_next_leased`/`recover_expired_leases`.
+
+**Not converted, `enqueue_due_schedule`**: this is a new, different kind of gap from the ones found so far. `webguard_control.enqueue_due_schedule` exists and reproduces the method's exact sequence, but its own `RETURNS TABLE` is a deliberately minimized 8-column summary (`outcome`, `schedule_id`, `schedule_state`, `schedule_revision`, `schedule_next_run_at`, `job_id`, `job_state`, `job_submitted_at`), not the full `ScanScheduleRecord`/`ScanJobRecord` pair this Python method's own contract promises. Checked the one real caller (`scheduler.py`'s `run_once`): it discards the schedule record entirely and reads only `job_record.job_id` from the job record, so the function's summary is already sufficient in practice, exactly like `authenticate_token`'s discovery that its own caller used far fewer fields than the full return type. The difference here: `scheduler_tenant_data` has zero table-level grant on `scan_schedules`, `scan_jobs`, `schedule_permits`, or `job_permits`, so there's no ordinary-refetch fallback available at all to reconstruct the missing fields, the same wall `postgres_jobs.py`'s `get_scope` hit. Closing this needs either widening the function's return columns (a change to Phase F's already-reviewed SQL) or narrowing this method's own return contract to match its one real caller, both real design decisions and neither made unilaterally here. Documented in the method's own docstring.
+
+**New test coverage**: neither `list_due_schedules` nor `block_due_schedule` had any real-Postgres test coverage calling them as Python methods before this change (`test_postgres_tenant_isolation_slice13.py` constructs `PostgresScheduleRepository` but never calls either; `test_postgres_control_functions.py` tests the SQL functions directly, not the Python wiring). Added `tests/integration/test_postgres_schedule_repository_wiring.py`, five new tests proving both methods work end to end against real Postgres: due/not-due filtering, the limit parameter, pausing with an error code, and both `None`-on-no-match cases (revision mismatch, unknown schedule id).
+
+**Proven against real disposable Postgres**: full contract suite (63/63), full Postgres integration sequence including the new wiring test and the `build_production_components` E2E, and the full 1799-test unit suite. Adversarial check: a raw `SELECT schedule_id FROM scan_schedules` fails under `scheduler_tenant_data` with permission denied; `webguard_control.list_due_schedules` succeeds under the identical restricted connection.
+
+Remaining Phase H worker/scheduler conversion work: `postgres_callback_service.py`'s callback resolver (`record_observation`). After that, every method with an existing Phase F control-function counterpart will have been either converted or precisely documented as blocked, closing the "rewire existing functions" half of Phase H's conversion work; adding tenant-context-setting to the ~90 genuinely-ordinary methods across all 13 files has not started.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
