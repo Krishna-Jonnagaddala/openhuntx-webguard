@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: ff112d7fe6c33a664cd6fa1db15b113307217129
+Commit: a992a4bfdbb10d814aaa16013ed88f2e7f5aa33a
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -45,7 +45,7 @@ future session doesn't waste time re-diagnosing it.
 | P1-8 | Baseline audit | Backup/restore never tested against any environment | NOT_STARTED | Terraform toggles exist; no EFS/persistent-volume resource | none | requires an actual applied environment | deferred to staging | Real backup/restore exercise, integrity verified, RTO/RPO measured |
 | P1-9 | Baseline audit | CloudHSM PKCS#11 `EC_POINT` encoding unverified against real hardware | BLOCKED_EXTERNAL | `kms` path is the tested fallback; CloudHSM code exists, unexercised | none against real hardware | real CloudHSM module/hardware access | N/A until hardware available | Genuine hardware validation of key extraction, identity, signing, independent verification |
 | P1-12-R1 | Post-audit residual | Sustained callback-service PostgreSQL outage can lose durable SSRF evidence (proven: yields false NOT_VULNERABLE, not INCONCLUSIVE) | DEFERRED_WITH_REASON | `callback_server.py`, `postgres_callback_service.py` | Proven residual: `test_no_fabricated_confirmation_when_persistence_never_recovers` | requires an explicit secondary-durability architecture decision (not a bug fix) | future architecture slice | Durable secondary store or documented, accepted, explicitly-surfaced limitation |
-| Phase H | Mandate §7 | Convert ordinary PostgreSQL repository callers to set tenant context before query; classify pre-auth/cross-tenant/callback paths separately | IN_PROGRESS (3 of 13 files classified; major scope correction found, see below) | 13 `postgres_*.py` repository files, ~115 public methods enumerated 2026-09-11; `postgres_identity.py` (25), `postgres_jobs.py` (30), `postgres_schedules.py` (11) fully classified 2026-09-11 (see below) | none yet — classification in progress, conversion not started | P1-2 closure depends on this | multi-session | Every ordinary tenant-data method sets context before query; adversarial cross-tenant test passes under real runtime credentials |
+| Phase H | Mandate §7 | Convert ordinary PostgreSQL repository callers to set tenant context before query; classify pre-auth/cross-tenant/callback paths separately | IN_PROGRESS (4 of 13 files classified; major scope correction found, see below) | 13 `postgres_*.py` repository files, ~115 public methods enumerated 2026-09-11; `postgres_identity.py` (25), `postgres_jobs.py` (30), `postgres_schedules.py` (11), `postgres_sessions.py` (6) fully classified 2026-09-11 (see below) | none yet — classification in progress, conversion not started | P1-2 closure depends on this | multi-session | Every ordinary tenant-data method sets context before query; adversarial cross-tenant test passes under real runtime credentials |
 
 ## Phase H: repository inventory (discovery, 2026-09-11)
 
@@ -192,6 +192,23 @@ The 5 Pre-auth methods are the concrete list Phase H's "narrow functions for pre
 **Summary for this file**: 8 Ordinary (2 of which — `pause_schedule_scoped`/`resume_schedule_scoped` — already have the atomic organization-scoped `UPDATE` predicate that `postgres_jobs.py`'s `request_cancellation` still lacks, worth pointing conversion work at as the reference implementation), 1 Scheduler-internal (verified against its actual caller), 3 Cross-tenant scheduler control (all 3 already have a tested `webguard_control` counterpart).
 
 Combined with `postgres_jobs.py` and `postgres_identity.py`: all 13 `webguard_control` functions Phase F built now have a confirmed source method, read directly from the SQL file's own comments (3 identity resolvers, 1 session resolver, 5 job-lease functions, 3 schedule functions, 1 callback function). What's still pending is the *other* methods in `postgres_sessions.py` and `postgres_callback_broker.py`/`postgres_callback_service.py` — those two files' own full classification passes haven't happened yet, only the one method each that a control function already covers.
+
+## Phase H: `postgres_sessions.py` classification (complete, 2026-09-11)
+
+`PostgresSessionRepository`, 6 public methods.
+
+| Method | Tables | Tenant source | Current role/ACL | Classification | Note |
+|---|---|---|---|---|---|
+| `create_session` | browser_sessions | `organization_id` param (embedded) | `api_tenant_data` INSERT | Ordinary (self-tenant registration variant) | |
+| `authenticate_session` | browser_sessions | **none** — session_id is the only key, parsed from the token itself; org is discovered from the row | `api_tenant_data` full-row SELECT today | **Pre-auth resolver** | Exact control-function counterpart already built: `webguard_control.resolve_browser_session(uuid)`, granted to `api_tenant_data`. Its own SQL comment names both this method and `auth.py`'s `BrowserSessionAuthenticator.authenticate()`'s subsequent `get_principal()`/`get_organization()` calls as combined source |
+| `get_session` | browser_sessions | **none** | `api_tenant_data` SELECT | Self-scoped | Verified sole caller: `service.py:2330`'s `get_session_info`, called with `context.token_id` — the caller's own already-authenticated session id, never a URL parameter. Same "no org parameter to set context from" signature gap as `postgres_identity.py`'s `list_tokens_for_principal`/`touch_last_login` |
+| `revoke_session` | browser_sessions | `principal_id` param, folded directly into the `UPDATE`'s own `WHERE` (P1-C1) | `api_tenant_data` UPDATE | Ordinary | Deliberately scoped by `principal_id`, not `organization_id` — its own docstring explains why: a session belongs to exactly one principal, there is no "admin force-revoke a teammate's session" concept anywhere in this codebase, and scoping by org instead would incorrectly let any same-org principal revoke another's session. Already the atomic, no-TOCTOU shape |
+| `revoke_all_sessions_for_principal` | browser_sessions | `principal_id` param | `api_tenant_data` UPDATE | Ordinary | Same principal-scoping reasoning as `revoke_session` |
+| `list_sessions_for_principal` | browser_sessions | `principal_id` param | `api_tenant_data` SELECT | Ordinary | Same reasoning |
+
+**Summary for this file**: 4 Ordinary (3 of which are deliberately principal-scoped rather than organization-scoped, with an explicit, already-correct rationale — this file has zero identified gaps), 1 Pre-auth resolver (control function already built and tested), 1 Self-scoped (verified against its actual caller, needs the same kind of signature review as the identity-file findings, not a control function).
+
+This is the cleanest file classified so far: no defense-in-depth gaps, no unverified assumptions about callers, and its own pre-existing docstrings already explain the scoping choices in the same terms Phase H needs.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
