@@ -180,16 +180,31 @@ class WebGuardPostgresPool:
 
     @contextmanager
     def tenant_connection(
-        self, organization_id: str | uuid.UUID, *, timeout_seconds: float | None = None
+        self,
+        organization_id: str | uuid.UUID,
+        *,
+        role: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> Iterator[psycopg.Connection]:
         """Like :meth:`connection`, but establishes transaction-local
         tenant context immediately after borrowing, before the caller
-        ever sees the connection -- for the case where the trusted
+        ever sees the connection: for the case where the trusted
         organization is already known at checkout time (an
         ``AuthContext``'s own organization, a job's already-resolved
-        scope, a schedule's own row). Not wired into any repository
-        call site by this change; this method exists as plumbing for a
-        future row-level-security policy phase (P1-2) to use.
+        scope, a schedule's own row). This is the primitive an
+        ordinary tenant-scoped repository method uses (P1-2 Phase H),
+        since organization_id is already a parameter there, so there
+        is no pre-auth resolve step the way ``authenticate_token``/
+        ``authenticate_session`` need one.
+
+        ``role``, when given, must be one of :data:`API_TENANT_DATA_ROLE`,
+        :data:`WORKER_TENANT_DATA_ROLE`, or
+        :data:`SCHEDULER_TENANT_DATA_ROLE`, validated the same way
+        :meth:`role_scoped_connection` validates it, before this
+        method ever borrows a connection. When given, ``SET LOCAL
+        ROLE`` runs first, then the tenant-context GUC is set on that
+        now-restricted connection; omitting it (the default) preserves
+        this method's exact prior behavior for every existing caller.
 
         ``organization_id`` is validated as a real UUID before this
         method ever borrows a connection from the pool, so a malformed
@@ -198,18 +213,22 @@ class WebGuardPostgresPool:
 
         Reuses :meth:`connection` entirely for the actual pool
         checkout/return, ``psycopg.Error`` normalization, and
-        per-checkout transaction scope -- this method adds exactly one
-        statement (the tenant-context ``set_config`` call, via
-        :func:`set_tenant_context`) inside that same transaction,
-        before yielding. Because that GUC is transaction-local, and
-        this method's own ``with`` block (via :meth:`connection`) is
-        itself the transaction boundary, the tenant context is cleared
-        automatically the instant the transaction ends -- there is no
-        manual reset here, and none is needed.
+        per-checkout transaction scope. This method adds at most two
+        statements (the optional role switch, then the tenant-context
+        ``set_config`` call via :func:`set_tenant_context`) inside that
+        same transaction, before yielding. Because both are
+        transaction-local, and this method's own ``with`` block (via
+        :meth:`connection`) is itself the transaction boundary, both
+        revert automatically the instant the transaction ends: there
+        is no manual reset here, and none is needed.
         """
 
         tenant_id = _canonical_organization_id(organization_id)
+        if role is not None and role not in _RUNTIME_ROLES:
+            raise ValueError(f"role must be one of {sorted(_RUNTIME_ROLES)}, got {role!r}.")
         with self.connection(timeout_seconds=timeout_seconds) as connection:
+            if role is not None:
+                connection.execute(f'SET LOCAL ROLE "{role}"')
             set_tenant_context(connection, tenant_id)
             yield connection
 
