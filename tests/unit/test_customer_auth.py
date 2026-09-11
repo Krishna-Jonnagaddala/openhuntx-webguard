@@ -337,8 +337,17 @@ class CustomerAuthTests(unittest.TestCase):
         # the raw bearer secret segment specifically, not just the
         # full cookie value (which also contains the session_id, a
         # non-secret identifier that legitimately does appear in the
-        # response body as `token_id`)
-        raw_secret = jar["wg_session"].rsplit("_", 1)[-1]
+        # response body as `token_id`). Split like the real parser
+        # does (webguard_api.identity._parse_prefixed_secret uses
+        # token.split("_", 2)[-1]) -- not rsplit("_", 1), which cuts
+        # at the LAST underscore and can slice into the secret itself:
+        # secrets.token_urlsafe's base64url alphabet legitimately
+        # includes "_", so a secret ending in "..._X" would make
+        # rsplit return only "X", a single character with a high
+        # coincidental chance of appearing somewhere in a JSON blob
+        # full of random UUIDs -- a real, observed flaky failure this
+        # comment now documents rather than merely warns about.
+        raw_secret = jar["wg_session"].split("_", 2)[-1]
         self.assertNotIn(raw_secret, serialized)
 
     # -- Logout ----------------------------------------------------------
