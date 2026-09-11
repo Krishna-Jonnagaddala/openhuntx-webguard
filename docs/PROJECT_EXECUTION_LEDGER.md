@@ -400,6 +400,16 @@ Continuing from the runtime role-switching mechanism proven in the previous PR, 
 
 This closes out the three pre-auth resolvers approved in the previous slice: one fully converted (`authenticate_token`, prior PR), one fully converted this slice (`get_principal_by_email`), and two genuine gaps found and documented rather than forced (`get_password_hash`, `consume_identity_token`). The remaining Phase H conversion work (the cross-tenant worker/scheduler control functions in `postgres_jobs.py`/`postgres_schedules.py`, the callback resolver in `postgres_callback_service.py`, and tenant-context-setting for every ordinary method across all 13 files) has not started.
 
+## Deployment ordering constraint discovered by this PR's own CI failure (2026-09-11)
+
+The "Frontend browser E2E (Playwright)" job failed on this PR with four registration/login flows all stuck at the same point (no Dashboard heading after sign-in). Root cause, confirmed by reproducing it locally: that job's Postgres only ever runs `scripts/run-postgres-migrations.py` (schema only), never the tenant-isolation role/ACL/function bootstrap. Since `get_principal_by_email` (and `authenticate_token`, merged in the prior PR) now hard-require `api_tenant_data` to exist via `role_scoped_connection`, every `register_account`/`login` call against that unbootstrapped database raised `DatabaseUnavailableError` and the whole E2E flow broke.
+
+This is not just a CI gap. It is real, and it generalizes: **any environment running this code, including real production, will have every registration, login, and API-token authentication fail outright the moment it handles its first request, unless `tenant_isolation_roles.sql`, `tenant_isolation_acl.sql`, `tenant_isolation_function_acl.sql`, `tenant_isolation_control_functions.sql`, and `tenant_isolation_runtime_grant.sql` have already been applied to that database, in that order.** Production has not had this bootstrap applied (confirmed in the prior PR's own ledger entry). Deploying `main` as it now stands, without applying that chain first, means a full authentication outage on the very first request.
+
+Fixed in CI: added an "Apply tenant-isolation runtime bootstrap" step to the Playwright E2E job, applying the same five files in the same order `tests/contract/test_identity_repository_contract.py`'s own `setUpClass` already does. Verified by reproducing the exact failure locally (`get_principal_by_email` against an unbootstrapped database raises; against a bootstrapped one, it returns cleanly) before and after the fix.
+
+Not fixed, and not something to fix unilaterally: this ordering constraint needs to be part of whatever process eventually deploys this code to a real environment. Recorded here in the strongest terms this ledger uses, since two merged PRs (#30, #31) already carry this property and a future session or a human deploying `main` needs to see this before doing so, not discover it from a production incident.
+
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
 | Milestone | Evidence |

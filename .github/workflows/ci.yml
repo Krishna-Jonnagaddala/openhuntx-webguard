@@ -481,6 +481,34 @@ jobs:
           WEBGUARD_DATABASE_URL: "postgresql://webguard:webguard_dev_only_not_for_production@127.0.0.1:5433/webguard"
         run: python scripts/run-postgres-migrations.py
 
+      # P1-2 Phase H: authenticate_token and get_principal_by_email now
+      # run their pre-auth resolve step under api_tenant_data (see
+      # postgres_pool.py's role_scoped_connection), so a real API
+      # server backed by this database needs the same role/ACL/
+      # function/runtime-grant bootstrap tests/contract/test_identity_repository_contract.py's
+      # own setUpClass applies, in the same order. Without it, every
+      # registration and login call fails with "role api_tenant_data
+      # does not exist" the moment the API server actually starts
+      # handling requests. Any real deployment needs this same chain
+      # applied before this code ever runs against it.
+      - name: Apply tenant-isolation runtime bootstrap
+        run: |
+          python3 -c "
+          import psycopg
+          from pathlib import Path
+          dsn = 'postgresql://webguard:webguard_dev_only_not_for_production@127.0.0.1:5433/webguard'
+          base = Path('infra/postgres/bootstrap')
+          for name in (
+              'tenant_isolation_roles.sql',
+              'tenant_isolation_acl.sql',
+              'tenant_isolation_function_acl.sql',
+              'tenant_isolation_control_functions.sql',
+              'tenant_isolation_runtime_grant.sql',
+          ):
+              with psycopg.connect(dsn) as connection:
+                  connection.execute((base / name).read_text(encoding='utf-8'))
+          "
+
       - name: Run Playwright E2E suite
         working-directory: apps/web
         env:
