@@ -179,6 +179,24 @@ class PostgresCallbackRegistrationRepository:
         source_class: str = "external",
         now: datetime | None = None,
     ) -> bool:
+        """P1-2 Phase H, genuinely blocked, not a wiring gap: unlike
+        every other method this phase found a gap in,
+        webguard_control.resolve_and_record_callback_observation has
+        no capability role at all to call it through. Its own SQL
+        comment (Section 9) explains why: the public callback receiver
+        has no organization_id to scope by until a token resolves, so
+        it cannot run as api_tenant_data/worker_tenant_data/
+        scheduler_tenant_data (each already carries ordinary
+        tenant-scoped privileges this pre-authentication path has no
+        business holding), and callback_function_owner is the
+        function's own privileged SECURITY DEFINER owner, not a
+        caller-facing identity. Phase F's own review deliberately
+        granted EXECUTE to no role at all rather than invent a new
+        NOLOGIN role unreviewed, and explicitly deferred that decision
+        to "the future deployment phase that actually wires a LOGIN
+        identity to this path." This raw query is not a stopgap
+        pending a wiring change; it is the only thing that can run
+        until that architecture decision is made."""
         moment = now or datetime.now(timezone.utc)
         with self._pool.connection() as connection:
             row = connection.execute(
