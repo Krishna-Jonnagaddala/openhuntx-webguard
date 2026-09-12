@@ -61,7 +61,7 @@ from webguard_contracts import (
 )
 
 from .db_errors import DatabaseIntegrityError
-from .postgres_pool import SCHEDULER_TENANT_DATA_ROLE, WebGuardPostgresPool
+from .postgres_pool import API_TENANT_DATA_ROLE, SCHEDULER_TENANT_DATA_ROLE, WebGuardPostgresPool
 from .store import JobStoreError
 
 _COLUMNS = (
@@ -112,6 +112,19 @@ def _job_record_from_row(row: tuple) -> ScanJobRecord:
 
 
 class PostgresScheduleRepository:
+    """P1-2 Phase H: scan_schedules and schedule_permits have no
+    scheduler_tenant_data grant at all (list_due_schedules's and
+    block_due_schedule's own docstrings already document this); only
+    api_tenant_data can touch them. Every ordinary method that reads
+    or writes those two tables runs under api_tenant_data via
+    tenant_connection. get_schedule_permit_binding is a genuine,
+    unclosed gap in the same shape postgres_jobs.py's
+    get_job_permit_binding documents: its only caller anywhere in this
+    codebase is scheduler.py, the scheduler process, but
+    schedule_permits has no scheduler_tenant_data grant, so no role is
+    both this method's true caller and actually able to run the
+    query. It stays on the unrestricted connection."""
+
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
 
@@ -167,7 +180,7 @@ class PostgresScheduleRepository:
             )
         effective_id = str(uuid4()) if schedule_id is None else schedule_id
         try:
-            with self._pool.connection() as connection:
+            with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
                 connection.execute(
                     """
                     INSERT INTO scan_schedules (
@@ -207,7 +220,7 @@ class PostgresScheduleRepository:
         return self.get_schedule_scoped(effective_id, organization_id)
 
     def get_schedule_scoped(self, schedule_id: str, organization_id: str) -> ScanScheduleRecord:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"SELECT {_COLUMNS} FROM scan_schedules WHERE schedule_id = %s AND organization_id = %s",  # noqa: S608
                 (schedule_id, organization_id),
@@ -239,7 +252,7 @@ class PostgresScheduleRepository:
             clauses.append("(created_at < %s OR (created_at = %s AND schedule_id::text < %s))")
             parameters.extend((after[0], after[0], after[1]))
         parameters.append(limit + 1)
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
                 f"""
                 SELECT {_COLUMNS} FROM scan_schedules
@@ -253,7 +266,7 @@ class PostgresScheduleRepository:
         return tuple(self._record_from_row(row) for row in rows[:limit]), has_more
 
     def list_schedules_scoped(self, organization_id: str, *, limit: int = 100) -> tuple[ScanScheduleRecord, ...]:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
                 f"SELECT {_COLUMNS} FROM scan_schedules WHERE organization_id = %s ORDER BY created_at, schedule_id LIMIT %s",  # noqa: S608
                 (organization_id, limit),
@@ -269,7 +282,7 @@ class PostgresScheduleRepository:
         now: datetime,
         next_run_at: datetime | None,
     ) -> ScanScheduleRecord:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 "SELECT revision, next_run_at FROM scan_schedules WHERE schedule_id = %s AND organization_id = %s",
                 (schedule_id, organization_id),
@@ -309,7 +322,19 @@ class PostgresScheduleRepository:
     def get_schedule_permit_binding(self, schedule_id: str) -> tuple[str, str] | None:
         """Unscoped -- retained for internal/system callers; see
         ``get_schedule_permit_binding_scoped`` for the customer/
-        service-facing equivalent."""
+        service-facing equivalent.
+
+        P1-2 Phase H gap, not yet closed: this method's only caller
+        anywhere in this codebase is scheduler.py, the scheduler
+        process. schedule_permits has no scheduler_tenant_data grant
+        at all (only api_tenant_data has SELECT), so there is no
+        restricted role that is both this method's true caller and
+        actually able to run the query. This raw query works only
+        because every WebGuard process still runs as webguard,
+        unrestricted. Closing this needs either a narrow SECURITY
+        DEFINER resolver granted to scheduler_tenant_data or an ACL
+        change extending it a SELECT on this table, not a unilateral
+        addition here."""
 
         with self._pool.connection() as connection:
             row = connection.execute(
@@ -327,7 +352,7 @@ class PostgresScheduleRepository:
         -- the authoritative schedule/organization relation -- inside
         this one query."""
 
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 """
                 SELECT binding.permit_id, binding.permit_sha256
