@@ -1,5 +1,11 @@
 """Shared OpenHuntX WebGuard data contracts."""
 
+from .compliance import (
+    ComplianceContractError,
+    Framework,
+    FrameworkStatus,
+    MasterControl,
+)
 from .crawl_checkpoints import (
     CRAWL_CHECKPOINT_INTEGRITY_ALGORITHM,
     CRAWL_CHECKPOINT_TYPE,
@@ -224,6 +230,10 @@ from .scans import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "ComplianceContractError",
+    "Framework",
+    "FrameworkStatus",
+    "MasterControl",
     "CURRENT_CRAWL_SCAN_SCHEMA_VERSION",
     "CURRENT_SCAN_JOB_SCHEMA_VERSION",
     "MAXIMUM_IDEMPOTENCY_KEY_LENGTH",

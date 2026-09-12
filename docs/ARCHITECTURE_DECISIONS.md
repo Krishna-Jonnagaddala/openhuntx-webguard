@@ -5,5 +5,6 @@ This project records architecture decisions as individual, numbered files in `do
 ## Decisions relevant to the SOC/Compliance platform expansion
 
 - [ADR 0033: Platform Expansion Module Boundaries](adr/0033-platform-expansion-module-boundaries.md): shared contracts stay in `webguard_contracts`, operational database stays PostgreSQL with the existing tenant-isolation model, module entitlement is the first shared-contract slice, new tenant tables get the same ACL/role/RLS review WebGuard tables already have, and domain objects (finding/incident/risk/audit finding) stay distinct types linked through one shared relationship graph rather than collapsed into a generic status enum.
+- [ADR 0034: Compliance Catalog Is Global Reference Data](adr/0034-compliance-catalog-is-global-reference-data.md): `frameworks`/`master_controls` are the first tables in this schema with no `organization_id`, since a framework's own requirements are identical for every tenant; reads run role-only under `api_tenant_data`, writes stay operator-only, and no framework ships real legally-reviewed content until that review happens.
 
 See `docs/adr/` for the full numbered history, including the WebGuard-era decisions this expansion builds on (identity and RBAC, tenant isolation phases, TrustScan permit and safety-receipt design, CI security gates, and others).
