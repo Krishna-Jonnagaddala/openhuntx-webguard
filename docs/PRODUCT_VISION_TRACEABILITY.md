@@ -2,7 +2,7 @@
 
 Maps each of the ten OpenHuntX vision pillars (per the Claude Master Completion Mandate, 2026-09-11) to actual verified implementation state. Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCKED_EXTERNAL, DEFERRED_WITH_REASON.
 
-This document reflects code found by direct repository inspection at commit `da5da852919bcde2f8773c6cf6eae4d393734c71`, not the mandate's own summary of it. Update it when a pillar's real status changes; do not let it drift back into aspiration.
+This document reflects code found by direct repository inspection at commit `9df82b0498f5ffda35b9c43d81ea5750e5aea294`, not the mandate's own summary of it. Update it when a pillar's real status changes; do not let it drift back into aspiration.
 
 ## 1. Cryptographic Scan Permit
 
@@ -14,9 +14,9 @@ Not yet done: versioned schema evolution for amendments-as-new-revisions (mandat
 
 ## 2. Per-action authorization enforcement
 
-**Status: IMPLEMENTED_UNVERIFIED (runtime boundary), NOT_STARTED (Phase H conversion)**
+**Status: IMPLEMENTED_UNVERIFIED (runtime boundary and data-layer wiring)**
 
-`safety.py` is the network-boundary gate all execution paths pass through today. The A–G PostgreSQL work (tenant roles, ACLs, function-owner capabilities, dormant RLS policies) defines the *data-layer* half of this pillar but is not yet wired into the live request/worker/scheduler/callback paths — that wiring is Phase H (see `docs/PROJECT_EXECUTION_LEDGER.md`), NOT_STARTED.
+`safety.py` is the network-boundary gate all execution paths pass through today. The A-G PostgreSQL work (tenant roles, ACLs, function-owner capabilities, dormant RLS policies) defines the data-layer half of this pillar; Phase H (see `docs/PROJECT_EXECUTION_LEDGER.md`) wires it into the live request/worker/scheduler/callback paths and is now complete across all 13 repository files, proven against a real disposable Postgres. The remaining gap is RLS itself: policies are defined but not `FORCE`-enabled in any real, non-disposable environment, so this pillar is not yet VERIFIED end to end.
 
 ## 3. Scanner execution attestation
 
@@ -71,7 +71,7 @@ Zero matching symbols (region binding, regional key custody, customer-hosted run
 | Pillar | Status |
 |---|---|
 | 1. Cryptographic Scan Permit | VERIFIED (core) / IN_PROGRESS (schema evolution) |
-| 2. Per-action authorization enforcement | IMPLEMENTED_UNVERIFIED (runtime) / NOT_STARTED (Phase H wiring) |
+| 2. Per-action authorization enforcement | IMPLEMENTED_UNVERIFIED (Phase H wiring complete; RLS+FORCE not yet real-environment activated) |
 | 3. Scanner execution attestation | NOT_STARTED |
 | 4. Runtime Safety Receipt | IMPLEMENTED_UNVERIFIED |
 | 5. Coverage Truth Map | NOT_STARTED |

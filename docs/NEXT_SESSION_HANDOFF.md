@@ -1,49 +1,48 @@
 # Next Session Handoff
 
-Written 2026-09-11 at the start of the Claude Master Completion Mandate execution. Read this before resuming; reconcile against Git before trusting anything below that could have changed.
+Rewritten 2026-09-12 after Phase H closed. Read this before resuming; reconcile against Git before trusting anything below that could have changed. The version of this file written 2026-09-11 (at the very start of mandate execution) is superseded entirely; nothing in it should be treated as current.
 
 ## Current state
 
 ```
-origin/main:          da5da852919bcde2f8773c6cf6eae4d393734c71 (Phase A-G complete)
-Open PR:              #17, fix/p1-6-terraform-lockfile, commit 43da1c7
-  -- CI status was still running when this checkpoint was written; check
-     `gh pr checks 17` before assuming it merged.
-Original dirty checkout: /Users/krishna/Documents/Portfolio, HEAD bc44177,
-  still carries superseded Phase-G leftovers and an unrelated
-  sentinel-incident-investigation-lab/ directory. Left untouched throughout.
-  Not the source of truth for anything.
-Worktrees in use this session:
-  /private/tmp/p1-6-terraform-lockfile-worktree (branch fix/p1-6-terraform-lockfile)
-  -- ephemeral /private/tmp has been cleared mid-session multiple times
-     already in this engagement; if this path is gone, the branch/commit
-     still exist in the remote and in Git's object database. Recreate the
-     worktree from the branch, don't recreate the work.
+origin/main: 9df82b0498f5ffda35b9c43d81ea5750e5aea294 (Phase H complete)
+No open PRs from this mandate's work as of this checkpoint.
+Original checkout: /Users/krishna/Documents/Portfolio, now synced to origin/main
+  (was 33 commits behind for most of this session; fast-forwarded this
+  checkpoint). A stale, pre-Phase-D-correction copy of the RLS policies SQL,
+  its test file, and a one-line CI diff were stashed rather than discarded
+  (`git stash list`, entry "stale-pre-phase-d-rls-precursor-20260912") since
+  they were confirmed byte-for-byte superseded by what's already on
+  origin/main. Safe to drop once the user confirms; not dropped unilaterally.
+  The unrelated sentinel-incident-investigation-lab/ directory (its own,
+  separate git repository) still sits untracked here. Leave it alone.
 ```
 
 ## What this session did
 
-1. Verified `origin/main` against the mandate's stated baseline — exact match, confirmed live, not trusted from the report.
-2. Verified the open-P1 accounting (6 items) directly against `docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md`'s own "CURRENT P1 ACCOUNTING" section — matches the mandate exactly.
-3. Fixed P1-6 (Terraform lockfile gitignored): regenerated `.terraform.lock.hcl` via `terraform init` on the CI-pinned version (1.16.0), confirmed byte-identical to the file already present in the dirty checkout, removed the stray `.gitignore` line, ran `fmt`/`validate`/Trivy/secret-scan/Ruff/dependency-audit, all green. Opened PR #17 rather than pushing directly to main (mandate §4: future work goes through branch/PR review, not the one-time direct-main push Phase G used).
-4. Created the five ledger documents this mandate requires (`docs/PRODUCT_VISION_TRACEABILITY.md`, `docs/PROJECT_EXECUTION_LEDGER.md`, `docs/IMPLEMENTATION_STATUS.md`, `docs/RELEASE_READINESS.md`, this file), grounded in direct repository search (not assumption) for what actually exists per vision pillar.
-5. Extracted the Phase H structural inventory: 13 `postgres_*.py` repository files, ~115 public methods, file/class/method-count only — no per-method tenant/principal/capability classification yet. See `docs/PROJECT_EXECUTION_LEDGER.md`'s Phase H section.
+1. Continued and completed Phase H (mandate §7): converted every ordinary PostgreSQL repository method across all 13 `postgres_*.py` files to run under its correct restricted tenant-data role, closing the runtime-conversion half of P1-2. PRs #30 through #47, all merged. See `docs/PROJECT_EXECUTION_LEDGER.md`'s Phase H section for the full per-PR account, including the runtime role-switching mechanism this required building from scratch (none existed before PR #30) and the 9 genuine, documented gaps left open (missing ACL grants or missing control-function support, not wiring oversights).
+2. Hit and resolved a GitHub Actions billing lapse mid-arc (account payments/spending limit, not a code issue): the user fixed it directly, and CI resumed cleanly afterward.
+3. Synced the original, long-stale main checkout to `origin/main` and reconciled its leftover uncommitted files (see "Current state" above).
+4. Refreshed `docs/PROJECT_EXECUTION_LEDGER.md`, `docs/PRODUCT_VISION_TRACEABILITY.md`, `docs/IMPLEMENTATION_STATUS.md`, `docs/RELEASE_READINESS.md`, and this file to reflect Phase H's completion and two P1 closures (P1-6, P1-7) that had landed but were never reflected back into the living tracker (`docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md`) or these rollups. Open P1 count corrected: 6 to 4.
 
 ## What is NOT done (do not assume otherwise)
 
-- Phase H per-method classification (tenant source, principal source, current pool/role, desired capability, transaction boundary, control-function need, error semantics, test coverage) — genuinely not started beyond the file/method-name inventory.
-- Any actual runtime conversion of a repository caller to set tenant context.
-- P1-7, P1-8, P1-9, P1-12-R1 — no code changes attempted this session; ledger rows reflect the baseline audit's original findings only.
-- The five ledger docs themselves are new and uncommitted as of this checkpoint (see below) — pending the same review path as PR #17, or bundled with it if not yet merged.
-- 1.25/1.26/1.27 milestone commit hashes in the ledger are carried from the mandate as-supplied, not independently re-derived.
+- RLS is still not `FORCE`-enabled on any table in any real environment. Phase G's policies and Phase H's runtime role-switching are both proven only against a real *disposable* Postgres (CI, local sandbox). P1-2 stays open on this basis alone.
+- The 9 Phase H gaps are real, not wiring oversights, and need a design decision before they can close: `get_password_hash`/`consume_identity_token` (need a new principal_id-keyed or created_at-extended control function), `get_scope`/`get_job_permit_binding`/`get` in `postgres_jobs.py` and `get_schedule_permit_binding` in `postgres_schedules.py` (worker/scheduler has zero ACL grant on the table each needs), `enqueue_due_schedule` (control function's return columns too narrow for this method's contract), `record_observation` (Phase F deliberately granted EXECUTE to no role, pending a pre-auth identity design), `revoke_registration` (zero live callers, so no UPDATE grant was ever issued). None of these were fixed unilaterally; each needs the same design scrutiny Phase F's original 13 functions got.
+- P1-8 (backup/restore) and P1-9 (CloudHSM hardware) remain untouched, both genuinely blocked on external access this mandate doesn't grant.
+- P1-12-R1 (sustained callback-outage evidence loss) remains open, deferred pending an explicit secondary-durability architecture decision, not a bug fix.
+- The `require_bound` cross-tenant ID-existence oracle (found during Phase H's own classification pass, PR #29) remains open: mitigated by UUID4 entropy, not fixed. Needs its own dedicated PR with regression tests if the user wants it closed.
+- Pillars 3, 5-10 of the product vision (attestation, Coverage Truth Map, Assessment Ledger, remediation evidence, standards exports, policy packs, data sovereignty) are still `NOT_STARTED`, confirmed by direct repository search, not assumption.
 
 ## Immediate next action
 
-1. Check `gh pr checks 17` / `gh pr view 17` — if green, this is mergeable; if red, diagnose before anything else.
-2. Decide whether the four new ledger docs land in PR #17 (doc-only, no conflict with the lockfile fix) or a separate PR — either is fine, they're independent of the lockfile change; bundling them into #17 is probably simpler unless #17 has already been reviewed/merged.
-3. Begin Phase H's actual classification pass, starting with `postgres_identity.py` (25 methods, includes the pre-authentication identity-resolution paths the mandate explicitly calls out as their own category) and `postgres_jobs.py` (30 methods, includes cross-tenant queue/schedule control paths) — these two are both the largest and the most classification-sensitive, per mandate §7's path taxonomy (ordinary tenant data / pre-auth identity resolution / cross-tenant queue-schedule control / callback token resolution / migration-admin).
-4. Do not restart Phase A-G, do not re-verify what commit `da5da852919bcde2f8773c6cf6eae4d393734c71` already proves — pull evidence from the session transcript / CI run 34506680942 instead of re-running the full 129-test Postgres suite unless a specific change requires it.
+Two independent paths are open; neither blocks the other:
+
+1. **RLS+FORCE activation in a real, non-disposable environment.** This is the one remaining piece of P1-2 and the release-candidate gate (`docs/RELEASE_READINESS.md`). It requires infrastructure access this mandate does not grant on its own (no production infrastructure changes, no public service exposure), so ask the user explicitly before starting this, rather than assuming a staging environment exists or may be touched.
+2. **Coverage Truth Map** (`docs/PRODUCT_VISION_TRACEABILITY.md` pillar 5) is the Competitive Research document's own stated first differentiator, and `docs/IMPLEMENTATION_STATUS.md` already names it the highest-leverage work now that Phase H is done. Nothing here has been scoped yet beyond that one-line confirmation that it's unbuilt. Before writing any code, do for this pillar what Phase H's own first PR did for tenant-context conversion: a real discovery/inventory pass (what scan/crawl/finding state already exists that a coverage model could be built on top of, e.g. `crawl_scans.py`/`reporting.py`; what a `(asset, operation, identity, test class, version)` coverage record actually needs to capture; whether it's a new table, a derived view, or an event-sourced projection) written into the ledger before any implementation PR, not started cold.
 
 ## Open questions for the user, not yet asked because none currently block independent work
 
-- None right now. P1-9 (CloudHSM) and P1-8 (backup/restore) will eventually need real hardware/environment access respectively, but neither blocks Phase H or P1-7, so no request has been made yet.
+- Whether to pursue RLS+FORCE activation now (needs an explicit environment/authorization answer) or treat Coverage Truth Map discovery as the next priority instead (needs no new authorization, matches the roadmap's own stated sequencing).
+- Whether to close the `require_bound` oracle finding, and whether the 9 Phase H gaps are worth a dedicated design pass now or should wait.
+- Whether the stashed pre-Phase-D-correction files (see "Current state") can be dropped outright, or should be kept a while longer.

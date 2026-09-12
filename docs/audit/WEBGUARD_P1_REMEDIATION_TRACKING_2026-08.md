@@ -37,7 +37,11 @@ post-audit findings are discovered during that work.
 
 **CLOSED BASELINE P1: P1-1.** P1-1 was the baseline audit's repository-level tenant-isolation gap (line 290 of the baseline audit): `authentication_contexts`, `authorization_comparison_plans`, and `browser_sessions` had zero tenant/principal enforcement at the SQL/repository layer, with correctness depending entirely on `service.py` checking first. Closed by the P1-C1 batch below.
 
-**CURRENT OPEN BASELINE P1: 5** (P1-2, P1-6 through P1-9; P1-1, P1-3, P1-4, and P1-5 closed, as above).
+**CLOSED BASELINE P1: P1-6.** P1-6 was `.terraform.lock.hcl` gitignored instead of committed, so `terraform apply` could pick a different provider build across machines/CI runs with no diff to review. Fixed by regenerating the lockfile via `terraform init` on the CI-pinned Terraform version (1.16.0), confirming it byte-identical to the file already present locally, and removing the stray `.gitignore` line. PR #17, merged as `c4132e5`, CI fully green (10/10 jobs).
+
+**CLOSED BASELINE P1: P1-7.** P1-7 was `TrustScanSigner.sign()`/`sign_safety_receipt()` hardcoding `signature_algorithm="Ed25519"` in the returned metadata regardless of which provider actually signed (local Ed25519, KMS ECDSA_SHA_256, or CloudHSM), so a permit or safety receipt signed by a non-Ed25519 provider carried a false algorithm label. Fixed by deriving the field from `self._registry.active.algorithm` (the provider's own reported algorithm) instead of a literal. Verification stays bound to key/algorithm exactly as before (resolved through the registry, never through the self-reported field), so this is a metadata-accuracy fix, not a verification-logic change. `tests/unit/test_p1_7_signature_algorithm_metadata.py` (8/8, real local and KMS sign/verify/tamper round trips); full signing suite 45/45; backend unit 1799/1799. PR #19, merged as `47da741`, CI fully green (10/10 jobs).
+
+**CURRENT OPEN BASELINE P1: 3** (P1-2, P1-8, P1-9; P1-1, P1-3, P1-4, P1-5, P1-6, and P1-7 closed, as above).
 
 ### P1-3: Structured logging / operational log stream
 
@@ -571,8 +575,10 @@ Production SSRF evidence preserved from this remediation's E2E proofs:
 ## CURRENT P1 ACCOUNTING
 
 - BASELINE P1 AT AUDIT: 9 (P1-1 through P1-9: immutable historical count, never altered)
-- CLOSED BASELINE P1: P1-1, P1-3, P1-4, P1-5 (see BASELINE P1 FINDINGS above)
-- CURRENT OPEN BASELINE P1: 5 (P1-2, P1-6, P1-7, P1-8, P1-9)
+- CLOSED BASELINE P1: P1-1, P1-3, P1-4, P1-5, P1-6, P1-7 (see BASELINE P1 FINDINGS above)
+- CURRENT OPEN BASELINE P1: 3 (P1-2, P1-8, P1-9)
 - CLOSED POST-AUDIT: P1-10, P1-11
 - PARTIAL / OPEN POST-AUDIT: P1-12 (P1-12-R1 sustained-outage residual open within it, not a separate finding ID; operationally observable via `callback_observation_persistence_exhausted` and, since P1-B2, via `readiness_failed`, not functionally solved)
-- CURRENT OPEN P1 TOTAL: 6
+- CURRENT OPEN P1 TOTAL: 4
+
+P1-2's own runtime-conversion half (Phase H: every ordinary PostgreSQL repository caller scoped to a restricted role before query) is complete as of PR #47 (`docs/PROJECT_EXECUTION_LEDGER.md`), proven against a real disposable Postgres. P1-2 stays open because RLS itself is not yet `FORCE`-enabled in any real, non-disposable environment; that activation is explicitly out of scope pending real infrastructure access.

@@ -7,12 +7,13 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: e84b6db44c756630423ff14bfa8ec62fd7fef908
-Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
+Commit: 9df82b0498f5ffda35b9c43d81ea5750e5aea294
+Verified: 2026-09-12, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
-Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
+Open P1 total: 4 (P1-2, P1-8, P1-9, P1-12-R1), verified against
   docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md's own "CURRENT P1
-  ACCOUNTING" section directly, not the mandate's paraphrase of it.
+  ACCOUNTING" section directly, not the mandate's paraphrase of it. P1-6 and
+  P1-7 closed this session (PRs #17, #19).
 ```
 
 ## Test-quality findings (not P1/audit items, recorded for continuity)
@@ -41,7 +42,7 @@ future session doesn't waste time re-diagnosing it.
 | A-G | Baseline audit P1-2 | Tenant-context plumbing through dormant RLS policies | VERIFIED | `infra/postgres/bootstrap/tenant_isolation_*.sql` | 129/129 combined Postgres suite, CI run 34506680942 | none | Phase A-G | Reconfirmed live at `da5da85`; see final P1-C2-G report in session transcript |
 | P1-6 | Baseline audit | Commit `.terraform.lock.hcl`, stop gitignoring it | VERIFIED | `.gitignore`, `infra/terraform/.terraform.lock.hcl` | PR #17, commit `c4132e5`, merged, CI fully green (10/10 jobs) | none | opportunistic fix | Met |
 | P1-2 | Baseline audit | RLS structurally blocked: no tenant-context GUC checkout/reset hook at runtime | IN_PROGRESS (runtime converted, RLS+FORCE not yet activated) | A-G bootstrap SQL exists; `postgres_pool.py`'s tenant-context helper exists (Phase B); Phase H has converted every ordinary repository caller that can be correctly scoped to set it before query | Dormant-state proven (29/29 Phase G); Phase H's own runtime conversion complete and proven (13/13 files, PRs #30-#46); RLS+FORCE activation in real infrastructure not started | RLS+FORCE activation in a real, non-disposable environment | Real runtime paths set tenant context (done); enforced isolation survives adversarial test (done, disposable Postgres); RLS+FORCE activated in a real (non-disposable) environment with evidence (not started, out of scope this session) |
-| P1-7 | Baseline audit | `TrustScanSigner.sign()`/`sign_safety_receipt()` hardcode `signature_algorithm="Ed25519"` regardless of actual provider | IMPLEMENTED_UNVERIFIED | `apps/api/src/webguard_api/permits.py`, `webguard_contracts/scan_permits.py`, `webguard_contracts/safety_receipts.py` | New `tests/unit/test_p1_7_signature_algorithm_metadata.py`, 8/8 pass (real ECDSA_SHA_256 sign/verify/tamper round trip); full signing suite 45/45; backend unit 1799/1799; PR #19, commit `ae5ea72`, CI pending | none | independent fix | Algorithm field is now provider-derived (`self._registry.active.algorithm`); local + KMS paths both tested; verification stays bound to key/algorithm (unchanged, resolves via registry not self-report) -- moves to VERIFIED once PR #19 CI confirms and is merged |
+| P1-7 | Baseline audit | `TrustScanSigner.sign()`/`sign_safety_receipt()` hardcode `signature_algorithm="Ed25519"` regardless of actual provider | VERIFIED | `apps/api/src/webguard_api/permits.py`, `webguard_contracts/scan_permits.py`, `webguard_contracts/safety_receipts.py` | `tests/unit/test_p1_7_signature_algorithm_metadata.py`, 8/8 pass (real ECDSA_SHA_256 sign/verify/tamper round trip); full signing suite 45/45; backend unit 1799/1799; PR #19 merged as `47da741`, CI fully green (10/10 jobs) | none | independent fix | Met: algorithm field is provider-derived (`self._registry.active.algorithm`); local + KMS paths both tested; verification stays bound to key/algorithm (unchanged, resolves via registry not self-report) |
 | P1-8 | Baseline audit | Backup/restore never tested against any environment | NOT_STARTED | Terraform toggles exist; no EFS/persistent-volume resource | none | requires an actual applied environment | deferred to staging | Real backup/restore exercise, integrity verified, RTO/RPO measured |
 | P1-9 | Baseline audit | CloudHSM PKCS#11 `EC_POINT` encoding unverified against real hardware | BLOCKED_EXTERNAL | `kms` path is the tested fallback; CloudHSM code exists, unexercised | none against real hardware | real CloudHSM module/hardware access | N/A until hardware available | Genuine hardware validation of key extraction, identity, signing, independent verification |
 | P1-12-R1 | Post-audit residual | Sustained callback-service PostgreSQL outage can lose durable SSRF evidence (proven: yields false NOT_VULNERABLE, not INCONCLUSIVE) | DEFERRED_WITH_REASON | `callback_server.py`, `postgres_callback_service.py` | Proven residual: `test_no_fabricated_confirmation_when_persistence_never_recovers` | requires an explicit secondary-durability architecture decision (not a bug fix) | future architecture slice | Durable secondary store or documented, accepted, explicitly-surfaced limitation |
