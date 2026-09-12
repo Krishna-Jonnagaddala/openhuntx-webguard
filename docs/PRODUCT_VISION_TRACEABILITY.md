@@ -32,9 +32,9 @@ No `attestation` symbol, no build-provenance binding of scanner version/binary d
 
 ## 5. Coverage Truth Map
 
-**Status: NOT_STARTED**
+**Status: IMPLEMENTED_UNVERIFIED (v1)**
 
-No coverage model separating discovered/authorized/attempted/completed/blocked/unreachable per (asset, operation, identity, test class, version). `crawl_scans.py`/`reporting.py` track scan-level progress, not this. This is the mandate's own recommended first differentiator (Competitive Research §"Three priorities") and is unbuilt.
+`coverage_records` (migration 0013), `postgres_coverage.py`, wired into `executor.py`, shipped PRs #49-50. Populates three of the vision's six states (completed, blocked, unreachable) for the base passive/analyzer check plan, keyed by (organization_id, asset, path, http_method, identity_label, check_id). `discovered` and `authorized` are not populated: no current signal distinguishes them without either guessing or building new tracking (individual discovered-URL tracking, a resolved per-operation authorization boundary) that doesn't exist yet. `identity_label` is always "unauthenticated": active-detection, authorization-comparison, and SSRF-callback findings carry no identity field to attribute coverage to. No API/report surface yet, by confirmed scope decision. See `docs/PROJECT_EXECUTION_LEDGER.md`'s "Coverage Truth Map" sections for the full discovery and implementation record.
 
 ## 6. Tamper-evident Assessment Ledger
 
@@ -74,7 +74,7 @@ Zero matching symbols (region binding, regional key custody, customer-hosted run
 | 2. Per-action authorization enforcement | IMPLEMENTED_UNVERIFIED (Phase H wiring complete; RLS+FORCE not yet real-environment activated) |
 | 3. Scanner execution attestation | NOT_STARTED |
 | 4. Runtime Safety Receipt | IMPLEMENTED_UNVERIFIED |
-| 5. Coverage Truth Map | NOT_STARTED |
+| 5. Coverage Truth Map | IMPLEMENTED_UNVERIFIED (v1: 3 of 6 states, unauthenticated only, no API surface) |
 | 6. Tamper-evident Assessment Ledger | NOT_STARTED |
 | 7. Verifiable remediation evidence | NOT_STARTED |
 | 8. Standards-based assessment exports | NOT_STARTED (interop) / IMPLEMENTED_UNVERIFIED (native) |
@@ -82,3 +82,15 @@ Zero matching symbols (region binding, regional key custody, customer-hosted run
 | 10. Data-sovereignty / customer-hosted execution | NOT_STARTED |
 
 Full-vision completion requires all ten at VERIFIED. A release candidate does not require this; see `docs/RELEASE_READINESS.md` for the separate release-scope gate.
+
+## Platform expansion: SOC and Compliance (added 2026-09-12)
+
+The ten pillars above remain WebGuard's own vision and are unaffected by this expansion. OpenHuntX is now a three-module platform (WebGuard, SOC, Compliance); see `docs/PLATFORM_SCOPE.md` for the module contract and `docs/audit/OPENHUNTX_THREE_MODULE_PLATFORM_HANDOFF_2026-09.md` for the full supplied design document, including its complete source disposition register (every numbered SOC and Compliance source section, S-01 through S-53 and C-01 through C-84, with a retain/revise/defer/integrate disposition and a binding recommendation). That register is not duplicated here; this file tracks implementation status as SOC/Compliance work actually lands, the handoff tracks the original design intent.
+
+**SOC (handoff section 9): NOT_STARTED.** Federated Sentinel/Defender XDR/Entra observation, query and detection engineering, ProofLoop scenario validation, AI-assisted investigation, and Response Guard governed actions are all proposed, not designed or built. See `docs/CONNECTOR_CAPABILITIES.md`.
+
+**Compliance (handoff section 10): NOT_STARTED.** Framework and control engine (SOC 2, ISO/IEC 27001:2022, HIPAA, GDPR, UK GDPR readiness), the orthogonal status/scoring model, the initial ~40-60 technical assertion catalogue, and governance/privacy/vendor/audit workflows are all proposed, not designed or built.
+
+**Platform-shared (handoff section 7): module entitlement designed** (`docs/adr/0033-platform-expansion-module-boundaries.md`); the generalized evidence envelope, assurance-relationship graph, and cross-module event bus remain proposed.
+
+Neither module may be marketed, badged, or reported as available, in beta, or in any deployed state until its own row here says otherwise. `docs/RELEASE_EVIDENCE.md` tracks the deployment-stage dimension for each capability as it's built.
