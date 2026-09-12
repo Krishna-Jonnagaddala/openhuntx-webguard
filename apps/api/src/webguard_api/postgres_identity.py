@@ -72,8 +72,16 @@ class PostgresIdentityRepository:
     in the API serve process (cli.py's operator subcommands are their
     only callers), so both stay on the unrestricted connection."""
 
-    def __init__(self, pool: WebGuardPostgresPool) -> None:
+    def __init__(self, pool: WebGuardPostgresPool, *, module_entitlements=None) -> None:
         self._pool = pool
+        # Platform expansion (docs/adr/0033): optional and defaulted so
+        # every pre-existing constructor call site is unaffected.
+        # Production wiring passes a real
+        # PostgresModuleEntitlementRepository; when absent (most
+        # existing tests), create_organization simply does not grant
+        # default entitlements, matching how coverage_repository's own
+        # None default on ScanJobExecutor works.
+        self._module_entitlements = module_entitlements
 
     def create_organization(
         self, name: str, *, now: datetime, organization_id: str | None = None
@@ -104,6 +112,8 @@ class PostgresIdentityRepository:
                 "organization_conflict",
                 "An organization with that identifier or name already exists.",
             ) from exc
+        if self._module_entitlements is not None:
+            self._module_entitlements.grant_default_entitlements(value.organization_id, now=now)
         return value
 
     def get_organization(self, organization_id: str) -> Organization:

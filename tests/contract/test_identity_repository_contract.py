@@ -370,8 +370,33 @@ class PostgresIdentityRepositoryContractTests(IdentityRepositoryContractMixin, u
 
     def make_repository(self):
         from webguard_api.postgres_identity import PostgresIdentityRepository
+        from webguard_api.postgres_module_entitlements import PostgresModuleEntitlementRepository
 
-        return PostgresIdentityRepository(self._pool)
+        return PostgresIdentityRepository(
+            self._pool,
+            module_entitlements=PostgresModuleEntitlementRepository(self._pool),
+        )
+
+    def test_create_organization_grants_default_module_entitlements(self) -> None:
+        """Platform expansion (docs/adr/0033): create_organization must
+        auto-grant WebGuard enabled and SOC/Compliance disabled so no
+        organization is ever left without an explicit entitlement row
+        for every module."""
+
+        from webguard_contracts import ModuleEntitlementStatus, PlatformModule
+
+        repo = self.make_repository()
+        org = repo.create_organization("Entitlement Test Org", now=NOW)
+        entitlements = repo._module_entitlements.list_entitlements(org.organization_id)
+        by_module = {item.module: item.status for item in entitlements}
+        self.assertEqual(
+            by_module,
+            {
+                PlatformModule.WEBGUARD: ModuleEntitlementStatus.ENABLED,
+                PlatformModule.SOC: ModuleEntitlementStatus.DISABLED,
+                PlatformModule.COMPLIANCE: ModuleEntitlementStatus.DISABLED,
+            },
+        )
 
 
 if __name__ == "__main__":

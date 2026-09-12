@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 922cb3157dfbe3191809550ed40fc1b45e14e7d5
+Commit: 1879d8e676aca10dddd690532aeddabe2de67cb9
 Verified: 2026-09-12, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 4 (P1-2, P1-8, P1-9, P1-12-R1), verified against
@@ -654,6 +654,18 @@ Reconciliation against this repository's own actual state (the handoff's own rep
 New durable records added this PR, per the handoff's own section 19 (reusing existing files where they already serve the same purpose, per that section's own "do not spawn conflicting ledgers" instruction): `docs/PLATFORM_SCOPE.md` (three-module contract, claim boundaries, delivery sequence, deferred-items table), `docs/adr/0033-platform-expansion-module-boundaries.md` (shared-contracts-package decision, database/infrastructure decision, module-entitlement-first decision, tenant-isolation-parity decision, domain-object-separation decision), `docs/ARCHITECTURE_DECISIONS.md` (a short index into the existing numbered `docs/adr/` convention, reconciling the handoff's requested filename with how this project already tracks decisions), `docs/CONNECTOR_CAPABILITIES.md` (SOC connector tracking, all rows currently `not_started`), `docs/RELEASE_EVIDENCE.md` (per-capability deployment-stage tracking). `docs/PROJECT_EXECUTION_LEDGER.md` (this file) continues to serve as the handoff's requested `EXECUTION_LEDGER.md`, not duplicated under a second name. `docs/PRODUCT_VISION_TRACEABILITY.md` gained a platform-expansion section and a correction: pillar 5 (Coverage Truth Map) was still marked NOT_STARTED there despite shipping in PRs #49-50, a genuine staleness bug in that file caught while reconciling it against this handoff, now fixed.
 
 **No code changes in this PR.** The first code slice (module entitlement, per ADR 0033) is tracked as its own following PR.
+
+## Platform expansion: module entitlement, the first shared-contract slice (2026-09-12)
+
+First code slice of the SOC/Compliance platform expansion (`docs/PLATFORM_SCOPE.md`, `docs/adr/0033-platform-expansion-module-boundaries.md`): which of WebGuard, SOC, and Compliance an organization has access to. Every organization is meant to carry exactly one row per module at all times, not a nullable/absent-means-disabled state; `get_entitlement`/`has_module_access` fail closed on a missing row rather than guessing what it would have meant.
+
+New: `PlatformModule`/`ModuleEntitlementStatus`/`ModuleEntitlement` in `webguard_contracts` (alongside `Organization`/`Principal`, the same package, per ADR 0033's own reasoning for not spinning up a second contracts package yet). Migration `0014_module_entitlements.sql` creates the table and backfills all three module rows for every existing organization (WebGuard enabled, SOC and Compliance disabled), so no organization is ever left without an explicit row. `module_entitlements.py` (domain error + `InMemoryModuleEntitlementRepository`, mirroring `targets.py`'s own local/lab-backend pattern) and `postgres_module_entitlements.py` (`PostgresModuleEntitlementRepository`, tenant-scoped from day one under `api_tenant_data`, since this is purely an API serve-process concern with no worker/scheduler/callback reader or writer).
+
+`postgres_identity.py`'s `create_organization` gained an optional `module_entitlements` constructor dependency (defaulting to `None`, unlike `scan_repository`/`finding_repository`'s in-memory defaults, matching `coverage_repository`'s own precedent on `ScanJobExecutor`): when present, every newly created organization gets the same three-row grant the migration backfilled for existing ones. `production_startup.py` wires a real `PostgresModuleEntitlementRepository` in; every other existing constructor call site (tests included) is unaffected since the parameter is optional.
+
+**Proven against real disposable Postgres**: a new 12-test contract suite (both `InMemoryModuleEntitlementRepository` and `PostgresModuleEntitlementRepository`, covering default-grant shape, enable/disable, fail-closed on an ungranted module, fail-closed on a missing row, and cross-tenant listing scope), plus a new test in `test_identity_repository_contract.py` proving `create_organization`'s own auto-grant wiring end to end. Full contract suite (80/80, up from 67), full Postgres integration regression sequence, both production E2E files, `test_production_ssrf_callback_e2e.py` clean.
+
+**A transient test-infrastructure note, not a code finding**: the full 1799-test unit suite hit one `ConnectionResetError` in `test_cloudhsm_signing.py`'s `test_oversized_sign_payload_is_rejected`, a real-socket HTTP test entirely unrelated to identity or module entitlement. This is the same flake category already documented in the Phase H arc's PR #42 ledger entry (a genuine, pre-existing, environment-specific flake in this local sandbox, not something this PR's change touches). Re-run(s) recorded below before merge.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
