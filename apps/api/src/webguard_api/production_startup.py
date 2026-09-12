@@ -90,6 +90,7 @@ from .postgres_coverage import PostgresCoverageRepository
 from .postgres_findings import PostgresFindingRepository
 from .postgres_identity import PostgresIdentityRepository
 from .postgres_jobs import PostgresJobRepository
+from .postgres_module_entitlements import PostgresModuleEntitlementRepository
 from .postgres_pool import WebGuardPostgresPool
 from .postgres_reports import PostgresReportRepository
 from .postgres_scans import PostgresScanRepository
@@ -121,6 +122,7 @@ class ProductionComponents:
     scans: PostgresScanRepository
     findings: PostgresFindingRepository
     coverage: PostgresCoverageRepository
+    module_entitlements: PostgresModuleEntitlementRepository
     callback_repository: PostgresCallbackBroker
     authentication_contexts: PostgresAuthenticationContextRepository
     authorization_comparison_plans: PostgresAuthorizationComparisonPlanRepository
@@ -157,7 +159,8 @@ def build_production_components(
         minimum_connections=config.database_pool_minimum,
         maximum_connections=config.database_pool_maximum,
     )
-    identity = PostgresIdentityRepository(pool)
+    module_entitlements = PostgresModuleEntitlementRepository(pool)
+    identity = PostgresIdentityRepository(pool, module_entitlements=module_entitlements)
     targets = PostgresTargetRepository(pool)
     target_verifications = PostgresTargetVerificationRepository(pool)
     jobs = PostgresJobRepository(pool)
@@ -322,6 +325,7 @@ def build_production_components(
         scans=scans,
         findings=findings,
         coverage=coverage,
+        module_entitlements=module_entitlements,
         callback_repository=callback_repository,
         authentication_contexts=authentication_contexts,
         authorization_comparison_plans=authorization_comparison_plans,

@@ -187,6 +187,11 @@ GRANT INSERT, UPDATE ON identity_tokens TO api_tenant_data;
 GRANT SELECT (token_id, principal_id, purpose, used_at) ON identity_tokens TO api_tenant_data;
 GRANT SELECT, INSERT, UPDATE ON browser_sessions TO api_tenant_data;
 GRANT SELECT, INSERT, DELETE ON auth_rate_limit_events TO api_tenant_data;
+-- module_entitlements (platform expansion, docs/adr/0033): purely an
+-- API serve-process concern, no worker/scheduler/callback path ever
+-- reads or writes it, so api_tenant_data is the only role granted
+-- anything here.
+GRANT SELECT, INSERT, UPDATE ON module_entitlements TO api_tenant_data;
 
 -- worker_tenant_data ------------------------------------------------------
 

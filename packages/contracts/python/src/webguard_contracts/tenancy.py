@@ -162,6 +162,86 @@ class Organization:
         }
 
 
+class PlatformModule(str, Enum):
+    """The three OpenHuntX modules an organization can be entitled to
+    (docs/PLATFORM_SCOPE.md). Module entitlement is separate from data
+    permission: this says whether a module is available to the
+    organization at all, not which principal can see which record
+    inside it."""
+
+    WEBGUARD = "webguard"
+    SOC = "soc"
+    COMPLIANCE = "compliance"
+
+
+class ModuleEntitlementStatus(str, Enum):
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    TRIAL = "trial"
+
+
+MODULE_ENTITLEMENT_TYPE = "module_entitlement"
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleEntitlement:
+    organization_id: str
+    module: PlatformModule
+    status: ModuleEntitlementStatus
+    updated_at: datetime
+    enabled_at: datetime | None = None
+    enabled_by: str | None = None
+    disabled_at: datetime | None = None
+    disabled_by: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "organization_id", _uuid(self.organization_id, "organization_id"))
+        if not isinstance(self.module, PlatformModule):
+            raise TenancyContractError(
+                "module_entitlement_module_invalid", "module must be a PlatformModule value."
+            )
+        if not isinstance(self.status, ModuleEntitlementStatus):
+            raise TenancyContractError(
+                "module_entitlement_status_invalid",
+                "status must be a ModuleEntitlementStatus value.",
+            )
+        object.__setattr__(self, "updated_at", _datetime(self.updated_at, "updated_at"))
+        object.__setattr__(
+            self,
+            "enabled_at",
+            None if self.enabled_at is None else _datetime(self.enabled_at, "enabled_at"),
+        )
+        object.__setattr__(
+            self,
+            "enabled_by",
+            None if self.enabled_by is None else _uuid(self.enabled_by, "enabled_by"),
+        )
+        object.__setattr__(
+            self,
+            "disabled_at",
+            None if self.disabled_at is None else _datetime(self.disabled_at, "disabled_at"),
+        )
+        object.__setattr__(
+            self,
+            "disabled_by",
+            None if self.disabled_by is None else _uuid(self.disabled_by, "disabled_by"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": MODULE_ENTITLEMENT_TYPE,
+            "schema_version": CURRENT_TENANCY_SCHEMA_VERSION,
+            "organization_id": self.organization_id,
+            "module": self.module.value,
+            "status": self.status.value,
+            "updated_at": _timestamp(self.updated_at),
+            "enabled_at": None if self.enabled_at is None else _timestamp(self.enabled_at),
+            "enabled_by": self.enabled_by,
+            "disabled_at": None if self.disabled_at is None else _timestamp(self.disabled_at),
+            "disabled_by": self.disabled_by,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class Principal:
     principal_id: str
@@ -338,11 +418,15 @@ __all__ = [
     "MAXIMUM_ORGANIZATION_NAME_LENGTH",
     "MAXIMUM_PRINCIPAL_NAME_LENGTH",
     "MAXIMUM_TOKEN_LABEL_LENGTH",
+    "MODULE_ENTITLEMENT_TYPE",
+    "ModuleEntitlement",
+    "ModuleEntitlementStatus",
     "ORGANIZATION_TYPE",
     "Organization",
     "OrganizationRole",
     "OrganizationStatus",
     "PRINCIPAL_TYPE",
+    "PlatformModule",
     "Principal",
     "PrincipalType",
     "SECURITY_AUDIT_EVENT_TYPE",
