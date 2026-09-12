@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 1879d8e676aca10dddd690532aeddabe2de67cb9
+Commit: 04c8c774e1775f4bfba3bde0540608e757d36efc
 Verified: 2026-09-12, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 4 (P1-2, P1-8, P1-9, P1-12-R1), verified against
@@ -666,6 +666,22 @@ New: `PlatformModule`/`ModuleEntitlementStatus`/`ModuleEntitlement` in `webguard
 **Proven against real disposable Postgres**: a new 12-test contract suite (both `InMemoryModuleEntitlementRepository` and `PostgresModuleEntitlementRepository`, covering default-grant shape, enable/disable, fail-closed on an ungranted module, fail-closed on a missing row, and cross-tenant listing scope), plus a new test in `test_identity_repository_contract.py` proving `create_organization`'s own auto-grant wiring end to end. Full contract suite (80/80, up from 67), full Postgres integration regression sequence, both production E2E files, `test_production_ssrf_callback_e2e.py` clean.
 
 **A transient test-infrastructure note, not a code finding**: the full 1799-test unit suite hit one `ConnectionResetError` in `test_cloudhsm_signing.py`'s `test_oversized_sign_payload_is_rejected`, a real-socket HTTP test entirely unrelated to identity or module entitlement. This is the same flake category already documented in the Phase H arc's PR #42 ledger entry (a genuine, pre-existing, environment-specific flake in this local sandbox, not something this PR's change touches). Re-run(s) recorded below before merge.
+
+## Platform expansion: SOC's first connector contract, Microsoft Entra (2026-09-12)
+
+First SOC-specific work in the platform expansion: a manifest for the Microsoft Entra connector (handoff §9.1 names it first in the Microsoft-first connector priority), per the mandate's own explicit instruction for a blocked connector: "complete its contract, fixtures, permission manifest, failure tests and UI, mark live validation blocked, and continue independent work."
+
+`apps/api/src/webguard_api/soc_connectors.py`: `ConnectorManifest`/`ConnectorPermission`/`ConnectorEndpoint` dataclasses plus `SOC_CONNECTOR_REGISTRY`, mirroring `ACTIVE_DETECTOR_REGISTRY`'s own registry pattern (a static description of what this codebase's own connector code can do, no `organization_id`, no database table, since a manifest is a property of the code at a version, not any tenant's live connection). A future, separate, tenant-scoped table for an organization's actual configured connector instance is explicitly deferred until a real live client exists to populate it.
+
+Every permission name (`RoleManagement.Read.Directory`, `Policy.Read.All`, `UserAuthenticationMethod.Read.All`, `User.Read.All`, `AuditLog.Read.All`, `Application.Read.All`) was verified against Microsoft's own Graph permissions reference via live web search before being written into the manifest, not assumed from training knowledge. This caught a real error mid-design: an initial draft used `DirectoryRole.Read.All` for privileged-role inventory, which does not exist as a documented Microsoft Graph permission; verification found the real one, `RoleManagement.Read.Directory`, before it was ever committed.
+
+The manifest bakes in, as first-class documented limitations (not left implicit for a future engineer to rediscover), the two distinctions the handoff itself calls out by name: per-user authentication-method registration is not Conditional Access enforcement, and a report-only Conditional Access policy enforces nothing. `test_soc_connectors.py` asserts these limitations are actually present in the manifest's own `known_limitations`, not just in a docstring nobody checks.
+
+**Proven, within the honest limits of a contract-only slice**: `test_soc_connectors.py` (5/5): every endpoint's required permission is declared on the manifest (enforced at construction time, proven by attempting to build a manifest that violates it), no manifest claims `live_validated` (this codebase has no live connector client at all), and the MFA/Conditional Access limitations are present. No network call is made anywhere in this slice; nothing here needed real disposable Postgres or CI's Postgres job, since no schema changed.
+
+`docs/CONNECTOR_CAPABILITIES.md`'s Entra row moved from `not_started` to `contract_designed`, with the verified permission list and the limitations above recorded there too, for a reader who doesn't open the source file.
+
+Remaining SOC connector work, not started: Defender XDR and Sentinel manifests (both need the same permission-verification rigor before being written), the actual live HTTP client for any connector (blocked on real Microsoft tenant credentials), fixtures for failure-mode testing (source silence, connector outage, parse rejection, clock skew, collection lag, missing fields, query failure per handoff §9.1), and the tenant-scoped connector-instance table once a live client exists to populate it.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
