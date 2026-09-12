@@ -42,7 +42,7 @@ from uuid import uuid4
 from webguard_scanner.callback_broker import CallbackPolicy
 
 from .callback_service import CallbackServiceError, ScopedCallbackRegistration
-from .postgres_pool import WebGuardPostgresPool
+from .postgres_pool import WORKER_TENANT_DATA_ROLE, WebGuardPostgresPool
 
 
 class PostgresCallbackRegistrationRepository:
@@ -54,7 +54,23 @@ class PostgresCallbackRegistrationRepository:
     shape as the in-memory repository. What this repository does not
     reproduce is the in-memory broker's *active-registration-limit*
     policy enforcement or its real-time wait/correlate mechanism -- see
-    the module docstring."""
+    the module docstring.
+
+    P1-2 Phase H: unlike every other repository in this arc,
+    callback_registrations and callback_observations grant
+    worker_tenant_data, not api_tenant_data, SELECT/INSERT.
+    production_startup.py wires this repository only into
+    postgres_callback_broker.PostgresCallbackBroker, which is itself
+    wired only into executor.py's ScanJobExecutor. register and
+    get_registration both run under worker_tenant_data via
+    tenant_connection, matching their true, sole caller. revoke_registration
+    has zero live callers anywhere in this codebase (see
+    tenant_isolation_acl.sql's own header comment on this exact
+    method), and callback_registrations has no UPDATE grant for any
+    tenant-data role, so it stays on the unrestricted connection
+    rather than being narrowed to a role that could not run its own
+    UPDATE. record_observation's own docstring covers its separate,
+    architecturally blocked gap."""
 
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
@@ -76,7 +92,7 @@ class PostgresCallbackRegistrationRepository:
         token_value = secrets.token_urlsafe(32)
         created_at = now or datetime.now(timezone.utc)
         expires_at = created_at + timedelta(seconds=effective_policy.token_ttl_seconds)
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=WORKER_TENANT_DATA_ROLE) as connection:
             active_count = connection.execute(
                 """
                 SELECT COUNT(*) FROM callback_registrations
@@ -126,7 +142,7 @@ class PostgresCallbackRegistrationRepository:
     def get_registration(
         self, token_value: str, *, organization_id: str
     ) -> ScopedCallbackRegistration:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=WORKER_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 """
                 SELECT token_value, organization_id, scan_id, job_id, permit_id, target,
@@ -152,6 +168,19 @@ class PostgresCallbackRegistrationRepository:
     def revoke_registration(
         self, token_value: str, *, organization_id: str, now: datetime | None = None
     ) -> ScopedCallbackRegistration:
+        """P1-2 Phase H gap, not a wiring gap: this method (and
+        postgres_callback_broker.py's own thin wrapper around it) has
+        zero live callers anywhere in this codebase, already recorded
+        in tenant_isolation_acl.sql's own header comment. That file
+        deliberately withholds UPDATE on callback_registrations from
+        every tenant-data role for exactly this reason ("if a
+        privilege cannot be tied to a live current method, do not
+        grant it"), so there is no role this UPDATE could run under
+        today even though organization_id is a real parameter here.
+        Stays on the unrestricted connection; closing this needs
+        either a live caller to prove the grant against or a
+        deliberate decision to grant it anyway ahead of one existing."""
+
         moment = now or datetime.now(timezone.utc)
         with self._pool.connection() as connection:
             row = connection.execute(
