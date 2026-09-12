@@ -96,12 +96,14 @@ class _FakeConnection:
 
 
 class _FakePool:
-    """Mimics `WebGuardPostgresPool`'s `.connection()` context manager,
-    the one direct dependency `_latest_observation()` has beyond the
-    repository. `poll_effects` is consumed one entry per call to
-    `.connection()` -- an `Exception` instance is raised, anything else
-    is treated as the row `fetchone()` should return (`None` = no
-    observation yet)."""
+    """Mimics `WebGuardPostgresPool`'s `.connection()`/
+    `.role_scoped_connection()` context managers, the one direct
+    dependency `_latest_observation()` has beyond the repository
+    (P1-2 Phase H converted it to `role_scoped_connection`, role-only,
+    since it has no `organization_id` to set tenant context with).
+    `poll_effects` is consumed one entry per call: an `Exception`
+    instance is raised, anything else is treated as the row
+    `fetchone()` should return (`None` = no observation yet)."""
 
     def __init__(self, poll_effects: list) -> None:
         self._effects = list(poll_effects)
@@ -114,6 +116,11 @@ class _FakePool:
         if isinstance(effect, Exception):
             raise effect
         yield _FakeConnection(effect)
+
+    @contextmanager
+    def role_scoped_connection(self, role: str):
+        with self.connection() as connection:
+            yield connection
 
 
 def _broker(repository: _FakeRepository, pool: _FakePool, *, policy: CallbackPolicy | None = None) -> PostgresCallbackBroker:

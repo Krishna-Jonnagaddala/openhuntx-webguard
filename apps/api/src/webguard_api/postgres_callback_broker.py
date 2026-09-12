@@ -83,7 +83,7 @@ from webguard_scanner.callback_broker import CallbackObservation, CallbackPolicy
 from .callback_service import CallbackServiceError
 from .db_errors import DatabaseError
 from .postgres_callback_service import PostgresCallbackRegistrationRepository
-from .postgres_pool import WebGuardPostgresPool
+from .postgres_pool import WORKER_TENANT_DATA_ROLE, WebGuardPostgresPool
 
 DEFAULT_POSTGRES_POLL_INTERVAL_SECONDS = 0.25
 
@@ -257,7 +257,16 @@ class PostgresCallbackBroker:
             time.sleep(policy.poll_interval_seconds)
 
     def _latest_observation(self, token_value: str) -> CallbackObservation | None:
-        with self._pool.connection() as connection:
+        """P1-2 Phase H: no organization_id parameter (the polling
+        loop only has a bare token_value at this point), and this
+        method's only caller is wait_for_observation, itself only
+        reachable from executor.py, the worker. callback_observations
+        grants worker_tenant_data SELECT, so this runs under
+        worker_tenant_data via role_scoped_connection: role-only, no
+        tenant-context GUC, since there is no organization_id here to
+        set it to."""
+
+        with self._pool.role_scoped_connection(WORKER_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 """
                 SELECT method, source_class, observed_at
