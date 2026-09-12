@@ -577,6 +577,20 @@ class ProductionModeEndToEndTests(unittest.TestCase):
             self.assertEqual(scans[0].status, "completed")
             self.assertGreaterEqual(scans[0].finding_count, 1)
 
+            # Coverage Truth Map v1 (product vision pillar 5): a real
+            # single-page scan through the real executor must have
+            # persisted at least one coverage_records row for this
+            # asset's base passive check plan, not just findings.
+            asset = self.target.rstrip("/")
+            coverage = components.coverage.list_coverage_for_asset(
+                organization.organization_id, asset
+            )
+            self.assertTrue(coverage, "expected at least one coverage record for this asset")
+            self.assertTrue(
+                all(item.identity_label == "unauthenticated" for item in coverage),
+                "v1 coverage population only covers the base, unauthenticated check plan",
+            )
+
             # -- cross-tenant isolation: a second organization must see
             # none of this organization's findings/scans --
             other_org = components.identity.create_organization("Other Org E2E", now=now)
@@ -585,6 +599,10 @@ class ProductionModeEndToEndTests(unittest.TestCase):
             )
             self.assertEqual(
                 components.findings.list_findings_scoped_page(other_org.organization_id, limit=10)[0],
+                (),
+            )
+            self.assertEqual(
+                components.coverage.list_coverage_for_asset(other_org.organization_id, asset),
                 (),
             )
 

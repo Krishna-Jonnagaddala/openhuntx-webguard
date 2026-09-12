@@ -86,6 +86,7 @@ from .postgres_authentication_contexts import PostgresAuthenticationContextRepos
 from .postgres_authorization_comparison import PostgresAuthorizationComparisonPlanRepository
 from .postgres_callback_broker import PostgresCallbackBroker
 from .postgres_callback_service import PostgresCallbackRegistrationRepository
+from .postgres_coverage import PostgresCoverageRepository
 from .postgres_findings import PostgresFindingRepository
 from .postgres_identity import PostgresIdentityRepository
 from .postgres_jobs import PostgresJobRepository
@@ -119,6 +120,7 @@ class ProductionComponents:
     jobs: PostgresJobRepository
     scans: PostgresScanRepository
     findings: PostgresFindingRepository
+    coverage: PostgresCoverageRepository
     callback_repository: PostgresCallbackBroker
     authentication_contexts: PostgresAuthenticationContextRepository
     authorization_comparison_plans: PostgresAuthorizationComparisonPlanRepository
@@ -161,6 +163,7 @@ def build_production_components(
     jobs = PostgresJobRepository(pool)
     scans = PostgresScanRepository(pool)
     findings = PostgresFindingRepository(pool)
+    coverage = PostgresCoverageRepository(pool)
     # Requirement (SSRF-callback wiring fix, closes audit finding
     # P0-1): the durable repository is still constructed directly here
     # (and still what `webguard-api callback-service` uses to record
@@ -283,6 +286,7 @@ def build_production_components(
         callback_repository=callback_repository,
         scan_repository=scans,
         finding_repository=findings,
+        coverage_repository=coverage,
         authentication_contexts=authentication_contexts,
         authorization_comparison_plans=authorization_comparison_plans,
         secret_provider=secret_provider,
@@ -317,6 +321,7 @@ def build_production_components(
         jobs=jobs,
         scans=scans,
         findings=findings,
+        coverage=coverage,
         callback_repository=callback_repository,
         authentication_contexts=authentication_contexts,
         authorization_comparison_plans=authorization_comparison_plans,

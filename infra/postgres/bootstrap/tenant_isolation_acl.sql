@@ -127,6 +127,15 @@ GRANT SELECT, INSERT, UPDATE ON authentication_contexts TO api_tenant_data;
 GRANT SELECT, INSERT, UPDATE ON authorization_comparison_plans TO api_tenant_data;
 GRANT SELECT, INSERT, UPDATE ON scan_permits TO api_tenant_data;
 GRANT SELECT ON job_safety_receipts TO api_tenant_data;
+-- coverage_records (P1-2 Phase H follow-on, product vision pillar 5):
+-- api_tenant_data has no live reader yet (no API/report surface
+-- exists this slice), but this mirrors the same worker-writes/api-
+-- reads split findings/scan_records already use, and
+-- list_coverage_for_asset is a real, test-exercised repository
+-- method today even without an HTTP caller yet, the same
+-- "converted anyway for consistency" precedent postgres_scans.py's
+-- list_scans_scoped already established.
+GRANT SELECT ON coverage_records TO api_tenant_data;
 -- No whole-row SELECT: password_credentials' own read
 -- (get_password_hash, for login) is inherently pre-authentication --
 -- a future identity function owner's resolver domain, not this
@@ -190,6 +199,12 @@ GRANT SELECT ON organization_authorizations TO worker_tenant_data;
 GRANT SELECT, INSERT, UPDATE ON scan_records TO worker_tenant_data;
 GRANT SELECT, INSERT, UPDATE ON findings TO worker_tenant_data;
 GRANT INSERT ON finding_events TO worker_tenant_data;
+-- coverage_records's own record_coverage is an upsert
+-- (INSERT ... ON CONFLICT ... DO UPDATE); full SELECT, INSERT, UPDATE
+-- covers both the conflict-target columns and the DO UPDATE SET
+-- clause's EXCLUDED references without needing a narrower column
+-- list, the same shape findings' own worker grant already uses.
+GRANT SELECT, INSERT, UPDATE ON coverage_records TO worker_tenant_data;
 
 -- scheduler_tenant_data ---------------------------------------------------
 

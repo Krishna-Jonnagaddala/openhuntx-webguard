@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 18aa88c5747f9d5796e12ee9ff4a39438f5923cd
+Commit: 6ce977fb25f16aed5155ac67f86d4d722771f050
 Verified: 2026-09-12, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 4 (P1-2, P1-8, P1-9, P1-12-R1), verified against
@@ -627,6 +627,22 @@ Pillar 5 of the product vision (`docs/PRODUCT_VISION_TRACEABILITY.md`), named in
 4. Whether v1 needs an API/report surface in the same PR as the data model and population, or whether "durably record it, queryable via direct SQL" is an acceptable first slice on its own, with a customer-facing surface as a distinct follow-up.
 
 Not proceeding to schema or code until these are resolved with the user; committing to a coverage-tuple shape via a new migration is materially harder to walk back than any single Phase H PR, since Phase H's own work only ever changed how an existing query connects, never what a table stores.
+
+## Coverage Truth Map v1: data model and population (2026-09-12)
+
+First implementation slice of pillar 5, following the discovery pass above and the scope confirmed with the user: exact URL/method, an explicit `unauthenticated` identity_label, forward-only population (no backfill), and data model plus population only, no API/report surface yet.
+
+New: `coverage_store.py` (domain types: `CoverageRecord`, `CoverageStatus`, `split_asset_and_path`), migration `0013_coverage_records.sql` (one row per `(organization_id, asset, path, http_method, identity_label, check_id)`), and `postgres_coverage.py` (`PostgresCoverageRepository`, built tenant-scoped from day one rather than retrofitted: `record_coverage` runs under `worker_tenant_data`, `list_coverage_for_asset` under `api_tenant_data`, mirroring the exact worker-writes/api-reads split `postgres_findings.py` already established).
+
+`CoverageStatus` is three values, not the vision's full six-state lattice (discovered/authorized/attempted/completed/blocked/unreachable). Only three have a real, already-computed signal behind them: a page's `ScanCoverage` already distinguishes executed checks from skipped ones, and a failed page's planned checks were never attempted. `discovered` would need individual discovered-URL tracking (`CrawlPageScanResult.discovered_links` is a count, not a list of URLs); `authorized` would need a resolved permit/authorization boundary per operation. Populating either from data that doesn't actually establish it would make the map look more complete than it is, exactly the failure mode a truth map exists to avoid. `identity_label` is always `unauthenticated` in v1 for the same reason: `NormalizedFinding`/`FindingIdentity` carries no identity field, so which principal's authentication material a given check ran under cannot be recovered from a report today. Confirmed directly in `executor.py`'s own code: `_apply_active_detection`/`_apply_authorization_comparison`/`_apply_ssrf_callback_detection` only ever append findings to a page via `dataclasses_replace(page, findings=...)`, never touching `page.coverage`, so the base `ScanCoverage` this migration reads from is guaranteed to reflect only the passive/analyzer check plan, never phantom entries from those three identity-aware detection layers.
+
+Wired into `executor.py` (`_record_coverage_for_report`, called alongside the existing `record_finding`/`complete_scan` block, gated the same way on `organization_id is not None`) and `production_startup.py` (`PostgresCoverageRepository(pool)`, passed to both `ScanJobExecutor` and the new `ProductionComponents.coverage` field). `coverage_repository` defaults to `None` on `ScanJobExecutor.__init__`, unlike `scan_repository`/`finding_repository`'s in-memory defaults: this is genuinely new, additive tracking with no pre-existing local/test behavior to preserve, so every one of the many existing constructor call sites across the test suite is completely unaffected.
+
+**Proven against real disposable Postgres**: `test_coverage_repository_contract.py` (4/4: create, upsert-preserves-first-observed-at, distinct-check-ids-are-independent-rows, cross-tenant-scoping), and `test_production_mode_e2e.py` extended with a real assertion that a genuine single-page scan through the real executor persists at least one `coverage_records` row with `identity_label == "unauthenticated"`, and that a second organization sees none of it. Full contract suite (67/67, up from 63), full Postgres integration regression sequence, both production E2E files, `test_production_ssrf_callback_e2e.py` clean, and the full 1799-test unit suite (unaffected, confirming the additive-only design claim above).
+
+No RLS policy was added for `coverage_records` in `tenant_isolation_rls_policies.sql`. That file is Phase G's own artifact and RLS+FORCE activation is a separate, infrastructure-gated task (see P1-2's own remaining half); adding a dormant policy for one new table without addressing the other twelve is inconsistent scope creep for this slice, not a natural extension of it. Recorded here as a known, deliberate omission, not a silent one.
+
+Remaining Coverage Truth Map work, not started: an API/report surface (deferred per the confirmed v1 scope), extending population to the active-detection/authorization-comparison/SSRF-callback layers once those carry real identity information, route-pattern normalization for the operation dimension, and the `discovered`/`authorized` states.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
