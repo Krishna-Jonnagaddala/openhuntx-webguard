@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 04c8c774e1775f4bfba3bde0540608e757d36efc
+Commit: 70cfb320d0c2f340b51a77a28a94e2f79797575a
 Verified: 2026-09-12, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 4 (P1-2, P1-8, P1-9, P1-12-R1), verified against
@@ -682,6 +682,18 @@ The manifest bakes in, as first-class documented limitations (not left implicit 
 `docs/CONNECTOR_CAPABILITIES.md`'s Entra row moved from `not_started` to `contract_designed`, with the verified permission list and the limitations above recorded there too, for a reader who doesn't open the source file.
 
 Remaining SOC connector work, not started: Defender XDR and Sentinel manifests (both need the same permission-verification rigor before being written), the actual live HTTP client for any connector (blocked on real Microsoft tenant credentials), fixtures for failure-mode testing (source silence, connector outage, parse rejection, clock skew, collection lag, missing fields, query failure per handoff §9.1), and the tenant-scoped connector-instance table once a live client exists to populate it.
+
+## Platform expansion: Compliance's first slice, the framework/master-control catalog (2026-09-12)
+
+First Compliance-specific work in the platform expansion (handoff §10.1): `frameworks` and `master_controls`, the reference catalog every later scoped-implementation/assertion/evidence layer will cite. See `docs/adr/0034-compliance-catalog-is-global-reference-data.md` for the full architecture decision this required before any schema could be written: these are the first tables in this schema with no `organization_id` at all, since a framework's own requirements are identical for every tenant. Reads run under `api_tenant_data` via `role_scoped_connection` (role-only, no GUC, the same "no tenant to scope by" treatment `postgres_identity.py`'s `get_principal` already uses); writes stay on the unrestricted connection, an operator/CLI-only concern mirroring `assign_authorization`/`revoke_token`'s own precedent, since no organization ever creates a framework definition through the API serve process.
+
+New `Framework`/`FrameworkStatus`/`MasterControl` in `webguard_contracts` (`compliance.py`, a new module distinct from `tenancy.py` since this is Compliance-domain, not identity/org-domain). Migration `0015` creates both tables and seeds the five initial profiles the handoff names (SOC 2, ISO/IEC 27001:2022 plus its 2024 amendment folded into one framework's own version string rather than double-counted as a second framework, HIPAA Security Rule, EU GDPR, UK GDPR) as `FrameworkStatus.PLACEHOLDER` rows: named, cited to their own authoritative source, zero `master_controls` under any of them. No control content is invented; `docs/PLATFORM_SCOPE.md` already records legal-text verification as an open blocker for every framework pack, and this slice does not route around that blocker by fabricating placeholder text.
+
+**Proven against real disposable Postgres**: `test_compliance_catalog_repository_contract.py` (4/4: seeded placeholders are readable and correctly flagged `PLACEHOLDER`, seeded placeholders carry zero controls, an unknown framework fails closed, and a full create-framework/create-control/list round trip). Full contract suite (84/84, up from 80). Full Postgres integration regression sequence, both production E2E files, `test_production_ssrf_callback_e2e.py` clean, security gates clean.
+
+A real migration mistake was caught and fixed during this slice, not silently avoided: the first seed-data draft used version strings ("current rule; a 2024 strengthening remains a proposal, tracked separately") that exceeded `MAXIMUM_VERSION_LENGTH` (64 characters), a contract validation this repository's own test suite caught immediately on the first run. Fixed by shortening the seed strings to genuinely version-shaped values, not by loosening the length limit.
+
+Remaining Compliance work, not started: the tenant-scoped "scoped implementation / assertion / evidence" layer (a distinct, later slice, genuinely tenant data unlike this catalog itself), loading any framework's real legally-reviewed control content (blocked pending legal-text verification), the ~40-60 initial technical assertion catalogue (handoff §10.3), and the governance/privacy/vendor/audit workflows (handoff §10.4).
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 

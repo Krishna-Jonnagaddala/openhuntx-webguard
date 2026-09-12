@@ -192,6 +192,15 @@ GRANT SELECT, INSERT, DELETE ON auth_rate_limit_events TO api_tenant_data;
 -- reads or writes it, so api_tenant_data is the only role granted
 -- anything here.
 GRANT SELECT, INSERT, UPDATE ON module_entitlements TO api_tenant_data;
+-- frameworks/master_controls (platform expansion, docs/adr/0034):
+-- global reference data, not tenant data, the first tables in this
+-- schema with no organization_id at all. SELECT only: writes (adding
+-- a framework or control to the catalog) are an OpenHuntX-operator
+-- concern with no live API-serve-process caller, the same shape
+-- postgres_identity.py's assign_authorization/revoke_token already
+-- established, so no INSERT/UPDATE is granted to any role here.
+GRANT SELECT ON frameworks TO api_tenant_data;
+GRANT SELECT ON master_controls TO api_tenant_data;
 
 -- worker_tenant_data ------------------------------------------------------
 
