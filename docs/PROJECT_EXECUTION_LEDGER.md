@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 9df82b0498f5ffda35b9c43d81ea5750e5aea294
+Commit: 18aa88c5747f9d5796e12ee9ff4a39438f5923cd
 Verified: 2026-09-12, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 4 (P1-2, P1-8, P1-9, P1-12-R1), verified against
@@ -604,6 +604,29 @@ Two test fixes were needed, both because this file's role choice differs from ev
 **Proven against real disposable Postgres**: `test_postgres_callback_broker.py` (25/25 unit tests, including the full `DatabaseError`-during-poll scenario suite), `test_callback_registration_repository_contract.py` (12/12, both in-memory and Postgres backends, including the cross-tenant and revoke-idempotency cases), the full contract suite, the full Postgres integration regression sequence, both production E2E files, and `test_production_ssrf_callback_e2e.py`, the real end-to-end proof that a genuine worker-side SSRF callback registration, poll, and observation now succeed end to end under `worker_tenant_data` specifically (clean, no flake this run). The full 1799-test unit suite passes.
 
 This closes Phase H's tenant-context-setting conversion across all 13 repository files. Every ordinary method that can be correctly scoped now runs under a restricted role; every method that cannot (documented across this arc: `get_password_hash`, `consume_identity_token` in `postgres_identity.py`; `get_scope`, `get_job_permit_binding`, `get` in `postgres_jobs.py`; `enqueue_due_schedule`, `get_schedule_permit_binding` in `postgres_schedules.py`; `record_observation`, `revoke_registration` in `postgres_callback_service.py`) carries a precise docstring explaining exactly why, not a silent gap. RLS itself is still not enabled on any table (Phase G's own policies remain dormant); activating it in a real, non-disposable environment remains explicitly out of scope for this session.
+
+## Coverage Truth Map: discovery (2026-09-12)
+
+Pillar 5 of the product vision (`docs/PRODUCT_VISION_TRACEABILITY.md`), named in `docs/ROADMAP.md`'s "Proof-carrying assessments" section as planned, not built. `docs/IMPLEMENTATION_STATUS.md` calls it the highest-leverage differentiation work now that Phase H is done. No design work exists yet beyond that one-line mention; this section is the first real pass, grounded in what's actually in the codebase, before any schema or code.
+
+**What already exists that this can build on**, confirmed by direct reading, not assumption:
+
+- `ScanCoverage` (`packages/contracts/python/src/webguard_contracts/scans.py`) already tracks `planned_checks`/`executed_checks`/`skipped_checks` by `check_id` per page/scan. `CrawlScanCoverage` rolls this up per crawl run. Both are real, tested, and already computed on every scan today. Neither is persisted anywhere queryable: it lives inside a `CrawlScanResult`/`ScanResult` object, gets serialized into a report, and is gone once that object leaves scope. This is the single biggest reason Coverage Truth Map doesn't already exist: the underlying signal is already computed, just never kept.
+- `findings` (`infra/postgres/migrations/0004_deferred_production_schema.sql`) has `asset`, `endpoint`, `http_method`, `check_id`, `check_version`, `scanner_version`, `organization_id` columns, close to coverage-tuple granularity, but it's a strict subset: a row exists only when a check found something. It has no row for "check ran here and found nothing" or "this path was discovered but never tested."
+- `targets` (`0002_targets.sql`) is the asset registry: one row per `(organization_id, url)`. This is the natural anchor for the "asset" dimension.
+- `identity_label` + `AuthenticationMethod` (`apps/api/src/webguard_api/authentication_contexts.py`) already exist and are used by the authorization-comparison feature (`authorization_comparison_plans`, `workers/scanner/src/webguard_scanner/authorization_crawl.py`'s single-identity authenticated crawl). This is real backing for the "identity" dimension, not a hypothetical one waiting on a separate "authenticated scanning" feature that ROADMAP.md's own "Coverage growth" section still lists as planned; that planned item is about broader multi-identity RBAC-comparison scanning, a different thing from having an identity concept to key coverage rows by.
+- `check_id` (analyzer names: `cors_analyzer`, `header_analyzer`, `cookie_analyzer`, `html_analyzer`, `disclosure_analyzer`, `tls_analyzer`, per `docs/CWE_COVERAGE.md`) is the natural backing for the "test class" dimension.
+
+**What a Coverage Truth Map needs that none of the above provides**: a durable, queryable record, one row per `(organization_id, asset, operation, identity, test class)` at minimum, with a status in {discovered, authorized, attempted, completed, blocked, unreachable} and a pointer back to the evidence (which `scan_id`/`finding_id` last touched it), updated as an upsert every time a scan or crawl completes, not derived by re-parsing report JSON at query time (too slow, and defeats the "truth map" framing of a durable ledger).
+
+**Open questions this discovery pass cannot resolve alone, needing a product decision, not further code archaeology**:
+
+1. Granularity of "operation": exact URL/method pairs (matches `findings`' own `endpoint`/`http_method` columns, but a coverage map keyed by exact URL will fragment badly on any path with query parameters or path segments that vary per request, e.g. `/users/{id}`) versus a normalized route pattern (needs a route-templating step that does not exist anywhere in this codebase today).
+2. Whether "identity" for an unauthenticated passive scan (the overwhelming majority of scans today) is a real dimension value (e.g. `"unauthenticated"`) or the tuple collapses to four dimensions when no `identity_label` applies.
+3. Whether v1 populates only going forward from new scans, or also backfills from `scan_records`/`findings` history already in the database (backfill requires re-deriving `planned_checks` for historical scans, which were never persisted, so a full backfill may not be possible without re-running old scans).
+4. Whether v1 needs an API/report surface in the same PR as the data model and population, or whether "durably record it, queryable via direct SQL" is an acceptable first slice on its own, with a customer-facing surface as a distinct follow-up.
+
+Not proceeding to schema or code until these are resolved with the user; committing to a coverage-tuple shape via a new migration is materially harder to walk back than any single Phase H PR, since Phase H's own work only ever changed how an existing query connects, never what a table stores.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
