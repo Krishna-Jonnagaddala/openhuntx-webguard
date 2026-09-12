@@ -49,7 +49,7 @@ from webguard_contracts import (
 
 from .db_errors import DatabaseIntegrityError
 from .permits import PersistedTrustScanPermit
-from .postgres_pool import WORKER_TENANT_DATA_ROLE, WebGuardPostgresPool
+from .postgres_pool import API_TENANT_DATA_ROLE, WORKER_TENANT_DATA_ROLE, WebGuardPostgresPool
 from .postgres_schedules import PostgresScheduleRepository
 from .store import JobStoreError, LeasedScanJob, LeaseRecoverySummary
 
@@ -97,7 +97,33 @@ def _maximum_attempts(value: object) -> int:
 
 class PostgresJobRepository:
     """Production job/permit store. See module docstring for the
-    compatibility contract with ``ScanJobStore``."""
+    compatibility contract with ``ScanJobStore``.
+
+    P1-2 Phase H: scan_jobs, job_permits, and job_safety_receipts have
+    no worker_tenant_data or scheduler_tenant_data grant at all; only
+    api_tenant_data can touch them. Every ordinary method that reads
+    or writes those three tables runs under api_tenant_data (via
+    tenant_connection where organization_id is a real parameter, via
+    role_scoped_connection where it isn't). scan_permits is different:
+    api_tenant_data, worker_tenant_data, and scheduler_tenant_data all
+    carry an identical SELECT grant on it, so get_scan_permit_scoped
+    (called from service.py, scheduler.py, and executor.py) runs under
+    api_tenant_data and works the same way regardless of which process
+    calls it, the same shared-SELECT reasoning postgres_scans.py's
+    get_scan_scoped documents for its own worker/API split.
+
+    Two genuine, unclosed gaps live here. get_scope (already
+    documented in its own docstring) and get_job_permit_binding are
+    both reachable only from executor.py, the worker, but
+    worker_tenant_data has no grant on scan_jobs or job_permits at
+    all. get (and, through it, is_cancellation_requested) has the same
+    problem in a sharper form: worker.py's run loop is its only real
+    caller, so there is no role that is both this method's true caller
+    and actually granted access to the table. All three stay on the
+    unrestricted connection; closing them needs either a narrow
+    SECURITY DEFINER resolver granted to worker_tenant_data or an ACL
+    change extending it a column-limited SELECT, not a unilateral
+    addition here."""
 
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
@@ -146,7 +172,7 @@ class PostgresJobRepository:
     def create_scan_permit(self, permit: SignedTrustScanPermit) -> PersistedTrustScanPermit:
         claims = permit.claims
         try:
-            with self._pool.connection() as connection:
+            with self._pool.tenant_connection(claims.organization_id, role=API_TENANT_DATA_ROLE) as connection:
                 connection.execute(
                     """
                     INSERT INTO scan_permits (
@@ -178,7 +204,7 @@ class PostgresJobRepository:
         return self.get_scan_permit(claims.permit_id)
 
     def get_scan_permit(self, permit_id: str) -> PersistedTrustScanPermit:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 """
                 SELECT permit_id, organization_id, authorization_id, authorization_sha256,
@@ -200,9 +226,15 @@ class PostgresJobRepository:
         itself, not a two-step unscoped fetch plus Python-level compare
         -- ``permit_id`` reaches this method directly from a caller-
         supplied HTTP path parameter (see ``service.py``'s
-        ``_permit_record``)."""
+        ``_permit_record``).
 
-        with self._pool.connection() as connection:
+        P1-2 Phase H: called from service.py (API), scheduler.py, and
+        executor.py (worker). api_tenant_data, worker_tenant_data, and
+        scheduler_tenant_data all carry the identical SELECT grant on
+        scan_permits, so this runs under api_tenant_data and works the
+        same way regardless of which process calls it."""
+
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 """
                 SELECT permit_id, organization_id, authorization_id, authorization_sha256,
@@ -219,7 +251,7 @@ class PostgresJobRepository:
     def revoke_scan_permit_scoped(
         self, permit_id: str, organization_id: str, *, revoked_by: str, now: datetime
     ) -> PersistedTrustScanPermit:
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 "SELECT revoked_at FROM scan_permits WHERE permit_id = %s AND organization_id = %s",
                 (permit_id, organization_id),
@@ -242,7 +274,18 @@ class PostgresJobRepository:
         """Unscoped -- retained for internal/system callers that already
         hold an independently-verified ``job_id`` (see
         ``get_job_permit_binding_scoped`` for the customer/service-facing
-        equivalent, which is what ``service.py`` must use)."""
+        equivalent, which is what ``service.py`` must use).
+
+        P1-2 Phase H gap, not yet closed: this method's only callers
+        anywhere in this codebase are both in executor.py, the worker.
+        job_permits has no worker_tenant_data grant at all (only
+        api_tenant_data has SELECT), so there is no restricted role
+        that is both this method's true caller and actually able to
+        run the query. This raw query works only because every
+        WebGuard process still runs as webguard, unrestricted.
+        Closing this needs either a narrow SECURITY DEFINER resolver
+        granted to worker_tenant_data or an ACL change extending it a
+        SELECT on this table, not a unilateral addition here."""
 
         with self._pool.connection() as connection:
             row = connection.execute(
@@ -262,7 +305,7 @@ class PostgresJobRepository:
         query, rather than trusting that whatever record the caller
         already fetched actually corresponds to this same job_id."""
 
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 """
                 SELECT binding.permit_id, binding.permit_sha256
@@ -320,7 +363,7 @@ class PostgresJobRepository:
         column of its own -- mirrors ``get_job_permit_binding_scoped``'s
         join-to-``scan_jobs`` rationale exactly."""
 
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 """
                 SELECT receipt.receipt_ref, receipt.receipt_sha256
@@ -407,7 +450,19 @@ class PostgresJobRepository:
             )
         effective_job_id = str(uuid4()) if job_id is None else job_id
 
-        with self._pool.connection() as connection:
+        # P1-2 Phase H: organization_id is genuinely optional here (the
+        # SQLite ScanJobStore this class mirrors supports an org-less
+        # job), but every real caller in the API serve process supplies
+        # it (see service.py's own submit() call). tenant_connection
+        # can't take a None organization_id, so this method falls back
+        # to role_scoped_connection, role-only, no tenant context, for
+        # the org-less case, and sets real tenant context otherwise.
+        connection_scope = (
+            self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE)
+            if organization_id is not None
+            else self._pool.role_scoped_connection(API_TENANT_DATA_ROLE)
+        )
+        with connection_scope as connection:
             if request.idempotency_key is not None:
                 existing = connection.execute(
                     f"SELECT {self._RECORD_COLUMNS}, request_fingerprint "  # noqa: S608
@@ -493,6 +548,22 @@ class PostgresJobRepository:
         return self._record_from_row(row), True
 
     def get(self, job_id: str) -> ScanJobRecord:
+        """P1-2 Phase H gap, not yet closed: this method has no caller
+        in the API serve process at all. Its only reachable path is
+        through is_cancellation_requested, called exclusively from
+        worker.py's own run loop. worker_tenant_data has no grant on
+        scan_jobs whatsoever, the same restriction get_scope's own
+        docstring documents, so there is no role that is both this
+        method's true caller and actually able to run the query.
+        Running it under api_tenant_data would misrepresent which
+        process is doing the reading, so this stays on the
+        unrestricted connection rather than picking a role that would
+        only happen to work in this sandbox. Closing this needs either
+        a narrow SECURITY DEFINER resolver granted to worker_tenant_data
+        (returning just cancellation_requested by job_id) or an ACL
+        change extending it a column-limited SELECT, not a unilateral
+        addition here."""
+
         with self._pool.connection() as connection:
             row = connection.execute(
                 f"SELECT {self._RECORD_COLUMNS} FROM scan_jobs WHERE job_id = %s", (job_id,)  # noqa: S608
@@ -536,7 +607,7 @@ class PostgresJobRepository:
         ``job_id``, and every ``_scoped`` mutation below it, e.g.
         ``request_cancellation_scoped``, relies on it failing closed)."""
 
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"SELECT {self._RECORD_COLUMNS} FROM scan_jobs "  # noqa: S608
                 "WHERE job_id = %s AND organization_id = %s",
@@ -579,7 +650,7 @@ class PostgresJobRepository:
             clauses.append("(submitted_at < %s OR (submitted_at = %s AND job_id::text < %s))")
             parameters.extend((after[0], after[0], after[1]))
         parameters.append(limit + 1)
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
                 f"""
                 SELECT {self._RECORD_COLUMNS} FROM scan_jobs
@@ -599,8 +670,18 @@ class PostgresJobRepository:
         return self.request_cancellation(job_id, now=now)
 
     def request_cancellation(self, job_id: str, *, now: datetime) -> ScanJobRecord:
+        """P1-2 Phase H: no organization_id parameter, by design (this
+        signature mirrors ScanJobStore's own split between an unscoped
+        mutation and a ``_scoped`` wrapper that validates org
+        membership first). Its only caller anywhere in this codebase
+        is request_cancellation_scoped, itself only called from
+        service.py, so this runs under api_tenant_data via
+        role_scoped_connection: role-only, no tenant-context GUC, since
+        there is no organization_id in this method's own signature to
+        set it to."""
+
         timestamp = _ts(now)
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"SELECT {self._RECORD_COLUMNS} FROM scan_jobs WHERE job_id = %s", (job_id,)  # noqa: S608
             ).fetchone()

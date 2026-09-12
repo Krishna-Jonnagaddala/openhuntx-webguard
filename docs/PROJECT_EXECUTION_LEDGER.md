@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: acabe55c29fbf46d7932cb6c5741212d5768d8c9
+Commit: 2ffa016e4c8d0e677876480cd8ae56321b7d8ef6
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -549,6 +549,22 @@ Three test files exercised `create_organization`, `create_principal`, or `set_pa
 **Proven against real disposable Postgres**: `test_identity_repository_contract.py` (22/22, both SQLite and Postgres backends), the full contract suite, the full Postgres integration sequence including `test_postgres_identity_credentials_write_shape.py`'s 12-test ACL-shape suite (unmodified, still passing), both production E2E files, and the full 1799-test unit suite.
 
 This closes the ordinary-method tenant-context-setting conversion for `postgres_identity.py`. Remaining Phase H tenant-context-setting work: `postgres_jobs.py`, `postgres_schedules.py`, `postgres_sessions.py`, and `postgres_callback_service.py`/`postgres_callback_broker.py`.
+
+## Phase H conversion: postgres_jobs.py, and two new worker-only gaps (2026-09-11)
+
+Converts the ordinary methods in `postgres_jobs.py` not already handled by PRs #32-#33 (`claim_next_leased`, `renew_lease`, `recover_expired_leases`, `_terminal_update`, all control-function conversions, untouched here) or already documented as blocked (`get_scope`, untouched).
+
+`scan_jobs`, `job_permits`, and `job_safety_receipts` have no `worker_tenant_data` or `scheduler_tenant_data` grant at all in `tenant_isolation_acl.sql`; only `api_tenant_data` can touch them. `create_scan_permit`, `revoke_scan_permit_scoped`, `get_job_permit_binding_scoped`, `get_job_safety_receipt_scoped`, `get_scoped`, and `list_jobs_scoped_page` all take or resolve a real `organization_id` and run under `api_tenant_data` via `tenant_connection`. `get_scan_permit` and `request_cancellation` have no `organization_id` in their own signature (both are internal-only helpers; grep confirms `request_cancellation`'s only caller anywhere is `request_cancellation_scoped`, itself only called from `service.py`) and run under `api_tenant_data` via `role_scoped_connection` instead.
+
+`get_scan_permit_scoped` is a different case: `scan_permits` is the one table in this file with an identical `SELECT` grant across all three tenant-data roles, and grep confirms this method is genuinely called from `service.py`, `scheduler.py`, and `executor.py`. It runs under `api_tenant_data` and works the same way regardless of which process calls it, the shared-SELECT reasoning already established for `postgres_scans.py`'s `get_scan_scoped`.
+
+`submit()` is a genuine edge case: its `organization_id` parameter is optional (the SQLite `ScanJobStore` it mirrors supports an org-less job, and several unit tests exercise exactly that against the SQLite backend), but `tenant_connection` cannot take `None`. Converted with a small conditional: `tenant_connection` when `organization_id` is supplied (every real Postgres-backed caller, confirmed by grep against `service.py` and the contract suite, always supplies it), `role_scoped_connection` otherwise, preserving the org-less path without crashing it.
+
+Two new gaps, not previously documented: `get_job_permit_binding`'s only callers anywhere in this codebase are both in `executor.py` (the worker), but `job_permits` has no `worker_tenant_data` grant at all, so no role is both this method's true caller and actually able to run the query. `get()` has the same shape in a sharper form: it has no caller in the API serve process at all, only reachable through `is_cancellation_requested`, called exclusively from `worker.py`'s run loop, against a table (`scan_jobs`) `worker_tenant_data` cannot touch at all. Both raw queries work today only because every WebGuard process still runs as `webguard`, unrestricted; both stay on the unrestricted connection with a docstring explaining precisely why, matching `get_scope`'s own existing treatment rather than picking a role that would only happen to work in this sandbox.
+
+**Proven against real disposable Postgres**: the full contract suite (`test_job_scan_finding_repository_contract.py`'s 8 Postgres-backed job/permit tests among its 17), the full Postgres integration regression sequence, both production E2E files, `test_production_ssrf_callback_e2e.py` clean, and the full 1799-test unit suite.
+
+This closes the ordinary-method tenant-context-setting conversion for `postgres_jobs.py`'s own methods (its schedule-delegate thin wrappers forward to `postgres_schedules.py`, not converted here). Remaining Phase H tenant-context-setting work: `postgres_schedules.py`, `postgres_sessions.py`, and `postgres_callback_service.py`/`postgres_callback_broker.py`.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
