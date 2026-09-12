@@ -76,6 +76,7 @@ from .authorization_comparison import (
 )
 from .callback_service import CallbackRepository, CallbackServiceError
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
+from .coverage_store import CoverageStatus, UNAUTHENTICATED_IDENTITY_LABEL, split_asset_and_path
 from .finding_store import InMemoryFindingRepository
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .safety import TrustScanRuntimeSafetyEngine, TrustScanRuntimeSafetyError
@@ -402,6 +403,66 @@ class JobExecutionOutcome:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _record_coverage_for_report(
+    coverage_repository,
+    report,
+    *,
+    organization_id: str,
+    scan_id: str,
+    now: datetime,
+) -> None:
+    """Coverage Truth Map v1 population (coverage_store.py's own
+    module docstring has the full scope rationale). Runs against
+    whatever ScanCoverage/CrawlScanCoverage the executor already
+    computed for this report; no new scanning, no new requests, just
+    persisting a signal that already existed and was previously
+    discarded once the report left scope.
+
+    identity_label is always UNAUTHENTICATED_IDENTITY_LABEL here: this
+    function only ever sees the base report single_scanner/
+    crawl_scanner returned, before _apply_active_detection/
+    _apply_authorization_comparison/_apply_ssrf_callback_detection
+    layer their own findings on top. Those three detectors can run
+    under a specific identity's authentication material, but
+    NormalizedFinding/FindingIdentity carries no identity field to
+    recover which one from the augmented report, so extending coverage
+    population to them is left for later work, not guessed at here."""
+
+    pages = getattr(report, "pages", None)
+    operations = (
+        ((report.target, report.status, report.coverage),)
+        if pages is None
+        else tuple((page.url, page.status, page.coverage) for page in pages)
+    )
+
+    for url, status, coverage in operations:
+        asset, path = split_asset_and_path(url)
+        unreachable = status is ScanStatus.FAILED
+        executed_check_ids = frozenset(coverage.executed_checks)
+        skipped_check_ids = {item.check_id for item in coverage.skipped_checks}
+        for check_id in coverage.planned_checks:
+            if check_id in executed_check_ids:
+                check_status = CoverageStatus.COMPLETED
+            elif check_id in skipped_check_ids:
+                check_status = CoverageStatus.BLOCKED
+            else:
+                check_status = (
+                    CoverageStatus.UNREACHABLE if unreachable else CoverageStatus.COMPLETED
+                )
+            coverage_repository.record_coverage(
+                organization_id=organization_id,
+                asset=asset,
+                path=path,
+                http_method="GET",
+                identity_label=UNAUTHENTICATED_IDENTITY_LABEL,
+                check_id=check_id,
+                status=check_status,
+                scanner_version=ENGINE_VERSION,
+                now=now,
+                scan_id=scan_id,
+            )
 
 
 def _prepare_private_directory(path: Path) -> None:
@@ -912,6 +973,7 @@ class ScanJobExecutor:
         callback_repository: TenantScopedCallbackBroker | None = None,
         scan_repository=None,
         finding_repository=None,
+        coverage_repository=None,
         secret_provider: SecretProvider | None = None,
         artifact_store: ArtifactStore | None = None,
     ) -> None:
@@ -968,6 +1030,16 @@ class ScanJobExecutor:
         self.finding_repository = (
             finding_repository if finding_repository is not None else InMemoryFindingRepository()
         )
+        # Coverage Truth Map v1 (product vision pillar 5): unlike
+        # scan_repository/finding_repository, there is no in-memory
+        # equivalent to default to. This is genuinely new, additive
+        # tracking with no pre-existing local/test behavior to
+        # preserve, so None means "don't populate coverage" rather
+        # than falling back to a throwaway backend nothing consumes.
+        # Production wiring passes PostgresCoverageRepository
+        # explicitly; every pre-existing constructor call site
+        # (real, all of them) is unaffected.
+        self.coverage_repository = coverage_repository
         # Slice 14 requirement 1: secret resolution goes through one
         # provider-neutral interface, mirroring TrustScanSigner/
         # SigningProvider (signing.py). Defaulted to a local adapter
@@ -1408,6 +1480,14 @@ class ScanJobExecutor:
                     evidence="; ".join(item.summary for item in finding.evidence) or None,
                     remediation=finding.remediation,
                     references=finding.references,
+                )
+            if self.coverage_repository is not None:
+                _record_coverage_for_report(
+                    self.coverage_repository,
+                    report,
+                    organization_id=scope[0],
+                    scan_id=scan_id,
+                    now=self.clock(),
                 )
             self.scan_repository.complete_scan(
                 scan_id,
