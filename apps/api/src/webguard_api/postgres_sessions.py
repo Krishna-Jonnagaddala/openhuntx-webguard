@@ -44,6 +44,18 @@ def _record_from_row(row: tuple) -> BrowserSessionRecord:
 
 
 class PostgresSessionRepository:
+    """P1-2 Phase H: browser_sessions has no worker_tenant_data or
+    scheduler_tenant_data grant at all; only api_tenant_data can touch
+    it. create_session has a real organization_id and runs under
+    api_tenant_data via tenant_connection. get_session,
+    revoke_session, revoke_all_sessions_for_principal, and
+    list_sessions_for_principal carry no organization_id in their own
+    signature at all (each is reached with only a session_id or
+    principal_id from an already-authenticated context), so each runs
+    under api_tenant_data via role_scoped_connection instead, the same
+    role-only, no-tenant-context treatment postgres_identity.py's own
+    no-organization-id cluster uses."""
+
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
 
@@ -64,7 +76,7 @@ class PostgresSessionRepository:
         csrf_token = secrets.token_urlsafe(32)
         idle_expires_at = now + idle_ttl
         absolute_expires_at = now + absolute_ttl
-        with self._pool.connection() as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 f"""
                 INSERT INTO browser_sessions ({_COLUMNS})
@@ -183,7 +195,7 @@ class PostgresSessionRepository:
         )
 
     def get_session(self, session_id: str) -> BrowserSessionRecord | None:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"SELECT {_COLUMNS} FROM browser_sessions WHERE session_id = %s",  # noqa: S608
                 (session_id,),
@@ -205,7 +217,7 @@ class PostgresSessionRepository:
         distinguishable error that would let a caller probe for valid
         session IDs belonging to someone else."""
 
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 "UPDATE browser_sessions SET revoked_at = %s "
                 "WHERE session_id = %s AND principal_id = %s AND revoked_at IS NULL",
@@ -215,7 +227,7 @@ class PostgresSessionRepository:
     def revoke_all_sessions_for_principal(
         self, principal_id: str, *, now: datetime, except_session_id: str | None = None
     ) -> int:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             if except_session_id is None:
                 cursor = connection.execute(
                     "UPDATE browser_sessions SET revoked_at = %s WHERE principal_id = %s AND revoked_at IS NULL",
@@ -232,7 +244,7 @@ class PostgresSessionRepository:
             return cursor.rowcount
 
     def list_sessions_for_principal(self, principal_id: str) -> tuple[BrowserSessionRecord, ...]:
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
                 f"SELECT {_COLUMNS} FROM browser_sessions WHERE principal_id = %s ORDER BY issued_at DESC",  # noqa: S608
                 (principal_id,),

@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 16faaffd95140c4f47d83d56a062f90e91d0749b
+Commit: e87f39186a5cfe6625d7997f19841e75933f6707
 Verified: 2026-09-11, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES
 Open P1 total: 6 (P1-2, P1-6, P1-7, P1-8, P1-9, P1-12-R1) -- verified against
@@ -579,6 +579,16 @@ Converts the ordinary methods in `postgres_schedules.py` not already handled by 
 This closes the ordinary-method tenant-context-setting conversion for `postgres_schedules.py`. Remaining Phase H tenant-context-setting work: `postgres_sessions.py` and `postgres_callback_service.py`/`postgres_callback_broker.py`.
 
 **A billing gap, not a code gap**: GitHub Actions CI for this repository briefly failed every job, on PR #44 and this PR alike, with "recent account payments have failed or your spending limit needs to be increased," an account-level billing issue rather than a code or test failure. The user resolved it directly; PR #44 re-ran green and merged, and this PR (rebased on that merge) follows the same path.
+
+## Phase H conversion: postgres_sessions.py (2026-09-12)
+
+Converts the 5 methods in `postgres_sessions.py` not already handled by the `authenticate_session` control-function conversion (an earlier PR, untouched here). `browser_sessions` has no `worker_tenant_data` or `scheduler_tenant_data` grant at all in `tenant_isolation_acl.sql`, the same restriction seen throughout the identity/session/job/schedule tables; only `api_tenant_data` can touch it.
+
+`create_session` has a real `organization_id` and runs under `api_tenant_data` via `tenant_connection`. `get_session`, `revoke_session`, `revoke_all_sessions_for_principal`, and `list_sessions_for_principal` carry no `organization_id` in their own signature at all: each is reached with only a `session_id` or `principal_id` already known from an authenticated context (grep confirms every call site in `service.py` passes `context.token_id` or `context.principal_id`, never a bare caller-supplied value). All four run under `api_tenant_data` via `role_scoped_connection`, the same role-only, no-tenant-context treatment `postgres_identity.py`'s own no-organization-id cluster (`get_principal`, `touch_last_login`, and others) already established. No new gap in this file: unlike the worker/scheduler-only methods found in the previous three PRs, every method here is genuinely API-only, confirmed by grep against `service.py`, `scheduler.py`, `executor.py`, and `worker.py`.
+
+**Proven against real disposable Postgres**: `test_postgres_sessions.py` (9/9, including the cross-principal revoke silent-no-op test and the full create/authenticate/touch lifecycle), the 14-test `test_postgres_tenant_isolation_slice13.py` suite, the full contract suite, the full Postgres integration regression sequence, both production E2E files, `test_production_ssrf_callback_e2e.py` clean, and the full 1799-test unit suite.
+
+This closes the ordinary-method tenant-context-setting conversion for `postgres_sessions.py`. Remaining Phase H tenant-context-setting work: `postgres_callback_service.py` and `postgres_callback_broker.py`, the last two files in this arc.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
