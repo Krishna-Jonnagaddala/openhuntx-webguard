@@ -92,6 +92,30 @@ class SocConnectorRegistryTests(unittest.TestCase):
             "Entra manifest must document the registration-vs-enforcement distinction",
         )
 
+    def test_defender_xdr_manifest_documents_device_inventory_deferral(self) -> None:
+        """Machine.Read.All belongs to a different API (Defender for
+        Endpoint, not Microsoft Graph) with a different OAuth resource
+        audience than every other endpoint in this manifest. That gap
+        must be named explicitly, not silently absent."""
+
+        defender_xdr = SOC_CONNECTOR_REGISTRY["defender_xdr"]
+        self.assertTrue(
+            any("machine" in limitation.lower() for limitation in defender_xdr.known_limitations),
+            "Defender XDR manifest must document why device/machine inventory is out of scope",
+        )
+
+    def test_defender_xdr_manifest_uses_only_graph_permissions(self) -> None:
+        """This slice is deliberately scoped to the unified Microsoft
+        Graph security namespace; Machine.Read.All (a non-Graph
+        permission) must not appear until the schema is extended to
+        model a second API family and OAuth resource."""
+
+        defender_xdr = SOC_CONNECTOR_REGISTRY["defender_xdr"]
+        permission_names = {permission.name for permission in defender_xdr.permissions}
+        self.assertNotIn("Machine.Read.All", permission_names)
+        for endpoint in defender_xdr.endpoints:
+            self.assertTrue(endpoint.path.startswith("/v1.0/") or endpoint.path.startswith("/beta/"))
+
 
 if __name__ == "__main__":
     unittest.main()
