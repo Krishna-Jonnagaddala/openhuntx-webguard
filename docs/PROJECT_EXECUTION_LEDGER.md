@@ -7,9 +7,9 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 70cfb320d0c2f340b51a77a28a94e2f79797575a
-Verified: 2026-09-12, by direct git fetch + rev-parse, not trusted from a prior report.
-origin/main == this commit: YES
+Commit: a73fe88 (feat(compliance): add framework/master-control catalog, Compliance's first slice, #54)
+Verified: 2026-09-14, by direct git fetch + rev-parse, not trusted from a prior report.
+origin/main == this commit: YES, immediately before this ledger entry's own PR branched from it.
 Open P1 total: 4 (P1-2, P1-8, P1-9, P1-12-R1), verified against
   docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md's own "CURRENT P1
   ACCOUNTING" section directly, not the mandate's paraphrase of it. P1-6 and
@@ -694,6 +694,22 @@ New `Framework`/`FrameworkStatus`/`MasterControl` in `webguard_contracts` (`comp
 A real migration mistake was caught and fixed during this slice, not silently avoided: the first seed-data draft used version strings ("current rule; a 2024 strengthening remains a proposal, tracked separately") that exceeded `MAXIMUM_VERSION_LENGTH` (64 characters), a contract validation this repository's own test suite caught immediately on the first run. Fixed by shortening the seed strings to genuinely version-shaped values, not by loosening the length limit.
 
 Remaining Compliance work, not started: the tenant-scoped "scoped implementation / assertion / evidence" layer (a distinct, later slice, genuinely tenant data unlike this catalog itself), loading any framework's real legally-reviewed control content (blocked pending legal-text verification), the ~40-60 initial technical assertion catalogue (handoff §10.3), and the governance/privacy/vendor/audit workflows (handoff §10.4).
+
+## Platform expansion: SOC's second connector contract, Microsoft Defender XDR (2026-09-14)
+
+Second SOC connector manifest, same discipline as Entra's: `docs/audit/OPENHUNTX_THREE_MODULE_PLATFORM_HANDOFF_2026-09.md` section 9.1 names Defender XDR alongside Sentinel and Entra in the Microsoft-first connector priority.
+
+`DEFENDER_XDR_CONNECTOR_MANIFEST` in `apps/api/src/webguard_api/soc_connectors.py` covers four Microsoft Graph security-namespace endpoints: list incidents (`SecurityIncident.Read.All`), list alerts_v2 (`SecurityAlert.Read.All`), run hunting query (`ThreatHunting.Read.All`), list secure scores (`SecurityEvents.Read.All`). Every permission was verified against Microsoft's own current documentation before being written down, not assumed from training knowledge.
+
+That verification pass surfaced a real design constraint, not just a permission name: Defender XDR's device/machine inventory (`Machine.Read.All`) is not a Microsoft Graph permission. It belongs to a separate API, Defender for Endpoint (`api.security.microsoft.com`), which per Microsoft's own July 2026 documentation still requires an access token issued for the legacy resource audience `https://api.securitycenter.microsoft.com`, distinct from `https://graph.microsoft.com`, or the call fails with 403 even though the endpoint host itself moved to the newer name. This module's `ConnectorEndpoint.api_version` field only validates Graph's own `v1.0`/`beta` monikers; that other API has no such versioning. Rather than loosen that validation as an incidental side effect of adding one endpoint, device inventory was left out of this manifest entirely and named as an explicit, deferred gap in its own `known_limitations`, not silently absent. The same constraint will resurface for Sentinel, which is Log Analytics / Azure Resource Manager REST, not Graph either; whatever schema change eventually accommodates a second API family should be designed once, for both, rather than bent to fit Defender XDR alone.
+
+Also documented as first-class limitations: `alerts_v2` and `incidents` overlap by design (an incident is Microsoft's own correlation of one or more alerts), so an assertion built from both must not double-count an alert already nested under an incident; and Secure Score is a point-in-time snapshot, never a trend, without this connector's own repeated collection over time.
+
+**Proven, within the honest limits of a contract-only slice**: `test_soc_connectors.py` (7/7, up from 5): the two new tests confirm the device-inventory deferral is actually recorded in `known_limitations` (not just claimed in a docstring) and that every Defender XDR endpoint path is genuinely Graph-versioned (`/v1.0/` or `/beta/`), proving the scoping decision above is enforced, not just described. All five pre-existing generic manifest tests (endpoint-permission consistency, no premature `live_validated` claim, registry key consistency) pass unchanged against both manifests now registered. No network call anywhere in this slice; nothing here needed real disposable Postgres, since no schema changed.
+
+`docs/CONNECTOR_CAPABILITIES.md`'s Defender XDR row moved from `not_started` to `contract_designed`, with the verified permission list and every limitation above recorded there too.
+
+Remaining SOC connector work, not started: the Sentinel manifest (Log Analytics / Azure Resource Manager REST, not Graph, so it needs its own permission model from scratch rather than reuse of this module's Graph-shaped endpoint validation), the actual live HTTP client for any connector (blocked on real Microsoft tenant credentials for all three), fixtures for failure-mode testing (source silence, connector outage, parse rejection, clock skew, collection lag, missing fields, query failure per handoff §9.1), the schema extension needed to represent a connector spanning more than one API family/OAuth resource (blocking Defender XDR's device inventory and likely all of Sentinel), and the tenant-scoped connector-instance table once a live client exists to populate it.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
