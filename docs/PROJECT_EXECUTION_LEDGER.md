@@ -7,8 +7,8 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 9c83552 (feat(soc): add Microsoft Defender XDR connector manifest, SOC's second connector, #55)
-Verified: 2026-09-14, by direct git fetch + rev-parse, not trusted from a prior report.
+Commit: 50641e7 (feat(compliance): add scoped control implementation, Compliance's second slice, #56)
+Verified: 2026-09-16, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES, immediately before this ledger entry's own PR branched from it.
 Open P1 total: 4 (P1-2, P1-8, P1-9, P1-12-R1), verified against
   docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md's own "CURRENT P1
@@ -728,6 +728,22 @@ This is genuinely tenant data (`organization_id` present, unlike the catalog it 
 `docs/PRODUCT_VISION_TRACEABILITY.md`'s Compliance line moved from `NOT_STARTED` to `IN_PROGRESS`, correcting a second staleness in the same paragraph: the SOC line there had also gone stale after PRs #53/#55 and is corrected in this same pass rather than left for a future session to rediscover.
 
 Remaining Compliance work, not started: the other six status dimensions (collection, test execution, assertion, control assessment, treatment, assurance review) and the assertion/evidence records they govern, loading any framework's real legally-reviewed control content (blocked pending legal-text verification), the ~40-60 initial technical assertion catalogue (handoff §10.3), and the governance/privacy/vendor/audit workflows (handoff §10.4).
+
+## Platform expansion: SOC's third connector contract, Microsoft Sentinel (2026-09-16)
+
+Third and last of the handoff's named Microsoft-first connectors (section 9.1: Sentinel, Defender XDR, Entra). Unlike the first two, Sentinel's classic incident/analytics-rule/data-connector surface is not Microsoft Graph at all: it is Azure Resource Manager, `Microsoft.SecurityInsights`, authorized by an Azure RBAC role assignment (`Microsoft Sentinel Reader`, Microsoft's own least-privileged role for this) on the workspace's resource group, not by a Graph permission an admin consents to. Verified 2026-09-16 against Microsoft's own current documentation, the same live-verification discipline as the first two connectors.
+
+This connector forced the schema question the Defender XDR PR's own `known_limitations` predicted ("the schema extension needed to represent a connector spanning more than one API family/OAuth resource... should be designed once, for both, rather than bent to fit Defender XDR alone") to actually get answered. `soc_connectors.py` gained `ConnectorPermissionType.AZURE_RBAC_ROLE` and a new `ConnectorApiScheme` enum (`MICROSOFT_GRAPH`/`AZURE_RESOURCE_MANAGER`) on `ConnectorEndpoint`, with `api_version` validated against Graph's `v1.0`/`beta` monikers or ARM's dated `YYYY-MM-DD`(`-preview`) format depending on which scheme an endpoint declares. `api_scheme` defaults to `MICROSOFT_GRAPH`, so Entra's and Defender XDR's existing endpoint definitions needed no change at all: their validation is exactly what it was before this manifest existed, proven by two new regression tests (`test_graph_endpoint_still_rejects_arm_style_api_version`, alongside `test_arm_endpoint_rejects_graph_style_api_version` proving the new branch is real, not decorative).
+
+`SENTINEL_CONNECTOR_MANIFEST` covers three read-only ARM endpoints, all under the single `Microsoft Sentinel Reader` role: list incidents, list analytics (alert) rules, list data connectors. The latter two feed directly into handoff section 10.3's own named initial Compliance assertion families ("detection enablement/execution errors" and "required log-source health" respectively) without needing any Sentinel-specific detection logic invented here, only the raw inventory read.
+
+Two more facts surfaced by verification and recorded as first-class `known_limitations`, not left for a future session to discover the hard way: Microsoft's own January 2026 documentation states classic Sentinel in the Azure portal, the exact surface this manifest models, retires 2027-03-31, after which all customers move to the unified Defender portal; and Sentinel incidents/alerts already surface through this module's own Defender XDR manifest (`serviceSource eq 'microsoftSentinel'` on `alerts_v2`) for a workspace already onboarded to that unified experience, so this ARM-native manifest is specifically for a standalone, non-onboarded workspace, and a real connector implementation must pick one surface per workspace, never poll both and double-count.
+
+**Proven, within the honest limits of a contract-only slice**: `test_soc_connectors.py` (12/12, up from 7): five new tests cover the Sentinel manifest's own claims (Azure RBAC permission type, ARM endpoint scheme and dated versioning, the Defender-XDR-overlap and 2027 retirement limitations being actually present) plus the two schema-generalization regression tests above. All prior tests (endpoint-permission consistency, no premature `live_validated`, registry key consistency, Entra's and Defender XDR's own specific limitation checks) pass unchanged against all three now-registered manifests. No network call anywhere in this slice; nothing here needed real disposable Postgres, since no schema changed. Full contract suite (90/90, unaffected). Full local unit suite (1820/1820, up from 1815). Security gates clean.
+
+`docs/CONNECTOR_CAPABILITIES.md`'s Sentinel row moved from `not_started` to `contract_designed`, with the verified role, API surface, and every limitation above recorded there too.
+
+All three named handoff connectors (Sentinel, Defender XDR, Entra) now have contract-designed manifests. Remaining SOC connector work, not started: the actual live HTTP client for any connector (blocked on real Microsoft tenant credentials for all three, plus for Sentinel specifically an actual Azure role assignment), fixtures for failure-mode testing (source silence, connector outage, parse rejection, clock skew, collection lag, missing fields, query failure per handoff §9.1), the schema/design work for Defender for Endpoint's own non-ARM, non-Graph, unversioned device-inventory API (still a distinct, unresolved gap from `ConnectorApiScheme`'s two current values), Splunk (explicitly sequenced after this Microsoft subset), and the tenant-scoped connector-instance table once a live client exists to populate it.
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 

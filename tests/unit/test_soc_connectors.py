@@ -116,6 +116,75 @@ class SocConnectorRegistryTests(unittest.TestCase):
         for endpoint in defender_xdr.endpoints:
             self.assertTrue(endpoint.path.startswith("/v1.0/") or endpoint.path.startswith("/beta/"))
 
+    def test_sentinel_manifest_uses_azure_rbac_not_graph_permissions(self) -> None:
+        """Sentinel's classic ARM surface is authorized by Azure RBAC
+        role assignment, not Graph admin-consent permissions; the
+        manifest must say so through its own permission_type, not just
+        in prose."""
+
+        from webguard_api.soc_connectors import ConnectorPermissionType
+
+        sentinel = SOC_CONNECTOR_REGISTRY["sentinel"]
+        for permission in sentinel.permissions:
+            self.assertEqual(permission.permission_type, ConnectorPermissionType.AZURE_RBAC_ROLE)
+
+    def test_sentinel_manifest_endpoints_use_arm_versioning(self) -> None:
+        """Sentinel's endpoints are Azure Resource Manager, dated
+        api-version strings, never Graph's v1.0/beta monikers."""
+
+        from webguard_api.soc_connectors import ConnectorApiScheme
+
+        sentinel = SOC_CONNECTOR_REGISTRY["sentinel"]
+        for endpoint in sentinel.endpoints:
+            self.assertEqual(endpoint.api_scheme, ConnectorApiScheme.AZURE_RESOURCE_MANAGER)
+            self.assertRegex(endpoint.api_version, r"^\d{4}-\d{2}-\d{2}(-preview)?$")
+
+    def test_sentinel_manifest_documents_defender_xdr_overlap_and_retirement(self) -> None:
+        """Two facts a real implementation must not miss: Sentinel
+        incidents already surface via the Defender XDR manifest for a
+        unified-onboarded workspace, and classic Sentinel's Azure
+        portal surface has a dated retirement (2027-03-31)."""
+
+        sentinel = SOC_CONNECTOR_REGISTRY["sentinel"]
+        limitations_text = " ".join(sentinel.known_limitations).lower()
+        self.assertIn("defender xdr", limitations_text)
+        self.assertIn("2027", limitations_text)
+
+    def test_arm_endpoint_rejects_graph_style_api_version(self) -> None:
+        """ConnectorEndpoint.__post_init__ must actually enforce the
+        ARM dated-version format, proven by attempting to build one
+        with a Graph-style 'v1.0' moniker instead."""
+
+        from webguard_api.soc_connectors import ConnectorApiScheme, ConnectorEndpoint
+
+        with self.assertRaises(ValueError):
+            ConnectorEndpoint(
+                label="Bad ARM endpoint",
+                method="GET",
+                path="/subscriptions/{subscriptionId}/providers/Microsoft.Test/things",
+                api_version="v1.0",
+                stability="stable",
+                required_permissions=("Some Role",),
+                api_scheme=ConnectorApiScheme.AZURE_RESOURCE_MANAGER,
+            )
+
+    def test_graph_endpoint_still_rejects_arm_style_api_version(self) -> None:
+        """The default scheme (Microsoft Graph) must keep its original
+        validation exactly as it was before ConnectorApiScheme existed:
+        a dated ARM-style version string is not a valid Graph moniker."""
+
+        from webguard_api.soc_connectors import ConnectorEndpoint
+
+        with self.assertRaises(ValueError):
+            ConnectorEndpoint(
+                label="Bad Graph endpoint",
+                method="GET",
+                path="/security/test",
+                api_version="2025-06-01",
+                stability="stable",
+                required_permissions=("Some.Permission",),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
