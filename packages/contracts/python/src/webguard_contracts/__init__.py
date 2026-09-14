@@ -6,6 +6,11 @@ from .compliance import (
     FrameworkStatus,
     MasterControl,
 )
+from .compliance_scope import (
+    ApplicabilityStatus,
+    ComplianceScopeError,
+    ScopedControlImplementation,
+)
 from .crawl_checkpoints import (
     CRAWL_CHECKPOINT_INTEGRITY_ALGORITHM,
     CRAWL_CHECKPOINT_TYPE,
@@ -234,6 +239,9 @@ __all__ = [
     "Framework",
     "FrameworkStatus",
     "MasterControl",
+    "ApplicabilityStatus",
+    "ComplianceScopeError",
+    "ScopedControlImplementation",
     "CURRENT_CRAWL_SCAN_SCHEMA_VERSION",
     "CURRENT_SCAN_JOB_SCHEMA_VERSION",
     "MAXIMUM_IDEMPOTENCY_KEY_LENGTH",
