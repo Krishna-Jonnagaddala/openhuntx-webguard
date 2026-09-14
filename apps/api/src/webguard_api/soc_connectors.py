@@ -42,6 +42,39 @@ manifest here is used to request real consent, since names, required
 roles, and resource audiences can change between a verification date
 and whenever a live client is actually built.
 
+The Sentinel manifest, verified 2026-09-16, is the connector that
+forced the deferred schema question above to actually be answered:
+Sentinel's classic incident/analytics-rule/data-connector surface is
+not Microsoft Graph at all. It is an Azure Resource Manager (ARM)
+provider, ``Microsoft.SecurityInsights``, authorized by Azure RBAC
+role assignment on the workspace's resource group (``Microsoft
+Sentinel Reader`` for the read-only endpoints here), not by a named
+Graph permission an admin consents to. Its endpoints are versioned by
+a dated ``api-version`` query parameter (for example ``2025-06-01``),
+not Graph's ``v1.0``/``beta`` monikers. ``ConnectorPermissionType`` and
+``ConnectorEndpoint`` are extended below (``AZURE_RBAC_ROLE``,
+``ConnectorApiScheme``) to represent this honestly rather than
+stretching the Graph-shaped fields to fit, resolving the gap the
+Defender XDR manifest's own ``known_limitations`` predicted. Existing
+Graph-scheme endpoints (Entra, Defender XDR) needed no change: the new
+``api_scheme`` field defaults to ``MICROSOFT_GRAPH``, so their
+validation is exactly what it was before this manifest existed.
+
+Also verified, and directly relevant to how long this manifest's own
+ARM surface stays worth building against: Microsoft's own January 2026
+documentation states classic Microsoft Sentinel in the Azure portal
+retires March 31, 2027, after which all customers move to the unified
+Microsoft Defender portal experience. Separately, Sentinel incidents
+and alerts already surface today through the exact same unified
+Microsoft Graph Security API this module's Defender XDR manifest
+covers (``serviceSource eq 'microsoftSentinel'`` on ``alerts_v2``), but
+only for a workspace already onboarded to that unified Defender
+experience; a standalone Sentinel workspace not onboarded there has no
+Graph surface at all and needs this ARM-native manifest instead. The
+two manifests are not redundant, they cover different, real deployment
+topologies, and this ARM surface is the one on a dated retirement path,
+not a target to keep investing in past that unification.
+
 ``live_validation_state`` on every manifest here is
 ``CONTRACT_DESIGNED``: no live HTTP client exists yet, and none should
 claim otherwise (docs/CONNECTOR_CAPABILITIES.md's own review
@@ -51,13 +84,30 @@ depends on no credential.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
+
+_ARM_API_VERSION = re.compile(r"^\d{4}-\d{2}-\d{2}(-preview)?$")
 
 
 class ConnectorPermissionType(str, Enum):
     APPLICATION = "application"
     DELEGATED = "delegated"
+    AZURE_RBAC_ROLE = "azure_rbac_role"
+
+
+class ConnectorApiScheme(str, Enum):
+    """Which API surface, and therefore which versioning scheme,
+    ConnectorEndpoint.api_version is validated against. Microsoft
+    Graph uses fixed 'v1.0'/'beta' monikers; Azure Resource Manager
+    providers like Microsoft.SecurityInsights use a dated
+    'YYYY-MM-DD' (optionally '-preview') api-version query
+    parameter, a genuinely different scheme, not a looser version of
+    Graph's."""
+
+    MICROSOFT_GRAPH = "microsoft_graph"
+    AZURE_RESOURCE_MANAGER = "azure_resource_manager"
 
 
 class ConnectorLiveValidationState(str, Enum):
@@ -83,12 +133,23 @@ class ConnectorEndpoint:
     api_version: str
     stability: str
     required_permissions: tuple[str, ...]
+    api_scheme: ConnectorApiScheme = ConnectorApiScheme.MICROSOFT_GRAPH
 
     def __post_init__(self) -> None:
         if self.stability not in ("stable", "preview"):
             raise ValueError(f"stability must be 'stable' or 'preview', got {self.stability!r}.")
-        if self.api_version not in ("v1.0", "beta"):
-            raise ValueError(f"api_version must be 'v1.0' or 'beta', got {self.api_version!r}.")
+        if self.api_scheme is ConnectorApiScheme.MICROSOFT_GRAPH:
+            if self.api_version not in ("v1.0", "beta"):
+                raise ValueError(
+                    f"api_version must be 'v1.0' or 'beta' for a Microsoft Graph endpoint, "
+                    f"got {self.api_version!r}."
+                )
+        elif self.api_scheme is ConnectorApiScheme.AZURE_RESOURCE_MANAGER:
+            if not _ARM_API_VERSION.fullmatch(self.api_version):
+                raise ValueError(
+                    f"api_version must be a dated 'YYYY-MM-DD' or 'YYYY-MM-DD-preview' string "
+                    f"for an Azure Resource Manager endpoint, got {self.api_version!r}."
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,15 +412,115 @@ DEFENDER_XDR_CONNECTOR_MANIFEST = ConnectorManifest(
     ),
 )
 
+# Verified 2026-09-16 against https://learn.microsoft.com/en-us/azure/sentinel/roles
+# and each endpoint's own Azure REST API reference page. A single
+# Azure RBAC role, not a set of named Graph permissions: all three
+# endpoints below are plain reads, and "Microsoft Sentinel Reader" is
+# Microsoft's own documented least-privileged role for viewing
+# incidents, workbooks, and "other resources" (which includes analytics
+# rules and data connectors; a separate write-scoped permission is only
+# needed to create or edit them, never to list or read them).
+_SENTINEL_PERMISSIONS = (
+    ConnectorPermission(
+        name="Microsoft Sentinel Reader",
+        permission_type=ConnectorPermissionType.AZURE_RBAC_ROLE,
+        purpose=(
+            "Azure RBAC role assignment on the workspace's resource group, Microsoft's own "
+            "least-privileged role for reading incidents, analytics rules, data connectors, "
+            "workbooks, and recommendations. Granted by an Azure role assignment, never by "
+            "Graph admin consent."
+        ),
+    ),
+)
+
+_SENTINEL_INCIDENT_PATH = (
+    "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/"
+    "Microsoft.OperationalInsights/workspaces/{workspaceName}/providers/"
+    "Microsoft.SecurityInsights/incidents"
+)
+_SENTINEL_ALERT_RULE_PATH = (
+    "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/"
+    "Microsoft.OperationalInsights/workspaces/{workspaceName}/providers/"
+    "Microsoft.SecurityInsights/alertRules"
+)
+_SENTINEL_DATA_CONNECTOR_PATH = (
+    "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/"
+    "Microsoft.OperationalInsights/workspaces/{workspaceName}/providers/"
+    "Microsoft.SecurityInsights/dataConnectors"
+)
+
+_SENTINEL_ENDPOINTS = (
+    ConnectorEndpoint(
+        label="List incidents",
+        method="GET",
+        path=_SENTINEL_INCIDENT_PATH,
+        api_version="2025-06-01",
+        stability="stable",
+        required_permissions=("Microsoft Sentinel Reader",),
+        api_scheme=ConnectorApiScheme.AZURE_RESOURCE_MANAGER,
+    ),
+    ConnectorEndpoint(
+        label="List analytics (alert) rules",
+        method="GET",
+        path=_SENTINEL_ALERT_RULE_PATH,
+        api_version="2025-06-01",
+        stability="stable",
+        required_permissions=("Microsoft Sentinel Reader",),
+        api_scheme=ConnectorApiScheme.AZURE_RESOURCE_MANAGER,
+    ),
+    ConnectorEndpoint(
+        label="List data connectors",
+        method="GET",
+        path=_SENTINEL_DATA_CONNECTOR_PATH,
+        api_version="2025-06-01",
+        stability="stable",
+        required_permissions=("Microsoft Sentinel Reader",),
+        api_scheme=ConnectorApiScheme.AZURE_RESOURCE_MANAGER,
+    ),
+)
+
+SENTINEL_CONNECTOR_MANIFEST = ConnectorManifest(
+    connector_id="sentinel",
+    display_name="Microsoft Sentinel",
+    vendor="Microsoft",
+    api_family="Azure Resource Manager (Microsoft.SecurityInsights)",
+    licensing_dependency="Requires an Azure Sentinel-enabled Log Analytics workspace; billed on log ingestion/retention, not a named per-seat license.",
+    regional_availability="Follows the customer's own Log Analytics workspace region; no separate regional selection. A given tenant may run multiple workspaces in different regions, each a separate connector target.",
+    permissions=_SENTINEL_PERMISSIONS,
+    endpoints=_SENTINEL_ENDPOINTS,
+    pagination="nextLink cursor-based pagination on all three endpoints, an ARM convention distinct from Graph's @odata.nextLink field name but the same cursor-follow shape.",
+    incremental_cursor_support=(
+        "incidents supports $filter on lastModifiedTimeUtc/createdTimeUtc for incremental "
+        "polling; alertRules and dataConnectors have no delta endpoint and must be fully "
+        "re-listed each cycle, the same full-relist shape this module's Entra manifest "
+        "already documents for its own non-delta endpoints."
+    ),
+    credential_refresh_notes="OAuth 2.0 client-credentials flow against Entra's own token endpoint, scoped to https://management.azure.com/.default; tokens are short-lived and refreshed per call batch. Authorization additionally requires the service principal actually hold the Microsoft Sentinel Reader Azure role assignment on the target resource group, a separate, portal/CLI-driven step from token acquisition.",
+    retry_policy="Exponential backoff honoring the Retry-After header on 429/503 responses; Azure Resource Manager's own throttling documentation, not this module, is the source of truth for backoff floors.",
+    rate_limit_notes="ARM enforces per-subscription and per-tenant request-rate limits reported via x-ms-ratelimit-remaining-* response headers, a different throttling signal shape than Graph's.",
+    backfill_limit_notes="Incident and alert-rule history is bounded by the underlying Log Analytics workspace's own data retention setting, configured per workspace and not a fixed platform constant; a backfill request older than that retention window returns an empty result, not an error.",
+    deletion_semantics="Analytics rules and data connectors are hard-deleted from the workspace on removal, unlike Entra's soft-deleted directory objects; a connector cycle that stops seeing one must treat it as removed immediately, with no recovery window to check.",
+    live_validation_state=ConnectorLiveValidationState.CONTRACT_DESIGNED,
+    known_limitations=(
+        "No live HTTP client exists yet; this is a manifest only, blocked on a real Sentinel-enabled workspace and a service principal actually holding the Microsoft Sentinel Reader role for live validation.",
+        "Classic Microsoft Sentinel in the Azure portal, the ARM surface this manifest models, retires March 31, 2027 per Microsoft's own documentation; customers move to the unified Microsoft Defender portal experience after that date. This manifest models what exists today, not a target worth extending indefinitely.",
+        "Sentinel incidents and alerts already surface through this module's own Defender XDR manifest (serviceSource eq 'microsoftSentinel' on alerts_v2) when a workspace is onboarded to the unified Defender portal experience. This ARM-native manifest is for a standalone Sentinel workspace not onboarded there; a connector implementation must pick the right surface per customer, never poll both for the same workspace and double-count the result.",
+        "Azure RBAC role assignment is a separate authorization step from OAuth token acquisition: a valid access token for a service principal that lacks the Microsoft Sentinel Reader role assignment on the target resource group still fails every endpoint here with a 403, an authorization model with no Graph admin-consent equivalent to reuse.",
+    ),
+)
+
 SOC_CONNECTOR_REGISTRY: dict[str, ConnectorManifest] = {
     ENTRA_CONNECTOR_MANIFEST.connector_id: ENTRA_CONNECTOR_MANIFEST,
     DEFENDER_XDR_CONNECTOR_MANIFEST.connector_id: DEFENDER_XDR_CONNECTOR_MANIFEST,
+    SENTINEL_CONNECTOR_MANIFEST.connector_id: SENTINEL_CONNECTOR_MANIFEST,
 }
 
 __all__ = [
     "SOC_CONNECTOR_REGISTRY",
     "DEFENDER_XDR_CONNECTOR_MANIFEST",
     "ENTRA_CONNECTOR_MANIFEST",
+    "SENTINEL_CONNECTOR_MANIFEST",
+    "ConnectorApiScheme",
     "ConnectorEndpoint",
     "ConnectorLiveValidationState",
     "ConnectorManifest",
