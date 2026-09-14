@@ -7,9 +7,11 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: 50641e7 (feat(compliance): add scoped control implementation, Compliance's second slice, #56)
+Commit: aa9f360 (feat(soc): add Microsoft Sentinel connector manifest, SOC's third connector, #57)
 Verified: 2026-09-16, by direct git fetch + rev-parse, not trusted from a prior report.
-origin/main == this commit: YES, immediately before this ledger entry's own PR branched from it.
+origin/main == this commit: YES. This ledger entry's own PR (#58) branched before
+#57 merged; rebased onto #57's merge commit once it landed, and its Sentinel-sourced
+assertion gap closed in the same rebase rather than left open (see below).
 Open P1 total: 4 (P1-2, P1-8, P1-9, P1-12-R1), verified against
   docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md's own "CURRENT P1
   ACCOUNTING" section directly, not the mandate's paraphrase of it. P1-6 and
@@ -744,6 +746,21 @@ Two more facts surfaced by verification and recorded as first-class `known_limit
 `docs/CONNECTOR_CAPABILITIES.md`'s Sentinel row moved from `not_started` to `contract_designed`, with the verified role, API surface, and every limitation above recorded there too.
 
 All three named handoff connectors (Sentinel, Defender XDR, Entra) now have contract-designed manifests. Remaining SOC connector work, not started: the actual live HTTP client for any connector (blocked on real Microsoft tenant credentials for all three, plus for Sentinel specifically an actual Azure role assignment), fixtures for failure-mode testing (source silence, connector outage, parse rejection, clock skew, collection lag, missing fields, query failure per handoff §9.1), the schema/design work for Defender for Endpoint's own non-ARM, non-Graph, unversioned device-inventory API (still a distinct, unresolved gap from `ConnectorApiScheme`'s two current values), Splunk (explicitly sequenced after this Microsoft subset), and the tenant-scoped connector-instance table once a live client exists to populate it.
+## Platform expansion: Compliance's third slice, the technical assertion catalog (2026-09-16)
+
+Third Compliance slice, and the necessary anchor for handoff section 10.2's remaining status dimensions. Applicability (#56) already attaches to a scoped control implementation directly; collection, test execution, and assertion status cannot honestly attach to anything until there is a real, named technical assertion to run, per section 10.1's own model order (framework requirements, master controls, scoped implementations, **assertions/tests**, evidence, mappings). Jumping straight to a "collection status" record without this catalog would have meant either inventing an assertion concept informally inside that record, or attaching collection state directly to a control in a way that cannot distinguish one control's several independent assertions from each other. This slice builds the catalog first, the same order the framework catalog (#54) preceded scoped control implementation (#56).
+
+`apps/api/src/webguard_api/technical_assertions.py`: `TechnicalAssertion`, `TechnicalAssertionError`, `AssertionOutcome`, `TECHNICAL_ASSERTION_REGISTRY`. Deliberately code-level, not database-backed, the same reasoning `soc_connectors.py`'s own `SOC_CONNECTOR_REGISTRY` and the scanner's `ACTIVE_DETECTOR_REGISTRY` already established: a real assertion inherently ships with its own collection/evaluation code, so it is fundamentally a code change, not a row an operator could add without a deploy, unlike `frameworks`/`master_controls` which are genuinely data an operator might load independent of any code change. `AssertionOutcome` is handoff section 10.2's own four-value "Assertion" status dimension (satisfied, violated, indeterminate, not tested) as one shared vocabulary, not a per-assertion custom set.
+
+Every assertion's `source_connector_id` and `required_permissions` are cross-checked in `TechnicalAssertion.__post_init__` against `SOC_CONNECTOR_REGISTRY` (soc_connectors.py): an assertion referencing an unregistered connector, or a permission that connector's own manifest does not declare, fails construction immediately, an enforced invariant proven by two tests that attempt exactly those violations, mirroring `ConnectorManifest`'s own endpoint-permission consistency proof.
+
+Seeded five assertions: three Entra-sourced (privileged directory role inventory, Conditional Access policy mode and exclusions, stale privileged account activity) and, once this branch was rebased onto Sentinel's own now-merged connector manifest (#57), two Sentinel-sourced (data connector health, analytics rule enablement), each a named family from handoff section 10.3. This worktree originally branched before #57 merged and would have shipped Entra-only; the rebase closed that gap in the same PR rather than leaving a known, immediately closable one open.
+
+Deliberately not modeled in this v1 catalog, matching handoff section 10.3's own full field list only partially (the same "ship the real subset, name the rest" discipline the framework catalog's own module docstring already established): applicable-population definition, input schema, the assertion logic itself, per-assertion output states, cadence, freshness budget, fixtures, owner, and framework-control mappings (section 10.1's own explicit split between "assertions/tests" and "mappings," a separate, later, reviewed relationship, never assumed here).
+
+**Proven**: `test_technical_assertions.py` (7/7: registry key consistency, every assertion's connector and permissions are real, unknown-connector and undeclared-permission construction both fail closed, `AssertionOutcome`'s four values match the handoff's own table exactly, and the stale-account assertion's two-permission requirement is not understated). No network call, no schema change; nothing here needed real disposable Postgres.
+
+Remaining Compliance work, not started: the tenant-scoped record of one organization's own collection attempt and outcome against one of these assertions (the actual "collection" and "assertion" status dimensions, now that this catalog exists to anchor them), the other five status dimensions (test execution, control assessment, treatment, assurance review) and the assertion/evidence records they govern, Defender-XDR-sourced assertions once a useful signal is identified, loading any framework's real legally-reviewed control content (blocked pending legal-text verification), and the governance/privacy/vendor/audit workflows (handoff §10.4).
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
