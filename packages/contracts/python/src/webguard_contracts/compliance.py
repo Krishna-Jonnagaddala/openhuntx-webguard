@@ -13,9 +13,12 @@ that is a deliberate, reviewed decision, not an oversight.
 
 A scoped, per-organization "how is this specific tenant doing against
 this control" record (implementation, assertion, evidence) is a
-distinct, tenant-scoped concept, explicitly not built in this slice
-(handoff section 10.1's own "scoped implementations" versus this
-module's plain "master controls").
+distinct, tenant-scoped concept (handoff section 10.1's own "scoped
+implementations" versus this module's plain "master controls").
+Applicability, the first of section 10.2's status dimensions, is now
+built: see ``compliance_scope.ScopedControlImplementation``. The
+remaining dimensions (collection, test execution, assertion, control
+assessment, treatment, assurance review) are still not built.
 
 FrameworkStatus.PLACEHOLDER exists because this platform ships no
 framework's real legally-reviewed content yet (docs/PLATFORM_SCOPE.md's

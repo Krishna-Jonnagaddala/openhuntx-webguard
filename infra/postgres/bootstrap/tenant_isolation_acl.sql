@@ -201,6 +201,13 @@ GRANT SELECT, INSERT, UPDATE ON module_entitlements TO api_tenant_data;
 -- established, so no INSERT/UPDATE is granted to any role here.
 GRANT SELECT ON frameworks TO api_tenant_data;
 GRANT SELECT ON master_controls TO api_tenant_data;
+-- scoped_control_implementations (platform expansion, handoff section
+-- 10.1-10.2): unlike frameworks/master_controls, this genuinely is
+-- tenant data (organization_id present), an organization's own
+-- applicability decision against the shared catalog. Same api-serve-
+-- process-only shape as module_entitlements: every write is a human
+-- decision made through the API, no worker/scheduler path touches it.
+GRANT SELECT, INSERT, UPDATE ON scoped_control_implementations TO api_tenant_data;
 
 -- worker_tenant_data ------------------------------------------------------
 

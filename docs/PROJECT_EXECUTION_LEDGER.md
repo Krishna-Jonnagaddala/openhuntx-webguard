@@ -7,7 +7,7 @@ Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCK
 ## Canonical baseline
 
 ```
-Commit: a73fe88 (feat(compliance): add framework/master-control catalog, Compliance's first slice, #54)
+Commit: 9c83552 (feat(soc): add Microsoft Defender XDR connector manifest, SOC's second connector, #55)
 Verified: 2026-09-14, by direct git fetch + rev-parse, not trusted from a prior report.
 origin/main == this commit: YES, immediately before this ledger entry's own PR branched from it.
 Open P1 total: 4 (P1-2, P1-8, P1-9, P1-12-R1), verified against
@@ -710,6 +710,24 @@ Also documented as first-class limitations: `alerts_v2` and `incidents` overlap 
 `docs/CONNECTOR_CAPABILITIES.md`'s Defender XDR row moved from `not_started` to `contract_designed`, with the verified permission list and every limitation above recorded there too.
 
 Remaining SOC connector work, not started: the Sentinel manifest (Log Analytics / Azure Resource Manager REST, not Graph, so it needs its own permission model from scratch rather than reuse of this module's Graph-shaped endpoint validation), the actual live HTTP client for any connector (blocked on real Microsoft tenant credentials for all three), fixtures for failure-mode testing (source silence, connector outage, parse rejection, clock skew, collection lag, missing fields, query failure per handoff §9.1), the schema extension needed to represent a connector spanning more than one API family/OAuth resource (blocking Defender XDR's device inventory and likely all of Sentinel), and the tenant-scoped connector-instance table once a live client exists to populate it.
+
+## Platform expansion: Compliance's second slice, scoped control implementation (2026-09-14)
+
+First tenant-scoped Compliance record, building on the framework/master-control catalog (#54): `webguard_contracts.compliance_scope.ScopedControlImplementation`, one organization's own applicability decision against one master control, the first of handoff section 10.2's seven orthogonal status dimensions (applicability, collection, test execution, assertion, control assessment, treatment, assurance review) to actually be built. It answers exactly one question, does this control apply to this organization, not whether the organization satisfies it; the other six dimensions and the assertion/evidence layer they support remain not built.
+
+`ApplicabilityStatus` has three values, not a boolean, mirroring the handoff's own table exactly: `UNRESOLVED` (nobody has made this call yet, carries no rationale or deciding principal, because there is no decision to attribute one to), `APPLICABLE` and `NOT_APPLICABLE_WITH_RATIONALE` (both represent a real human decision per section 10.1's "reviewer-approved inclusion/exclusion" and section 10.4's "risk acceptance is an authorised human decision," so both require a deciding principal and a decision timestamp; the latter additionally requires the rationale text itself). All three constraints are enforced in the dataclass's own `__post_init__`, not left to documentation, and 9/9 new contract tests (`test_compliance_scope_contract.py`) exercise every transition, including the two that must fail.
+
+Migration `0016` deliberately does not store `framework_id` on `scoped_control_implementations`, unlike an earlier draft considered while designing this table: `control_id` already determines its framework via `master_controls`' own foreign key, and a second, independently written copy of that fact could silently disagree with the catalog it depends on. `postgres_compliance_scope.py`'s repository always derives `framework_id` by joining to `master_controls`, so a read can never be inconsistent with the catalog. Two CHECK constraints on the table itself mirror the contract's own `__post_init__` rules (`unresolved` rows must carry no decision, `not_applicable_with_rationale` rows must carry a rationale), so the invariant holds even against a write that bypasses the Python contract entirely.
+
+This is genuinely tenant data (`organization_id` present, unlike the catalog it references), so both reads and writes run under `api_tenant_data` via `tenant_connection`, the same shape `module_entitlements` already established for an API-serve-process-only concern with no worker/scheduler path. Unlike module entitlements, this slice ships Postgres-only, no in-memory backend: every row is a real foreign-key child of `master_controls`, and an in-memory backend faithful to that relationship would need to duplicate the framework catalog in memory or accept silent drift from it. Deferred rather than built on a shaky foundation, an explicit scope decision recorded here and in the repository's own module docstring, not a silent omission.
+
+`list_applicability_for_framework` returns only controls this organization has actually recorded a decision for, never a synthesized default for every control the framework defines. A missing row means this control has never been brought into scope at all, a fact distinct from an explicit `unresolved` decision; collapsing the two would misrepresent the organization's real review coverage, exactly the denominator-honesty rule section 10.2 states directly ("Expose denominators... Neither may be displayed as '117 protected'").
+
+**Proven against real disposable Postgres**: `test_scoped_control_implementation_repository_contract.py` (6/6: an unrecorded control fails closed, an unresolved decision round-trips, a decision can be revised from unresolved to not-applicable-with-rationale, listing excludes never-scoped controls, listing is scoped per organization, and a control_id with no matching catalog row fails on the table's own foreign key). Full contract suite (90/90, up from 84). Full Postgres integration regression sequence, both production E2E files clean. Full local unit suite (1815/1815, up from 1806). Security gates clean.
+
+`docs/PRODUCT_VISION_TRACEABILITY.md`'s Compliance line moved from `NOT_STARTED` to `IN_PROGRESS`, correcting a second staleness in the same paragraph: the SOC line there had also gone stale after PRs #53/#55 and is corrected in this same pass rather than left for a future session to rediscover.
+
+Remaining Compliance work, not started: the other six status dimensions (collection, test execution, assertion, control assessment, treatment, assurance review) and the assertion/evidence records they govern, loading any framework's real legally-reviewed control content (blocked pending legal-text verification), the ~40-60 initial technical assertion catalogue (handoff §10.3), and the governance/privacy/vendor/audit workflows (handoff §10.4).
 
 ## Milestone history (reconstructed from Git + tracker, not fabricated)
 
