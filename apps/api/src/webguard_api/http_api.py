@@ -43,6 +43,7 @@ _SCAN_PATH = re.compile(r"^/v1/scans/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 _ASSET_PATH = re.compile(r"^/v1/assets/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _ASSET_VERIFICATION_START_PATH = re.compile(r"^/v1/assets/([0-9a-f-]{36})/verification$")
 _ASSET_VERIFICATION_CHECK_PATH = re.compile(r"^/v1/assets/([0-9a-f-]{36})/verification/check$")
+_ASSET_COVERAGE_PATH = re.compile(r"^/v1/assets/([0-9a-f-]{36})/coverage$")
 _TEAM_MEMBER_PATH = re.compile(r"^/v1/team/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _API_KEY_PATH = re.compile(r"^/v1/api-keys/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _PERMIT_REVOKE_PATH = re.compile(r"^/v1/permits/([0-9a-f-]{36})/revoke$")
@@ -879,6 +880,11 @@ def build_handler(
                     )
                     payload = service.list_scans(
                         context, page, request_id=request_id
+                    )
+                elif _ASSET_COVERAGE_PATH.fullmatch(path):
+                    page = self._page_request(query, filters={})
+                    payload = service.list_asset_coverage(
+                        context, _ASSET_COVERAGE_PATH.fullmatch(path).group(1), page, request_id=request_id
                     )
                 else:
                     self._require_empty_query(query)

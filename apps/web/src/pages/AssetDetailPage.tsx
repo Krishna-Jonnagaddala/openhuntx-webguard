@@ -7,9 +7,13 @@ import {
   LoadingState,
   PageHeader,
   StatusBadge,
+  Table,
+  Td,
+  Th,
 } from "../components/ui/primitives";
 import {
   useAsset,
+  useAssetCoverage,
   useCheckVerification,
   useIssuePermitAndSubmitJob,
   useStartVerification,
@@ -154,6 +158,101 @@ function StartScanPanel({ targetId }: { targetId: string }) {
   );
 }
 
+function CoveragePanel({ targetId }: { targetId: string }) {
+  const [cursorStack, setCursorStack] = useState<(string | undefined)[]>([undefined]);
+  const cursor = cursorStack[cursorStack.length - 1];
+  const { data, isLoading, error } = useAssetCoverage(targetId, cursor);
+
+  const counts = data?.status_counts;
+  const totalRecorded = counts ? counts.completed + counts.blocked + counts.unreachable : 0;
+
+  return (
+    <Card className="p-4 lg:col-span-2">
+      <h2 className="mb-2 text-sm font-semibold text-[var(--color-text-primary)]">Coverage</h2>
+      <p className="mb-3 text-xs text-[var(--color-text-tertiary)]">
+        Which URL/method/check combinations have actually been assessed, and what happened. Counts below are
+        what this asset has recorded so far, not a claim that everything possible was checked.
+      </p>
+      {isLoading ? (
+        <p className="text-sm text-[var(--color-text-secondary)]">Loading coverage…</p>
+      ) : error ? (
+        <p role="alert" className="text-sm text-[var(--color-danger)]">
+          {error instanceof ApiError ? error.message : "Unable to load coverage for this asset."}
+        </p>
+      ) : !data || totalRecorded === 0 ? (
+        <p className="text-sm text-[var(--color-text-secondary)]">
+          No coverage recorded for this asset yet. This means no scan has completed against it while coverage
+          tracking was active, not that it has been assessed and found clean.
+        </p>
+      ) : (
+        <div>
+          <ul className="mb-3 flex flex-wrap gap-4 text-sm text-[var(--color-text-secondary)]">
+            <li>
+              <span className="font-medium text-[var(--color-text-primary)]">{totalRecorded}</span> recorded
+            </li>
+            <li>
+              <span className="font-medium text-[var(--color-text-primary)]">{counts!.completed}</span> completed
+            </li>
+            <li>
+              <span className="font-medium text-[var(--color-text-primary)]">{counts!.blocked}</span> blocked
+            </li>
+            <li>
+              <span className="font-medium text-[var(--color-text-primary)]">{counts!.unreachable}</span> unreachable
+            </li>
+          </ul>
+          <Table>
+            <thead>
+              <tr>
+                <Th>Path</Th>
+                <Th>Method</Th>
+                <Th>Check</Th>
+                <Th>Identity</Th>
+                <Th>Status</Th>
+                <Th>Last observed</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.coverage.map((row) => (
+                <tr key={`${row.path}|${row.http_method}|${row.identity_label}|${row.check_id}`}>
+                  <Td className="font-mono text-xs">{row.path}</Td>
+                  <Td>{row.http_method}</Td>
+                  <Td>{row.check_id}</Td>
+                  <Td>{row.identity_label}</Td>
+                  <Td>
+                    <StatusBadge status={row.status} />
+                  </Td>
+                  <Td>{new Date(row.last_observed_at).toLocaleString()}</Td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+          <div className="mt-3 flex items-center justify-between">
+            <Button
+              variant="secondary"
+              disabled={cursorStack.length <= 1}
+              onClick={() => setCursorStack((stack) => stack.slice(0, -1))}
+            >
+              Previous
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={!data.page.next_cursor}
+              onClick={() => setCursorStack((stack) => [...stack, data.page.next_cursor ?? undefined])}
+            >
+              Next
+            </Button>
+          </div>
+          <p className="mt-3 text-xs text-[var(--color-text-tertiary)]">
+            Identity tracked today: <span className="font-medium">unauthenticated</span> only — authenticated-scan
+            coverage is not yet attributed to a specific identity. Not yet tracked at all:{" "}
+            {data.not_populated_states.join(", ")}.
+          </p>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 export function AssetDetailPage() {
   const { targetId } = useParams<{ targetId: string }>();
   const { data: asset, isLoading, error } = useAsset(targetId);
@@ -199,6 +298,7 @@ export function AssetDetailPage() {
             View findings for this asset →
           </Link>
         </Card>
+        <CoveragePanel targetId={asset.target_id} />
       </div>
     </div>
   );

@@ -76,7 +76,12 @@ from .authorization_comparison import (
 )
 from .callback_service import CallbackRepository, CallbackServiceError
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
-from .coverage_store import CoverageStatus, UNAUTHENTICATED_IDENTITY_LABEL, split_asset_and_path
+from .coverage_store import (
+    CoverageStatus,
+    InMemoryCoverageRepository,
+    UNAUTHENTICATED_IDENTITY_LABEL,
+    split_asset_and_path,
+)
 from .finding_store import InMemoryFindingRepository
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .safety import TrustScanRuntimeSafetyEngine, TrustScanRuntimeSafetyError
@@ -1030,16 +1035,18 @@ class ScanJobExecutor:
         self.finding_repository = (
             finding_repository if finding_repository is not None else InMemoryFindingRepository()
         )
-        # Coverage Truth Map v1 (product vision pillar 5): unlike
-        # scan_repository/finding_repository, there is no in-memory
-        # equivalent to default to. This is genuinely new, additive
-        # tracking with no pre-existing local/test behavior to
-        # preserve, so None means "don't populate coverage" rather
-        # than falling back to a throwaway backend nothing consumes.
-        # Production wiring passes PostgresCoverageRepository
-        # explicitly; every pre-existing constructor call site
-        # (real, all of them) is unaffected.
-        self.coverage_repository = coverage_repository
+        # Coverage Truth Map v1 (product vision pillar 5). Phase 4 (an
+        # API/report surface) added InMemoryCoverageRepository, so this
+        # now follows the identical optional/defaulted pattern
+        # scan_repository/finding_repository already use, rather than
+        # leaving coverage un-populated in local/lab mode: a caller
+        # that never explicitly disabled coverage tracking now gets it
+        # for free, the same way it already gets scan/finding tracking
+        # for free. Production wiring still passes
+        # PostgresCoverageRepository explicitly.
+        self.coverage_repository = (
+            coverage_repository if coverage_repository is not None else InMemoryCoverageRepository()
+        )
         # Slice 14 requirement 1: secret resolution goes through one
         # provider-neutral interface, mirroring TrustScanSigner/
         # SigningProvider (signing.py). Defaulted to a local adapter

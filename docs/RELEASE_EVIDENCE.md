@@ -12,6 +12,7 @@ This file tracks capability-level release evidence. Requirement-level status (wh
 | Phase A-H tenant-isolation runtime conversion | `integration_tested` | PRs #30-47, proven against real disposable Postgres and CI's own fresh Postgres job |
 | RLS+FORCE enforcement | `designed` | Policies defined (`infra/postgres/bootstrap/tenant_isolation_rls_policies.sql`), never enabled; P1-2 stays open on this basis |
 | Coverage Truth Map v1 | `integration_tested` | PRs #49-50, real end-to-end production-pipeline assertion in `test_production_mode_e2e.py` |
+| Coverage Truth Map v1 read API (`GET /v1/assets/{id}/coverage`) | `integration_tested` | Phase 4, 2026-09-15: tenant-scoped, paginated, HTTP-level unit tests plus a real disposable-Postgres contract suite; rendered on the existing `AssetDetailPage.tsx` |
 
 ## SOC
 
@@ -23,7 +24,9 @@ This file tracks capability-level release evidence. Requirement-level status (wh
 
 | Capability | State | Evidence |
 |---|---|---|
-| Everything in section 10 of the handoff | `proposed` | No design or code exists yet beyond this repository-evidence scaffold |
+| Framework/master-control catalog, scoped control implementation (applicability), technical assertion catalog | `integration_tested` | PRs #54/#56/#58, proven against real disposable Postgres. This row was stale ("everything proposed") until 2026-09-15's reconciliation; see the OpenHuntX Scope & Progress Audit, 2026-09-14 |
+| Technical assertion collection and evaluation (`assertion_collections.py`, first executed assertion `entra_conditional_access_policy_mode`) | `locally_tested` | Phase 5, 2026-09-15: fixture- and manually-supplied evidence paths, tenant-scoped, real disposable-Postgres contract suite (5 tests) plus pure evaluation-logic unit tests (11 tests). No live vendor connector: evidence is always labeled `fixture` or `manual`, never presented as a live read. No service/HTTP/CLI surface yet, matching this stage's own established Compliance pattern |
+| Everything else in section 10 of the handoff | `proposed` | Not designed or built |
 
 ## Platform-shared
 

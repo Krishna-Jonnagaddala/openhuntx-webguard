@@ -739,4 +739,20 @@ CREATE POLICY "wg_identity_owner_password_credentials_select" ON public.password
     FOR SELECT TO identity_function_owner
     USING (true);
 
+
+-- technical_assertion_collections (migration 0017, platform ---------
+-- expansion, Phase 5 of the 2026-09-14 scope audit): direct
+-- organization_id, api-serve-process-only per tenant_isolation_acl.sql's
+-- own comment (SELECT/INSERT only, no UPDATE: a collection attempt is
+-- immutable once written).
+DROP POLICY IF EXISTS "wg_api_technical_assertion_collections_select" ON public.technical_assertion_collections;
+CREATE POLICY "wg_api_technical_assertion_collections_select" ON public.technical_assertion_collections
+    FOR SELECT TO api_tenant_data
+    USING (organization_id = public.webguard_current_tenant());
+
+DROP POLICY IF EXISTS "wg_api_technical_assertion_collections_insert" ON public.technical_assertion_collections;
+CREATE POLICY "wg_api_technical_assertion_collections_insert" ON public.technical_assertion_collections
+    FOR INSERT TO api_tenant_data
+    WITH CHECK (organization_id = public.webguard_current_tenant());
+
 COMMIT;

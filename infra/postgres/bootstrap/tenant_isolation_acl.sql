@@ -208,6 +208,16 @@ GRANT SELECT ON master_controls TO api_tenant_data;
 -- process-only shape as module_entitlements: every write is a human
 -- decision made through the API, no worker/scheduler path touches it.
 GRANT SELECT, INSERT, UPDATE ON scoped_control_implementations TO api_tenant_data;
+-- technical_assertion_collections (platform expansion, handoff
+-- section 10.2, Phase 5 of the 2026-09-14 scope audit): same
+-- api-serve-process-only shape as scoped_control_implementations
+-- above (no worker/scheduler path collects or evaluates an
+-- assertion; that happens synchronously inside one API request in
+-- this version). No UPDATE: a collection attempt is an immutable
+-- historical record once written, the same append-only reasoning
+-- finding_events already established; a wrong or stale collection
+-- gets superseded by a new attempt, never edited in place.
+GRANT SELECT, INSERT ON technical_assertion_collections TO api_tenant_data;
 
 -- worker_tenant_data ------------------------------------------------------
 
