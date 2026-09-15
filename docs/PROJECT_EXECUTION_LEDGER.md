@@ -37,6 +37,40 @@ Recorded here because it explains a real red `main` CI run that had
 nothing to do with the PR that triggered it (PR #20, doc-only), so a
 future session doesn't waste time re-diagnosing it.
 
+**Load-sensitive test race found, not fixed, 2026-09-15**:
+`tests/unit/test_cloudhsm_signing.py`'s
+`test_oversized_sign_payload_is_rejected` sends a ~133KB base64
+payload to the signing service's real local HTTP server and expects a
+clean `400`. `signing_service.py`'s `do_POST` checks `Content-Length`
+against `_MAXIMUM_MESSAGE_BYTES` and, if it is too large, responds and
+closes the connection *without ever reading the request body*
+(`self.rfile.read(length)` is only reached once the size check
+passes). The test's own client (`self.request`, a plain
+`http.client.HTTPConnection`) hands the full payload to a single
+`connection.request(...)` call, which blocks inside its own
+`sendall()` until the whole body is written. This is a real client/
+server race, not a logic bug in either side: whether the client
+finishes writing before the server's early close reaches it depends
+on how much of the payload the kernel has already buffered, which
+depends on system load. Standalone, this test passed 3/3 (isolated
+runs, empty socket/file-descriptor state); in a full `tests/unit`
+run it failed 3/3 (reproduced identically against `main` at `ac82ea3`
+and against two other branches' otherwise-unrelated content) with
+`ConnectionResetError: [Errno 54] Connection reset by peer` raised
+from inside `http.client`'s own `send()`, not from any assertion in
+the test. Not fixed here: this session's task was reconstructing two
+unrelated checkpoints' file history and verifying test counts, not
+signing-service test design, and a real fix (draining the body before
+closing on the server side, or having the client send in a way that
+tolerates an early close, e.g. via a raw socket with `SO_LINGER`
+handling) deserves its own PR with its own regression coverage rather
+than a drive-by patch bundled into an unrelated checkpoint. Recorded
+here, precisely, so a future red run of this one
+test in an otherwise-passing suite is recognized immediately instead
+of re-diagnosed from scratch, and is never silently re-run until green
+or ignored: the assertion is unchanged, the fragility is in the test's
+own transport pattern, not in the security property it verifies.
+
 ## Requirement rows
 
 | ID | Source | Intended behavior | Status | Code/contracts | Tests/evidence | Dependency | Milestone | Acceptance condition |
