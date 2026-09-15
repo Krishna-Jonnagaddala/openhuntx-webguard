@@ -151,15 +151,25 @@ export interface DashboardSummary {
   counts_capped_at: number;
 }
 
+export type VerificationMethod = "well_known_http" | "dns_txt";
+
 export interface AssetVerification {
   verification_id: string;
   target_id: string;
-  method: "well_known_http";
+  method: VerificationMethod;
   status: "pending" | "verified" | "failed" | "expired";
   checked_at: string;
   evidence: string | null;
   expires_at?: string;
-  instructions?: { path: string; expected_content: string };
+  instructions?:
+    | { path: string; expected_content: string }
+    | { record_type: string; record_prefix: string; expected_content: string };
+  // Present only on the response to a check that neither matched nor
+  // expired: the verification itself stays pending (same value, same
+  // deadline) and this reports the attempt's own outcome without
+  // being persisted, so "check again" never requires a new value.
+  last_check_detail?: string;
+  last_checked_at?: string;
 }
 
 export interface AssetAuthorization {
@@ -366,7 +376,8 @@ export const assetsApi = {
     api.post<AssetRecord>("/v1/assets", body),
   update: (id: string, body: { label?: string | null; default_mode?: string | null }) =>
     api.patch<AssetRecord>(`/v1/assets/${id}`, body),
-  startVerification: (id: string) => api.postNoBody<AssetVerification>(`/v1/assets/${id}/verification`),
+  startVerification: (id: string, method: VerificationMethod) =>
+    api.post<AssetVerification>(`/v1/assets/${id}/verification`, { method }),
   checkVerification: (id: string) =>
     api.postNoBody<AssetVerification>(`/v1/assets/${id}/verification/check`),
 };

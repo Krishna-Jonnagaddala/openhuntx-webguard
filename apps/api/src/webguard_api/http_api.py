@@ -1105,15 +1105,19 @@ def build_handler(
                     return
                 asset_verification_start_match = _ASSET_VERIFICATION_START_PATH.fullmatch(path)
                 if asset_verification_start_match:
-                    lengths = self.headers.get_all("Content-Length") or []
-                    if lengths and any(value != "0" for value in lengths):
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
                         raise ApiTransportError(
-                            "asset_verification_body_not_allowed",
-                            "Verification-start requests cannot contain a body.",
-                            status=400,
+                            "asset_verification_body_invalid", "Request body must be valid JSON.", status=400
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "asset_verification_body_invalid", "Request body must be a JSON object.", status=400
                         )
                     payload = service.start_asset_verification(
-                        context, asset_verification_start_match.group(1), request_id=request_id
+                        context, asset_verification_start_match.group(1), body, request_id=request_id
                     )
                     self._send_json(
                         201, payload, request_id=request_id, extra_headers=self._rate_headers(decision)

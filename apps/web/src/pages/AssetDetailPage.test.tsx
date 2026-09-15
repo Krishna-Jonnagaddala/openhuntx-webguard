@@ -16,7 +16,7 @@ vi.mock("react-router-dom", async () => {
 vi.mock("../hooks/queries", () => ({
   useAsset: () => useAssetMock(),
   useStartVerification: () => ({ mutate: vi.fn(), isPending: false }),
-  useCheckVerification: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCheckVerification: () => ({ mutate: vi.fn(), isPending: false, isError: false, reset: vi.fn(), data: undefined }),
   useIssuePermitAndSubmitJob: () => ({ mutateAsync: submitMutateAsync, isPending: false, isError: false }),
 }));
 

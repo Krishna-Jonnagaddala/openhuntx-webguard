@@ -37,6 +37,7 @@ from .config import (
 )
 from .environment import Environment
 from .executor import ScanJobExecutor
+from .finding_store import InMemoryFindingRepository
 from .health_server import (
     DEFAULT_HEALTH_DB_TIMEOUT_SECONDS,
     HealthServer,
@@ -57,6 +58,7 @@ from .postgres_callback_service import PostgresCallbackRegistrationRepository
 from .postgres_pool import WebGuardPostgresPool
 from .rate_limit import FixedWindowRateLimiter
 from .permits import TrustScanSigner
+from .scan_store import InMemoryScanRepository
 from .scheduler import ScanScheduleCoordinator
 from .service import ApiServiceError, WebGuardJobService
 from .signing import LocalDevelopmentSigner, SigningKeyRegistry, SigningProviderError
@@ -167,6 +169,16 @@ def _components(config: ServiceConfig):
     # `--artifacts <anything else>` to `serve`/`run` would have made
     # every report download silently fail with `artifact_not_found`.
     artifact_store = LocalArtifactStore(config.artifact_directory)
+    # Same rationale as artifact_store just above: the executor writes a
+    # completed scan's record and any findings it produced, and the
+    # service reads both back for GET /v1/scans and GET /v1/findings.
+    # Each defaults independently to its own private in-memory
+    # repository if not given one explicitly, so leaving these unset
+    # here left every scan invisible on the Scans/Findings pages even
+    # though it ran and completed: the two in-memory stores just never
+    # agreed, the same way artifact_store didn't before that fix.
+    scan_repository = InMemoryScanRepository()
+    finding_repository = InMemoryFindingRepository()
     executor = ScanJobExecutor(
         authorizations=authorizations,
         store=store,
@@ -177,6 +189,8 @@ def _components(config: ServiceConfig):
             identity.authorization_is_assigned
         ),
         artifact_store=artifact_store,
+        scan_repository=scan_repository,
+        finding_repository=finding_repository,
     )
     web_app_base_url = os.environ.get("WEBGUARD_WEB_APP_BASE_URL", "http://127.0.0.1:5173")
     service = WebGuardJobService(
@@ -186,6 +200,8 @@ def _components(config: ServiceConfig):
         trustscan_signer=trustscan_signer,
         artifact_store=artifact_store,
         web_app_base_url=web_app_base_url,
+        scan_repository=scan_repository,
+        finding_repository=finding_repository,
     )
     worker = ScanJobWorker(
         store=store,

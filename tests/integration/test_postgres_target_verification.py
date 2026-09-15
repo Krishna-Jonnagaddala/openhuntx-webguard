@@ -86,7 +86,7 @@ class PostgresTargetVerificationTests(unittest.TestCase):
         from webguard_api.postgres_pool import WebGuardPostgresPool
         from webguard_api.postgres_targets import PostgresTargetRepository
         from webguard_api.postgres_target_verification import PostgresTargetVerificationRepository
-        from webguard_api.target_verification import VerificationMethod
+        from webguard_api.target_verification import VerificationMethod, VerificationStatus
 
         self.pool = WebGuardPostgresPool(POSTGRES_TEST_DSN, minimum_connections=2, maximum_connections=5)
         self.addCleanup(self.pool.close)
@@ -126,13 +126,15 @@ class PostgresTargetVerificationTests(unittest.TestCase):
         self.assertEqual(current.expected_token, initiated.expected_token)
 
     def test_get_current_never_exposes_the_token_once_a_check_has_run(self) -> None:
+        from webguard_api.target_verification import VerificationStatus
+
         now = datetime.now(timezone.utc)
         initiated = self.verifications.initiate(
             self.target_id, organization_id=self.organization_id, method=self.method, now=now,
         )
         self.verifications.record_result(
             initiated.verification_id, organization_id=self.organization_id,
-            matched=False, detail="token-mismatch", now=now,
+            status=VerificationStatus.FAILED, detail="token-mismatch", now=now,
         )
         current = self.verifications.get_current(self.target_id, organization_id=self.organization_id)
         self.assertIsNotNone(current)

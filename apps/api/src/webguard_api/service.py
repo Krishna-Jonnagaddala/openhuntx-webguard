@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Callable
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from webguard_contracts import (
@@ -55,7 +56,13 @@ from .passwords import PasswordPolicyError, hash_password, needs_rehash, validat
 from .rate_limit import RateLimitError
 from .report_store import ReportStoreError
 from .scan_store import ScanStoreError
-from .target_verification import TargetVerificationError, VerificationMethod, check_well_known_token
+from .target_verification import (
+    TargetVerificationError,
+    VerificationMethod,
+    VerificationStatus,
+    check_dns_txt_token,
+    check_well_known_token,
+)
 from .targets import TargetRepositoryError
 from .pagination import PageRequest, PaginationError, SignedCursorCodec
 from .permits import (
@@ -72,6 +79,26 @@ from .structured_logging import log_event
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _canonicalize_asset_url(url: str) -> str:
+    """Normalize an empty path to "/" (so "https://x.example" and
+    "https://x.example/" store identically) without imposing the
+    stricter owned-target authorization contract (HTTPS-only, no
+    query/fragment). _find_authorization_for_asset joins assets to
+    authorizations by exact URL match, and authorization documents
+    are always canonicalized this way by
+    webguard_contracts.canonicalize_owned_target_url, so an asset
+    stored exactly as typed would otherwise never match. Anything
+    stricter than this would break the local well-known-verification
+    test fixtures, which legitimately use plain-HTTP loopback URLs.
+    """
+
+    parsed = urlsplit(url)
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError("url must be an absolute URL with a scheme and hostname.")
+    path = parsed.path or "/"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
 
 
 def _active_checks_audit_detail(active_checks: tuple[str, ...]) -> str | None:
@@ -2625,6 +2652,7 @@ class WebGuardJobService:
     # -- Assets (Slice 15 requirement 2) --------------------------------
 
     _ASSET_MODES = frozenset({"single_page", "crawl"})
+    _VERIFICATION_METHODS = frozenset(method.value for method in VerificationMethod)
 
     def _find_authorization_for_asset(self, organization_id: str, url: str):
         """Targets and authorizations are deliberately separate entities
@@ -2724,8 +2752,16 @@ class WebGuardJobService:
                 status=400,
             )
         try:
+            canonical_url = _canonicalize_asset_url(body["url"].strip())
+        except ValueError as exc:
+            self._audit(
+                context, request_id=request_id, action="assets.create", resource_type="target",
+                resource_id="pending", outcome=AuditOutcome.DENIED, detail_code="asset_url_invalid",
+            )
+            raise ApiServiceError("asset_url_invalid", str(exc), status=400) from exc
+        try:
             record = self.targets.create_target(
-                context.organization_id, body["url"].strip(), created_by=context.principal_id,
+                context.organization_id, canonical_url, created_by=context.principal_id,
                 now=self.clock(), label=label, default_mode=default_mode,
             )
         except TargetRepositoryError as exc:
@@ -2823,22 +2859,33 @@ class WebGuardJobService:
         )
         return self._asset_public_dict(context, record, detailed=True)
 
-    def start_asset_verification(self, context: AuthContext, target_id: str, *, request_id: str) -> dict:
+    def start_asset_verification(self, context: AuthContext, target_id: str, body: dict, *, request_id: str) -> dict:
         """Requirement 3: server-generated token only -- the frontend
         never marks an asset verified; it only ever displays what this
-        returns and later asks for a check."""
+        returns and later asks for a check. The caller chooses which
+        method to attempt (``well_known_http`` or ``dns_txt``, see
+        ``target_verification.py``'s own module docstring for why both
+        exist): a domain fronted by a host with no file-publishing
+        surface has no way to complete the first, and needs the
+        second."""
 
         self._require(
             context, ApiPermission.ASSET_MANAGE, request_id=request_id,
             action="assets.verification.start", resource_type="target", resource_id=target_id,
         )
+        if not isinstance(body, dict) or body.get("method") not in self._VERIFICATION_METHODS:
+            raise ApiServiceError(
+                "asset_verification_method_invalid",
+                f"method must be one of: {', '.join(sorted(self._VERIFICATION_METHODS))}.",
+                status=400,
+            )
         try:
             self.targets.get_target(target_id, organization_id=context.organization_id)
         except TargetRepositoryError as exc:
             raise ApiServiceError(exc.code, exc.message, status=404) from exc
         record = self.target_verifications.initiate(
             target_id, organization_id=context.organization_id,
-            method=VerificationMethod.WELL_KNOWN_HTTP, now=self.clock(),
+            method=VerificationMethod(body["method"]), now=self.clock(),
         )
         self._audit(
             context, request_id=request_id, action="assets.verification.start", resource_type="target",
@@ -2848,8 +2895,20 @@ class WebGuardJobService:
 
     def check_asset_verification(self, context: AuthContext, target_id: str, *, request_id: str) -> dict:
         """The only path that can ever set ``status=verified`` -- by
-        performing the real, server-side fetch itself (requirement 3:
-        verification state must come from server-side validation)."""
+        performing the real, server-side check itself (requirement 3:
+        verification state must come from server-side validation).
+
+        A check that neither matches nor has expired is a retryable,
+        informational outcome, not a terminal one: DNS propagation and
+        CDN cache warm-up routinely take minutes to hours, and a real
+        customer publishing the right value should never be forced to
+        throw it away and publish a brand new one just because the
+        first check ran before it had spread. Only a genuine match
+        (``verified``) or the token's own 24-hour expiry
+        (``expired``) changes the stored status; anything else leaves
+        the pending verification, and its own still-valid token,
+        completely untouched, and reports the attempt's own detail
+        back to the caller without persisting it."""
 
         self._require(
             context, ApiPermission.ASSET_MANAGE, request_id=request_id,
@@ -2868,26 +2927,45 @@ class WebGuardJobService:
             )
         now = self.clock()
         if current.expires_at is not None and now >= current.expires_at:
-            matched, detail = False, "verification_token_expired"
+            record = self.target_verifications.record_result(
+                current.verification_id, organization_id=context.organization_id,
+                status=VerificationStatus.EXPIRED, detail="verification_token_expired", now=now,
+            )
+            self._audit(
+                context, request_id=request_id, action="assets.verification.check", resource_type="target",
+                resource_id=target_id, outcome=AuditOutcome.FAILED, detail_code="verification_token_expired",
+            )
+            return record.to_public_dict()
+        try:
+            token = self.target_verifications.get_pending_token(
+                current.verification_id, organization_id=context.organization_id
+            )
+        except TargetVerificationError as exc:
+            raise ApiServiceError(exc.code, exc.message, status=409) from exc
+        if current.method is VerificationMethod.DNS_TXT:
+            matched, detail = check_dns_txt_token(target.url, token)
         else:
-            try:
-                token = self.target_verifications.get_pending_token(
-                    current.verification_id, organization_id=context.organization_id
-                )
-            except TargetVerificationError as exc:
-                raise ApiServiceError(exc.code, exc.message, status=409) from exc
             matched, detail = check_well_known_token(target.url, token)
-        record = self.target_verifications.record_result(
-            current.verification_id, organization_id=context.organization_id,
-            matched=matched, detail=detail, now=now,
-        )
+        if matched:
+            record = self.target_verifications.record_result(
+                current.verification_id, organization_id=context.organization_id,
+                status=VerificationStatus.VERIFIED, detail=detail, now=now,
+            )
+            self._audit(
+                context, request_id=request_id, action="assets.verification.check", resource_type="target",
+                resource_id=target_id, outcome=AuditOutcome.SUCCEEDED, detail_code=detail,
+            )
+            return record.to_public_dict()
         self._audit(
             context, request_id=request_id, action="assets.verification.check", resource_type="target",
-            resource_id=target_id,
-            outcome=AuditOutcome.SUCCEEDED if matched else AuditOutcome.FAILED,
-            detail_code=detail,
+            resource_id=target_id, outcome=AuditOutcome.FAILED, detail_code=detail,
         )
-        return record.to_public_dict()
+        payload = current.to_public_dict()
+        payload["last_check_detail"] = detail
+        payload["last_checked_at"] = (
+            now.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        )
+        return payload
 
     # -- Dashboard (Slice 15 requirement 1) -----------------------------
 

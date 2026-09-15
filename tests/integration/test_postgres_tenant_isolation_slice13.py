@@ -509,7 +509,11 @@ class Slice13TenantIsolationTests(unittest.TestCase):
 
         from webguard_api.postgres_target_verification import PostgresTargetVerificationRepository
         from webguard_api.postgres_targets import PostgresTargetRepository
-        from webguard_api.target_verification import TargetVerificationError, VerificationMethod
+        from webguard_api.target_verification import (
+            TargetVerificationError,
+            VerificationMethod,
+            VerificationStatus,
+        )
 
         targets = PostgresTargetRepository(self.pool)
         verification = PostgresTargetVerificationRepository(self.pool)
@@ -540,7 +544,7 @@ class Slice13TenantIsolationTests(unittest.TestCase):
         with self.assertRaises(TargetVerificationError) as cross_record:
             verification.record_result(
                 initiated.verification_id, organization_id=self.org_b.organization_id,
-                matched=True, detail="cross-tenant-attempt", now=NOW,
+                status=VerificationStatus.VERIFIED, detail="cross-tenant-attempt", now=NOW,
             )
         self.assertEqual(cross_record.exception.code, "target_verification_not_found")
 
@@ -550,7 +554,7 @@ class Slice13TenantIsolationTests(unittest.TestCase):
 
         recorded = verification.record_result(
             initiated.verification_id, organization_id=self.org_a.organization_id,
-            matched=True, detail="own-org-verified", now=NOW,
+            status=VerificationStatus.VERIFIED, detail="own-org-verified", now=NOW,
         )
         self.assertEqual(recorded.status.value, "verified")
 
