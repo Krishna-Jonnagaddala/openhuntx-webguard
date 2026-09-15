@@ -50,8 +50,12 @@ FUNCTION_OWNER_ROLES = [
 ]
 ALL_BOOTSTRAP_ROLES = TENANT_DATA_ROLES + FUNCTION_OWNER_ROLES
 
-# All 27 tables in the schema (migrations 0001-0012).
-ALL_27_TABLES = [
+# All tables in the schema. Migrations 0001-0012 gave Phase G its
+# original 27; migrations 0013-0016 (platform expansion) added 5 more,
+# reconciled here 2026-09-15 per the OpenHuntX Scope & Progress Audit,
+# 2026-09-14, which found the three new tenant-owned tables among them
+# carried no policy at all.
+ALL_TABLES = [
     "organizations", "principals", "memberships", "api_tokens",
     "organization_authorizations", "security_audit_events",
     "targets", "target_verifications",
@@ -61,35 +65,41 @@ ALL_27_TABLES = [
     "authentication_contexts", "authorization_comparison_plans", "crawl_checkpoints",
     "finding_events", "password_credentials", "identity_tokens",
     "browser_sessions", "auth_rate_limit_events",
+    "coverage_records", "module_entitlements", "frameworks", "master_controls",
+    "scoped_control_implementations",
 ]
-assert len(ALL_27_TABLES) == 27
+assert len(ALL_TABLES) == 32
 
-# The one non-tenant-owned table: no organization_id column, used only
-# on pre-authentication routes, bucket_key never an organization id.
-GLOBAL_SYSTEM_TABLES = ["auth_rate_limit_events"]
+# Non-tenant-owned tables: auth_rate_limit_events has no
+# organization_id column and is used only on pre-authentication
+# routes; frameworks/master_controls (migration 0015) are global
+# reference data with no organization_id column at all, identical in
+# every tenant's view. None of the three can meaningfully carry a
+# tenant-equality policy.
+NON_TENANT_TABLES = ["auth_rate_limit_events", "frameworks", "master_controls"]
 
-# Tenant-owned = every table except the one global/system table above.
-# This is a claim about DATA OWNERSHIP, independent of whether any
-# role currently has an ACL grant on it (crawl_checkpoints is
-# tenant-owned -- it carries organization_id directly -- but has zero
-# current grantees, so it gets no policy below; that is a statement
-# about today's callers, not about who owns the data).
-TENANT_OWNED_TABLES = [t for t in ALL_27_TABLES if t not in GLOBAL_SYSTEM_TABLES]
-assert len(TENANT_OWNED_TABLES) == 26
+# Tenant-owned = every table except the non-tenant tables above. This
+# is a claim about DATA OWNERSHIP, independent of whether any role
+# currently has an ACL grant on it (crawl_checkpoints is tenant-owned,
+# carrying organization_id directly, but has zero current grantees, so
+# it gets no policy below; that is a statement about today's callers,
+# not about who owns the data).
+TENANT_OWNED_TABLES = [t for t in ALL_TABLES if t not in NON_TENANT_TABLES]
+assert len(TENANT_OWNED_TABLES) == 29
 
-# Tables a policy exists for today (25 of the 26 tenant-owned tables:
+# Tables a policy exists for today (28 of the 29 tenant-owned tables:
 # everything except crawl_checkpoints, which has zero ACL grantees on
 # any role -- Phase D's own precedent for a dormant table).
 ZERO_POLICY_TENANT_OWNED_TABLES = ["crawl_checkpoints"]
 RLS_MANAGED_TABLES = [t for t in TENANT_OWNED_TABLES if t not in ZERO_POLICY_TENANT_OWNED_TABLES]
-assert len(RLS_MANAGED_TABLES) == 25
+assert len(RLS_MANAGED_TABLES) == 28
 
 # Every table this suite will eventually enable+force RLS on inside
 # the disposable database, to prove future enforcement semantics --
 # this includes crawl_checkpoints (Section 2: proving default-deny
 # with zero policies), unlike RLS_MANAGED_TABLES above.
 FUTURE_RLS_TARGET_TABLES = TENANT_OWNED_TABLES
-assert len(FUTURE_RLS_TARGET_TABLES) == 26
+assert len(FUTURE_RLS_TARGET_TABLES) == 29
 
 # Expected (table, role, command) triples, mirroring the SQL file
 # exactly (same source classification as the generator that produced
@@ -190,6 +200,16 @@ EXPECTED_POLICIES = [
     ("password_credentials", "api_tenant_data", "INSERT", False),
     ("password_credentials", "api_tenant_data", "UPDATE", False),
     ("password_credentials", "identity_function_owner", "SELECT", True),
+    ("coverage_records", "api_tenant_data", "SELECT", False),
+    ("coverage_records", "worker_tenant_data", "SELECT", False),
+    ("coverage_records", "worker_tenant_data", "INSERT", False),
+    ("coverage_records", "worker_tenant_data", "UPDATE", False),
+    ("module_entitlements", "api_tenant_data", "SELECT", False),
+    ("module_entitlements", "api_tenant_data", "INSERT", False),
+    ("module_entitlements", "api_tenant_data", "UPDATE", False),
+    ("scoped_control_implementations", "api_tenant_data", "SELECT", False),
+    ("scoped_control_implementations", "api_tenant_data", "INSERT", False),
+    ("scoped_control_implementations", "api_tenant_data", "UPDATE", False),
 ]
 # P1-2 Phase-D correction (tenant_isolation_acl.sql): api_tenant_data
 # gained narrow column SELECT on both tables (identity_tokens:
@@ -200,7 +220,10 @@ EXPECTED_POLICIES = [
 # -- a DML dependency, not a new business-level read capability, since
 # the ACL still withholds table-level SELECT and every sensitive
 # column (password_hash, secret_hash) on both tables. 92 + 2 = 94.
-assert len(EXPECTED_POLICIES) == 94
+# 2026-09-15: +10 for coverage_records/module_entitlements/
+# scoped_control_implementations (see the classification update in
+# tenant_isolation_rls_policies.sql). 94 + 10 = 104.
+assert len(EXPECTED_POLICIES) == 104
 
 
 def _role_short(role: str) -> str:
@@ -287,7 +310,7 @@ class RLSPolicyMetadataTests(unittest.TestCase):
             ).fetchall()
 
         actual_by_name = {row[0]: row for row in rows}
-        self.assertEqual(len(rows), 94, f"expected exactly 94 policies, got {len(rows)}: {sorted(actual_by_name)}")
+        self.assertEqual(len(rows), 104, f"expected exactly 104 policies, got {len(rows)}: {sorted(actual_by_name)}")
 
         cmd_map = {"r": "SELECT", "a": "INSERT", "w": "UPDATE", "d": "DELETE", "*": "ALL"}
         expected_names = set()
@@ -415,7 +438,7 @@ class RLSPolicyMetadataTests(unittest.TestCase):
                     ).fetchone()[0]
                     self.assertFalse(has_priv, f"{role} must not have {priv} on crawl_checkpoints")
 
-    def test_production_rls_state_is_off_for_all_27_tables(self) -> None:
+    def test_production_rls_state_is_off_for_all_tables(self) -> None:
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -424,10 +447,10 @@ class RLSPolicyMetadataTests(unittest.TestCase):
                 WHERE relnamespace = 'public'::regnamespace AND relkind = 'r'
                   AND relname = ANY(%s)
                 """,
-                (ALL_27_TABLES,),
+                (ALL_TABLES,),
             ).fetchall()
         found = {row[0] for row in rows}
-        self.assertEqual(found, set(ALL_27_TABLES), "expected to find all 27 tables")
+        self.assertEqual(found, set(ALL_TABLES), f"expected to find all {len(ALL_TABLES)} tables")
         for relname, rowsecurity, forcerowsecurity in rows:
             self.assertFalse(rowsecurity, f"{relname}: relrowsecurity must be FALSE in the production bootstrap")
             self.assertFalse(forcerowsecurity, f"{relname}: relforcerowsecurity must be FALSE in the production bootstrap")
@@ -455,7 +478,7 @@ class RLSPolicyMetadataTests(unittest.TestCase):
             ).fetchall()
 
         self.assertEqual(before, after, "a second run of the policy bootstrap must leave policy metadata identical")
-        self.assertEqual(len(after), 94, "second run must not create duplicate or missing policies")
+        self.assertEqual(len(after), 104, "second run must not create duplicate or missing policies")
 
 
 @unittest.skipUnless(
@@ -813,6 +836,45 @@ class TwoTenantIsolationTests(unittest.TestCase):
                 "VALUES (%s, %s, %s, 'ref', %s)",
                 (fx["checkpoint_id"], org_id, fx["job_id"], now),
             )
+
+            # Platform expansion tables (migrations 0013/0014/0016),
+            # added to this fixture 2026-09-15 alongside their own new
+            # RLS policies. coverage_records/module_entitlements/
+            # scoped_control_implementations are tenant-owned, one row
+            # per tenant below; master_controls is global reference
+            # data (migration 0015), so the shared control row is
+            # inserted once, with ON CONFLICT DO NOTHING making the
+            # second call (tenant B's own _seed_tenant_fixture) a
+            # no-op rather than a duplicate-key failure.
+            connection.execute(
+                "INSERT INTO coverage_records (organization_id, asset, path, http_method, identity_label, "
+                "check_id, status, scanner_version, first_observed_at, last_observed_at) "
+                "VALUES (%s, 'https://example.com', '/', 'GET', 'unauthenticated', 'header_analyzer', "
+                "'completed', 'v1', %s, %s)",
+                (org_id, now, now),
+            )
+
+            connection.execute(
+                "INSERT INTO module_entitlements (organization_id, module, status, updated_at) "
+                "VALUES (%s, 'webguard', 'enabled', %s)",
+                (org_id, now),
+            )
+
+            connection.execute(
+                "INSERT INTO master_controls (control_id, framework_id, control_number, title, created_at, "
+                "updated_at) VALUES ('test-control', 'soc2', 'TEST-1', 'Test control', %s, %s), "
+                "('test-control-2', 'soc2', 'TEST-2', 'Second test control', %s, %s) "
+                "ON CONFLICT (control_id) DO NOTHING",
+                (now, now, now, now),
+            )
+            fx["control_id"] = "test-control"
+            fx["spare_control_id"] = "test-control-2"
+            connection.execute(
+                "INSERT INTO scoped_control_implementations (organization_id, control_id, applicability_status, "
+                "decided_by, decided_at, created_at, updated_at) "
+                "VALUES (%s, %s, 'applicable', %s, %s, %s, %s)",
+                (org_id, fx["control_id"], fx["principal_id"], now, now, now),
+            )
         return fx
 
     @classmethod
@@ -841,6 +903,55 @@ class TwoTenantIsolationTests(unittest.TestCase):
             "worker_tenant_data": self._worker_dsn,
             "scheduler_tenant_data": self._scheduler_dsn,
         }[role]
+
+    # -- Threat-model precision: self-set GUC bypass ------------------------
+
+    def test_a_tenant_scoped_role_can_read_another_tenants_row_by_resetting_its_own_guc(self) -> None:
+        """The GUC RLS reads (`webguard.current_organization_id`) is a
+        plain, unprivileged Postgres session variable: any role that
+        can execute `SELECT set_config(...)`, which is every role by
+        default with no special grant, can set it to any value,
+        including a different tenant's real organization_id. This
+        proves RLS+FORCE, exactly as bootstrapped in production, does
+        not stop a caller who can run arbitrary SQL as an
+        already-connected api_tenant_data/worker_tenant_data/
+        scheduler_tenant_data credential: such a caller simply resets
+        the GUC itself and RLS honors the new value as legitimate,
+        because RLS has no way to distinguish "the application's own
+        `tenant_connection()` set this" from "the connected session set
+        this directly." RLS here defends against an application bug
+        that omits a tenant predicate while still correctly
+        establishing context; it does not defend against a compromised
+        or malicious holder of a runtime tenant-data credential, who
+        has this same `set_config` capability the application itself
+        relies on. See docs/PROJECT_EXECUTION_LEDGER.md's P1-2 row and
+        infra/postgres/bootstrap/tenant_isolation_rls_policies.sql's
+        own THREAT MODEL comment, which already states this; this test
+        is the missing proof of it against a real, FORCE-RLS-enabled
+        database, not merely a documentation claim."""
+
+        with self._connect(self._api_dsn) as connection:
+            self._set_tenant(connection, self.ORG_A)
+            legitimate = connection.execute(
+                "SELECT organization_id FROM principals WHERE principal_id = %s",
+                (self.FIXTURE["A"]["principal_id"],),
+            ).fetchone()
+            self.assertEqual(str(legitimate[0]), self.ORG_A)
+
+            # No privilege escalation, no new role, no BYPASSRLS: the
+            # exact same statement set_tenant_context() itself issues,
+            # run again on the same already-open connection.
+            self._set_tenant(connection, self.ORG_B)
+            leaked = connection.execute(
+                "SELECT organization_id FROM principals WHERE principal_id = %s",
+                (self.FIXTURE["B"]["principal_id"],),
+            ).fetchone()
+            self.assertIsNotNone(
+                leaked,
+                "expected the self-reset GUC to be honored by RLS, proving the bypass; "
+                "if this is None, RLS blocked it and the threat-model text above is wrong",
+            )
+            self.assertEqual(str(leaked[0]), self.ORG_B)
 
     # -- Section 26: no-context fail-closed, write side ----------------------
 
@@ -883,7 +994,7 @@ class TwoTenantIsolationTests(unittest.TestCase):
     }
 
     def test_ordinary_select_matrix_no_context_tenant_a_tenant_b(self) -> None:
-        self.assertEqual(len(self.ORDINARY_SELECT_PAIRS), 30, f"{self.ORDINARY_SELECT_PAIRS}")
+        self.assertEqual(len(self.ORDINARY_SELECT_PAIRS), 34, f"{self.ORDINARY_SELECT_PAIRS}")
         # Ground truth per table/tenant, read via superuser (always
         # bypasses RLS). Most tables carry exactly one row per tenant,
         # but a few also carry an extra "spare" row used elsewhere
@@ -930,9 +1041,9 @@ class TwoTenantIsolationTests(unittest.TestCase):
                     count_b = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
                     self.assertEqual(count_b, expected_b, f"{role}/{table}: tenant B row count must match ground truth")
                     tenant_b_tested += 1
-        self.assertEqual(no_context_tested, 30)
-        self.assertEqual(tenant_a_tested, 30)
-        self.assertEqual(tenant_b_tested, 30)
+        self.assertEqual(no_context_tested, 34)
+        self.assertEqual(tenant_a_tested, 34)
+        self.assertEqual(tenant_b_tested, 34)
 
     # -- Section 8: exhaustive ordinary INSERT matrix ------------------------
 
@@ -1060,6 +1171,23 @@ class TwoTenantIsolationTests(unittest.TestCase):
                 "VALUES (%s, 'argon2', 'hash', now(), now())",
                 (fx["spare_principal_id"],),
             ),
+            "coverage_records": (
+                "INSERT INTO coverage_records (organization_id, asset, path, http_method, identity_label, "
+                "check_id, status, scanner_version, first_observed_at, last_observed_at) "
+                "VALUES (%s, 'https://example.com', %s, 'GET', 'unauthenticated', 'header_analyzer', "
+                "'completed', 'v1', now(), now())",
+                (org, f"/{new_id}"),
+            ),
+            "module_entitlements": (
+                "INSERT INTO module_entitlements (organization_id, module, status, updated_at) "
+                "VALUES (%s, 'soc', 'disabled', now())",
+                (org,),
+            ),
+            "scoped_control_implementations": (
+                "INSERT INTO scoped_control_implementations (organization_id, control_id, applicability_status, "
+                "created_at, updated_at) VALUES (%s, %s, 'unresolved', now(), now())",
+                (org, fx["spare_control_id"]),
+            ),
         }
         return specs[table]
 
@@ -1098,7 +1226,7 @@ class TwoTenantIsolationTests(unittest.TestCase):
 
     def test_ordinary_insert_matrix(self) -> None:
         pairs = [(role, table) for role, table in self.ORDINARY_INSERT_PAIRS if table != "organizations"]
-        self.assertEqual(len(pairs), 22, f"{pairs}")
+        self.assertEqual(len(pairs), 25, f"{pairs}")
         tested = []
         for role, table in pairs:
             with self.subTest(role=role, table=table):
@@ -1123,10 +1251,16 @@ class TwoTenantIsolationTests(unittest.TestCase):
                     finally:
                         connection.rollback()
                 tested.append((role, table))
-        self.assertEqual(len(tested), 22)
+        self.assertEqual(len(tested), 25)
 
     # -- Section 9: exhaustive ordinary UPDATE matrix ------------------------
 
+    # A value is either one column name (single-column PK) or a tuple
+    # of column names (composite PK). coverage_records/
+    # module_entitlements/scoped_control_implementations (2026-09-15)
+    # are this suite's first composite-PK tables; _pk_where below
+    # normalizes both shapes into one WHERE clause rather than
+    # special-casing them through the rest of this test.
     _UPDATE_PK = {
         "principals": "principal_id", "api_tokens": "token_id", "targets": "target_id",
         "target_verifications": "verification_id", "scan_permits": "permit_id", "scan_jobs": "job_id",
@@ -1135,6 +1269,9 @@ class TwoTenantIsolationTests(unittest.TestCase):
         "authorization_comparison_plans": "comparison_plan_id",
         "identity_tokens": "token_id", "browser_sessions": "session_id",
         "password_credentials": "principal_id",
+        "coverage_records": ("organization_id", "asset", "path", "http_method", "identity_label", "check_id"),
+        "module_entitlements": ("organization_id", "module"),
+        "scoped_control_implementations": ("organization_id", "control_id"),
     }
     _UPDATE_FIXTURE_KEY = {
         "principals": "principal_id", "api_tokens": "token_id", "targets": "target_id",
@@ -1144,6 +1281,13 @@ class TwoTenantIsolationTests(unittest.TestCase):
         "authorization_comparison_plans": "comparison_plan_id",
         "identity_tokens": "identity_token_id", "browser_sessions": "browser_session_id",
         "password_credentials": "principal_id",
+        # Fixed literal values, not fixture-stored ids: coverage_records'
+        # own fixture row always uses these exact literals (see
+        # _seed_tenant_fixture), and module_entitlements' own PK second
+        # column is the fixed 'webguard' seeded for every organization.
+        "coverage_records": ("org_id", "_lit:https://example.com", "_lit:/", "_lit:GET", "_lit:unauthenticated", "_lit:header_analyzer"),
+        "module_entitlements": ("org_id", "_lit:webguard"),
+        "scoped_control_implementations": ("org_id", "control_id"),
     }
     _UPDATE_HARMLESS_SET = {
         "principals": "display_name = 'unchanged'",
@@ -1160,12 +1304,45 @@ class TwoTenantIsolationTests(unittest.TestCase):
         "identity_tokens": "used_at = NULL",
         "browser_sessions": "user_agent = 'unchanged'",
         "password_credentials": "password_hash = 'unchanged'",
+        "coverage_records": "scanner_version = 'unchanged'",
+        "module_entitlements": "status = 'enabled'",
+        "scoped_control_implementations": "applicability_status = 'applicable'",
     }
     # organization_id is a real column on these; password_credentials
     # has no organization_id at all (it is derived via principal_id),
     # so tenant-reassignment does not apply the same way -- reported
-    # as NOT APPLICABLE rather than skipped silently.
-    _DIRECT_UPDATE_TABLES = set(_UPDATE_PK) - {"password_credentials"}
+    # as NOT APPLICABLE rather than skipped silently. The three
+    # composite-PK tables already carry organization_id as part of
+    # their own PK, so "reassign organization_id" is, for them,
+    # necessarily also a primary-key change: a different statement
+    # shape than the other direct tables' pure attribute reassignment,
+    # so they are excluded from this specific reassignment-denied
+    # subtest (RLS's WITH CHECK on the UPDATE policy already covers
+    # them via the ordinary own_row_allowed/other_tenant_row_denied
+    # cases above; PostgreSQL's own PK uniqueness, not RLS, is what
+    # would reject a same-transaction PK-changing UPDATE here, so
+    # asserting on "row-level security" in the exception text would be
+    # asserting the wrong mechanism).
+    _DIRECT_UPDATE_TABLES = set(_UPDATE_PK) - {
+        "password_credentials", "coverage_records", "module_entitlements", "scoped_control_implementations",
+    }
+
+    @staticmethod
+    def _pk_where(table: str, fx: dict) -> tuple[str, tuple]:
+        """Builds a WHERE clause and bind params for _UPDATE_PK[table],
+        whether it is one column or a composite tuple. A
+        "_lit:<value>" fixture-key entry is a literal constant instead
+        of a fixture lookup, for a PK column whose value is fixed
+        across every fixture row (see _UPDATE_FIXTURE_KEY's own
+        comment)."""
+
+        pk = TwoTenantIsolationTests._UPDATE_PK[table]
+        fixture_key = TwoTenantIsolationTests._UPDATE_FIXTURE_KEY[table]
+        columns = (pk,) if isinstance(pk, str) else pk
+        keys = (fixture_key,) if isinstance(fixture_key, str) else fixture_key
+        values = tuple(k[len("_lit:"):] if k.startswith("_lit:") else fx[k] for k in keys)
+        clause = " AND ".join(f"{column} = %s" for column in columns)
+        return clause, values
 
     # P1-2 Phase-D correction (tenant_isolation_acl.sql): identity_tokens
     # and password_credentials originally had UPDATE (and, for
@@ -1186,23 +1363,21 @@ class TwoTenantIsolationTests(unittest.TestCase):
     _UPDATE_NOT_DIRECTLY_EXECUTABLE: set[str] = set()
 
     def test_ordinary_update_matrix(self) -> None:
-        self.assertEqual(len(self.ORDINARY_UPDATE_PAIRS), 15, f"{self.ORDINARY_UPDATE_PAIRS}")
+        self.assertEqual(len(self.ORDINARY_UPDATE_PAIRS), 18, f"{self.ORDINARY_UPDATE_PAIRS}")
         tested = []
         not_executable = []
         for role, table in self.ORDINARY_UPDATE_PAIRS:
             if table in self._UPDATE_NOT_DIRECTLY_EXECUTABLE:
                 not_executable.append((role, table))
                 continue
-            pk = self._UPDATE_PK[table]
-            fixture_key = self._UPDATE_FIXTURE_KEY[table]
             set_clause = self._UPDATE_HARMLESS_SET[table]
             with self.subTest(role=role, table=table, case="own_row_allowed"):
                 with self._connect(self._dsn_for_role(role)) as connection:
                     try:
                         self._set_tenant(connection, self.ORG_A)
-                        own_id = self.FIXTURE["A"][fixture_key]
+                        where_clause, params = self._pk_where(table, self.FIXTURE["A"])
                         result = connection.execute(
-                            f"UPDATE {table} SET {set_clause} WHERE {pk} = %s", (own_id,)  # noqa: S608
+                            f"UPDATE {table} SET {set_clause} WHERE {where_clause}", params  # noqa: S608
                         )
                         self.assertEqual(result.rowcount, 1, f"{role}/{table}: updating the caller's own row must succeed")
                     finally:
@@ -1212,9 +1387,9 @@ class TwoTenantIsolationTests(unittest.TestCase):
                 with self._connect(self._dsn_for_role(role)) as connection:
                     try:
                         self._set_tenant(connection, self.ORG_A)
-                        victim_id = self.FIXTURE["B"][fixture_key]
+                        where_clause, params = self._pk_where(table, self.FIXTURE["B"])
                         result = connection.execute(
-                            f"UPDATE {table} SET {set_clause} WHERE {pk} = %s", (victim_id,)  # noqa: S608
+                            f"UPDATE {table} SET {set_clause} WHERE {where_clause}", params  # noqa: S608
                         )
                         self.assertEqual(
                             result.rowcount, 0, f"{role}/{table}: tenant A must not be able to UPDATE tenant B's row"
@@ -1227,17 +1402,17 @@ class TwoTenantIsolationTests(unittest.TestCase):
                     with self._connect(self._dsn_for_role(role)) as connection:
                         try:
                             self._set_tenant(connection, self.ORG_A)
-                            own_id = self.FIXTURE["A"][fixture_key]
+                            where_clause, params = self._pk_where(table, self.FIXTURE["A"])
                             with self.assertRaises(Exception) as ctx:
                                 connection.execute(
-                                    f"UPDATE {table} SET organization_id = %s WHERE {pk} = %s",  # noqa: S608
-                                    (self.ORG_B, own_id),
+                                    f"UPDATE {table} SET organization_id = %s WHERE {where_clause}",  # noqa: S608
+                                    (self.ORG_B, *params),
                                 )
                             self.assertIn("row-level security", str(ctx.exception).lower())
                         finally:
                             connection.rollback()
             tested.append((role, table))
-        self.assertEqual(len(tested), 15)
+        self.assertEqual(len(tested), 18)
         self.assertEqual(set(not_executable), set(), "no ordinary UPDATE pair should remain blocked after the Phase-D correction")
 
     # -- P1-2 Phase-D correction reconciliation: the two new DML-

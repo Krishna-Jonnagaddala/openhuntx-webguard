@@ -10,26 +10,31 @@ This file tracks capability-level release evidence. Requirement-level status (wh
 |---|---|---|
 | Ten-pillar core (permit, safety receipt, scanner, reporting) | `integration_tested` | Baseline audit + full regression suite, `docs/PRODUCT_VISION_TRACEABILITY.md` |
 | Phase A-H tenant-isolation runtime conversion | `integration_tested` | PRs #30-47, proven against real disposable Postgres and CI's own fresh Postgres job |
-| RLS+FORCE enforcement | `designed` | Policies defined (`infra/postgres/bootstrap/tenant_isolation_rls_policies.sql`), never enabled; P1-2 stays open on this basis |
-| Coverage Truth Map v1 | `integration_tested` | PRs #49-50, real end-to-end production-pipeline assertion in `test_production_mode_e2e.py` |
+| RLS+FORCE enforcement | `designed` | Policies defined (`infra/postgres/bootstrap/tenant_isolation_rls_policies.sql`), never enabled; P1-2 stays open on this basis. Three tenant tables added since (`coverage_records`, `module_entitlements`, `scoped_control_implementations`) currently have no policy of their own either |
+| Coverage Truth Map v1 | `integration_tested` | PRs #49-50, real end-to-end production-pipeline assertion in `test_production_mode_e2e.py`. No API/report surface exists yet: `coverage_records` is written by every scan and read by nothing |
 
 ## SOC
 
 | Capability | State | Evidence |
 |---|---|---|
-| Everything in section 9 of the handoff | `proposed` | No design or code exists yet beyond this repository-evidence scaffold |
+| Connector manifests (Entra, Defender XDR, Sentinel) | `implemented`, unit-tested | `apps/api/src/webguard_api/soc_connectors.py`, PRs #53/#55/#57; every permission/RBAC role verified against Microsoft's current documentation; `docs/CONNECTOR_CAPABILITIES.md` |
+| Live connector clients | `proposed` | Zero HTTP clients exist by design; no Microsoft tenant credentials available to this project |
+| Everything else in section 9 of the handoff (telemetry normalization, detection engineering, ProofLoop, cases/investigations, AI-assisted analysis, Response Guard) | `proposed` | No design or code exists |
 
 ## Compliance
 
 | Capability | State | Evidence |
 |---|---|---|
-| Everything in section 10 of the handoff | `proposed` | No design or code exists yet beyond this repository-evidence scaffold |
+| Framework/master-control catalog | `integration_tested` | Migration 0015, PR #54; 5 seeded placeholder frameworks, zero real control content, proven against real disposable Postgres |
+| Scoped control implementation (applicability) | `integration_tested` | Migration 0016, PR #56; the first of section 10.2's seven status dimensions, tenant-scoped, proven against real disposable Postgres |
+| Technical assertion catalog | `locally_tested` | `apps/api/src/webguard_api/technical_assertions.py`, PR #58; 5 assertions (3 Entra-sourced, 2 Sentinel-sourced), cross-validated against connector manifests at construction time; no schema change, no database table, nothing executed |
+| Collection/test-execution/assertion-outcome/control-assessment/treatment/assurance-review dimensions; evidence records; governance/privacy/vendor/audit workflows | `proposed` | Not designed or built |
 
 ## Platform-shared
 
 | Capability | State | Evidence |
 |---|---|---|
-| Module entitlement | `designed` | See `docs/adr/0033-platform-expansion-module-boundaries.md`; implementation tracked in `docs/PROJECT_EXECUTION_LEDGER.md` |
+| Module entitlement | `integration_tested` | Migration 0014, PR #52; wired into organization creation, proven against real disposable Postgres |
 | Shared evidence envelope (handoff section 11) | `proposed` | Not started; Coverage Truth Map's own `coverage_records` table is the closest existing precedent for the shape a generalized envelope needs |
 
 ## Known risks carried into this expansion
@@ -37,5 +42,8 @@ This file tracks capability-level release evidence. Requirement-level status (wh
 - Every SOC connector needs real Microsoft tenant credentials this project does not have; nothing SOC-related can reach `integration_tested` or later until that access exists.
 - Compliance framework packs need authoritative legal-text verification (GDPR/UK GDPR commencement text specifically could not be fully retrieved by the source handoff's own research pass) before any legal claim in a released pack.
 - RLS+FORCE activation needs a real, non-disposable environment this session has no standing authorization to provision.
+- No code path anywhere connects a WebGuard finding to a SOC or Compliance record, or the reverse. The three modules currently share only `organization_id` as a common key; the flagship cross-module workflow (handoff §14) has not been attempted.
 
 No rollout/rollback plan exists for any SOC/Compliance capability yet, since none has reached a stage where one is needed. This section will gain real rollout/rollback evidence as capabilities reach `staging_validated`.
+
+This file was last reconciled against actual repository state on 2026-09-15 (previously last updated 2026-09-12, before PRs #52-58 shipped). See the OpenHuntX Scope & Progress Audit, 2026-09-14, for the evidence-backed review this reconciliation is based on.

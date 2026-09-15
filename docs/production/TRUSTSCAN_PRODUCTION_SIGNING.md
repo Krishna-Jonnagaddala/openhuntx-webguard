@@ -1,5 +1,17 @@
 # TrustScan Production Signing: Key Custody Decision (Slice 14)
 
+## Correction, 2026-09-15: the Option A premise has changed
+
+AWS added a native Ed25519 key spec to KMS (`ECC_NIST_EDWARDS25519`, signing algorithm `ED25519_SHA_512` with `MessageType:RAW`, matching this codebase's own raw-message EdDSA convention exactly), generally available since 2025-11-07. That predates this document's own writing, so the "AWS KMS has no Ed25519 KeySpec" premise quoted below was already stale when written, not something that changed afterward. This document was not re-checked against AWS's current documentation until now.
+
+This changes the "Options considered" analysis below in one specific way: Option A was recommended in part because it was **the only option that closed the key-custody gap without a permit-schema/algorithm migration**. That is no longer true. A fourth option now exists that this document never evaluated:
+
+**Option D: AWS KMS-backed Ed25519 (native, `ECC_NIST_EDWARDS25519`)**. Keeps the Ed25519 algorithm, same as Option A, so the same "preserves the existing cryptographic format entirely" argument applies. Unlike Option A, it needs no CloudHSM cluster (no ~$2,300+/month minimum, no crypto-officer/crypto-user ceremony, no PKCS#11 dependency): `KmsSigningProvider`'s existing duck-typed `KmsClientProtocol` pattern already fits a KMS call, just with a different key spec and signing algorithm than the `ECDSA_SHA_256` it uses today.
+
+What this correction does not do: it does not build Option D, does not change which provider is active (still `LocalDevelopmentSigner` everywhere), does not change `KmsSigningProvider`'s algorithm, and does not claim any live validation of KMS Ed25519 signing by this project. No AWS account exists to test against. The comparison above is derived from AWS's own published, current developer documentation, not from a working integration.
+
+**What this means for the Option A recommendation below**: it needs re-evaluation by whoever owns this decision, not a unilateral change here. `CloudHsmSigningProvider` and its supporting `TrustScan Signing Service` are already built and tested against the real gap (per `docs/production/TRUSTSCAN_SIGNING_SERVICE.md`); switching to a not-yet-built Option D would mean writing new code and re-earning that same test coverage, against a provider this project has also never run against real AWS KMS. Whether that trade is worth it depends on real pricing, request-quota, and latency comparisons this session cannot perform. The reasoning below is preserved as the historical decision record; treat its Option A justification as based on a premise that no longer fully holds, not as an instruction to keep building on CloudHSM by default.
+
 ## Status
 
 **Decided (this document) and implemented (Slice 18), not deployed.** This document's Option A recommendation is now real code: `CloudHsmSigningProvider`, a dedicated `TrustScan Signing Service`, and `infra/terraform/cloudhsm.tf` all exist, are unit- and integration-tested, and preserve the exact Ed25519 contract described below with zero schema change. See `docs/production/TRUSTSCAN_SIGNING_SERVICE.md` for the full implementation, key-lifecycle operation, and (stated precisely there) exactly what has and has not been proven (no CloudHSM cluster has been provisioned, and the PKCS#11 adapter has never run against real hardware). The rest of this document is preserved as-written below: it is the decision record, not duplicated in the new document.

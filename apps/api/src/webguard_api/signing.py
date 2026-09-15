@@ -27,18 +27,36 @@ Two concrete ``SigningProvider`` implementations exist:
   production code can inject one without this package ever depending
   on it, and tests can inject a fake with zero network access.
 
-The AWS KMS Ed25519 gap (read, do not skip): AWS KMS's asymmetric
-``KeySpec`` values are RSA_2048/3072/4096 and
-ECC_NIST_P256/P384/P521/SECG_P256K1 -- there is no Ed25519/EdDSA
-option in KMS as of this writing. ``KmsSigningProvider`` therefore
-targets ``ECDSA_SHA_256`` as its own distinct, honestly-labeled
-algorithm; it never claims Ed25519 compatibility and is never wired as
-TrustScan's active signer in this slice or silently substituted for
-``LocalDevelopmentSigner``. Switching TrustScan's production signing
-algorithm from Ed25519 to ECDSA_SHA_256 would change what
-``SignedTrustScanPermit.signature`` actually verifies against and is a
-separate, explicit permit-schema/security decision this slice does not
-make.
+The AWS KMS Ed25519 gap, corrected 2026-09 (read, do not skip): when
+``KmsSigningProvider`` was built, AWS KMS's asymmetric ``KeySpec``
+values were RSA_2048/3072/4096 and ECC_NIST_P256/P384/P521/SECG_P256K1
+only, with no Ed25519/EdDSA option. That is no longer true: AWS
+added ``ECC_NIST_EDWARDS25519`` (Ed25519) as a KMS asymmetric signing
+key spec, generally available since 2025-11-07, with the
+``ED25519_SHA_512`` signing algorithm (``MessageType:RAW``, the same
+raw-message EdDSA convention every provider in this file already
+uses) or ``ED25519_PH_SHA_512`` (prehashed, ``MessageType:DIGEST``).
+See AWS's current KMS developer guide's key-spec reference for the
+authoritative, current list.
+
+This class has not been changed to use it: ``KmsSigningProvider``
+still targets ``ECDSA_SHA_256`` exactly as before, and no
+``ECC_NIST_EDWARDS25519``-backed provider exists in this codebase.
+Nothing here has been live-tested against AWS KMS at all, with either
+key spec: this correction is sourced from AWS's own published
+documentation, not from a validated integration. What the corrected
+fact does change is the reasoning that once justified building
+``CloudHsmSigningProvider`` specifically: at the time, CloudHSM was
+the only HSM-backed path that could keep the Ed25519 algorithm without
+a permit-schema migration. A native KMS-Ed25519 provider would now
+close that same gap without CloudHSM's cluster cost and PKCS#11
+indirection. Whether to actually build one, migrate to it, or keep
+the CloudHSM path already built is a real, unmade engineering
+decision: see ``docs/production/TRUSTSCAN_PRODUCTION_SIGNING.md``'s
+own 2026-09 correction note for the full reassessment. This module
+still does not make that decision: switching TrustScan's production
+signing key custody, by any path, remains a separate, explicit,
+reviewed change this docstring only describes, never performs.
 
 Slice 18 implements ``docs/production/TRUSTSCAN_PRODUCTION_SIGNING.md``'s
 recommended v1 path (Option A: AWS CloudHSM-backed Ed25519) via two new
@@ -183,9 +201,11 @@ class KmsClientProtocol(Protocol):
 
 class KmsSigningProvider:
     """Signs through an injected AWS KMS-shaped client. Targets
-    ``ECDSA_SHA_256`` -- KMS has no Ed25519 ``KeySpec`` -- and never
-    claims Ed25519 compatibility. Not wired as TrustScan's active
-    signer this slice; see module docstring."""
+    ``ECDSA_SHA_256``, unchanged since this class was built; AWS KMS
+    has separately since added an Ed25519 key spec
+    (``ECC_NIST_EDWARDS25519``, GA 2025-11-07) that this class does not
+    use. Never claims Ed25519 compatibility. Not wired as TrustScan's
+    active signer; see module docstring's 2026-09 correction note."""
 
     algorithm = "ECDSA_SHA_256"
 
@@ -272,14 +292,19 @@ class Pkcs11Ed25519KeyProtocol(Protocol):
 
 class CloudHsmSigningProvider:
     """Signs through an injected, duck-typed PKCS#11 Ed25519 key
-    handle. AWS CloudHSM -- unlike AWS KMS -- supports Ed25519
-    natively via PKCS#11, so this preserves TrustScan's existing
-    signature format entirely: same algorithm, same claims, same
-    verification code path as ``LocalDevelopmentSigner``, zero permit-
-    schema change (``docs/production/TRUSTSCAN_PRODUCTION_SIGNING.md``'s
-    Option A). The private key never leaves the HSM; this class only
-    ever calls ``sign()``/reads public material through the injected
-    handle, never anything encryption/decryption-shaped."""
+    handle. AWS CloudHSM supports Ed25519 natively via PKCS#11, so this
+    preserves TrustScan's existing signature format entirely: same
+    algorithm, same claims, same verification code path as
+    ``LocalDevelopmentSigner``, zero permit-schema change
+    (``docs/production/TRUSTSCAN_PRODUCTION_SIGNING.md``'s Option A).
+    AWS KMS has since also added a native Ed25519 key spec (see the
+    module docstring's 2026-09 correction note), so CloudHSM is no
+    longer the only managed path that keeps this algorithm: that
+    document's Option A recommendation is flagged there for
+    re-evaluation, not changed here. The private key never leaves the
+    HSM; this class only ever calls ``sign()``/reads public material
+    through the injected handle, never anything encryption/decryption-
+    shaped."""
 
     algorithm = "Ed25519"
 
