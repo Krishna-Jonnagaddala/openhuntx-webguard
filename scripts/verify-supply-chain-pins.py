@@ -23,6 +23,7 @@ EXPECTED = {
     "typing-extensions": "4.15.0",
     "argon2-cffi": "25.1.0",
     "argon2-cffi-bindings": "26.1.0",
+    "dnspython": "2.8.0",
 }
 
 CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -104,6 +105,7 @@ expected_runtime = {
     "typing-extensions",
     "argon2-cffi",
     "argon2-cffi-bindings",
+    "dnspython",
 }
 if set(locked) != expected_runtime:
     fail(f"runtime lock package set changed: {sorted(locked)}")
@@ -144,6 +146,8 @@ if f"psycopg-pool=={EXPECTED['psycopg-pool']}" not in api["project"]["dependenci
     fail("API psycopg-pool dependency is not exactly pinned")
 if f"argon2-cffi=={EXPECTED['argon2-cffi']}" not in api["project"]["dependencies"]:
     fail("API argon2-cffi dependency is not exactly pinned")
+if f"dnspython=={EXPECTED['dnspython']}" not in api["project"]["dependencies"]:
+    fail("API dnspython dependency is not exactly pinned")
 if "version" in api["project"]:
     fail("API pyproject must not define a second static version authority")
 if api["project"].get("dynamic") != ["version"]:
