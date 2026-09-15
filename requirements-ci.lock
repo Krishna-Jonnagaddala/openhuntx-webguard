@@ -55,3 +55,10 @@ argon2-cffi==25.1.0 \
 argon2-cffi-bindings==26.1.0 \
     --hash=sha256:27f1821903e2ceadcb88ec2b45ef190897b7682449c772f4d9b53e42c520cf29 \
     --hash=sha256:21ca0396fe5ec995dd54431c32698189666f9224810acfa752e50d2bd94d9df2
+
+# C1-004 -- DNS TXT ownership verification, a second method alongside
+# well-known-HTTP. dnspython's wheel is pure Python, so one hash covers
+# the entire reviewed Python 3.11/3.12/3.13/3.14 matrix and macOS ARM64
+# developer path, the same as this file's other pure-Python pins.
+dnspython==2.8.0 \
+    --hash=sha256:01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af
