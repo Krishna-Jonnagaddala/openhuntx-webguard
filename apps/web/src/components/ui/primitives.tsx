@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useId, useRef, type KeyboardEvent, type ReactNode } from "react";
 
 export function Card({ children, className }: { children: ReactNode; className?: string }) {
   return (
@@ -146,4 +146,231 @@ export function Td({ children, className }: { children: ReactNode; className?: s
 
 export function VisuallyHidden({ children }: { children: ReactNode }) {
   return <span className="sr-only">{children}</span>;
+}
+
+export interface TabItem {
+  id: string;
+  label: string;
+  count?: number;
+}
+
+/** Roving-tab-index tab list (WAI-ARIA "manual activation" pattern:
+ * arrow keys move focus, the panel only changes on Enter/Space or a
+ * click, so a keyboard user can arrow past tabs without triggering a
+ * fetch for each one). The caller owns which panel renders. */
+export function Tabs({
+  items,
+  value,
+  onChange,
+  className,
+}: {
+  items: TabItem[];
+  value: string;
+  onChange: (id: string) => void;
+  className?: string;
+}) {
+  function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    const index = items.findIndex((item) => item.id === value);
+    if (index === -1) return;
+    if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+      event.preventDefault();
+      const delta = event.key === "ArrowRight" ? 1 : -1;
+      const next = items[(index + delta + items.length) % items.length];
+      onChange(next.id);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      onChange(items[0].id);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      onChange(items[items.length - 1].id);
+    }
+  }
+
+  return (
+    <div
+      role="tablist"
+      aria-orientation="horizontal"
+      onKeyDown={handleKeyDown}
+      className={`flex items-center gap-1 overflow-x-auto border-b border-[var(--color-border)] ${className ?? ""}`}
+    >
+      {items.map((item) => {
+        const active = item.id === value;
+        return (
+          <button
+            key={item.id}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            tabIndex={active ? 0 : -1}
+            onClick={() => onChange(item.id)}
+            className={`relative shrink-0 whitespace-nowrap px-3 py-2.5 text-sm font-medium transition-colors ${
+              active
+                ? "text-[var(--color-text-primary)]"
+                : "text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
+            }`}
+          >
+            {item.label}
+            {item.count !== undefined ? (
+              <span className="ml-1.5 text-xs text-[var(--color-text-tertiary)]">{item.count}</span>
+            ) : null}
+            {active ? (
+              <span className="absolute inset-x-0 -bottom-px h-0.5 rounded-full bg-[var(--color-accent)]" />
+            ) : null}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** A focused, labelled modal. Traps Escape-to-close and restores focus
+ * to the element that opened it; does not implement a full focus
+ * trap (tabbing out to the browser chrome is possible), a deliberate
+ * scope line for this app's own dialogs, which are short forms/
+ * confirmations, not multi-step wizards. */
+export function Dialog({
+  open,
+  onClose,
+  title,
+  description,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  description?: string;
+  children: ReactNode;
+}) {
+  const titleId = useId();
+  const descriptionId = useId();
+  const previouslyFocused = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    previouslyFocused.current = document.activeElement as HTMLElement | null;
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      previouslyFocused.current?.focus?.();
+    };
+  }, [open, onClose]);
+
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div
+        aria-hidden="true"
+        className="absolute inset-0 bg-[var(--color-canvas)]/80 backdrop-blur-sm"
+        onClick={onClose}
+      />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={description ? descriptionId : undefined}
+        className="relative w-full max-w-lg rounded-lg border border-[var(--color-border-strong)] bg-[var(--color-surface-raised)] p-5 shadow-2xl"
+      >
+        <h2 id={titleId} className="text-base font-semibold text-[var(--color-text-primary)]">
+          {title}
+        </h2>
+        {description ? (
+          <p id={descriptionId} className="mt-1 text-sm text-[var(--color-text-secondary)]">
+            {description}
+          </p>
+        ) : null}
+        <div className="mt-4">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+export function IconButton({
+  label,
+  children,
+  ...props
+}: { label: string; children: ReactNode } & React.ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      className="rounded-md p-2 text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] disabled:opacity-50"
+      {...props}
+    >
+      {children}
+    </button>
+  );
+}
+
+export function Breadcrumb({ items }: { items: { label: string; to?: string }[] }) {
+  return (
+    <nav aria-label="Breadcrumb" className="mb-3 flex items-center gap-1.5 text-sm text-[var(--color-text-tertiary)]">
+      {items.map((item, index) => (
+        <span key={index} className="flex items-center gap-1.5">
+          {index > 0 ? <span aria-hidden="true">/</span> : null}
+          {item.to ? (
+            <a href={item.to} className="hover:text-[var(--color-text-secondary)]">
+              {item.label}
+            </a>
+          ) : (
+            <span className={index === items.length - 1 ? "text-[var(--color-text-secondary)]" : ""}>
+              {item.label}
+            </span>
+          )}
+        </span>
+      ))}
+    </nav>
+  );
+}
+
+/** A dashboard-style number callout. Keeps text alongside the number
+ * (never color alone) so the figure is legible without relying on
+ * the accent hue. */
+export function StatCard({
+  label,
+  value,
+  hint,
+  tone = "neutral",
+}: {
+  label: string;
+  value: ReactNode;
+  hint?: string;
+  tone?: "neutral" | "accent" | "success" | "warning" | "danger";
+}) {
+  const toneClass: Record<string, string> = {
+    neutral: "text-[var(--color-text-primary)]",
+    accent: "text-[var(--color-accent)]",
+    success: "text-[var(--color-success)]",
+    warning: "text-[var(--color-warning)]",
+    danger: "text-[var(--color-danger)]",
+  };
+  return (
+    <Card className="p-4">
+      <p className="text-xs font-medium uppercase tracking-wide text-[var(--color-text-tertiary)]">{label}</p>
+      <p className={`mt-1.5 font-display text-2xl ${toneClass[tone]}`}>{value}</p>
+      {hint ? <p className="mt-1 text-xs text-[var(--color-text-secondary)]">{hint}</p> : null}
+    </Card>
+  );
+}
+
+/** An amber, icon-plus-text notice for a capability that exists in
+ * this codebase but is not yet reachable the way the surrounding UI
+ * might suggest (no live connector, no evaluation logic yet, etc).
+ * Distinct from EmptyState (which describes "nothing here yet" for a
+ * capability that fully works) and from a permission-denied state
+ * (which is an authorization outcome, not a development state). */
+export function InDevelopmentNotice({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex items-start gap-2.5 rounded-lg border border-[var(--color-warning)]/30 bg-[var(--color-warning-bg)] px-4 py-3 text-sm text-[var(--color-text-primary)]">
+      <svg viewBox="0 0 20 20" className="mt-0.5 h-4 w-4 shrink-0 text-[var(--color-warning)]" fill="none" aria-hidden="true">
+        <path d="M10 3.5 2.5 16h15L10 3.5Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+        <path d="M10 8v3.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+        <circle cx="10" cy="13.6" r="0.9" fill="currentColor" />
+      </svg>
+      <div>{children}</div>
+    </div>
+  );
 }

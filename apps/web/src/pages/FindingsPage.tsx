@@ -86,7 +86,7 @@ export function FindingsPage() {
                   <SeverityBadge severity={finding.severity} />
                 </Td>
                 <Td>
-                  <Link to={`/findings/${finding.finding_id}`} className="text-[var(--color-text-primary)] hover:text-[var(--color-accent)]">
+                  <Link to={`/app/webguard/findings/${finding.finding_id}`} className="text-[var(--color-text-primary)] hover:text-[var(--color-accent)]">
                     {finding.title}
                   </Link>
                 </Td>

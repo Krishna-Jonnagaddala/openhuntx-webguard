@@ -77,7 +77,7 @@ export function DashboardPage() {
             <ul className="space-y-2">
               {data.recent_scans.map((scan) => (
                 <li key={scan.scan_id} className="flex items-center justify-between text-sm">
-                  <Link to={`/scans/${scan.scan_id}`} className="truncate text-[var(--color-text-primary)] hover:text-[var(--color-accent)]">
+                  <Link to={`/app/webguard/scans/${scan.scan_id}`} className="truncate text-[var(--color-text-primary)] hover:text-[var(--color-accent)]">
                     {scan.target}
                   </Link>
                   <StatusBadge status={scan.status} />
@@ -95,7 +95,7 @@ export function DashboardPage() {
               {data.recent_high_or_critical_findings.map((finding) => (
                 <li key={finding.finding_id} className="flex items-center justify-between gap-2 text-sm">
                   <Link
-                    to={`/findings/${finding.finding_id}`}
+                    to={`/app/webguard/findings/${finding.finding_id}`}
                     className="truncate text-[var(--color-text-primary)] hover:text-[var(--color-accent)]"
                   >
                     {finding.title}

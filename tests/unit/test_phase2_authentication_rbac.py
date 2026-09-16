@@ -280,6 +280,11 @@ class Phase2AuthenticationAndRbacTests(unittest.TestCase):
             ApiPermission.ASSET_READ,
             ApiPermission.ASSET_MANAGE,
             ApiPermission.TEAM_READ,
+            ApiPermission.MODULE_ENTITLEMENTS_READ,
+            ApiPermission.SOC_CONNECTOR_READ,
+            ApiPermission.COMPLIANCE_CATALOG_READ,
+            ApiPermission.COMPLIANCE_ASSERTION_READ,
+            ApiPermission.COMPLIANCE_ASSERTION_COLLECT,
         }
 
         for permission in ApiPermission:
@@ -298,6 +303,10 @@ class Phase2AuthenticationAndRbacTests(unittest.TestCase):
             ApiPermission.REPORT_READ,
             ApiPermission.ASSET_READ,
             ApiPermission.TEAM_READ,
+            ApiPermission.MODULE_ENTITLEMENTS_READ,
+            ApiPermission.SOC_CONNECTOR_READ,
+            ApiPermission.COMPLIANCE_CATALOG_READ,
+            ApiPermission.COMPLIANCE_ASSERTION_READ,
         }
 
         for permission in ApiPermission:

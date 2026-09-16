@@ -84,6 +84,8 @@ from .mail import PostmarkClientProtocol, PostmarkHttpClient, ProductionMailProv
 from .pagination import SignedCursorCodec
 from .postgres_authentication_contexts import PostgresAuthenticationContextRepository
 from .postgres_authorization_comparison import PostgresAuthorizationComparisonPlanRepository
+from .postgres_assertion_collections import PostgresAssertionCollectionRepository
+from .postgres_compliance_catalog import PostgresComplianceCatalogRepository
 from .postgres_callback_broker import PostgresCallbackBroker
 from .postgres_callback_service import PostgresCallbackRegistrationRepository
 from .postgres_coverage import PostgresCoverageRepository
@@ -278,6 +280,9 @@ def build_production_components(
         mail_provider=mail_provider,
         auth_rate_limiter=auth_rate_limiter,
         web_app_base_url=config.web_app_base_url,
+        module_entitlements=module_entitlements,
+        compliance_catalog=PostgresComplianceCatalogRepository(pool),
+        assertion_collections=PostgresAssertionCollectionRepository(pool),
     )
     executor = ScanJobExecutor(
         authorizations=authorizations,

@@ -44,6 +44,9 @@ _ASSET_PATH = re.compile(r"^/v1/assets/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 _ASSET_VERIFICATION_START_PATH = re.compile(r"^/v1/assets/([0-9a-f-]{36})/verification$")
 _ASSET_VERIFICATION_CHECK_PATH = re.compile(r"^/v1/assets/([0-9a-f-]{36})/verification/check$")
 _ASSET_COVERAGE_PATH = re.compile(r"^/v1/assets/([0-9a-f-]{36})/coverage$")
+_COMPLIANCE_ASSERTION_COLLECTIONS_PATH = re.compile(
+    r"^/v1/compliance/assertions/([a-z0-9_]+)/collections$"
+)
 _TEAM_MEMBER_PATH = re.compile(r"^/v1/team/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _API_KEY_PATH = re.compile(r"^/v1/api-keys/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _PERMIT_REVOKE_PATH = re.compile(r"^/v1/permits/([0-9a-f-]{36})/revoke$")
@@ -789,6 +792,34 @@ def build_handler(
                     payload = service.list_assets(context, page, request_id=request_id)
                     self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
                     return
+                if path == "/v1/module-entitlements":
+                    self._require_empty_query(query)
+                    payload = service.list_module_entitlements(context, request_id=request_id)
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
+                    return
+                if path == "/v1/soc/connectors":
+                    self._require_empty_query(query)
+                    payload = service.list_soc_connectors(context, request_id=request_id)
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
+                    return
+                if path == "/v1/compliance/frameworks":
+                    self._require_empty_query(query)
+                    payload = service.list_compliance_frameworks(context, request_id=request_id)
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
+                    return
+                if path == "/v1/compliance/assertions":
+                    self._require_empty_query(query)
+                    payload = service.list_compliance_assertions(context, request_id=request_id)
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
+                    return
+                collections_match = _COMPLIANCE_ASSERTION_COLLECTIONS_PATH.fullmatch(path)
+                if collections_match:
+                    self._require_empty_query(query)
+                    payload = service.list_assertion_collections(
+                        context, collections_match.group(1), request_id=request_id
+                    )
+                    self._send_json(200, payload, request_id=request_id, extra_headers=self._rate_headers(decision))
+                    return
                 if path == "/v1/me":
                     self._require_empty_query(query)
                     payload = service.me(context, request_id=request_id)
@@ -1124,6 +1155,26 @@ def build_handler(
                         )
                     payload = service.start_asset_verification(
                         context, asset_verification_start_match.group(1), body, request_id=request_id
+                    )
+                    self._send_json(
+                        201, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
+                    )
+                    return
+                assertion_collect_match = _COMPLIANCE_ASSERTION_COLLECTIONS_PATH.fullmatch(path)
+                if assertion_collect_match:
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "assertion_collection_body_invalid", "Request body must be valid JSON.", status=400
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "assertion_collection_body_invalid", "Request body must be a JSON object.", status=400
+                        )
+                    payload = service.collect_assertion(
+                        context, assertion_collect_match.group(1), body, request_id=request_id
                     )
                     self._send_json(
                         201, payload, request_id=request_id, extra_headers=self._rate_headers(decision)

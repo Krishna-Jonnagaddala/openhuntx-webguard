@@ -25,7 +25,7 @@ test("invitation: real email, accepting activates the account with the granted r
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
 
   // -- invite a teammate as administrator --
-  await page.goto("/team");
+  await page.goto("/app/team");
   await page.getByRole("button", { name: "Invite member" }).click();
   await page.getByLabel("Name").fill("Invitee E2E");
   await page.getByLabel("Email").fill(inviteeEmail);
@@ -63,7 +63,7 @@ test("invitation: real email, accepting activates the account with the granted r
   // -- the invitee's own session reflects the granted role, and RBAC
   // enforces it identically to any other administrator: no owner-only
   // capability leaks in --
-  await page.goto("/settings");
+  await page.goto("/app/settings");
   await expect(page.getByText("administrator", { exact: true })).toBeVisible();
 
   // -- sign out, then a fresh login with the invitee's own chosen

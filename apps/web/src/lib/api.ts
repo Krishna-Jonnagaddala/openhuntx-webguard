@@ -575,3 +575,108 @@ export const auditApi = {
 export const settingsApi = {
   get: () => api.get<SettingsResponse>("/v1/settings"),
 };
+
+// -- Platform: module entitlements, SOC, Compliance ------------------------
+// Mirrors docs/PLATFORM_SCOPE.md: WebGuard/SOC/Compliance are one
+// platform's three modules. SOC and Compliance return real backend
+// data (connector manifests, the framework catalog, the assertion
+// catalog and an organization's own collection history) -- nothing
+// here is a live vendor connection, since no SOC connector in this
+// codebase has a live HTTP client yet.
+
+export type PlatformModuleId = "webguard" | "soc" | "compliance";
+export type ModuleEntitlementStatus = "enabled" | "disabled" | "trial";
+
+export interface ModuleEntitlement {
+  module: PlatformModuleId;
+  status: ModuleEntitlementStatus;
+  updated_at: string;
+  enabled_at: string | null;
+}
+
+export const moduleEntitlementsApi = {
+  list: () => api.get<{ entitlements: ModuleEntitlement[] }>("/v1/module-entitlements"),
+};
+
+export type ConnectorLiveValidationState =
+  | "not_started"
+  | "contract_designed"
+  | "fixture_tested"
+  | "blocked_on_credentials"
+  | "live_validated";
+
+export interface SocConnectorPermission {
+  name: string;
+  permission_type: "application" | "delegated" | "azure_rbac_role";
+  purpose: string;
+}
+
+export interface SocConnector {
+  connector_id: string;
+  display_name: string;
+  vendor: string;
+  api_family: string;
+  licensing_dependency: string;
+  live_validation_state: ConnectorLiveValidationState;
+  permissions: SocConnectorPermission[];
+  endpoint_count: number;
+  known_limitations: string[];
+}
+
+export const socApi = {
+  connectors: () => api.get<{ connectors: SocConnector[] }>("/v1/soc/connectors"),
+};
+
+export type FrameworkStatus = "placeholder" | "current" | "proposed" | "future_readiness" | "superseded";
+
+export interface ComplianceFramework {
+  framework_id: string;
+  name: string;
+  version: string;
+  status: FrameworkStatus;
+  source_reference: string;
+  created_at: string;
+  updated_at: string;
+  control_count: number;
+}
+
+export interface TechnicalAssertion {
+  assertion_id: string;
+  title: string;
+  objective: string;
+  version: string;
+  source_connector_id: string;
+  required_permissions: string[];
+  evaluatable: boolean;
+}
+
+export type EvidenceSource = "fixture" | "manual";
+export type CollectionStatus = "succeeded" | "failed";
+export type AssertionOutcome = "satisfied" | "violated" | "indeterminate" | "not_tested";
+
+export interface AssertionCollection {
+  collection_id: string;
+  assertion_id: string;
+  assertion_version: string;
+  evidence_source: EvidenceSource;
+  evidence_provenance: string;
+  collection_status: CollectionStatus;
+  collection_error: string | null;
+  collected_by: string;
+  collected_at: string;
+  outcome: AssertionOutcome | null;
+  outcome_detail: string | null;
+  evaluated_at: string | null;
+}
+
+export const complianceApi = {
+  frameworks: () => api.get<{ frameworks: ComplianceFramework[] }>("/v1/compliance/frameworks"),
+  assertions: () =>
+    api.get<{ assertions: TechnicalAssertion[]; fixture_evidence_sets: string[] }>("/v1/compliance/assertions"),
+  collections: (assertionId: string) =>
+    api.get<{ collections: AssertionCollection[] }>(`/v1/compliance/assertions/${assertionId}/collections`),
+  collect: (
+    assertionId: string,
+    body: { evidence_source: "fixture"; fixture_name: string } | { evidence_source: "manual"; manual_evidence: unknown[] },
+  ) => api.post<AssertionCollection>(`/v1/compliance/assertions/${assertionId}/collections`, body),
+};

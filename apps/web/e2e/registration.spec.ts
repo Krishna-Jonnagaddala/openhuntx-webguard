@@ -36,6 +36,6 @@ test("registration: verification email is real, opening its link verifies the ac
   await expect(page.getByRole("status")).toHaveText("Email address verified.");
 
   // The account's own settings page now reflects the verified state.
-  await page.goto("/settings");
+  await page.goto("/app/settings");
   await expect(page.getByText("verified", { exact: true })).toBeVisible();
 });

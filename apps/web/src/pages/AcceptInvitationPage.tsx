@@ -13,7 +13,7 @@ export function AcceptInvitationPage() {
   const [localError, setLocalError] = useState<string | null>(null);
 
   if (status === "signed-in" && session) {
-    return <Navigate to="/" replace />;
+    return <Navigate to="/app" replace />;
   }
 
   async function handleSubmit(event: FormEvent) {

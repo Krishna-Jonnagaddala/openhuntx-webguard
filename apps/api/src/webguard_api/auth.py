@@ -45,6 +45,11 @@ class ApiPermission(str, Enum):
     ASSET_MANAGE = "assets.manage"
     TEAM_READ = "team.read"
     TEAM_MANAGE = "team.manage"
+    MODULE_ENTITLEMENTS_READ = "module_entitlements.read"
+    SOC_CONNECTOR_READ = "soc.connectors.read"
+    COMPLIANCE_CATALOG_READ = "compliance.catalog.read"
+    COMPLIANCE_ASSERTION_READ = "compliance.assertions.read"
+    COMPLIANCE_ASSERTION_COLLECT = "compliance.assertions.collect"
 
 
 _ROLE_PERMISSIONS = {
@@ -79,6 +84,11 @@ _ROLE_PERMISSIONS = {
             ApiPermission.ASSET_READ,
             ApiPermission.ASSET_MANAGE,
             ApiPermission.TEAM_READ,
+            ApiPermission.MODULE_ENTITLEMENTS_READ,
+            ApiPermission.SOC_CONNECTOR_READ,
+            ApiPermission.COMPLIANCE_CATALOG_READ,
+            ApiPermission.COMPLIANCE_ASSERTION_READ,
+            ApiPermission.COMPLIANCE_ASSERTION_COLLECT,
         }
     ),
     OrganizationRole.VIEWER: frozenset(
@@ -90,6 +100,10 @@ _ROLE_PERMISSIONS = {
             ApiPermission.REPORT_READ,
             ApiPermission.ASSET_READ,
             ApiPermission.TEAM_READ,
+            ApiPermission.MODULE_ENTITLEMENTS_READ,
+            ApiPermission.SOC_CONNECTOR_READ,
+            ApiPermission.COMPLIANCE_CATALOG_READ,
+            ApiPermission.COMPLIANCE_ASSERTION_READ,
         }
     ),
 }

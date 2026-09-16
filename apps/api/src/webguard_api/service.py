@@ -159,6 +159,9 @@ class WebGuardJobService:
         session_idle_timeout: timedelta | None = None,
         session_absolute_timeout: timedelta | None = None,
         web_app_base_url: str = "http://127.0.0.1:5173",
+        module_entitlements=None,
+        compliance_catalog=None,
+        assertion_collections=None,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
@@ -288,6 +291,27 @@ class WebGuardJobService:
         # wiring passes the real deployed frontend origin explicitly
         # (`ProductionServiceConfig.web_app_base_url`, fail-closed).
         self._web_app_base_url = web_app_base_url.rstrip("/")
+        # Platform expansion (docs/PLATFORM_SCOPE.md): same optional/
+        # defaulted pattern as every repository above. module_entitlements
+        # already ships both an in-memory and a Postgres backend;
+        # compliance_catalog/assertion_collections default to their own
+        # in-memory backends so local/lab mode shows the real five-
+        # framework placeholder catalog and can actually run a fixture
+        # collection, the same "local demos populate real data"
+        # precedent coverage_repository established.
+        from .module_entitlements import InMemoryModuleEntitlementRepository
+        from .compliance_catalog_store import InMemoryComplianceCatalogRepository
+        from .assertion_collections import InMemoryAssertionCollectionRepository
+
+        self.module_entitlements = (
+            module_entitlements if module_entitlements is not None else InMemoryModuleEntitlementRepository()
+        )
+        self.compliance_catalog = (
+            compliance_catalog if compliance_catalog is not None else InMemoryComplianceCatalogRepository()
+        )
+        self.assertion_collections = (
+            assertion_collections if assertion_collections is not None else InMemoryAssertionCollectionRepository()
+        )
 
     def _send_mail_best_effort(self, *, to: str, subject: str, body: str, category: str) -> None:
         """A delivery failure never fails the caller's own operation --
@@ -2266,6 +2290,35 @@ class WebGuardJobService:
             )
         except IdentityStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        # Platform expansion: every organization is meant to carry
+        # exactly one entitlement row per PlatformModule from the moment
+        # it exists (module_entitlements.py's own module docstring).
+        # production_startup.py's PostgresIdentityRepository already
+        # grants this internally when constructed with a
+        # module_entitlements repository (its own create_organization
+        # calls grant_default_entitlements directly) -- but that made
+        # the guarantee an implementation detail of one specific
+        # identity backend, not something this service promised for
+        # every organization it registers. cli.py's local/lab IdentityStore
+        # (SQLite-backed) has no module_entitlements wiring at all, so
+        # local/lab registration left every organization with zero
+        # entitlement rows until this line.
+        #
+        # Guarded by a read first: grant_default_entitlements is a
+        # plain INSERT with no ON CONFLICT handling (by design --
+        # PostgresModuleEntitlementRepository.grant_default_entitlements
+        # is meant to run exactly once per organization, at creation).
+        # Calling it unconditionally here would raise a unique-
+        # constraint violation for every organization whose identity
+        # backend (PostgresIdentityRepository) already granted defaults
+        # internally a few lines above -- confirmed the hard way: this
+        # broke registration outright against a real database (CI's
+        # Playwright E2E job, all three specs that register through the
+        # real HTTP route). Checking first makes this call a genuine
+        # backstop for a backend that did not already grant (local/lab),
+        # not a second write against one that did (production).
+        if not self.module_entitlements.list_entitlements(organization.organization_id):
+            self.module_entitlements.grant_default_entitlements(organization.organization_id, now=now)
         self.identity.set_password_hash(
             principal.principal_id, algorithm="argon2id", password_hash=hash_password(password), now=now
         )
@@ -3144,6 +3197,270 @@ class WebGuardJobService:
             resource_id=context.organization_id, outcome=AuditOutcome.SUCCEEDED,
         )
         return {"members": [self._principal_public_dict(m) for m in members]}
+
+    def list_module_entitlements(self, context: AuthContext, *, request_id: str) -> dict:
+        """Which of WebGuard/SOC/Compliance this organization can
+        access (docs/PLATFORM_SCOPE.md). An organization created before
+        this route existed, or before ``register_account`` started
+        calling ``grant_default_entitlements``, may legitimately have
+        zero rows here -- that is reported as an empty list, never
+        fabricated as "all enabled" or "all disabled"."""
+
+        self._require(
+            context, ApiPermission.MODULE_ENTITLEMENTS_READ, request_id=request_id,
+            action="module_entitlements.list", resource_type="organization",
+            resource_id=context.organization_id,
+        )
+        entitlements = self.module_entitlements.list_entitlements(context.organization_id)
+        self._audit(
+            context, request_id=request_id, action="module_entitlements.list", resource_type="organization",
+            resource_id=context.organization_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {
+            "entitlements": [
+                {
+                    "module": entitlement.module.value,
+                    "status": entitlement.status.value,
+                    "updated_at": entitlement.updated_at.isoformat(),
+                    "enabled_at": entitlement.enabled_at.isoformat() if entitlement.enabled_at else None,
+                }
+                for entitlement in entitlements
+            ]
+        }
+
+    def list_soc_connectors(self, context: AuthContext, *, request_id: str) -> dict:
+        """SOC connector manifests (soc_connectors.py): what this
+        codebase's own connector contracts declare, not any
+        organization's live connection state -- none exists yet, since
+        no connector here has a live HTTP client (every manifest's own
+        ``live_validation_state`` is ``contract_designed``). Global
+        reference data, the same as the Compliance framework catalog:
+        every organization sees the identical list."""
+
+        self._require(
+            context, ApiPermission.SOC_CONNECTOR_READ, request_id=request_id,
+            action="soc.connectors.list", resource_type="organization",
+            resource_id=context.organization_id,
+        )
+        from .soc_connectors import SOC_CONNECTOR_REGISTRY
+
+        connectors = []
+        for manifest in SOC_CONNECTOR_REGISTRY.values():
+            connectors.append(
+                {
+                    "connector_id": manifest.connector_id,
+                    "display_name": manifest.display_name,
+                    "vendor": manifest.vendor,
+                    "api_family": manifest.api_family,
+                    "licensing_dependency": manifest.licensing_dependency,
+                    "live_validation_state": manifest.live_validation_state.value,
+                    "permissions": [
+                        {"name": p.name, "permission_type": p.permission_type.value, "purpose": p.purpose}
+                        for p in manifest.permissions
+                    ],
+                    "endpoint_count": len(manifest.endpoints),
+                    "known_limitations": list(manifest.known_limitations),
+                }
+            )
+        self._audit(
+            context, request_id=request_id, action="soc.connectors.list", resource_type="organization",
+            resource_id=context.organization_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {"connectors": sorted(connectors, key=lambda c: c["connector_id"])}
+
+    def list_compliance_frameworks(self, context: AuthContext, *, request_id: str) -> dict:
+        """The Compliance framework catalog (global reference data,
+        identical for every organization -- see webguard_contracts.compliance's
+        own module docstring for why this carries no organization_id at
+        all). Every framework here is FrameworkStatus.PLACEHOLDER with
+        zero MasterControl rows: named and cited to its authoritative
+        source, no legally-reviewed control content loaded yet. That is
+        reported honestly (control_count=0), never hidden or padded."""
+
+        self._require(
+            context, ApiPermission.COMPLIANCE_CATALOG_READ, request_id=request_id,
+            action="compliance.frameworks.list", resource_type="organization",
+            resource_id=context.organization_id,
+        )
+        frameworks = self.compliance_catalog.list_frameworks()
+        payload = []
+        for framework in frameworks:
+            controls = self.compliance_catalog.list_master_controls(framework.framework_id)
+            payload.append({**framework.to_dict(), "control_count": len(controls)})
+        self._audit(
+            context, request_id=request_id, action="compliance.frameworks.list", resource_type="organization",
+            resource_id=context.organization_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {"frameworks": payload}
+
+    def list_compliance_assertions(self, context: AuthContext, *, request_id: str) -> dict:
+        """The technical assertion catalog (technical_assertions.py):
+        what this codebase knows how to check, not any organization's
+        own result. Global reference data, same as the framework
+        catalog and the SOC connector manifests."""
+
+        self._require(
+            context, ApiPermission.COMPLIANCE_ASSERTION_READ, request_id=request_id,
+            action="compliance.assertions.list", resource_type="organization",
+            resource_id=context.organization_id,
+        )
+        from .assertion_collections import EvidenceSource, FIXTURE_EVIDENCE_SETS
+        from .technical_assertions import TECHNICAL_ASSERTION_REGISTRY
+
+        assertions = [
+            {
+                "assertion_id": assertion.assertion_id,
+                "title": assertion.title,
+                "objective": assertion.objective,
+                "version": assertion.version,
+                "source_connector_id": assertion.source_connector_id,
+                "required_permissions": list(assertion.required_permissions),
+                "evaluatable": assertion.assertion_id in {"entra_conditional_access_policy_mode"},
+            }
+            for assertion in TECHNICAL_ASSERTION_REGISTRY.values()
+        ]
+        self._audit(
+            context, request_id=request_id, action="compliance.assertions.list", resource_type="organization",
+            resource_id=context.organization_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {
+            "assertions": sorted(assertions, key=lambda a: a["assertion_id"]),
+            "fixture_evidence_sets": sorted(FIXTURE_EVIDENCE_SETS.keys()),
+        }
+
+    def _assertion_collection_dict(self, record) -> dict:
+        return {
+            "collection_id": record.collection_id,
+            "assertion_id": record.assertion_id,
+            "assertion_version": record.assertion_version,
+            "evidence_source": record.evidence_source.value,
+            "evidence_provenance": record.evidence_provenance,
+            "collection_status": record.collection_status.value,
+            "collection_error": record.collection_error,
+            "collected_by": record.collected_by,
+            "collected_at": record.collected_at.isoformat(),
+            "outcome": record.outcome.value if record.outcome else None,
+            "outcome_detail": record.outcome_detail,
+            "evaluated_at": record.evaluated_at.isoformat() if record.evaluated_at else None,
+        }
+
+    def list_assertion_collections(self, context: AuthContext, assertion_id: str, *, request_id: str) -> dict:
+        """One organization's own collection/evaluation history against
+        one assertion, most recent first. An assertion nobody has ever
+        attempted returns an empty list -- NOT_TESTED is the absence of
+        a row here, never a fabricated record (assertion_collections.py's
+        own module docstring)."""
+
+        self._require(
+            context, ApiPermission.COMPLIANCE_ASSERTION_READ, request_id=request_id,
+            action="compliance.assertion_collections.list", resource_type="assertion", resource_id=assertion_id,
+        )
+        from .technical_assertions import TECHNICAL_ASSERTION_REGISTRY
+
+        if assertion_id not in TECHNICAL_ASSERTION_REGISTRY:
+            raise ApiServiceError(
+                "technical_assertion_unknown", f"{assertion_id!r} is not a known assertion.", status=404
+            )
+        records = self.assertion_collections.list_for_assertion(context.organization_id, assertion_id)
+        self._audit(
+            context, request_id=request_id, action="compliance.assertion_collections.list",
+            resource_type="assertion", resource_id=assertion_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {"collections": [self._assertion_collection_dict(r) for r in records]}
+
+    def collect_assertion(self, context: AuthContext, assertion_id: str, body: dict, *, request_id: str) -> dict:
+        """Runs one collection attempt (assertion_collections.collect_and_evaluate)
+        and persists it. evidence_source must be "fixture" (with
+        fixture_name naming one of FIXTURE_EVIDENCE_SETS) or "manual"
+        (with manual_evidence, shaped the same way a real connector
+        response eventually will be) -- never both, never neither.
+        Nothing here talks to a live Microsoft tenant: no SOC connector
+        in this codebase has a live HTTP client yet."""
+
+        self._require(
+            context, ApiPermission.COMPLIANCE_ASSERTION_COLLECT, request_id=request_id,
+            action="compliance.assertion_collections.create", resource_type="assertion", resource_id=assertion_id,
+        )
+        # Module entitlement, not RBAC: role says whether THIS principal
+        # may collect within an organization that has Compliance at
+        # all; this says whether the organization does. Enforced here,
+        # the one place this route actually creates persisted tenant
+        # state -- the read-only catalog/manifest routes above stay
+        # ungated, since letting a not-yet-entitled organization preview
+        # what Compliance offers leaks no tenant data and no other
+        # tenant's information (they are the same static catalog for
+        # every organization). A missing entitlement row (an
+        # organization that predates this route) fails closed the same
+        # as an explicit "disabled" status -- never treated as implicitly
+        # enabled.
+        from .module_entitlements import ModuleEntitlementError
+        from webguard_contracts import ModuleEntitlementStatus, PlatformModule
+
+        try:
+            entitlement = self.module_entitlements.get_entitlement(
+                context.organization_id, PlatformModule.COMPLIANCE
+            )
+        except ModuleEntitlementError:
+            entitlement = None
+        if entitlement is None or entitlement.status not in (
+            ModuleEntitlementStatus.ENABLED,
+            ModuleEntitlementStatus.TRIAL,
+        ):
+            self._audit(
+                context, request_id=request_id, action="compliance.assertion_collections.create",
+                resource_type="assertion", resource_id=assertion_id, outcome=AuditOutcome.DENIED,
+                detail_code="compliance_module_not_entitled",
+            )
+            raise ApiServiceError(
+                "compliance_module_not_entitled",
+                "This organization's Compliance module is not enabled.",
+                status=403,
+            )
+        from .assertion_collections import AssertionCollectionError, EvidenceSource, collect_and_evaluate
+
+        if not isinstance(body, dict):
+            raise ApiServiceError("assertion_collection_body_invalid", "Request body must be a JSON object.", status=400)
+        source = body.get("evidence_source")
+        if source not in ("fixture", "manual"):
+            raise ApiServiceError(
+                "assertion_collection_body_invalid", "evidence_source must be 'fixture' or 'manual'.", status=400
+            )
+        fixture_name = body.get("fixture_name")
+        manual_evidence = body.get("manual_evidence")
+        if source == "fixture" and (not isinstance(fixture_name, str) or manual_evidence is not None):
+            raise ApiServiceError(
+                "assertion_collection_body_invalid",
+                "evidence_source='fixture' requires fixture_name and no manual_evidence.", status=400,
+            )
+        if source == "manual" and (not isinstance(manual_evidence, list) or fixture_name is not None):
+            raise ApiServiceError(
+                "assertion_collection_body_invalid",
+                "evidence_source='manual' requires a manual_evidence array and no fixture_name.", status=400,
+            )
+        try:
+            record = collect_and_evaluate(
+                organization_id=context.organization_id,
+                assertion_id=assertion_id,
+                evidence_source=EvidenceSource(source),
+                collected_by=context.principal_id,
+                now=self.clock(),
+                fixture_name=fixture_name,
+                manual_evidence=manual_evidence,
+            )
+        except AssertionCollectionError as exc:
+            self._audit(
+                context, request_id=request_id, action="compliance.assertion_collections.create",
+                resource_type="assertion", resource_id=assertion_id, outcome=AuditOutcome.DENIED,
+                detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=400) from exc
+        record = self.assertion_collections.record(record)
+        self._audit(
+            context, request_id=request_id, action="compliance.assertion_collections.create",
+            resource_type="assertion", resource_id=assertion_id, outcome=AuditOutcome.SUCCEEDED,
+            detail_code=record.collection_status.value,
+        )
+        return self._assertion_collection_dict(record)
 
     def invite_team_member(self, context: AuthContext, body: dict, *, request_id: str) -> dict:
         """Slice 16 revision: Slice 15 issued an initial API bearer

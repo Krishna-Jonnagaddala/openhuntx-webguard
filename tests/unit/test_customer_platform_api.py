@@ -754,6 +754,78 @@ class CustomerPlatformApiTests(unittest.TestCase):
         self.assertEqual(status, 500, payload)
         self.assertEqual(payload["error"]["code"], "report_integrity_check_failed")
 
+    # -- Platform expansion: module entitlements, SOC, Compliance --------
+    # HTTP-transport coverage only, proving http_api.py's own routing
+    # and JSON encoding for the new routes; the service-level RBAC,
+    # entitlement-gating, and collection/evaluation behavior these
+    # routes call into is covered by test_platform_expansion_api.py.
+
+    def test_module_entitlements_route_returns_an_empty_list_for_this_fixture_organization(self) -> None:
+        status, _, payload = self.json_request("GET", "/v1/module-entitlements")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload, {"entitlements": []})
+
+    def test_soc_connectors_route_returns_the_three_real_manifests(self) -> None:
+        status, _, payload = self.json_request("GET", "/v1/soc/connectors")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(
+            sorted(connector["connector_id"] for connector in payload["connectors"]),
+            ["defender_xdr", "entra", "sentinel"],
+        )
+
+    def test_compliance_frameworks_route_returns_five_placeholder_frameworks(self) -> None:
+        status, _, payload = self.json_request("GET", "/v1/compliance/frameworks")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(payload["frameworks"]), 5)
+
+    def test_compliance_assertions_route_and_empty_collection_history(self) -> None:
+        status, _, payload = self.json_request("GET", "/v1/compliance/assertions")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(payload["assertions"]), 5)
+
+        status, _, history = self.json_request(
+            "GET", "/v1/compliance/assertions/entra_conditional_access_policy_mode/collections"
+        )
+        self.assertEqual(status, 200, history)
+        self.assertEqual(history["collections"], [])
+
+    def test_compliance_collect_route_fails_closed_without_an_entitlement(self) -> None:
+        # This fixture's organization has never been granted any
+        # module entitlement row (create_identity_fixture does not
+        # call grant_default_entitlements), so the route must fail
+        # closed with 403, never silently allow the collection through.
+        status, _, payload = self.json_request(
+            "POST",
+            "/v1/compliance/assertions/entra_conditional_access_policy_mode/collections",
+            {"evidence_source": "fixture", "fixture_name": "entra_ca_policies_one_enforced"},
+        )
+        self.assertEqual(status, 403, payload)
+        self.assertEqual(payload["error"]["code"], "compliance_module_not_entitled")
+
+    def test_compliance_collect_route_succeeds_once_entitled_and_then_appears_in_history(self) -> None:
+        from webguard_contracts import ModuleEntitlementStatus, PlatformModule
+
+        self.service.module_entitlements.grant_default_entitlements(self.context.organization_id, now=NOW)
+        self.service.module_entitlements.set_entitlement(
+            self.context.organization_id, PlatformModule.COMPLIANCE,
+            status=ModuleEntitlementStatus.ENABLED, now=NOW,
+        )
+        status, _, created = self.json_request(
+            "POST",
+            "/v1/compliance/assertions/entra_conditional_access_policy_mode/collections",
+            {"evidence_source": "fixture", "fixture_name": "entra_ca_policies_one_enforced"},
+        )
+        self.assertEqual(status, 201, created)
+        self.assertEqual(created["collection_status"], "succeeded")
+        self.assertEqual(created["outcome"], "satisfied")
+
+        status, _, history = self.json_request(
+            "GET", "/v1/compliance/assertions/entra_conditional_access_policy_mode/collections"
+        )
+        self.assertEqual(status, 200, history)
+        self.assertEqual(len(history["collections"]), 1)
+        self.assertEqual(history["collections"][0]["collection_id"], created["collection_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

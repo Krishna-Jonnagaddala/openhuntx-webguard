@@ -100,6 +100,6 @@ describe("AssetDetailPage verification + scan-creation gating", () => {
       authorizationId: "auth-1",
       mode: "crawl",
     });
-    expect(navigateMock).toHaveBeenCalledWith("/scans?justSubmitted=job-1");
+    expect(navigateMock).toHaveBeenCalledWith("/app/webguard/scans?justSubmitted=job-1");
   });
 });
