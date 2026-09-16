@@ -474,6 +474,56 @@ class CustomerPlatformApiTests(unittest.TestCase):
         self.assertEqual(status, 200, rechecked)
         self.assertEqual(rechecked["status"], "verified")
 
+    def test_dns_txt_verification_stays_pending_and_retryable_on_token_mismatch(self) -> None:
+        """The DNS-side analogue of
+        test_well_known_verification_stays_pending_and_retryable_on_mismatch:
+        the record exists and resolves (unlike the sibling
+        record-missing test above, a distinct failure mode
+        check_dns_txt_token codes separately as "token-mismatch", not
+        "dns-record-not-found") but its value is wrong -- the most
+        realistic customer error for this method, a copy-paste mistake
+        or a stale value left over from a previous attempt, not an
+        absent record. A check against the wrong value must not
+        destroy the still-valid pending token, identical to every
+        other method's own non-destructive retry contract. Deterministic,
+        controlled test evidence only: dns.resolver.Resolver.resolve is
+        mocked at the same third-party-client boundary the sibling DNS
+        tests in this file already mock; nothing here validates against
+        live DNS."""
+
+        status, _, created = self.json_request("POST", "/v1/assets", {"url": "https://dns-mismatch.example/"})
+        target_id = created["target_id"]
+        status, _, started = self.json_request(
+            "POST", f"/v1/assets/{target_id}/verification", {"method": "dns_txt"}
+        )
+        self.assertEqual(status, 201, started)
+        token = started["instructions"]["expected_content"]
+
+        class _FakeTxtRdata:
+            def __init__(self, value: str) -> None:
+                self.strings = (value.encode(),)
+
+        def _resolves_wrong_value(resolver, qname, rdtype, *args, **kwargs):
+            return [_FakeTxtRdata("this-is-not-the-expected-token")]
+
+        with patch("dns.resolver.Resolver.resolve", _resolves_wrong_value):
+            status, _, checked = self.json_request("POST", f"/v1/assets/{target_id}/verification/check")
+        self.assertEqual(status, 200, checked)
+        self.assertEqual(checked["status"], "pending")
+        self.assertEqual(checked["last_check_detail"], "token-mismatch")
+        self.assertEqual(checked["instructions"]["expected_content"], token)
+
+        # Fix the record (simulating the customer correcting the
+        # published value) and check again with no new verification
+        # started: the original token must still be the one honored.
+        def _now_resolves_correctly(resolver, qname, rdtype, *args, **kwargs):
+            return [_FakeTxtRdata(token)]
+
+        with patch("dns.resolver.Resolver.resolve", _now_resolves_correctly):
+            status, _, rechecked = self.json_request("POST", f"/v1/assets/{target_id}/verification/check")
+        self.assertEqual(status, 200, rechecked)
+        self.assertEqual(rechecked["status"], "verified")
+
     def test_starting_over_while_still_pending_issues_a_genuinely_new_token(self) -> None:
         """The other half of the retry story: a customer who wants a
         fresh value entirely (not just a retry of the same one) can
