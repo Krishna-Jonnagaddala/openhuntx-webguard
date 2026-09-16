@@ -61,7 +61,7 @@ export function ScansPage() {
             {data.scans.map((scan) => (
               <tr key={scan.scan_id} className="hover:bg-[var(--color-surface-hover)]">
                 <Td>
-                  <Link to={`/scans/${scan.scan_id}`} className="text-[var(--color-text-primary)] hover:text-[var(--color-accent)]">
+                  <Link to={`/app/webguard/scans/${scan.scan_id}`} className="text-[var(--color-text-primary)] hover:text-[var(--color-accent)]">
                     {scan.target}
                   </Link>
                 </Td>

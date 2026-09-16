@@ -292,7 +292,7 @@ function StartScanPanel({ targetId }: { targetId: string }) {
         authorizationId: authorization.authorization_id,
         mode,
       });
-      navigate(`/scans?justSubmitted=${job.job_id}`);
+      navigate(`/app/webguard/scans?justSubmitted=${job.job_id}`);
     } catch {
       // surfaced below
     }
@@ -482,7 +482,7 @@ export function AssetDetailPage() {
               ))}
             </ul>
           )}
-          <Link to={`/findings?asset=${encodeURIComponent(asset.url)}`} className="mt-3 inline-block text-sm text-[var(--color-accent)] hover:underline">
+          <Link to={`/app/webguard/findings?asset=${encodeURIComponent(asset.url)}`} className="mt-3 inline-block text-sm text-[var(--color-accent)] hover:underline">
             View findings for this asset →
           </Link>
         </Card>

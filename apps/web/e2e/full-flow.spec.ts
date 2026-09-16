@@ -51,7 +51,7 @@ test("full customer platform flow: sign in, add asset, verify, scan, findings, r
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
 
   // -- add the controlled fixture asset --
-  await page.goto("/assets");
+  await page.goto("/app/webguard/assets");
   await page.getByRole("button", { name: "Add asset" }).click();
   await page.getByLabel("URL").fill(TARGET_URL!);
   await page.getByRole("button", { name: "Add asset", exact: true }).click();
@@ -97,12 +97,12 @@ test("full customer platform flow: sign in, add asset, verify, scan, findings, r
   await expect(page.getByText(/A report has been requested for this scan/i)).toBeVisible({ timeout: 10_000 });
 
   // -- dashboard reflects the completed scan and its findings --
-  await page.goto("/");
+  await page.goto("/app/webguard");
   await expect(page.getByText("No scans yet.")).toHaveCount(0);
   await expect(page.getByText("No findings recorded yet.")).toHaveCount(0);
 
   // -- open a finding and change its lifecycle status --
-  await page.goto("/findings");
+  await page.goto("/app/webguard/findings");
   const firstFindingLink = page.getByRole("table").getByRole("link").first();
   const findingTitle = await firstFindingLink.textContent();
   await firstFindingLink.click();
@@ -118,7 +118,7 @@ test("full customer platform flow: sign in, add asset, verify, scan, findings, r
   // real navigation-triggered download), reading the saved file and
   // confirming it parses as the real, completed WebGuardReport this
   // scan actually produced, not an empty placeholder or an error body. --
-  await page.goto("/reports");
+  await page.goto("/app/webguard/reports");
   await expect(page.getByRole("heading", { name: "Reports" })).toBeVisible();
   // The reports table lists by scan_id, not target URL -- this test's
   // scan is the only report that exists at this point in the run.
@@ -146,6 +146,6 @@ test("full customer platform flow: sign in, add asset, verify, scan, findings, r
   // -- a protected page is inaccessible after logout: the SPA's
   // route guard redirects back to /login rather than rendering
   // authenticated content from stale client state --
-  await page.goto("/assets");
+  await page.goto("/app/webguard/assets");
   await expect(page).toHaveURL(/\/login/);
 });

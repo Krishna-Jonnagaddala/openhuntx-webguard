@@ -42,7 +42,7 @@ test("password reset: real email, reset revokes the old session, new password si
 
   // -- session A must now be revoked: a fresh load of a protected
   // page redirects to /login, not the dashboard --
-  await page.goto("/");
+  await page.goto("/app");
   await expect(page).toHaveURL(/\/login/);
 
   // -- the OLD password no longer works --

@@ -78,7 +78,7 @@ describe("App routing", () => {
 
   it("redirects an unauthenticated visitor away from a protected route to /login", async () => {
     mockSignedOutFetch();
-    renderApp("/assets");
+    renderApp("/app/webguard/assets");
     await waitFor(() => expect(screen.getByRole("heading", { name: "Sign in" })).toBeInTheDocument());
   });
 
@@ -88,20 +88,27 @@ describe("App routing", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "Sign in" })).toBeInTheDocument());
   });
 
-  it("renders the app shell for a signed-in visitor on a protected route", async () => {
-    mockSignedInFetch();
-
-    renderApp("/assets");
-
-    await waitFor(() => expect(screen.getByRole("heading", { name: "Assets" })).toBeInTheDocument());
-    expect(screen.getByRole("link", { name: "Dashboard" })).toBeInTheDocument();
+  it("shows the public platform home to a signed-out visitor at the root path", async () => {
+    mockSignedOutFetch();
+    renderApp("/");
+    await waitFor(() => expect(screen.getByRole("link", { name: "Create an account" })).toBeInTheDocument());
     expect(screen.queryByRole("heading", { name: "Sign in" })).not.toBeInTheDocument();
   });
 
-  it("redirects an unknown protected path back to the dashboard", async () => {
+  it("renders the app shell for a signed-in visitor on a protected route", async () => {
     mockSignedInFetch();
 
-    renderApp("/this-route-does-not-exist");
+    renderApp("/app/webguard/assets");
+
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Assets" })).toBeInTheDocument());
+    expect(screen.getByRole("link", { name: "Overview" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Sign in" })).not.toBeInTheDocument();
+  });
+
+  it("redirects an unknown protected path back to the WebGuard dashboard", async () => {
+    mockSignedInFetch();
+
+    renderApp("/app/this-route-does-not-exist");
 
     await waitFor(() => expect(screen.getByRole("heading", { name: "Dashboard" })).toBeInTheDocument());
   });

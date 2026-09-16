@@ -13,7 +13,7 @@ function RequestReportPanel({ scanId }: { scanId: string }) {
       <p className="text-sm text-[var(--color-text-secondary)]">
         A report has been requested for this scan (
         <StatusBadge status={existing.state} />
-        ). <Link to="/reports" className="text-[var(--color-accent)] hover:underline">View reports →</Link>
+        ). <Link to="/app/webguard/reports" className="text-[var(--color-accent)] hover:underline">View reports →</Link>
       </p>
     );
   }
@@ -94,7 +94,7 @@ export function ScanDetailPage() {
             <ul className="space-y-2">
               {findings.findings.map((finding) => (
                 <li key={finding.finding_id}>
-                  <Link to={`/findings/${finding.finding_id}`} className="text-sm text-[var(--color-text-primary)] hover:text-[var(--color-accent)]">
+                  <Link to={`/app/webguard/findings/${finding.finding_id}`} className="text-sm text-[var(--color-text-primary)] hover:text-[var(--color-accent)]">
                     {finding.title}
                   </Link>
                 </li>

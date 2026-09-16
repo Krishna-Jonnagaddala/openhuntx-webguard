@@ -54,7 +54,7 @@ export function VerifyEmailPage() {
               {message}
             </p>
           )}
-          <Link to="/" className="mt-4 inline-block text-sm text-[var(--color-accent)] hover:underline">
+          <Link to="/app" className="mt-4 inline-block text-sm text-[var(--color-accent)] hover:underline">
             Go to WebGuard
           </Link>
         </div>

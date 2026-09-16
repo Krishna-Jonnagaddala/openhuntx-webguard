@@ -95,9 +95,25 @@ export function OpenHuntXMark({ className }: { className?: string }) {
   );
 }
 
-export function OpenHuntXWordmark({ className }: { className?: string }) {
+/**
+ * `glow` applies docs/product/OPENHUNTX_BRAND_MARK.md §3's "primary
+ * lockup" drop-shadow treatment (`filter: drop-shadow(0 0
+ * 26px rgba(229,27,42,0.45))`), documented there as reserved for a
+ * marketing/hero surface this app didn't have yet -- the public site
+ * added alongside the three-module platform expansion is that
+ * surface. Every in-product usage (header, login) keeps the flat,
+ * glow-free default.
+ */
+export function OpenHuntXWordmark({ className, glow = false }: { className?: string; glow?: boolean }) {
   return (
-    <span className={className} style={{ fontFamily: "var(--font-display)", lineHeight: 0.9 }}>
+    <span
+      className={className}
+      style={{
+        fontFamily: "var(--font-display)",
+        lineHeight: 0.9,
+        filter: glow ? "drop-shadow(0 0 26px rgba(229,27,42,0.45))" : undefined,
+      }}
+    >
       <span
         style={{
           background:
@@ -124,14 +140,45 @@ export function OpenHuntXWordmark({ className }: { className?: string }) {
   );
 }
 
-export function WebGuardLockup({ className }: { className?: string }) {
+/** The platform-level lockup: mark + wordmark alone, no product name.
+ * Used as the home link and everywhere OpenHuntX is referred to as
+ * the parent platform rather than one specific module. */
+export function OpenHuntXLockup({ className, glow = false }: { className?: string; glow?: boolean }) {
+  return (
+    <div className={`flex items-center gap-2 ${className ?? ""}`}>
+      <OpenHuntXMark className="h-6 w-6 shrink-0" />
+      <OpenHuntXWordmark className="text-base" glow={glow} />
+    </div>
+  );
+}
+
+export type PlatformProductName = "WebGuard" | "SOC" | "Compliance";
+
+/** Mark + wordmark + one product name -- the shape
+ * docs/product/OPENHUNTX_BRAND_MARK.md's own in-product app-bar panel
+ * shows. SOC and Compliance are plain navigation/product names here,
+ * never a fabricated lockup of their own (per the platform brief:
+ * "do not invent official logo lockups for them"). */
+export function ProductLockup({ product, className }: { product: PlatformProductName; className?: string }) {
   return (
     <div className={`flex items-center gap-2 ${className ?? ""}`}>
       <OpenHuntXMark className="h-6 w-6 shrink-0" />
       <span className="flex items-baseline gap-1.5">
         <OpenHuntXWordmark className="text-base" />
-        <span className="font-display text-sm tracking-wide text-[var(--color-text-secondary)]">WebGuard</span>
+        <span className="font-display text-sm tracking-wide text-[var(--color-text-secondary)]">{product}</span>
       </span>
     </div>
   );
 }
+
+/** @deprecated use `<ProductLockup product="WebGuard" />` -- kept so
+ * no existing import site breaks while the platform shell migrates. */
+export function WebGuardLockup({ className }: { className?: string }) {
+  return <ProductLockup product="WebGuard" className={className} />;
+}
+
+/** The WebGuard product descriptor from the original brand mark
+ * lockup. Scoped to WebGuard alone -- never applied to the platform
+ * home or to SOC/Compliance, which have no equivalent descriptor of
+ * their own yet. */
+export const WEBGUARD_TAGLINE = "WEB VULNERABILITY DISCOVERY & SECURITY ASSURANCE";

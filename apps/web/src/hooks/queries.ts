@@ -4,14 +4,17 @@ import {
   assetsApi,
   auditApi,
   authApi,
+  complianceApi,
   dashboardApi,
   findingsApi,
   jobsApi,
+  moduleEntitlementsApi,
   permitsApi,
   reportsApi,
   schedulesApi,
   scansApi,
   settingsApi,
+  socApi,
   teamApi,
 } from "../lib/api";
 import type { VerificationMethod } from "../lib/api";
@@ -274,4 +277,42 @@ export function useAuditLog(params?: { outcome?: string }) {
 
 export function useSettings() {
   return useQuery({ queryKey: ["settings"], queryFn: settingsApi.get });
+}
+
+// -- Platform: module entitlements, SOC, Compliance ------------------------
+
+export function useModuleEntitlements() {
+  return useQuery({ queryKey: ["module-entitlements"], queryFn: moduleEntitlementsApi.list });
+}
+
+export function useSocConnectors() {
+  return useQuery({ queryKey: ["soc-connectors"], queryFn: socApi.connectors });
+}
+
+export function useComplianceFrameworks() {
+  return useQuery({ queryKey: ["compliance-frameworks"], queryFn: complianceApi.frameworks });
+}
+
+export function useComplianceAssertions() {
+  return useQuery({ queryKey: ["compliance-assertions"], queryFn: complianceApi.assertions });
+}
+
+export function useAssertionCollections(assertionId: string | undefined) {
+  return useQuery({
+    queryKey: ["assertion-collections", assertionId],
+    queryFn: () => complianceApi.collections(assertionId as string),
+    enabled: !!assertionId,
+  });
+}
+
+export function useCollectAssertion(assertionId: string) {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (
+      body:
+        | { evidence_source: "fixture"; fixture_name: string }
+        | { evidence_source: "manual"; manual_evidence: unknown[] },
+    ) => complianceApi.collect(assertionId, body),
+    onSuccess: () => client.invalidateQueries({ queryKey: ["assertion-collections", assertionId] }),
+  });
 }
