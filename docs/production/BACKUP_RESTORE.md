@@ -78,9 +78,69 @@ version upgrade), take an explicit manual `aws rds create-db-snapshot`
 and of the `backup_retention_days` window, and should be tagged with
 the reason they were taken.
 
+## Local restore mechanics rehearsal (2026-09-16, locally executable today)
+
+**This is not the restore test below** -- it proves the data-level
+mechanics work, not that RDS/PITR/RTO/RPO do. `scripts/backup-postgres.py`
+and `scripts/restore-postgres.py` are a locally executable, psycopg-only
+backup/restore pair (no dependency on the `pg_dump`/`pg_restore` client
+binaries being installed anywhere), runnable against any already-migrated
+PostgreSQL instance -- a developer's own local database today, a
+disposable CI instance, or eventually a real staging/production one.
+`schema_migrations` is deliberately excluded from the dump: it is
+derived from which migration files have run, not customer data, and
+restoring it independently of actually running those files risks the
+exact "restored state disagrees with the live schema" risk the restore
+checklist below warns about.
+
+Performed and verified against this developer's own local database
+(33 tables, 696 rows, a trivial development-scale dataset, not
+representative of any real data volume):
+
+1. Backed up every table to a plain-text COPY dump plus a JSON
+   manifest (row counts per table).
+2. Restored into a separately migrated and tenant-isolation-bootstrapped
+   target database.
+3. Verified every restored table's row count matched the manifest
+   both immediately after its own load and again after every other
+   table had also been loaded (the second check exists because this
+   rehearsal caught a real bug during its own development: an early
+   version issued `TRUNCATE <table> CASCADE` one table at a time
+   inside the load loop, so truncating a later table such as
+   `organizations` silently cascaded to wipe `findings` and
+   `coverage_records` that an earlier loop iteration had already
+   restored, even though the row-count check for those earlier tables
+   passed at the moment they were themselves loaded. Fixed by issuing
+   one single `TRUNCATE` naming every table together, before any table
+   is loaded, so no table is ever truncated after another has already
+   received its data).
+4. Verified full row-for-row content equality (not just counts)
+   between source and restored database across all 33 tables.
+5. Ran the full `tests/contract` suite (99/99) against the restored
+   database to confirm schema constraints, tenant-isolation roles, and
+   RLS policy definitions all survive a restore intact.
+6. Confirmed `run-postgres-migrations.py --dry-run` reports the
+   restored database as already up to date, proving the deliberate
+   exclusion of `schema_migrations` from the data restore does not
+   leave the target's own migration bookkeeping confused.
+7. Timed the round trip: backup 0.32s, restore 0.23s, for this
+   trivial dataset. This number says nothing about RDS-scale timing
+   and must not be read as an RTO estimate -- recorded only so a
+   future, larger-scale rehearsal has a baseline to compare against.
+
+**What this does and does not close**: this proves the data-level
+backup/restore mechanics are correct against real PostgreSQL, and it
+caught and fixed one genuine bug in the process. It does not touch
+P1-8's actual closure requirement below -- RDS snapshot behavior,
+PITR, real RTO/RPO, and the cutover sequence all still require a real,
+applied AWS environment this project does not have. P1-8 remains
+`NOT_STARTED` for exactly that reason, unchanged by this rehearsal.
+
 ## Restore testing
 
-**Not yet performed.** A backup strategy this document calls "proven"
+**Not yet performed against real infrastructure** (see the local
+mechanics rehearsal immediately above for what has been verified
+without it). A backup strategy this document calls "proven"
 requires, at minimum:
 
 1. Restoring a real (or realistically-sized synthetic) snapshot to a
