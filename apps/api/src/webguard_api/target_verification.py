@@ -3,22 +3,40 @@
 Migration 0002 (Slice 12) reserved the ``target_verifications`` schema
 ahead of any real implementation ("no verification mechanism is
 implemented this slice, and no code writes to this table yet"). This
-module is that implementation -- scoped deliberately to one method,
-not the two named as examples in the brief ("such as DNS TXT,
-.well-known HTTP token"): the ``.well-known`` HTTP token check, because
-it reuses this project's own existing, already-safety-reviewed target
-validation and fetch machinery (``scope_validator.validate_target_url``
-+ ``safe_http.fetch_once``) exactly, with zero new network-safety code.
-A customer-supplied "my domain" value is exactly the kind of input the
-scanner's own SSRF protections exist for -- this module deliberately
-does not invent a second, weaker HTTP client for what is structurally
-the same problem (fetch a URL derived from customer input, safely).
+module implements both methods named as examples in the brief ("such
+as DNS TXT, .well-known HTTP token"):
 
-DNS TXT verification is not implemented this slice -- it would need a
-DNS resolver library this project does not currently depend on
-(the standard library has no TXT record support), and is deferred as a
-named, documented gap rather than attempted with a hand-rolled DNS
-parser, which would be a worse security trade than deferring.
+- ``WELL_KNOWN_HTTP`` reuses this project's own existing, already-
+  safety-reviewed target validation and fetch machinery
+  (``scope_validator.validate_target_url`` + ``safe_http.fetch_once``)
+  exactly, with zero new network-safety code. A customer-supplied "my
+  domain" value is exactly the kind of input the scanner's own SSRF
+  protections exist for, so this module deliberately does not invent a
+  second, weaker HTTP client for what is structurally the same problem
+  (fetch a URL derived from customer input, safely).
+- ``DNS_TXT`` resolves a dedicated ``_webguard-verification.<host>``
+  TXT record via ``dnspython`` (a real dependency now, not the
+  hand-rolled parser this module's own docstring used to reject as a
+  worse security trade). A DNS TXT lookup does not carry the same
+  SSRF shape ``WELL_KNOWN_HTTP`` does: it asks the recursive
+  resolver to look up a name, and it never opens a connection to an
+  address the customer chose, so it needs no equivalent of
+  ``validate_target_url``, only an operational bound (timeout) against
+  a slow or unresponsive authoritative server. The hostname resolved
+  is always the same ``target.url`` this organization already owns a
+  tenant-scoped ``targets`` row for, never an arbitrary request-time
+  string, matching ``WELL_KNOWN_HTTP``'s own trust boundary.
+
+Real deployment forced a concrete gap in the file-based method that is
+worth recording here, not just in a ticket: a domain fronted by a
+no-code site builder (Wix, Squarespace, Framer, Figma Sites, and
+others) commonly has no way to publish an arbitrary static file at an
+arbitrary path at all, and some CDN/host combinations redirect between
+``www``/apex or http/https before this method's deliberately
+redirect-averse fetch ever reaches the file. DNS TXT verification
+needs only DNS control, which every domain owner already has
+regardless of what serves the site itself, and is therefore the
+method that actually completes for that real, not hypothetical, case.
 """
 
 from __future__ import annotations
@@ -31,6 +49,9 @@ from enum import Enum
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import dns.exception
+import dns.resolver
+
 from webguard_scanner.safe_http import FetchPolicy, SafeRequestError, fetch_once
 from webguard_scanner.scope_validator import (
     TargetValidationError,
@@ -38,6 +59,24 @@ from webguard_scanner.scope_validator import (
     ValidationPolicy,
     validate_target_url,
 )
+
+_DNS_TXT_RECORD_PREFIX = "_webguard-verification"
+_DNS_LOOKUP_TIMEOUT_SECONDS = 5.0
+# Deliberately not this host's own configured resolver. Two real,
+# independent reasons, not one: (1) dnspython's default Resolver()
+# parses /etc/resolv.conf literally, but that file is not authoritative
+# on every platform (macOS says so in its own header comment), since
+# real resolution goes through scutil/mDNSResponder instead, and a
+# router-advertised nameserver listed there can be simply unreachable
+# while the OS's own working resolution path is fine, exactly the
+# failure this project hit verifying a real customer's record: `dig`
+# resolved it correctly in milliseconds while dnspython's default
+# Resolver() timed out after 15 seconds against the same host's
+# /etc/resolv.conf entry. (2) Even where the local resolver does work,
+# a corporate VPN, a filtering resolver, or split-horizon internal DNS
+# could give a customer-verification check a different answer than the
+# public internet sees, which is the one that actually matters here.
+_PUBLIC_DNS_RESOLVERS = ("1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4")
 
 
 class TargetVerificationError(ValueError):
@@ -49,6 +88,7 @@ class TargetVerificationError(ValueError):
 
 class VerificationMethod(str, Enum):
     WELL_KNOWN_HTTP = "well_known_http"
+    DNS_TXT = "dns_txt"
 
 
 class VerificationStatus(str, Enum):
@@ -96,10 +136,17 @@ class TargetVerificationRecord:
                 .replace("+00:00", "Z")
             )
         if self.expected_token is not None:
-            payload["instructions"] = {
-                "path": _WELL_KNOWN_PATH,
-                "expected_content": self.expected_token,
-            }
+            if self.method is VerificationMethod.DNS_TXT:
+                payload["instructions"] = {
+                    "record_type": "TXT",
+                    "record_prefix": _DNS_TXT_RECORD_PREFIX,
+                    "expected_content": self.expected_token,
+                }
+            else:
+                payload["instructions"] = {
+                    "path": _WELL_KNOWN_PATH,
+                    "expected_content": self.expected_token,
+                }
         return payload
 
 
@@ -141,6 +188,64 @@ def check_well_known_token(target_url: str, expected_token: str) -> tuple[bool, 
     if body != expected_token:
         return False, "token-mismatch"
     return True, "verified-well-known-token-match"
+
+
+def dns_txt_record_name(target_url: str) -> str:
+    """The dedicated TXT record name a verification check resolves --
+    a fixed prefix on the asset's own host, never the apex domain's own
+    bare name. A dedicated subdomain avoids ever having to search
+    through whatever other TXT records the domain owner already has
+    there for unrelated reasons (SPF, DKIM, other providers' own site
+    verification), the same ``_acme-challenge.<host>`` convention
+    ACME's DNS-01 challenge uses for exactly this reason."""
+
+    hostname = urlsplit(target_url).hostname
+    if not hostname:
+        raise TargetVerificationError(
+            "target_verification_invalid_url", "target URL has no resolvable hostname."
+        )
+    return f"{_DNS_TXT_RECORD_PREFIX}.{hostname}"
+
+
+def check_dns_txt_token(target_url: str, expected_token: str) -> tuple[bool, str]:
+    """Resolve the dedicated TXT record and check whether any of its
+    values match the expected token. Returns ``(matched, detail)``, the
+    same contract ``check_well_known_token`` uses.
+
+    Unlike the HTTP method, this makes no connection to any address the
+    customer chose: it only asks the recursive resolver to look up a
+    name, so it needs no SSRF-style address validation, only a bound
+    on how long a slow or unresponsive authoritative server can hang
+    this call. Queries a fixed set of public resolvers
+    (``_PUBLIC_DNS_RESOLVERS``, see that constant's own comment for
+    why), never this host's own configured one."""
+
+    try:
+        record_name = dns_txt_record_name(target_url)
+    except TargetVerificationError as exc:
+        return False, f"target-validation-failed.{exc.code}"
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = list(_PUBLIC_DNS_RESOLVERS)
+    resolver.timeout = _DNS_LOOKUP_TIMEOUT_SECONDS
+    resolver.lifetime = _DNS_LOOKUP_TIMEOUT_SECONDS
+    try:
+        answer = resolver.resolve(record_name, "TXT")
+    except dns.resolver.NXDOMAIN:
+        return False, "dns-record-not-found"
+    except dns.resolver.NoAnswer:
+        return False, "dns-record-not-found"
+    except dns.exception.Timeout:
+        return False, "dns-lookup-timed-out"
+    except dns.exception.DNSException as exc:
+        return False, f"dns-lookup-failed.{type(exc).__name__.lower()}"
+    for rdata in answer:
+        # A TXT record's value can be split across multiple quoted
+        # strings; dnspython exposes them as `strings`, a tuple of byte
+        # chunks that concatenate to the record's real value.
+        value = b"".join(rdata.strings).decode("utf-8", errors="replace").strip()
+        if value == expected_token:
+            return True, "verified-dns-txt-match"
+    return False, "token-mismatch"
 
 
 def _without_token(record: TargetVerificationRecord) -> TargetVerificationRecord:
@@ -221,7 +326,7 @@ class InMemoryTargetVerificationRepository:
         verification_id: str,
         *,
         organization_id: str,
-        matched: bool,
+        status: VerificationStatus,
         detail: str,
         now: datetime,
     ) -> TargetVerificationRecord:
@@ -234,7 +339,6 @@ class InMemoryTargetVerificationRepository:
                 raise TargetVerificationError(
                     "target_verification_not_found", "No pending verification matches the requested ID."
                 )
-            status = VerificationStatus.VERIFIED if matched else VerificationStatus.FAILED
             updated = TargetVerificationRecord(
                 verification_id=record.verification_id,
                 target_id=record.target_id,
@@ -256,6 +360,8 @@ __all__ = [
     "TargetVerificationRecord",
     "VerificationMethod",
     "VerificationStatus",
+    "check_dns_txt_token",
     "check_well_known_token",
+    "dns_txt_record_name",
     "well_known_verification_url",
 ]

@@ -14,6 +14,7 @@ import {
   settingsApi,
   teamApi,
 } from "../lib/api";
+import type { VerificationMethod } from "../lib/api";
 
 export function useChangePassword() {
   return useMutation({
@@ -81,8 +82,9 @@ export function useUpdateAsset() {
 export function useStartVerification() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: assetsApi.startVerification,
-    onSuccess: (_data, id) => client.invalidateQueries({ queryKey: ["asset", id] }),
+    mutationFn: ({ id, method }: { id: string; method: VerificationMethod }) =>
+      assetsApi.startVerification(id, method),
+    onSuccess: (_data, { id }) => client.invalidateQueries({ queryKey: ["asset", id] }),
   });
 }
 

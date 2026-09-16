@@ -130,11 +130,10 @@ class PostgresTargetVerificationRepository:
         verification_id: str,
         *,
         organization_id: str,
-        matched: bool,
+        status: VerificationStatus,
         detail: str,
         now: datetime,
     ) -> TargetVerificationRecord:
-        status = VerificationStatus.VERIFIED if matched else VerificationStatus.FAILED
         with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 f"""

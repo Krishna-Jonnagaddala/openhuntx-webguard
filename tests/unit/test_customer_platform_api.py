@@ -27,6 +27,7 @@ from webguard_api.artifact_store import LocalArtifactStore
 from webguard_contracts import OrganizationRole, PrincipalType
 
 from tests.unit.service_test_support import (
+    AUTH_ID,
     NOW,
     OWNER_ID,
     VIEWER_ID,
@@ -149,6 +150,32 @@ class CustomerPlatformApiTests(unittest.TestCase):
         self.assertEqual(status, 201)
         status, _, payload = self.json_request("POST", "/v1/assets", {"url": "https://dup.example/"})
         self.assertEqual(status, 409, payload)
+
+    def test_asset_url_typed_without_trailing_slash_still_matches_an_assigned_authorization(self) -> None:
+        """The fixture authorization's target is "https://example.com/"
+        (CLI-canonicalized, see service_test_support.TARGET). A customer
+        naturally types a bare domain with no trailing slash; the asset
+        must still store it in the same canonical shape or
+        _find_authorization_for_asset's exact-match join never fires."""
+
+        status, _, created = self.json_request("POST", "/v1/assets", {"url": "https://example.com"})
+        self.assertEqual(status, 201, created)
+        target_id = created["target_id"]
+
+        status, _, detail = self.json_request("GET", f"/v1/assets/{target_id}")
+        self.assertEqual(status, 200, detail)
+        self.assertIsNotNone(detail["authorization"])
+        self.assertEqual(detail["authorization"]["authorization_id"], AUTH_ID)
+
+    def test_asset_url_without_trailing_slash_conflicts_with_the_same_url_with_one(self) -> None:
+        status, _, _ = self.json_request("POST", "/v1/assets", {"url": "https://dup-slash.example/"})
+        status, _, payload = self.json_request("POST", "/v1/assets", {"url": "https://dup-slash.example"})
+        self.assertEqual(status, 409, payload)
+
+    def test_asset_url_without_scheme_or_host_is_rejected(self) -> None:
+        status, _, payload = self.json_request("POST", "/v1/assets", {"url": "not-a-url"})
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["error"]["code"], "asset_url_invalid")
 
     def test_viewer_cannot_create_asset(self) -> None:
         status, _, payload = self.json_request(
@@ -292,7 +319,9 @@ class CustomerPlatformApiTests(unittest.TestCase):
         self.assertEqual(status, 201, created)
         target_id = created["target_id"]
 
-        status, _, started = self.json_request("POST", f"/v1/assets/{target_id}/verification")
+        status, _, started = self.json_request(
+            "POST", f"/v1/assets/{target_id}/verification", {"method": "well_known_http"}
+        )
         self.assertEqual(status, 201, started)
         self.assertEqual(started["status"], "pending")
         token = started["instructions"]["expected_content"]
@@ -318,7 +347,12 @@ class CustomerPlatformApiTests(unittest.TestCase):
         self.assertEqual(detail["verification"]["status"], "verified")
         self.assertNotIn("instructions", detail["verification"])
 
-    def test_well_known_verification_fails_on_token_mismatch(self) -> None:
+    def test_well_known_verification_stays_pending_and_retryable_on_mismatch(self) -> None:
+        """A check that doesn't match yet must never destroy the still-
+        valid pending token: the customer should be able to fix
+        whatever was wrong and click "Check now" again, not be forced
+        to publish an entirely new value first."""
+
         fixture_server = ThreadingHTTPServer(("127.0.0.1", 0), _WellKnownFixtureHandler)
         fixture_thread = threading.Thread(target=fixture_server.serve_forever, daemon=True)
         fixture_thread.start()
@@ -330,8 +364,11 @@ class CustomerPlatformApiTests(unittest.TestCase):
 
         status, _, created = self.json_request("POST", "/v1/assets", {"url": target_url})
         target_id = created["target_id"]
-        status, _, started = self.json_request("POST", f"/v1/assets/{target_id}/verification")
+        status, _, started = self.json_request(
+            "POST", f"/v1/assets/{target_id}/verification", {"method": "well_known_http"}
+        )
         self.assertEqual(status, 201, started)
+        original_token = started["instructions"]["expected_content"]
 
         from webguard_scanner import ValidatedTarget
 
@@ -347,7 +384,158 @@ class CustomerPlatformApiTests(unittest.TestCase):
         with patch("webguard_api.target_verification.validate_target_url", side_effect=_validated):
             status, _, checked = self.json_request("POST", f"/v1/assets/{target_id}/verification/check")
         self.assertEqual(status, 200, checked)
-        self.assertEqual(checked["status"], "failed")
+        self.assertEqual(checked["status"], "pending")
+        self.assertEqual(checked["last_check_detail"], "token-mismatch")
+        self.assertEqual(checked["instructions"]["expected_content"], original_token)
+
+        # Fix the fixture (simulating the customer publishing the
+        # correct file) and check again with no new verification
+        # started: the original token must still be the one honored.
+        _WellKnownFixtureHandler.expected_token = original_token
+        with patch("webguard_api.target_verification.validate_target_url", side_effect=_validated):
+            status, _, rechecked = self.json_request("POST", f"/v1/assets/{target_id}/verification/check")
+        self.assertEqual(status, 200, rechecked)
+        self.assertEqual(rechecked["status"], "verified")
+
+    def test_verification_start_rejects_unknown_method(self) -> None:
+        status, _, created = self.json_request("POST", "/v1/assets", {"url": "https://method-invalid.example/"})
+        target_id = created["target_id"]
+        status, _, started = self.json_request(
+            "POST", f"/v1/assets/{target_id}/verification", {"method": "carrier_pigeon"}
+        )
+        self.assertEqual(status, 400, started)
+
+    def test_dns_txt_verification_succeeds_against_resolved_record(self) -> None:
+        """No fixture DNS server is spun up (no such thing as a
+        disposable authoritative nameserver here): this mocks
+        ``dns.resolver.Resolver.resolve`` at the same boundary the
+        well-known tests mock ``validate_target_url`` at, the
+        third-party client call itself, not this module's own logic."""
+
+        status, _, created = self.json_request("POST", "/v1/assets", {"url": "https://dns-verify.example/"})
+        target_id = created["target_id"]
+        status, _, started = self.json_request(
+            "POST", f"/v1/assets/{target_id}/verification", {"method": "dns_txt"}
+        )
+        self.assertEqual(status, 201, started)
+        self.assertEqual(started["instructions"]["record_type"], "TXT")
+        self.assertEqual(started["instructions"]["record_prefix"], "_webguard-verification")
+        token = started["instructions"]["expected_content"]
+
+        class _FakeTxtRdata:
+            def __init__(self, value: str) -> None:
+                self.strings = (value.encode(),)
+
+        def _resolve(resolver, qname, rdtype, *args, **kwargs):
+            self.assertEqual(str(qname).rstrip("."), "_webguard-verification.dns-verify.example")
+            self.assertEqual(rdtype, "TXT")
+            return [_FakeTxtRdata(token)]
+
+        with patch("dns.resolver.Resolver.resolve", _resolve):
+            status, _, checked = self.json_request("POST", f"/v1/assets/{target_id}/verification/check")
+        self.assertEqual(status, 200, checked)
+        self.assertEqual(checked["status"], "verified")
+
+    def test_dns_txt_verification_stays_pending_and_retryable_when_record_missing(self) -> None:
+        """The real-world case this method exists for: a record that
+        hasn't propagated yet must not cost the customer their
+        already-published value. Same non-destructive contract as the
+        well-known method's own retry test."""
+
+        import dns.resolver as dns_resolver_module
+
+        status, _, created = self.json_request("POST", "/v1/assets", {"url": "https://dns-missing.example/"})
+        target_id = created["target_id"]
+        status, _, started = self.json_request(
+            "POST", f"/v1/assets/{target_id}/verification", {"method": "dns_txt"}
+        )
+        self.assertEqual(status, 201, started)
+        token = started["instructions"]["expected_content"]
+
+        def _not_found(resolver, qname, rdtype, *args, **kwargs):
+            raise dns_resolver_module.NXDOMAIN()
+
+        with patch("dns.resolver.Resolver.resolve", _not_found):
+            status, _, checked = self.json_request("POST", f"/v1/assets/{target_id}/verification/check")
+        self.assertEqual(status, 200, checked)
+        self.assertEqual(checked["status"], "pending")
+        self.assertEqual(checked["last_check_detail"], "dns-record-not-found")
+        self.assertEqual(checked["instructions"]["expected_content"], token)
+
+        class _FakeTxtRdata:
+            def __init__(self, value: str) -> None:
+                self.strings = (value.encode(),)
+
+        def _now_resolves(resolver, qname, rdtype, *args, **kwargs):
+            return [_FakeTxtRdata(token)]
+
+        with patch("dns.resolver.Resolver.resolve", _now_resolves):
+            status, _, rechecked = self.json_request("POST", f"/v1/assets/{target_id}/verification/check")
+        self.assertEqual(status, 200, rechecked)
+        self.assertEqual(rechecked["status"], "verified")
+
+    def test_starting_over_while_still_pending_issues_a_genuinely_new_token(self) -> None:
+        """The other half of the retry story: a customer who wants a
+        fresh value entirely (not just a retry of the same one) can
+        ask for it explicitly, and it must actually be different, not
+        the same token re-served."""
+
+        status, _, created = self.json_request("POST", "/v1/assets", {"url": "https://dns-restart.example/"})
+        target_id = created["target_id"]
+        status, _, first = self.json_request(
+            "POST", f"/v1/assets/{target_id}/verification", {"method": "dns_txt"}
+        )
+        self.assertEqual(status, 201, first)
+        first_token = first["instructions"]["expected_content"]
+
+        status, _, second = self.json_request(
+            "POST", f"/v1/assets/{target_id}/verification", {"method": "dns_txt"}
+        )
+        self.assertEqual(status, 201, second)
+        second_token = second["instructions"]["expected_content"]
+        self.assertNotEqual(first_token, second_token)
+
+        # The old token must no longer be the one a check honors.
+        class _FakeTxtRdata:
+            def __init__(self, value: str) -> None:
+                self.strings = (value.encode(),)
+
+        def _resolves_old_token(resolver, qname, rdtype, *args, **kwargs):
+            return [_FakeTxtRdata(first_token)]
+
+        with patch("dns.resolver.Resolver.resolve", _resolves_old_token):
+            status, _, checked = self.json_request("POST", f"/v1/assets/{target_id}/verification/check")
+        self.assertEqual(status, 200, checked)
+        self.assertEqual(checked["status"], "pending")
+        self.assertEqual(checked["last_check_detail"], "token-mismatch")
+
+    def test_verification_expires_after_the_token_ttl(self) -> None:
+        """Closes a real pre-existing gap: a timed-out token used to be
+        recorded as plain ``failed``, the same status a genuine
+        mismatch produces, even though the schema and
+        ``VerificationStatus`` enum both already name ``expired`` as
+        its own outcome."""
+
+        status, _, created = self.json_request("POST", "/v1/assets", {"url": "https://dns-expiring.example/"})
+        target_id = created["target_id"]
+        status, _, started = self.json_request(
+            "POST", f"/v1/assets/{target_id}/verification", {"method": "dns_txt"}
+        )
+        self.assertEqual(status, 201, started)
+
+        from datetime import timedelta
+
+        from webguard_api.target_verification import VERIFICATION_TOKEN_TTL
+
+        original_clock = self.service.clock
+        self.service.clock = lambda: NOW + VERIFICATION_TOKEN_TTL + timedelta(seconds=1)
+        try:
+            status, _, checked = self.json_request("POST", f"/v1/assets/{target_id}/verification/check")
+        finally:
+            self.service.clock = original_clock
+        self.assertEqual(status, 200, checked)
+        self.assertEqual(checked["status"], "expired")
+        self.assertEqual(checked["evidence"], "verification_token_expired")
 
     # -- Dashboard ---------------------------------------------------------
 

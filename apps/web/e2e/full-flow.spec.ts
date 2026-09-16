@@ -60,7 +60,7 @@ test("full customer platform flow: sign in, add asset, verify, scan, findings, r
 
   // -- verify ownership through the real server-side check --
   await expect(page.getByRole("heading", { name: "Ownership verification" })).toBeVisible();
-  await page.getByRole("button", { name: "Start verification" }).click();
+  await page.getByRole("button", { name: "Verify via file" }).click();
   await page.getByRole("button", { name: "Check now" }).click();
   await expect(page.getByText("Ownership has been verified.")).toBeVisible({ timeout: 15_000 });
 
