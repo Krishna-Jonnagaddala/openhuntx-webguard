@@ -35,6 +35,7 @@ from .config import (
     ServiceConfig,
     ServiceConfigError,
 )
+from .coverage_store import InMemoryCoverageRepository
 from .environment import Environment
 from .executor import ScanJobExecutor
 from .finding_store import InMemoryFindingRepository
@@ -179,6 +180,11 @@ def _components(config: ServiceConfig):
     # agreed, the same way artifact_store didn't before that fix.
     scan_repository = InMemoryScanRepository()
     finding_repository = InMemoryFindingRepository()
+    # Phase 4 of the Coverage Truth Map (an API/report surface): a
+    # completed scan's coverage rows must be readable through the same
+    # instance the executor wrote them to, or GET /v1/assets/{id}/coverage
+    # would be permanently empty in local/lab mode.
+    coverage_repository = InMemoryCoverageRepository()
     executor = ScanJobExecutor(
         authorizations=authorizations,
         store=store,
@@ -191,6 +197,7 @@ def _components(config: ServiceConfig):
         artifact_store=artifact_store,
         scan_repository=scan_repository,
         finding_repository=finding_repository,
+        coverage_repository=coverage_repository,
     )
     web_app_base_url = os.environ.get("WEBGUARD_WEB_APP_BASE_URL", "http://127.0.0.1:5173")
     service = WebGuardJobService(
@@ -202,6 +209,7 @@ def _components(config: ServiceConfig):
         web_app_base_url=web_app_base_url,
         scan_repository=scan_repository,
         finding_repository=finding_repository,
+        coverage_repository=coverage_repository,
     )
     worker = ScanJobWorker(
         store=store,

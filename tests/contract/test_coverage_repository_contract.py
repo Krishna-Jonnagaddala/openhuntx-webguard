@@ -1,10 +1,10 @@
 """Contract tests for `PostgresCoverageRepository` (product vision
-pillar 5, Coverage Truth Map v1). No in-memory backend exists for this
-table: it is genuinely new, additive tracking with no pre-existing
-local/test behavior to mirror (see coverage_store.py's own module
-docstring), so this is a single, direct Postgres-backed test class
-rather than the two-backend mixin pattern used elsewhere in this
-directory.
+pillar 5, Coverage Truth Map v1, Phase 4's read API). An in-memory
+backend (`InMemoryCoverageRepository`) was added in Phase 4 too; it is
+exercised through the service/HTTP layer instead, in
+`tests/unit/test_customer_platform_api.py`'s own "Coverage" section,
+rather than duplicating this file's direct-repository test bodies for
+a second backend.
 """
 
 from __future__ import annotations
@@ -235,6 +235,74 @@ class PostgresCoverageRepositoryContractTests(unittest.TestCase):
 
         self.assertEqual(len(repo.list_coverage_for_asset(org_a, "https://example.com")), 1)
         self.assertEqual(len(repo.list_coverage_for_asset(org_b, "https://example.com")), 0)
+
+    def test_paginated_listing_orders_most_recently_observed_first_and_paginates(self) -> None:
+        from webguard_api.coverage_store import CoverageStatus
+
+        repo = self.make_repository()
+        org_id = self.make_organization_id()
+        for index, check_id in enumerate(("a_check", "b_check", "c_check")):
+            repo.record_coverage(
+                organization_id=org_id,
+                asset="https://example.com",
+                path="/",
+                http_method="GET",
+                identity_label="unauthenticated",
+                check_id=check_id,
+                status=CoverageStatus.COMPLETED,
+                scanner_version="1.0.0",
+                now=NOW + timedelta(minutes=index),
+            )
+
+        first_page, has_more = repo.list_coverage_for_asset_page(org_id, "https://example.com", limit=2)
+        self.assertEqual(len(first_page), 2)
+        self.assertTrue(has_more)
+        self.assertEqual([r.check_id for r in first_page], ["c_check", "b_check"], "most recently observed first")
+
+        from webguard_api.coverage_store import coverage_cursor_key
+
+        last = first_page[-1]
+        second_page, has_more_2 = repo.list_coverage_for_asset_page(
+            org_id, "https://example.com", limit=2,
+            after=(last.last_observed_at.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"), coverage_cursor_key(last)),
+        )
+        self.assertEqual([r.check_id for r in second_page], ["a_check"])
+        self.assertFalse(has_more_2)
+
+    def test_paginated_listing_is_tenant_scoped(self) -> None:
+        from webguard_api.coverage_store import CoverageStatus
+
+        repo = self.make_repository()
+        org_a, org_b = self.make_organization_id(), self.make_organization_id()
+        repo.record_coverage(
+            organization_id=org_a, asset="https://example.com", path="/", http_method="GET",
+            identity_label="unauthenticated", check_id="header_analyzer",
+            status=CoverageStatus.COMPLETED, scanner_version="1.0.0", now=NOW,
+        )
+        page, has_more = repo.list_coverage_for_asset_page(org_b, "https://example.com", limit=10)
+        self.assertEqual(page, ())
+        self.assertFalse(has_more)
+
+    def test_status_counts_reflect_every_recorded_row_not_just_one_page(self) -> None:
+        from webguard_api.coverage_store import CoverageStatus
+
+        repo = self.make_repository()
+        org_id = self.make_organization_id()
+        statuses = (CoverageStatus.COMPLETED, CoverageStatus.COMPLETED, CoverageStatus.BLOCKED, CoverageStatus.UNREACHABLE)
+        for index, status in enumerate(statuses):
+            repo.record_coverage(
+                organization_id=org_id, asset="https://example.com", path="/", http_method="GET",
+                identity_label="unauthenticated", check_id=f"check_{index}",
+                status=status, scanner_version="1.0.0", now=NOW,
+            )
+        counts = repo.count_coverage_by_status(org_id, "https://example.com")
+        self.assertEqual(counts, {"completed": 2, "blocked": 1, "unreachable": 1})
+
+    def test_status_counts_for_an_asset_with_no_rows_is_empty_not_fabricated(self) -> None:
+        repo = self.make_repository()
+        org_id = self.make_organization_id()
+        counts = repo.count_coverage_by_status(org_id, "https://never-scanned.example")
+        self.assertEqual(counts, {}, "an asset with zero recorded rows must report zero, never a manufactured total")
 
 
 if __name__ == "__main__":

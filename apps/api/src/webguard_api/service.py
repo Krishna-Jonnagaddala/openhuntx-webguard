@@ -148,6 +148,7 @@ class WebGuardJobService:
         readiness_check: Callable[[], None] | None = None,
         finding_repository=None,
         scan_repository=None,
+        coverage_repository=None,
         report_repository=None,
         artifact_store=None,
         targets=None,
@@ -180,6 +181,19 @@ class WebGuardJobService:
 
         self.scan_repository = (
             scan_repository if scan_repository is not None else InMemoryScanRepository()
+        )
+        # Phase 4 of the Coverage Truth Map (an API/report surface):
+        # same optional/defaulted pattern as scan_repository/
+        # finding_repository above. Coverage previously had no
+        # in-memory backend at all (ScanJobExecutor's own
+        # coverage_repository defaulted to None), so local/lab-mode
+        # scans recorded nothing to read; this default makes local
+        # demos populate real coverage data the same way they already
+        # populate scans and findings.
+        from .coverage_store import InMemoryCoverageRepository
+
+        self.coverage_repository = (
+            coverage_repository if coverage_repository is not None else InMemoryCoverageRepository()
         )
         # Slice 14 requirement 5: same optional/defaulted pattern as
         # every other repository above -- local/unit/lab behavior is
@@ -2822,6 +2836,88 @@ class WebGuardJobService:
             resource_id=target_id, outcome=AuditOutcome.SUCCEEDED,
         )
         return self._asset_public_dict(context, record, detailed=True)
+
+    def list_asset_coverage(
+        self, context: AuthContext, target_id: str, page: PageRequest, *, request_id: str
+    ) -> dict:
+        """Coverage Truth Map v1 read surface (product vision pillar
+        5). Tenant identity is derived entirely from context.organization_id,
+        the server-resolved caller identity from the authenticated
+        request; nothing here accepts a caller-supplied organization
+        id. get_target already fails closed (404) on a target that
+        exists but belongs to a different organization, so a coverage
+        read for one tenant can never resolve a different tenant's
+        asset in the first place.
+
+        Returns actually recorded rows only, plus a page-independent
+        status-count summary of every row for this asset (not just
+        this page), so a paginated client can still show an honest
+        denominator. Never claims a state (discovered/authorized) that
+        v1 does not populate, and never manufactures a percentage: a
+        caller with zero recorded rows sees an empty list and a
+        summary of all zeros, not a fabricated "100% covered."
+        identity_label is always "unauthenticated" today (see
+        coverage_store.py's own module docstring); surfaced verbatim,
+        not smoothed over.
+        """
+
+        self._require(
+            context, ApiPermission.ASSET_READ, request_id=request_id,
+            action="assets.coverage.list", resource_type="target", resource_id=target_id,
+        )
+        try:
+            target = self.targets.get_target(target_id, organization_id=context.organization_id)
+        except TargetRepositoryError as exc:
+            self._audit(
+                context, request_id=request_id, action="assets.coverage.list", resource_type="target",
+                resource_id=target_id, outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        from .coverage_store import coverage_cursor_key, split_asset_and_path
+
+        asset, _ = split_asset_and_path(target.url)
+        records, has_more = self.coverage_repository.list_coverage_for_asset_page(
+            context.organization_id, asset, limit=page.limit,
+            after=self._decode_page(context, page, resource="asset_coverage"),
+        )
+        next_cursor = None
+        if has_more and records:
+            last = records[-1]
+            next_cursor = self._next_cursor(
+                context, page, resource="asset_coverage",
+                ordered_at=last.last_observed_at, resource_id=coverage_cursor_key(last),
+            )
+        status_counts = self.coverage_repository.count_coverage_by_status(context.organization_id, asset)
+        self._audit(
+            context, request_id=request_id, action="assets.coverage.list", resource_type="target",
+            resource_id=target_id, outcome=AuditOutcome.SUCCEEDED,
+        )
+        return {
+            "asset": asset,
+            "coverage": [
+                {
+                    "path": record.path,
+                    "http_method": record.http_method,
+                    "identity_label": record.identity_label,
+                    "check_id": record.check_id,
+                    "status": record.status.value,
+                    "scanner_version": record.scanner_version,
+                    "check_version": record.check_version,
+                    "last_scan_id": record.last_scan_id,
+                    "last_finding_id": record.last_finding_id,
+                    "first_observed_at": self._timestamp(record.first_observed_at),
+                    "last_observed_at": self._timestamp(record.last_observed_at),
+                }
+                for record in records
+            ],
+            "status_counts": {
+                "completed": status_counts.get("completed", 0),
+                "blocked": status_counts.get("blocked", 0),
+                "unreachable": status_counts.get("unreachable", 0),
+            },
+            "not_populated_states": ["discovered", "authorized"],
+            "page": self._page_payload(page.limit, next_cursor),
+        }
 
     def update_asset(self, context: AuthContext, target_id: str, body: dict, *, request_id: str) -> dict:
         self._require(

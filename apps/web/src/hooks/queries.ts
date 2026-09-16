@@ -51,6 +51,14 @@ export function useAsset(id: string | undefined) {
   });
 }
 
+export function useAssetCoverage(id: string | undefined, cursor: string | undefined) {
+  return useQuery({
+    queryKey: ["asset-coverage", id, cursor],
+    queryFn: () => assetsApi.coverage(id as string, cursor),
+    enabled: !!id,
+  });
+}
+
 export function useCreateAsset() {
   const client = useQueryClient();
   return useMutation({

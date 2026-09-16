@@ -10,6 +10,7 @@ import json
 import tempfile
 import threading
 import unittest
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -198,6 +199,108 @@ class CustomerPlatformApiTests(unittest.TestCase):
         issued = other_identity.create_token(other_principal.principal_id, label="other", now=NOW)
         status, _, payload = self.json_request(
             "GET", f"/v1/assets/{created['target_id']}", headers={"Authorization": f"Bearer {issued.token}"}, token=None
+        )
+        self.assertEqual(status, 404, payload)
+
+    # -- Coverage Truth Map (Phase 4: a read API) --------------------------
+
+    def test_coverage_for_a_never_scanned_asset_is_an_empty_list_not_a_fabricated_total(self) -> None:
+        status, _, created = self.json_request("POST", "/v1/assets", {"url": "https://never-scanned.example/"})
+        self.assertEqual(status, 201, created)
+
+        status, _, payload = self.json_request("GET", f"/v1/assets/{created['target_id']}/coverage")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["coverage"], [])
+        self.assertEqual(payload["status_counts"], {"completed": 0, "blocked": 0, "unreachable": 0})
+        self.assertEqual(set(payload["not_populated_states"]), {"discovered", "authorized"})
+        self.assertIsNone(payload["page"]["next_cursor"])
+
+    def test_coverage_reflects_actually_recorded_rows_with_honest_identity_label(self) -> None:
+        status, _, created = self.json_request("POST", "/v1/assets", {"url": "https://coverage.example/"})
+        self.assertEqual(status, 201, created)
+
+        from webguard_api.coverage_store import CoverageStatus
+
+        self.service.coverage_repository.record_coverage(
+            organization_id=self.context.organization_id, asset="https://coverage.example", path="/",
+            http_method="GET", identity_label="unauthenticated", check_id="header_analyzer",
+            status=CoverageStatus.COMPLETED, scanner_version="1.0.0", now=NOW,
+        )
+        self.service.coverage_repository.record_coverage(
+            organization_id=self.context.organization_id, asset="https://coverage.example", path="/admin",
+            http_method="GET", identity_label="unauthenticated", check_id="tls_analyzer",
+            status=CoverageStatus.BLOCKED, scanner_version="1.0.0", now=NOW,
+        )
+
+        status, _, payload = self.json_request("GET", f"/v1/assets/{created['target_id']}/coverage")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(len(payload["coverage"]), 2)
+        self.assertEqual(payload["status_counts"], {"completed": 1, "blocked": 1, "unreachable": 0})
+        self.assertTrue(all(row["identity_label"] == "unauthenticated" for row in payload["coverage"]))
+
+    def test_coverage_pagination_returns_a_usable_cursor_for_the_next_page(self) -> None:
+        status, _, created = self.json_request("POST", "/v1/assets", {"url": "https://paged.example/"})
+        self.assertEqual(status, 201, created)
+
+        from webguard_api.coverage_store import CoverageStatus
+
+        for index, check_id in enumerate(("a_check", "b_check", "c_check")):
+            self.service.coverage_repository.record_coverage(
+                organization_id=self.context.organization_id, asset="https://paged.example", path="/",
+                http_method="GET", identity_label="unauthenticated", check_id=check_id,
+                status=CoverageStatus.COMPLETED, scanner_version="1.0.0",
+                now=NOW + timedelta(minutes=index),
+            )
+
+        status, _, first_page = self.json_request(
+            "GET", f"/v1/assets/{created['target_id']}/coverage?limit=2"
+        )
+        self.assertEqual(status, 200, first_page)
+        self.assertEqual(len(first_page["coverage"]), 2)
+        self.assertIsNotNone(first_page["page"]["next_cursor"])
+        self.assertEqual(first_page["status_counts"], {"completed": 3, "blocked": 0, "unreachable": 0})
+
+        status, _, second_page = self.json_request(
+            "GET",
+            f"/v1/assets/{created['target_id']}/coverage?limit=2&cursor={first_page['page']['next_cursor']}",
+        )
+        self.assertEqual(status, 200, second_page)
+        self.assertEqual(len(second_page["coverage"]), 1)
+        self.assertIsNone(second_page["page"]["next_cursor"])
+        seen_checks = {row["check_id"] for row in first_page["coverage"]} | {row["check_id"] for row in second_page["coverage"]}
+        self.assertEqual(seen_checks, {"a_check", "b_check", "c_check"})
+
+    def test_coverage_is_tenant_scoped(self) -> None:
+        status, _, created = self.json_request("POST", "/v1/assets", {"url": "https://coverage-scoped.example/"})
+        self.assertEqual(status, 201, created)
+
+        from webguard_api.coverage_store import CoverageStatus
+
+        self.service.coverage_repository.record_coverage(
+            organization_id=self.context.organization_id, asset="https://coverage-scoped.example", path="/",
+            http_method="GET", identity_label="unauthenticated", check_id="header_analyzer",
+            status=CoverageStatus.COMPLETED, scanner_version="1.0.0", now=NOW,
+        )
+
+        from webguard_api import IdentityStore
+
+        other_identity = IdentityStore(Path(self.temporary.name) / "jobs.sqlite3")
+        other_org = other_identity.create_organization("Other Coverage Org", now=NOW)
+        other_principal = other_identity.create_principal(
+            other_org.organization_id, "Other Owner",
+            principal_type=PrincipalType.USER,
+            role=OrganizationRole.OWNER, now=NOW,
+        )
+        issued = other_identity.create_token(other_principal.principal_id, label="other", now=NOW)
+        status, _, payload = self.json_request(
+            "GET", f"/v1/assets/{created['target_id']}/coverage",
+            headers={"Authorization": f"Bearer {issued.token}"}, token=None,
+        )
+        self.assertEqual(status, 404, payload)
+
+    def test_coverage_for_unknown_asset_is_404(self) -> None:
+        status, _, payload = self.json_request(
+            "GET", "/v1/assets/00000000-0000-0000-0000-000000000000/coverage"
         )
         self.assertEqual(status, 404, payload)
 

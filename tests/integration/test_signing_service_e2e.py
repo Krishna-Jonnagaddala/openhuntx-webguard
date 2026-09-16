@@ -41,12 +41,71 @@ RUN_INTEGRATION = os.environ.get("WEBGUARD_RUN_INTEGRATION") == "1"
 POSTGRES_TEST_DSN = os.environ.get("WEBGUARD_POSTGRES_TEST_DSN")
 RUN_SIGNING_SERVICE_E2E = RUN_INTEGRATION and bool(POSTGRES_TEST_DSN)
 
+# P1-2 Phase H: create_organization/create_target run under
+# api_tenant_data (postgres_pool.py's tenant_connection), so this real
+# build_production_components-backed E2E needs the same role/ACL/
+# function/runtime-grant bootstrap test_production_ssrf_callback_e2e.py's
+# own setUpClass applies, in the same order. Unlike that sibling file
+# (and test_production_mode_e2e.py, test_production_runtime_completion_e2e.py),
+# this file previously had no setUpClass/tearDownClass of its own and
+# relied on whatever bootstrap state happened to already exist on
+# POSTGRES_TEST_DSN, correct only when this file runs alone or
+# immediately after an external bootstrap, and silently broken when
+# run in the same process after a sibling file's own tearDownClass had
+# already dropped those roles (reproduced 2026-09-15: "role
+# api_tenant_data does not exist" when run after
+# test_production_ssrf_callback_e2e.py in one unittest invocation).
+# This class now owns its own bootstrap/teardown, exactly like its
+# three siblings, so it is correct regardless of what ran before it.
+_BOOTSTRAP_DIR = Path(__file__).resolve().parent.parent.parent / "infra" / "postgres" / "bootstrap"
+_ROLES_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_roles.sql"
+_TENANT_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_acl.sql"
+_FUNCTION_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_function_acl.sql"
+_CONTROL_FUNCTIONS_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_control_functions.sql"
+_RUNTIME_GRANT_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_runtime_grant.sql"
+_ALL_BOOTSTRAP_ROLES = (
+    "api_tenant_data",
+    "worker_tenant_data",
+    "scheduler_tenant_data",
+    "identity_function_owner",
+    "worker_function_owner",
+    "scheduler_function_owner",
+    "callback_function_owner",
+)
+
 
 @unittest.skipUnless(
     RUN_SIGNING_SERVICE_E2E,
     "requires WEBGUARD_RUN_INTEGRATION=1 and WEBGUARD_POSTGRES_TEST_DSN",
 )
 class SigningServiceEndToEndTests(unittest.TestCase):
+    @classmethod
+    def _connect(cls):
+        import psycopg
+
+        return psycopg.connect(POSTGRES_TEST_DSN)
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        for sql_path in (
+            _ROLES_SQL_PATH,
+            _TENANT_ACL_SQL_PATH,
+            _FUNCTION_ACL_SQL_PATH,
+            _CONTROL_FUNCTIONS_SQL_PATH,
+            _RUNTIME_GRANT_SQL_PATH,
+        ):
+            with cls._connect() as connection:
+                connection.execute(sql_path.read_text(encoding="utf-8"))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        with cls._connect() as connection:
+            connection.autocommit = True
+            connection.execute("DROP SCHEMA IF EXISTS webguard_control CASCADE")
+            for role in _ALL_BOOTSTRAP_ROLES:
+                connection.execute(f'DROP OWNED BY "{role}"')
+                connection.execute(f'DROP ROLE IF EXISTS "{role}"')
+
     def test_permit_signed_by_the_signing_service_verifies_and_the_scan_executes(self) -> None:
         from unittest.mock import patch
 
