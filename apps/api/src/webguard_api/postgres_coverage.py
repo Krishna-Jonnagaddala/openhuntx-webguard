@@ -122,5 +122,54 @@ class PostgresCoverageRepository:
             ).fetchall()
         return tuple(_record_from_row(row) for row in rows)
 
+    def list_coverage_for_asset_page(
+        self,
+        organization_id: str,
+        asset: str,
+        *,
+        limit: int,
+        after: tuple[str, str] | None = None,
+    ) -> tuple[tuple[CoverageRecord, ...], bool]:
+        """Same (last_observed_at DESC, path, http_method,
+        identity_label, check_id) ordering and Unit-Separator-joined
+        composite cursor key as InMemoryCoverageRepository's own
+        list_coverage_for_asset_page (coverage_store.py's own
+        coverage_cursor_key), so the service layer's pagination logic
+        is identical for both backends."""
+
+        clauses = ["organization_id = %(organization_id)s", "asset = %(asset)s"]
+        params: dict[str, object] = {"organization_id": organization_id, "asset": asset, "limit": limit + 1}
+        if after is not None:
+            clauses.append(
+                "(last_observed_at, path || chr(31) || http_method || chr(31) || "
+                "identity_label || chr(31) || check_id) < (%(after_at)s, %(after_key)s)"
+            )
+            params["after_at"] = after[0]
+            params["after_key"] = after[1]
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            rows = connection.execute(
+                f"SELECT {_COLUMNS} FROM coverage_records "  # noqa: S608
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY last_observed_at DESC, path DESC, http_method DESC, identity_label DESC, check_id DESC "
+                "LIMIT %(limit)s",
+                params,
+            ).fetchall()
+        records = tuple(_record_from_row(row) for row in rows)
+        has_more = len(records) > limit
+        return records[:limit], has_more
+
+    def count_coverage_by_status(self, organization_id: str, asset: str) -> dict[str, int]:
+        """Page-independent totals; see InMemoryCoverageRepository's
+        own docstring for why this exists alongside the paginated
+        list."""
+
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            rows = connection.execute(
+                "SELECT status, count(*) FROM coverage_records "
+                "WHERE organization_id = %s AND asset = %s GROUP BY status",
+                (organization_id, asset),
+            ).fetchall()
+        return {status: count for status, count in rows}
+
 
 __all__ = ["PostgresCoverageRepository"]

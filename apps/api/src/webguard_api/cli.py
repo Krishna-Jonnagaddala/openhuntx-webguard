@@ -35,6 +35,7 @@ from .config import (
     ServiceConfig,
     ServiceConfigError,
 )
+from .coverage_store import InMemoryCoverageRepository
 from .environment import Environment
 from .executor import ScanJobExecutor
 from .health_server import (
@@ -167,6 +168,11 @@ def _components(config: ServiceConfig):
     # `--artifacts <anything else>` to `serve`/`run` would have made
     # every report download silently fail with `artifact_not_found`.
     artifact_store = LocalArtifactStore(config.artifact_directory)
+    # Phase 4 of the Coverage Truth Map (an API/report surface): a
+    # completed scan's coverage rows must be readable through the same
+    # instance the executor wrote them to, or GET /v1/assets/{id}/coverage
+    # would be permanently empty in local/lab mode.
+    coverage_repository = InMemoryCoverageRepository()
     executor = ScanJobExecutor(
         authorizations=authorizations,
         store=store,
@@ -177,6 +183,7 @@ def _components(config: ServiceConfig):
             identity.authorization_is_assigned
         ),
         artifact_store=artifact_store,
+        coverage_repository=coverage_repository,
     )
     web_app_base_url = os.environ.get("WEBGUARD_WEB_APP_BASE_URL", "http://127.0.0.1:5173")
     service = WebGuardJobService(
@@ -186,6 +193,7 @@ def _components(config: ServiceConfig):
         trustscan_signer=trustscan_signer,
         artifact_store=artifact_store,
         web_app_base_url=web_app_base_url,
+        coverage_repository=coverage_repository,
     )
     worker = ScanJobWorker(
         store=store,

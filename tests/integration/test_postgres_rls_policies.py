@@ -54,7 +54,9 @@ ALL_BOOTSTRAP_ROLES = TENANT_DATA_ROLES + FUNCTION_OWNER_ROLES
 # original 27; migrations 0013-0016 (platform expansion) added 5 more,
 # reconciled here 2026-09-15 per the OpenHuntX Scope & Progress Audit,
 # 2026-09-14, which found the three new tenant-owned tables among them
-# carried no policy at all.
+# carried no policy at all; migration 0017 (Compliance Phase 5, same
+# audit) added one more, technical_assertion_collections, reconciled
+# here alongside its own new RLS policies.
 ALL_TABLES = [
     "organizations", "principals", "memberships", "api_tokens",
     "organization_authorizations", "security_audit_events",
@@ -66,9 +68,9 @@ ALL_TABLES = [
     "finding_events", "password_credentials", "identity_tokens",
     "browser_sessions", "auth_rate_limit_events",
     "coverage_records", "module_entitlements", "frameworks", "master_controls",
-    "scoped_control_implementations",
+    "scoped_control_implementations", "technical_assertion_collections",
 ]
-assert len(ALL_TABLES) == 32
+assert len(ALL_TABLES) == 33
 
 # Non-tenant-owned tables: auth_rate_limit_events has no
 # organization_id column and is used only on pre-authentication
@@ -85,21 +87,21 @@ NON_TENANT_TABLES = ["auth_rate_limit_events", "frameworks", "master_controls"]
 # it gets no policy below; that is a statement about today's callers,
 # not about who owns the data).
 TENANT_OWNED_TABLES = [t for t in ALL_TABLES if t not in NON_TENANT_TABLES]
-assert len(TENANT_OWNED_TABLES) == 29
+assert len(TENANT_OWNED_TABLES) == 30
 
-# Tables a policy exists for today (28 of the 29 tenant-owned tables:
+# Tables a policy exists for today (29 of the 30 tenant-owned tables:
 # everything except crawl_checkpoints, which has zero ACL grantees on
 # any role -- Phase D's own precedent for a dormant table).
 ZERO_POLICY_TENANT_OWNED_TABLES = ["crawl_checkpoints"]
 RLS_MANAGED_TABLES = [t for t in TENANT_OWNED_TABLES if t not in ZERO_POLICY_TENANT_OWNED_TABLES]
-assert len(RLS_MANAGED_TABLES) == 28
+assert len(RLS_MANAGED_TABLES) == 29
 
 # Every table this suite will eventually enable+force RLS on inside
 # the disposable database, to prove future enforcement semantics --
 # this includes crawl_checkpoints (Section 2: proving default-deny
 # with zero policies), unlike RLS_MANAGED_TABLES above.
 FUTURE_RLS_TARGET_TABLES = TENANT_OWNED_TABLES
-assert len(FUTURE_RLS_TARGET_TABLES) == 29
+assert len(FUTURE_RLS_TARGET_TABLES) == 30
 
 # Expected (table, role, command) triples, mirroring the SQL file
 # exactly (same source classification as the generator that produced
@@ -210,6 +212,8 @@ EXPECTED_POLICIES = [
     ("scoped_control_implementations", "api_tenant_data", "SELECT", False),
     ("scoped_control_implementations", "api_tenant_data", "INSERT", False),
     ("scoped_control_implementations", "api_tenant_data", "UPDATE", False),
+    ("technical_assertion_collections", "api_tenant_data", "SELECT", False),
+    ("technical_assertion_collections", "api_tenant_data", "INSERT", False),
 ]
 # P1-2 Phase-D correction (tenant_isolation_acl.sql): api_tenant_data
 # gained narrow column SELECT on both tables (identity_tokens:
@@ -222,8 +226,11 @@ EXPECTED_POLICIES = [
 # column (password_hash, secret_hash) on both tables. 92 + 2 = 94.
 # 2026-09-15: +10 for coverage_records/module_entitlements/
 # scoped_control_implementations (see the classification update in
-# tenant_isolation_rls_policies.sql). 94 + 10 = 104.
-assert len(EXPECTED_POLICIES) == 104
+# tenant_isolation_rls_policies.sql), +2 more for
+# technical_assertion_collections (migration 0017, Compliance Phase
+# 5): SELECT/INSERT only, no UPDATE, since a collection attempt is
+# immutable once written. 94 + 10 + 2 = 106.
+assert len(EXPECTED_POLICIES) == 106
 
 
 def _role_short(role: str) -> str:
@@ -310,7 +317,7 @@ class RLSPolicyMetadataTests(unittest.TestCase):
             ).fetchall()
 
         actual_by_name = {row[0]: row for row in rows}
-        self.assertEqual(len(rows), 104, f"expected exactly 104 policies, got {len(rows)}: {sorted(actual_by_name)}")
+        self.assertEqual(len(rows), 106, f"expected exactly 106 policies, got {len(rows)}: {sorted(actual_by_name)}")
 
         cmd_map = {"r": "SELECT", "a": "INSERT", "w": "UPDATE", "d": "DELETE", "*": "ALL"}
         expected_names = set()
@@ -478,7 +485,7 @@ class RLSPolicyMetadataTests(unittest.TestCase):
             ).fetchall()
 
         self.assertEqual(before, after, "a second run of the policy bootstrap must leave policy metadata identical")
-        self.assertEqual(len(after), 104, "second run must not create duplicate or missing policies")
+        self.assertEqual(len(after), 106, "second run must not create duplicate or missing policies")
 
 
 @unittest.skipUnless(
@@ -875,6 +882,19 @@ class TwoTenantIsolationTests(unittest.TestCase):
                 "VALUES (%s, %s, 'applicable', %s, %s, %s, %s)",
                 (org_id, fx["control_id"], fx["principal_id"], now, now, now),
             )
+
+            # technical_assertion_collections (migration 0017, Phase 5
+            # of the 2026-09-14 scope audit), added to this fixture
+            # 2026-09-15 alongside its own new RLS policies.
+            fx["assertion_collection_id"] = str(uuid.uuid4())
+            connection.execute(
+                "INSERT INTO technical_assertion_collections (collection_id, organization_id, assertion_id, "
+                "assertion_version, evidence_source, evidence_provenance, collection_status, raw_evidence, "
+                "outcome, collected_by, collected_at, evaluated_at) "
+                "VALUES (%s, %s, 'entra_conditional_access_policy_mode', 'v1', 'fixture', 'fixture:seed', "
+                "'succeeded', '{}', 'satisfied', %s, %s, %s)",
+                (fx["assertion_collection_id"], org_id, fx["principal_id"], now, now),
+            )
         return fx
 
     @classmethod
@@ -994,7 +1014,10 @@ class TwoTenantIsolationTests(unittest.TestCase):
     }
 
     def test_ordinary_select_matrix_no_context_tenant_a_tenant_b(self) -> None:
-        self.assertEqual(len(self.ORDINARY_SELECT_PAIRS), 34, f"{self.ORDINARY_SELECT_PAIRS}")
+        # 2026-09-15: 30 (original) + 4 (coverage_records/module_entitlements/
+        # scoped_control_implementations, this audit's own Phase 3 correction)
+        # + 1 (technical_assertion_collections, Phase 5). 30 + 4 + 1 = 35.
+        self.assertEqual(len(self.ORDINARY_SELECT_PAIRS), 35, f"{self.ORDINARY_SELECT_PAIRS}")
         # Ground truth per table/tenant, read via superuser (always
         # bypasses RLS). Most tables carry exactly one row per tenant,
         # but a few also carry an extra "spare" row used elsewhere
@@ -1041,9 +1064,9 @@ class TwoTenantIsolationTests(unittest.TestCase):
                     count_b = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
                     self.assertEqual(count_b, expected_b, f"{role}/{table}: tenant B row count must match ground truth")
                     tenant_b_tested += 1
-        self.assertEqual(no_context_tested, 34)
-        self.assertEqual(tenant_a_tested, 34)
-        self.assertEqual(tenant_b_tested, 34)
+        self.assertEqual(no_context_tested, 35)
+        self.assertEqual(tenant_a_tested, 35)
+        self.assertEqual(tenant_b_tested, 35)
 
     # -- Section 8: exhaustive ordinary INSERT matrix ------------------------
 
@@ -1188,6 +1211,14 @@ class TwoTenantIsolationTests(unittest.TestCase):
                 "created_at, updated_at) VALUES (%s, %s, 'unresolved', now(), now())",
                 (org, fx["spare_control_id"]),
             ),
+            "technical_assertion_collections": (
+                "INSERT INTO technical_assertion_collections (collection_id, organization_id, assertion_id, "
+                "assertion_version, evidence_source, evidence_provenance, collection_status, raw_evidence, "
+                "outcome, collected_by, collected_at, evaluated_at) "
+                "VALUES (%s, %s, 'entra_conditional_access_policy_mode', 'v1', 'fixture', 'fixture:new', "
+                "'succeeded', '{}', 'satisfied', %s, now(), now())",
+                (new_id, org, principal),
+            ),
         }
         return specs[table]
 
@@ -1226,7 +1257,10 @@ class TwoTenantIsolationTests(unittest.TestCase):
 
     def test_ordinary_insert_matrix(self) -> None:
         pairs = [(role, table) for role, table in self.ORDINARY_INSERT_PAIRS if table != "organizations"]
-        self.assertEqual(len(pairs), 25, f"{pairs}")
+        # 2026-09-15: 22 (original) + 3 (coverage_records/module_entitlements/
+        # scoped_control_implementations, this audit's own Phase 3 correction)
+        # + 1 (technical_assertion_collections, Phase 5). 22 + 3 + 1 = 26.
+        self.assertEqual(len(pairs), 26, f"{pairs}")
         tested = []
         for role, table in pairs:
             with self.subTest(role=role, table=table):
@@ -1251,7 +1285,7 @@ class TwoTenantIsolationTests(unittest.TestCase):
                     finally:
                         connection.rollback()
                 tested.append((role, table))
-        self.assertEqual(len(tested), 25)
+        self.assertEqual(len(tested), 26)
 
     # -- Section 9: exhaustive ordinary UPDATE matrix ------------------------
 

@@ -162,6 +162,30 @@ export interface AssetVerification {
   instructions?: { path: string; expected_content: string };
 }
 
+export interface CoverageRow {
+  path: string;
+  http_method: string;
+  identity_label: string;
+  check_id: string;
+  status: "completed" | "blocked" | "unreachable";
+  scanner_version: string;
+  check_version: string | null;
+  last_scan_id: string | null;
+  last_finding_id: string | null;
+  first_observed_at: string;
+  last_observed_at: string;
+}
+
+export interface AssetCoveragePage extends PagePayload {
+  asset: string;
+  coverage: CoverageRow[];
+  status_counts: { completed: number; blocked: number; unreachable: number };
+  // Vision states this v1 read surface never populates (no signal
+  // exists today to distinguish them honestly); surfaced so the UI
+  // can say so rather than implying a smaller, already-complete map.
+  not_populated_states: string[];
+}
+
 export interface AssetAuthorization {
   authorization_id: string;
   issued_at: string;
@@ -369,6 +393,8 @@ export const assetsApi = {
   startVerification: (id: string) => api.postNoBody<AssetVerification>(`/v1/assets/${id}/verification`),
   checkVerification: (id: string) =>
     api.postNoBody<AssetVerification>(`/v1/assets/${id}/verification/check`),
+  coverage: (id: string, cursor?: string) =>
+    api.get<AssetCoveragePage>(`/v1/assets/${id}/coverage`, { cursor }),
 };
 
 export const scansApi = {
