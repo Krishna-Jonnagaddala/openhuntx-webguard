@@ -61,7 +61,9 @@ from webguard_contracts import (
     write_owned_target_authorization_file,
 )
 from webguard_scanner import ValidatedTarget
+from webguard_scanner.callback_broker import CallbackPolicy
 from webguard_api.callback_server import CallbackHttpReceiver
+from webguard_api.callback_service import CallbackServiceError
 from webguard_api.http_api import create_server
 from webguard_api.postgres_callback_broker import PostgresCallbackBroker
 from webguard_api.postgres_callback_service import PostgresCallbackRegistrationRepository
@@ -489,6 +491,65 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
             count, 0,
             "no observation row from this run may exist -- persistence genuinely never succeeded",
         )
+
+    def test_wait_for_observation_never_returns_a_negative_shape_when_the_poll_itself_fails(self) -> None:
+        """Complements test_no_fabricated_confirmation_when_persistence_never_recovers,
+        which proves the write-side (the receiver's own INSERT)
+        failing permanently is a genuinely undetectable, accepted
+        residual: reads still succeed, correctly find zero rows, and
+        the caller cannot tell that apart from a real negative result
+        (P1-12-R1). This test proves the *other* half of the same
+        finding's own architecture, against real PostgreSQL rather
+        than the fake pool tests/unit/test_postgres_callback_broker.py
+        already uses: when the read side itself fails (the poll query
+        inside _latest_observation, e.g. Postgres genuinely unreachable
+        mid-wait), wait_for_observation must raise CallbackServiceError,
+        never silently return the same (None, False, False) shape a
+        genuine absent observation returns. Unlike the write-side
+        residual above, this case IS locally detectable and already
+        has production code for it (postgres_callback_broker.py's own
+        `except DatabaseError` inside its polling loop); this test adds
+        the real-Postgres integration proof that code path was missing
+        before now, closing an evidence gap, not a code gap -- the
+        production code itself was not changed for this test to pass."""
+        import psycopg
+
+        _, components, auth_dir = self._build_components()
+        organization, owner, _, now = self._bootstrap_org(components)
+        target = "https://prod-e2e-fixture.test/"
+        authorization_id = self._authorize_target(
+            components, auth_dir, organization, owner, target, now
+        )
+
+        broker = components.executor.callback_repository
+        callback_token = broker.register(
+            scan_id=str(uuid4()),
+            candidate_fingerprint="read-side-failure-fixture",
+            organization_id=organization.organization_id,
+            target=target,
+            authorization_id=authorization_id,
+        )
+
+        real_execute = psycopg.Connection.execute
+
+        def faulty_read(self_conn, query, params=None, **kwargs):
+            text = query if isinstance(query, str) else query.as_string(self_conn)
+            if "FROM callback_observations" in text and "SELECT method" in text:
+                raise psycopg.OperationalError(
+                    "simulated poll-side connection failure (P1-12-R1 read-path proof)"
+                )
+            return real_execute(self_conn, query, params, **kwargs)
+
+        with patch.object(psycopg.Connection, "execute", faulty_read):
+            with self.assertRaises(CallbackServiceError) as ctx:
+                broker.wait_for_observation(
+                    callback_token,
+                    organization_id=organization.organization_id,
+                    policy=CallbackPolicy(
+                        maximum_wait_seconds=1.0, grace_seconds=1.0, poll_interval_seconds=0.1
+                    ),
+                )
+        self.assertIsNotNone(ctx.exception.code)
 
 
 if __name__ == "__main__":

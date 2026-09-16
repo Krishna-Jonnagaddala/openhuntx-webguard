@@ -152,6 +152,26 @@ class Slice13TenantIsolationTests(unittest.TestCase):
         page, _ = jobs.list_jobs_scoped_page(self.org_b.organization_id, limit=10)
         self.assertNotIn(job.job_id, [record.job_id for record in page])
 
+    def test_organization_id_for_job_resolves_under_worker_tenant_data(self) -> None:
+        """P1-2 Phase H gap closed, 2026-09-16: organization_id_for_job
+        used to delegate to get_scope(), which runs on an unrestricted
+        connection because it also needs submitted_by. This method
+        itself only needs the scalar organization_id, which
+        webguard_control.resolve_job_organization already returns and
+        is already granted to worker_tenant_data -- proves the
+        conversion actually resolves the real organization_id for a
+        real job, and returns None for an unknown one, through the
+        restricted role rather than the unrestricted connection this
+        method used before."""
+
+        from webguard_api.postgres_jobs import PostgresJobRepository
+
+        jobs = PostgresJobRepository(self.pool)
+        job = self._submit_job_for_org_a(jobs)
+
+        self.assertEqual(jobs.organization_id_for_job(job.job_id), self.org_a.organization_id)
+        self.assertIsNone(jobs.organization_id_for_job(str(uuid4())))
+
     def test_scans_cross_tenant_read_fails_closed(self) -> None:
         from webguard_api.postgres_jobs import PostgresJobRepository
         from webguard_api.postgres_scans import PostgresScanRepository

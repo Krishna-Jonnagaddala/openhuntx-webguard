@@ -618,8 +618,30 @@ class PostgresJobRepository:
         return self._record_from_row(row)
 
     def organization_id_for_job(self, job_id: str) -> str | None:
-        scope = self.get_scope(job_id)
-        return None if scope is None else scope[0]
+        """P1-2 Phase H gap closed, 2026-09-16: this method previously
+        delegated to get_scope(), which runs unrestricted because it
+        also needs submitted_by (a column worker_tenant_data has no
+        grant on). This method itself only ever needs the scalar
+        organization_id, which webguard_control.resolve_job_organization
+        already returns and is already granted to worker_tenant_data
+        (tenant_isolation_function_acl.sql). Verified as a genuinely
+        live worker-context caller, not dead code: production_startup.py
+        wires this method in as ScanJobExecutor's own organization_resolver,
+        invoked from executor.py's runtime completion path with the
+        worker's own already-claimed record.job_id -- get_scope's own
+        docstring's claim that this had "no external caller of its own
+        to prove the conversion against" no longer holds against that
+        wiring. get_scope itself is unchanged and remains open: it is
+        a distinct method with a distinct, still-real gap (submitted_by
+        has no restricted-role path), not merely this method routed
+        through it."""
+
+        with self._pool.role_scoped_connection(WORKER_TENANT_DATA_ROLE) as connection:
+            row = connection.execute(
+                "SELECT webguard_control.resolve_job_organization(%s)",
+                (job_id,),
+            ).fetchone()
+        return None if row is None or row[0] is None else str(row[0])
 
     def list_jobs_scoped_page(
         self,

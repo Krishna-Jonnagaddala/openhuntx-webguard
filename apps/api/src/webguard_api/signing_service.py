@@ -70,6 +70,19 @@ from .structured_logging import log_event
 
 _MAXIMUM_MESSAGE_BYTES = 4096  # a TrustScan permit/receipt's signing_bytes is always small
 
+# Bound on how much of an oversized request body this service will
+# read and discard before rejecting it (see do_POST's size check
+# below). Deliberately NOT the client's own declared Content-Length:
+# a caller could declare an enormous value while sending little or
+# nothing, and reading up to that declared length would let a single
+# request block this thread indefinitely -- an unbounded-read DoS
+# vector, not the fix this constant exists to provide. 1 MiB comfortably
+# drains any realistic oversized-payload test case (this module's own
+# maximum legitimate message is 4 KiB) while still bounding a
+# maliciously large declared Content-Length to a small, fixed amount
+# of wasted read time.
+_MAXIMUM_DRAIN_BYTES = 1_048_576
+
 
 class SigningServiceError(RuntimeError):
     def __init__(self, code: str, message: str, *, status: int) -> None:
@@ -161,6 +174,22 @@ def build_signing_service_handler(
             try:
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 if length <= 0 or length > _MAXIMUM_MESSAGE_BYTES + 512:
+                    # Read and discard up to _MAXIMUM_DRAIN_BYTES of the
+                    # rejected body before responding: this handler
+                    # never keeps the connection alive (close_connection
+                    # is set after every response), and closing a socket
+                    # that still has unread bytes sitting in its receive
+                    # buffer can make the OS send a TCP RST instead of a
+                    # clean FIN, which a client mid-sendall() can observe
+                    # as a bare connection reset instead of this
+                    # response's actual 400 status. Draining first,
+                    # bounded rather than reading the caller's own
+                    # (untrusted) declared length, avoids that race for
+                    # any realistically-sized oversized payload without
+                    # letting a maliciously huge declared Content-Length
+                    # block this thread reading indefinitely.
+                    if length > 0:
+                        self.rfile.read(min(length, _MAXIMUM_DRAIN_BYTES))
                     raise SigningServiceError(
                         "signing_service_body_invalid", "Request body is missing or too large.", status=400
                     )
