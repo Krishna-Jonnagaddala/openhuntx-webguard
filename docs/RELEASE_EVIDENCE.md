@@ -10,9 +10,11 @@ This file tracks capability-level release evidence. Requirement-level status (wh
 |---|---|---|
 | Ten-pillar core (permit, safety receipt, scanner, reporting) | `integration_tested` | Baseline audit + full regression suite, `docs/PRODUCT_VISION_TRACEABILITY.md` |
 | Phase A-H tenant-isolation runtime conversion | `integration_tested` | PRs #30-47, proven against real disposable Postgres and CI's own fresh Postgres job |
-| RLS+FORCE enforcement | `designed` | Policies defined (`infra/postgres/bootstrap/tenant_isolation_rls_policies.sql`) for all 29 tenant-owned tables with a current ACL grantee, including `coverage_records`/`module_entitlements`/`scoped_control_implementations` (added 2026-09-15, this audit's own Phase 3 correction) and `technical_assertion_collections` (added 2026-09-15, Phase 5) — never enabled; P1-2 stays open on this basis |
+| RLS+FORCE enforcement | `designed` | Policies defined (`infra/postgres/bootstrap/tenant_isolation_rls_policies.sql`) for all 29 tenant-owned tables with a current ACL grantee, including `coverage_records`/`module_entitlements`/`scoped_control_implementations` (added 2026-09-15, this audit's own Phase 3 correction) and `technical_assertion_collections` (added 2026-09-15, Phase 5); never enabled, P1-2 stays open on this basis. `docs/production/RLS_STAGING_ACTIVATION.md` (2026-09-16) now documents the exact activation/rollback procedure and acceptance checks; the state here stays `designed`, since writing the procedure is not running it against a real environment |
 | Coverage Truth Map v1 | `integration_tested` | PRs #49-50, real end-to-end production-pipeline assertion in `test_production_mode_e2e.py` |
 | Coverage Truth Map v1 read API (`GET /v1/assets/{id}/coverage`) | `integration_tested` | Phase 4, 2026-09-15: tenant-scoped, paginated, HTTP-level unit tests plus a real disposable-Postgres contract suite; rendered on the existing `AssetDetailPage.tsx` |
+| One Phase H method-level gap (`organization_id_for_job`), signing-service TCP-race fix, P1-12-R1 callback regression coverage | `integration_tested` | PR #64 merged as `088815e`, 2026-09-16: `organization_id_for_job` converted to `webguard_control.resolve_job_organization` under a worker-tenant-scoped connection; bounded drain added to `signing_service.py` to fix a real RST-on-close race; four previously-unwired E2E test files (signing service, production mode, production runtime completion, production SSRF callback) now run in the `postgresql-integration` CI job; new regression test proves a polling `DatabaseError` never returns the same shape as a genuine absent callback observation |
+| DNS TXT verification, token-mismatch failure path | `integration_tested` | PR #65 merged as `c9e9aa4`, 2026-09-16: dedicated test for `check_dns_txt_token`'s mismatch case, mirroring the existing well-known-verification mismatch test |
 
 ## SOC
 
@@ -43,9 +45,9 @@ This file tracks capability-level release evidence. Requirement-level status (wh
 
 - Every SOC connector needs real Microsoft tenant credentials this project does not have; nothing SOC-related can reach `integration_tested` or later until that access exists.
 - Compliance framework packs need authoritative legal-text verification (GDPR/UK GDPR commencement text specifically could not be fully retrieved by the source handoff's own research pass) before any legal claim in a released pack.
-- RLS+FORCE activation needs a real, non-disposable environment this session has no standing authorization to provision.
+- RLS+FORCE activation needs a real, non-disposable environment this session has no standing authorization to provision. The procedure to run once that environment exists is now written down (`docs/production/RLS_STAGING_ACTIVATION.md`, 2026-09-16); the environment itself is still the blocker, not the plan.
 - No code path anywhere connects a WebGuard finding to a SOC or Compliance record, or the reverse. The three modules currently share only `organization_id` as a common key; the flagship cross-module workflow (handoff §14) has not been attempted.
 
 No rollout/rollback plan exists for any SOC/Compliance capability yet, since none has reached a stage where one is needed. This section will gain real rollout/rollback evidence as capabilities reach `staging_validated`.
 
-This file was last reconciled against actual repository state on 2026-09-15 (previously last updated 2026-09-12, before PRs #52-58 shipped). See the OpenHuntX Scope & Progress Audit, 2026-09-14, for the evidence-backed review this reconciliation is based on.
+This file was last reconciled against actual repository state on 2026-09-16 (previously last updated 2026-09-15, before PRs #64-66 shipped). See the OpenHuntX Scope & Progress Audit, 2026-09-14, for the evidence-backed review this reconciliation is based on, and `docs/PROJECT_EXECUTION_LEDGER.md`'s "OpenHuntX Scope & Progress Audit and continuation" entry for the work done since.

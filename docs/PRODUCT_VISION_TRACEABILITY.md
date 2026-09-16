@@ -14,9 +14,13 @@ Not yet done: versioned schema evolution for amendments-as-new-revisions (mandat
 
 ## 2. Per-action authorization enforcement
 
-**Status: IMPLEMENTED_UNVERIFIED (runtime boundary and data-layer wiring)**
+**Status: IMPLEMENTED_UNVERIFIED**
 
-`safety.py` is the network-boundary gate all execution paths pass through today. The A-G PostgreSQL work (tenant roles, ACLs, function-owner capabilities, dormant RLS policies) defines the data-layer half of this pillar; Phase H (see `docs/PROJECT_EXECUTION_LEDGER.md`) wires it into the live request/worker/scheduler/callback paths and is now complete across all 13 repository files, proven against a real disposable Postgres. The remaining gap is RLS itself: policies are defined but not `FORCE`-enabled in any real, non-disposable environment, so this pillar is not yet VERIFIED end to end.
+This pillar is two separate controls against two different threats, tracked together here because this project built and reviewed them in the same phase, not because they are the same mechanism. Keeping them distinct matters: closing one does not close the other, and a reader should not infer database tenant isolation from a statement about scanner authorization or vice versa.
+
+**Scanner action authorization**: `TrustScanRuntimeSafetyEngine` (`safety.py`) checks every outbound scan request against its signed permit's scope, rate limits, and allowed actions before that request goes out, and produces the signed Safety Receipt (pillar 4) recording what it actually enforced. This is what "per-action authorization" names: is this specific scan step within what the customer actually authorized, checked at the moment WebGuard is about to act, not whether some database row is visible to the wrong tenant. It has its own dedicated test coverage (`tests/unit/test_trustscan_runtime_safety.py`, plus the concurrency-focused `test_phase3_execution_races.py` and `test_phase3_revocation_cancellation_races.py`) and is not blocked on anything below.
+
+**Database tenant enforcement**: the Phase A-G PostgreSQL work (tenant roles, ACLs, function-owner capabilities, RLS policies) and Phase H's runtime wiring of it into the live request/worker/scheduler/callback paths (`docs/PROJECT_EXECUTION_LEDGER.md`, complete across all 13 repository files, proven against a real disposable Postgres) is a defense-in-depth control against a different failure mode entirely: application code that omits a tenant filter it should have included. It does not decide whether a scan action was authorized; it decides whether one tenant's data can leak to another tenant's connection if a repository method has a bug. This is tracked as P1-2, and its remaining half (RLS itself defined but not `FORCE`-enabled in any real, non-disposable environment, see `docs/production/RLS_STAGING_ACTIVATION.md` for the activation procedure) is what keeps this pillar at IMPLEMENTED_UNVERIFIED rather than VERIFIED.
 
 ## 3. Scanner execution attestation
 
@@ -73,10 +77,10 @@ Zero matching symbols (region binding, regional key custody, customer-hosted run
 | Pillar | Status |
 |---|---|
 | 1. Cryptographic Scan Permit | VERIFIED (core) / IN_PROGRESS (schema evolution) |
-| 2. Per-action authorization enforcement | IMPLEMENTED_UNVERIFIED (Phase H wiring complete; RLS+FORCE not yet real-environment activated) |
+| 2. Per-action authorization enforcement | IMPLEMENTED_UNVERIFIED (scanner permit enforcement tested and unblocked; separate database tenant-isolation control, RLS+FORCE, not yet real-environment activated) |
 | 3. Scanner execution attestation | NOT_STARTED |
 | 4. Runtime Safety Receipt | IMPLEMENTED_UNVERIFIED |
-| 5. Coverage Truth Map | IMPLEMENTED_UNVERIFIED (v1: 3 of 6 states, unauthenticated only, no API surface) |
+| 5. Coverage Truth Map | IMPLEMENTED_UNVERIFIED (v1: 3 of 6 states, unauthenticated only, tenant-scoped paginated read API since Phase 4) |
 | 6. Tamper-evident Assessment Ledger | NOT_STARTED |
 | 7. Verifiable remediation evidence | NOT_STARTED |
 | 8. Standards-based assessment exports | NOT_STARTED (interop) / IMPLEMENTED_UNVERIFIED (native) |
