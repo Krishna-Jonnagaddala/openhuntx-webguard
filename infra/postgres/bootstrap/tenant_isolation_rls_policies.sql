@@ -79,6 +79,26 @@
 -- by reading every call site in service.py. It is excluded from RLS
 -- entirely, not merely from this file's current policy set.
 --
+-- CLASSIFICATION UPDATE, 2026-09-15 (5 tables added since Phase G by
+-- migrations 0013-0016, none previously classified here or policied):
+-- coverage_records, module_entitlements, and scoped_control_implementations
+-- are direct-organization_id tenant-owned tables, each with a real ACL
+-- grantee, and each now receives a policy below, the same discipline
+-- Phase G applied to every other direct table (found unenforced by
+-- the OpenHuntX Scope & Progress Audit, 2026-09-14, closed in this
+-- pass). frameworks and master_controls (migration 0015) are global
+-- reference data with no organization_id column at all, correctly
+-- excluded from RLS entirely, the same treatment auth_rate_limit_events
+-- already established for a genuinely non-tenant table: a "policy" on
+-- either would have to be a hardcoded USING (true), and hardcoding
+-- true is exactly the "unconditional ordinary-role policy" this file's
+-- own test suite (test_no_unconditional_ordinary_role_policy) already
+-- forbids for tenant-data roles, for the same reason it forbids it
+-- everywhere else: it would mask, not implement, "this table has no
+-- tenant to filter by." Current totals: 32 tables, 29 tenant-owned (28
+-- policied, crawl_checkpoints still the sole zero-ACL exception), 3
+-- non-tenant-owned (auth_rate_limit_events, frameworks, master_controls).
+--
 -- ORDINARY-ROLE POLICIES (api_tenant_data, worker_tenant_data,
 -- scheduler_tenant_data) always use the tenant predicate, never
 -- `USING (true)`. Every policy below is command-appropriate rather
@@ -738,6 +758,77 @@ DROP POLICY IF EXISTS "wg_identity_owner_password_credentials_select" ON public.
 CREATE POLICY "wg_identity_owner_password_credentials_select" ON public.password_credentials
     FOR SELECT TO identity_function_owner
     USING (true);
+
+
+-- coverage_records (migration 0013, platform expansion / product ----
+-- vision pillar 5): direct organization_id, same shape as scan_records
+-- above. api_tenant_data has SELECT only (no live API reader yet, per
+-- tenant_isolation_acl.sql's own comment, but the ACL and this policy
+-- are written for the repository method that already exists);
+-- worker_tenant_data has the full SELECT/INSERT/UPDATE its upsert
+-- (record_coverage) needs.
+DROP POLICY IF EXISTS "wg_api_coverage_records_select" ON public.coverage_records;
+CREATE POLICY "wg_api_coverage_records_select" ON public.coverage_records
+    FOR SELECT TO api_tenant_data
+    USING (organization_id = public.webguard_current_tenant());
+
+DROP POLICY IF EXISTS "wg_worker_coverage_records_select" ON public.coverage_records;
+CREATE POLICY "wg_worker_coverage_records_select" ON public.coverage_records
+    FOR SELECT TO worker_tenant_data
+    USING (organization_id = public.webguard_current_tenant());
+
+DROP POLICY IF EXISTS "wg_worker_coverage_records_insert" ON public.coverage_records;
+CREATE POLICY "wg_worker_coverage_records_insert" ON public.coverage_records
+    FOR INSERT TO worker_tenant_data
+    WITH CHECK (organization_id = public.webguard_current_tenant());
+
+DROP POLICY IF EXISTS "wg_worker_coverage_records_update" ON public.coverage_records;
+CREATE POLICY "wg_worker_coverage_records_update" ON public.coverage_records
+    FOR UPDATE TO worker_tenant_data
+    USING (organization_id = public.webguard_current_tenant())
+    WITH CHECK (organization_id = public.webguard_current_tenant());
+
+
+-- module_entitlements (migration 0014, platform expansion): direct ---
+-- organization_id, api-serve-process-only per tenant_isolation_acl.sql's
+-- own comment (no worker/scheduler/callback path ever touches it), so
+-- only api_tenant_data gets a policy here.
+DROP POLICY IF EXISTS "wg_api_module_entitlements_select" ON public.module_entitlements;
+CREATE POLICY "wg_api_module_entitlements_select" ON public.module_entitlements
+    FOR SELECT TO api_tenant_data
+    USING (organization_id = public.webguard_current_tenant());
+
+DROP POLICY IF EXISTS "wg_api_module_entitlements_insert" ON public.module_entitlements;
+CREATE POLICY "wg_api_module_entitlements_insert" ON public.module_entitlements
+    FOR INSERT TO api_tenant_data
+    WITH CHECK (organization_id = public.webguard_current_tenant());
+
+DROP POLICY IF EXISTS "wg_api_module_entitlements_update" ON public.module_entitlements;
+CREATE POLICY "wg_api_module_entitlements_update" ON public.module_entitlements
+    FOR UPDATE TO api_tenant_data
+    USING (organization_id = public.webguard_current_tenant())
+    WITH CHECK (organization_id = public.webguard_current_tenant());
+
+
+-- scoped_control_implementations (migration 0016, platform expansion):
+-- direct organization_id, same api-serve-process-only shape as
+-- module_entitlements above (every write is a human decision made
+-- through the API; no worker/scheduler path touches it).
+DROP POLICY IF EXISTS "wg_api_scoped_control_implementations_select" ON public.scoped_control_implementations;
+CREATE POLICY "wg_api_scoped_control_implementations_select" ON public.scoped_control_implementations
+    FOR SELECT TO api_tenant_data
+    USING (organization_id = public.webguard_current_tenant());
+
+DROP POLICY IF EXISTS "wg_api_scoped_control_implementations_insert" ON public.scoped_control_implementations;
+CREATE POLICY "wg_api_scoped_control_implementations_insert" ON public.scoped_control_implementations
+    FOR INSERT TO api_tenant_data
+    WITH CHECK (organization_id = public.webguard_current_tenant());
+
+DROP POLICY IF EXISTS "wg_api_scoped_control_implementations_update" ON public.scoped_control_implementations;
+CREATE POLICY "wg_api_scoped_control_implementations_update" ON public.scoped_control_implementations
+    FOR UPDATE TO api_tenant_data
+    USING (organization_id = public.webguard_current_tenant())
+    WITH CHECK (organization_id = public.webguard_current_tenant());
 
 
 -- technical_assertion_collections (migration 0017, platform ---------

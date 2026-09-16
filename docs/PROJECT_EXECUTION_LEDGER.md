@@ -2,20 +2,27 @@
 
 Durable, requirement-level tracking for OpenHuntX WebGuard engineering work, per the Claude Master Completion Mandate (2026-09-11). This is a coordination document, not the authoritative vulnerability record — that remains `docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md` and `docs/audit/WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md` (immutable). This ledger links to that evidence rather than duplicating it.
 
+**Caveat, added 2026-09-15**: the "Claude Master Completion Mandate" itself does not exist as a file anywhere in this repository (confirmed by the OpenHuntX Scope & Progress Audit, 2026-09-14). It is referenced by name and paraphrased throughout this and other project docs, but was never committed verbatim the way the three-module platform handoff was (that document *is* committed, at `docs/audit/OPENHUNTX_THREE_MODULE_PLATFORM_HANDOFF_2026-09.md`). Any specific section-number citation of the mandate elsewhere in this project's docs (e.g. "mandate §2", "mandate §25") reflects this project's own paraphrase of a document not independently verifiable against its original wording, not a checked quotation. If a verbatim copy exists outside this repository, committing it the way the handoff was committed would resolve this.
+
 Status values: NOT_STARTED, IN_PROGRESS, IMPLEMENTED_UNVERIFIED, VERIFIED, BLOCKED_EXTERNAL, DEFERRED_WITH_REASON.
 
 ## Canonical baseline
 
 ```
-Commit: aa9f360 (feat(soc): add Microsoft Sentinel connector manifest, SOC's third connector, #57)
-Verified: 2026-09-16, by direct git fetch + rev-parse, not trusted from a prior report.
-origin/main == this commit: YES. This ledger entry's own PR (#58) branched before
-#57 merged; rebased onto #57's merge commit once it landed, and its Sentinel-sourced
-assertion gap closed in the same rebase rather than left open (see below).
-Open P1 total: 4 (P1-2, P1-8, P1-9, P1-12-R1), verified against
-  docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md's own "CURRENT P1
-  ACCOUNTING" section directly, not the mandate's paraphrase of it. P1-6 and
-  P1-7 closed this session (PRs #17, #19).
+Commit: ac82ea3 (feat(compliance): add technical assertion catalog, Compliance's
+third slice, #58)
+Verified: 2026-09-15, by direct git log + rev-parse, not trusted from a prior report.
+origin/main == this commit: YES (per the OpenHuntX Scope & Progress Audit,
+2026-09-14, which independently confirmed rev-list --left-right --count
+origin/main...HEAD returns 0 0).
+Open P1 total: 5 (P1-2, P1-8, P1-9, P1-12-R1, P1-13), not 4. P1-13 is a new,
+  independently-derived finding (object storage's own tenant-isolation posture)
+  from the 2026-09-14 audit, not part of the original August baseline and not a
+  residual of any existing finding. P1-6 and P1-7 closed earlier (PRs #17, #19).
+Correction, 2026-09-15: the two entries below previously dated "2026-09-16"
+  (SOC's third connector, Compliance's third slice) are corrected to 2026-09-14,
+  matching their actual merge commit timestamps (aa9f360, ac82ea3). The
+  original dates were typos, not a claim about work done after this baseline.
 ```
 
 ## Test-quality findings (not P1/audit items, recorded for continuity)
@@ -37,19 +44,143 @@ Recorded here because it explains a real red `main` CI run that had
 nothing to do with the PR that triggered it (PR #20, doc-only), so a
 future session doesn't waste time re-diagnosing it.
 
+**Two real, root-caused defects found and fixed, 2026-09-15, plus one
+methodology error corrected in this same pass.** An initial broad
+validation run (`python -m unittest discover -s tests/integration -p
+'test_*.py' -v`, `WEBGUARD_RUN_INTEGRATION=1` and
+`WEBGUARD_POSTGRES_TEST_DSN` pointed at this session's local Postgres
+container) reported 2, then on a second attempt 4, errors. These were
+initially and incorrectly described as "flaky." They are not: three
+repeated runs of the same single failing test reproduced the identical
+error 3/3 times, deterministically, and a failure being deterministic
+is the opposite of flaky.
+
+*Root cause 1 (local environment, not a code defect)*: this session's
+persistent local Postgres container (reused across sessions, unlike
+CI's fresh-per-run service container) had never had
+`infra/postgres/bootstrap/tenant_isolation_runtime_grant.sql` applied
+to its `webguard` database, so the connecting role had no membership in
+`api_tenant_data`/`worker_tenant_data`/`scheduler_tenant_data` and
+every `SET LOCAL ROLE` inside `postgres_pool.py`'s `tenant_connection`
+failed with `permission denied for table organizations`. Fixed by
+applying that file (verified: `has_table_privilege('api_tenant_data',
+'public.organizations', 'INSERT')` was `false` before, `true` after).
+
+*Root cause 2 (real, pre-existing test-suite defect, now fixed)*:
+`tests/integration/test_signing_service_e2e.py` had no
+`setUpClass`/`tearDownClass` role lifecycle of its own, unlike its
+three siblings (`test_production_mode_e2e.py`,
+`test_production_runtime_completion_e2e.py`,
+`test_production_ssrf_callback_e2e.py`), which each create the
+tenant-isolation roles fresh and drop them again when done. This file
+silently depended on whatever bootstrap state happened to already
+exist on `WEBGUARD_POSTGRES_TEST_DSN`, so it passed when run alone
+(after root cause 1's fix) but failed with `role "api_tenant_data"
+does not exist` when run in the same process immediately after a
+sibling's own teardown had already dropped those roles. Fixed by
+giving it the identical `setUpClass`/`tearDownClass` pattern its
+siblings already use. Verified both standalone and in the exact
+four-file combination that originally reproduced the failure.
+
+*Methodology correction*: `unittest discover -s tests/integration -p
+'test_*.py' -v` with `WEBGUARD_POSTGRES_TEST_DSN` set is not a
+combination this project's own CI ever runs, and the two root causes
+above only manifest under it. `.github/workflows/ci.yml`'s
+`postgresql-integration` job runs `tests/contract` via `discover` plus
+exactly 10 named `tests.integration.*` modules as **separate
+sequential `python -m unittest <module>` processes**, never combined
+in one process; that exact 10-file sequence, replicated here against a
+freshly recreated database, passes 246/246 with zero errors. The
+`authorised-lab-integration` job does run `discover -s tests/integration`,
+but never sets `WEBGUARD_POSTGRES_TEST_DSN`, so every Postgres-gated
+test class skips there. **Net effect, recorded here as a genuine,
+separate finding**: `test_production_mode_e2e.py`,
+`test_production_runtime_completion_e2e.py`,
+`test_production_ssrf_callback_e2e.py`, and `test_signing_service_e2e.py`
+currently have no CI coverage at all in either job. Each was run
+standalone in this pass (matching how each is actually designed to
+run) and passed 10/10 tests total, but nothing currently re-runs them
+on every push. Not fixed in this pass (a CI workflow change is a
+separate, explicit decision); flagged here so a future session does
+not have to rediscover it.
+
+*A third, unrelated, genuine bug found in the same pass*:
+`tests/integration/test_postgres_target_verification.py`'s
+`test_get_current_never_exposes_the_token_once_a_check_has_run`
+referenced `VerificationStatus` without importing it in its own
+method scope (a sibling method's `setUp`-local import does not leak
+into a different test method's namespace) -- a real `NameError`,
+introduced by this session's earlier, unrelated demo-verification work
+(the `record_result(matched=bool)` -> `record_result(status=
+VerificationStatus)` signature change), never caught before because no
+session had run this specific file against a real Postgres database
+since that change landed. Fixed by adding the same per-method lazy
+import its sibling test already uses. Verified: 2/2 passing.
+
+**Final, methodology-matched validation, 2026-09-15**: CI's exact
+10-file + `tests/contract` sequence, 246/246 passing. The four
+production E2E files, standalone, 10/10 passing. The remaining five
+Postgres-integration files not in either group
+(`test_callback_service_outage_resilience.py`,
+`test_postgres_schedule_repository_wiring.py`,
+`test_postgres_scheduler_outage_resilience.py`,
+`test_postgres_worker_outage_resilience.py`,
+`test_postgres_worker_crash_recovery.py`), standalone, 54/54 (some
+skipped pending additional env vars beyond a Postgres DSN, not
+failures). Full local unit suite: 1837/1837. Security gates: clean.
+
+**Load-sensitive test race found, not fixed, 2026-09-15**:
+`tests/unit/test_cloudhsm_signing.py`'s
+`test_oversized_sign_payload_is_rejected` sends a ~133KB base64
+payload to the signing service's real local HTTP server and expects a
+clean `400`. `signing_service.py`'s `do_POST` checks `Content-Length`
+against `_MAXIMUM_MESSAGE_BYTES` and, if it is too large, responds and
+closes the connection *without ever reading the request body*
+(`self.rfile.read(length)` is only reached once the size check
+passes). The test's own client (`self.request`, a plain
+`http.client.HTTPConnection`) hands the full payload to a single
+`connection.request(...)` call, which blocks inside its own
+`sendall()` until the whole body is written. This is a real client/
+server race, not a logic bug in either side: whether the client
+finishes writing before the server's early close reaches it depends
+on how much of the payload the kernel has already buffered, which
+depends on system load. Standalone, this test passed 3/3 (isolated
+runs, empty socket/file-descriptor state); in a full `tests/unit`
+run it failed 3/3 (reproduced identically against `main` at `ac82ea3`
+and against two other branches' otherwise-unrelated content) with
+`ConnectionResetError: [Errno 54] Connection reset by peer` raised
+from inside `http.client`'s own `send()`, not from any assertion in
+the test. Not fixed here: this session's task was reconstructing two
+unrelated checkpoints' file history and verifying test counts, not
+signing-service test design, and a real fix (draining the body before
+closing on the server side, or having the client send in a way that
+tolerates an early close, e.g. via a raw socket with `SO_LINGER`
+handling) deserves its own PR with its own regression coverage rather
+than a drive-by patch bundled into an unrelated checkpoint. Recorded
+here, precisely, so a future red run of this one
+test in an otherwise-passing suite is recognized immediately instead
+of re-diagnosed from scratch, and is never silently re-run until green
+or ignored: the assertion is unchanged, the fragility is in the test's
+own transport pattern, not in the security property it verifies.
+
 ## Requirement rows
 
 | ID | Source | Intended behavior | Status | Code/contracts | Tests/evidence | Dependency | Milestone | Acceptance condition |
 |---|---|---|---|---|---|---|---|---|
 | A-G | Baseline audit P1-2 | Tenant-context plumbing through dormant RLS policies | VERIFIED | `infra/postgres/bootstrap/tenant_isolation_*.sql` | 129/129 combined Postgres suite, CI run 34506680942 | none | Phase A-G | Reconfirmed live at `da5da85`; see final P1-C2-G report in session transcript |
 | P1-6 | Baseline audit | Commit `.terraform.lock.hcl`, stop gitignoring it | VERIFIED | `.gitignore`, `infra/terraform/.terraform.lock.hcl` | PR #17, commit `c4132e5`, merged, CI fully green (10/10 jobs) | none | opportunistic fix | Met |
-| P1-2 | Baseline audit | RLS structurally blocked: no tenant-context GUC checkout/reset hook at runtime | IN_PROGRESS (runtime converted, RLS+FORCE not yet activated) | A-G bootstrap SQL exists; `postgres_pool.py`'s tenant-context helper exists (Phase B); Phase H has converted every ordinary repository caller that can be correctly scoped to set it before query | Dormant-state proven (29/29 Phase G); Phase H's own runtime conversion complete and proven (13/13 files, PRs #30-#46); RLS+FORCE activation in real infrastructure not started | RLS+FORCE activation in a real, non-disposable environment | Real runtime paths set tenant context (done); enforced isolation survives adversarial test (done, disposable Postgres); RLS+FORCE activated in a real (non-disposable) environment with evidence (not started, out of scope this session) |
+| P1-2 | Baseline audit | RLS structurally blocked: no tenant-context GUC checkout/reset hook at runtime | IN_PROGRESS (runtime converted, RLS+FORCE not yet activated) | A-G bootstrap SQL exists; `postgres_pool.py`'s tenant-context helper exists (Phase B); Phase H has converted every ordinary repository caller that can be correctly scoped to set it before query | Dormant-state proven (30/30 Phase G, up from 29, see the 2026-09-15 threat-model test below); Phase H's own runtime conversion complete and proven (13/13 files, PRs #30-#46); RLS+FORCE activation in real infrastructure not started | RLS+FORCE activation in a real, non-disposable environment | Real runtime paths set tenant context (done); enforced isolation survives adversarial test against an omitted predicate (done, disposable Postgres); RLS+FORCE activated in a real (non-disposable) environment with evidence (not started, out of scope this session) |
+
+**P1-2 threat-model precision, 2026-09-15**: `test_a_tenant_scoped_role_can_read_another_tenants_row_by_resetting_its_own_guc` (`tests/integration/test_postgres_rls_policies.py`) proves, against a real disposable Postgres with RLS+FORCE actually enabled on every managed table, that a connection holding one of the three ordinary tenant-data roles (`api_tenant_data`/`worker_tenant_data`/`scheduler_tenant_data`) can call the exact same `SELECT set_config('webguard.current_organization_id', ...)` statement `set_tenant_context()` itself issues, reassign its own tenant context to a different organization mid-connection, and have RLS honor the new value as legitimate. `infra/postgres/bootstrap/tenant_isolation_rls_policies.sql`'s own THREAT MODEL comment already stated this correctly (the GUC is "intentionally self-settable by any session"); this test is the missing empirical proof, run against real RLS enforcement rather than asserted from the SQL comment alone.
+
+This sharpens, and in one respect corrects, how RLS+FORCE's protection should be described going forward. It is real, valuable defense against an application/repository bug that omits a tenant predicate while still correctly calling `tenant_connection()`: exactly Phase H's own runtime-conversion work, and exactly what the disposable-Postgres adversarial tests above already prove. It is **not** defense against a compromised or malicious holder of a live tenant-data credential capable of running arbitrary SQL: such a caller has the identical `set_config` capability the application itself relies on, and no policy in this file changes that. Prior language describing RLS+FORCE activation as protecting against "a compromised or buggy runtime principal capable of executing arbitrary SQL" (see the OpenHuntX Scope & Progress Audit, 2026-09-14, Section 5) overstates this for the "compromised" half specifically; the "buggy" half (an omitted predicate) remains accurate. P1-2 stays open under the same closure condition as before (RLS+FORCE activated and adversarially proven in a real, non-disposable environment); this note changes what that closure will and will not mean, not whether it is still needed.
 | P1-7 | Baseline audit | `TrustScanSigner.sign()`/`sign_safety_receipt()` hardcode `signature_algorithm="Ed25519"` regardless of actual provider | VERIFIED | `apps/api/src/webguard_api/permits.py`, `webguard_contracts/scan_permits.py`, `webguard_contracts/safety_receipts.py` | `tests/unit/test_p1_7_signature_algorithm_metadata.py`, 8/8 pass (real ECDSA_SHA_256 sign/verify/tamper round trip); full signing suite 45/45; backend unit 1799/1799; PR #19 merged as `47da741`, CI fully green (10/10 jobs) | none | independent fix | Met: algorithm field is provider-derived (`self._registry.active.algorithm`); local + KMS paths both tested; verification stays bound to key/algorithm (unchanged, resolves via registry not self-report) |
 | P1-8 | Baseline audit | Backup/restore never tested against any environment | NOT_STARTED | Terraform toggles exist; no EFS/persistent-volume resource | none | requires an actual applied environment | deferred to staging | Real backup/restore exercise, integrity verified, RTO/RPO measured |
 | P1-9 | Baseline audit | CloudHSM PKCS#11 `EC_POINT` encoding unverified against real hardware | BLOCKED_EXTERNAL | `kms` path is the tested fallback; CloudHSM code exists, unexercised | none against real hardware | real CloudHSM module/hardware access | N/A until hardware available | Genuine hardware validation of key extraction, identity, signing, independent verification |
 | P1-12-R1 | Post-audit residual | Sustained callback-service PostgreSQL outage can lose durable SSRF evidence (proven: yields false NOT_VULNERABLE, not INCONCLUSIVE) | DEFERRED_WITH_REASON | `callback_server.py`, `postgres_callback_service.py` | Proven residual: `test_no_fabricated_confirmation_when_persistence_never_recovers` | requires an explicit secondary-durability architecture decision (not a bug fix) | future architecture slice | Durable secondary store or documented, accepted, explicitly-surfaced limitation |
+| P1-13 | OpenHuntX Scope & Progress Audit, 2026-09-14 (new finding, not a residual of any prior P1) | Object storage and `secret_provider.py` both isolate tenants by construction only, never independently re-enforced by the layer that actually holds the data. Traced 2026-09-15, both confirmed the same shape: `ObjectStorageArtifactStore.get_reference`/`LocalArtifactStore` (`artifact_store.py`) take a bare `reference` string and fetch it with no tenant check of their own (`_reject_unsafe_reference` blocks path traversal only, not a syntactically valid wrong-tenant key); every current caller is safe only because it derives that string from an already tenant-scoped read first (`service.py:3312`'s `download_report`: `report_repository.get_report_scoped(report_id, organization_id=context.organization_id)`, then `get_reference(record.report_ref)`). `SecretsManagerSecretProvider.resolve`/`LocalSecretProvider.resolve` (`secret_provider.py`) take a bare `secret_reference_id` with the identical shape: every call site (`executor.py:256`, `662-666`, `883`) derives it from `authentication_contexts.require_bound(authentication_context_id, organization_id=organization_id, ...)`, which raises unless the context belongs to that exact organization, before the secret is ever resolved. In both cases, today's isolation is real and currently correct, but is a single-point-of-failure application-level check, not a second, independent layer: an omitted `organization_id=` predicate in one future change to `report_repository` or `authentication_contexts` would silently grant full cross-tenant report/credential access with no compensating control at the storage or secrets layer, unlike Postgres, which at least has RLS available as a (now precisely-scoped, see this row's own threat-model note above) partial second layer. | IN_PROGRESS (tracing and severity grading complete; no code change made; the actual architectural decision, per-tenant bucket/secret scoping versus an explicitly accepted residual, is unmade and requires real AWS infrastructure this session has no access to evaluate against) | `apps/api/src/webguard_api/artifact_store.py` (`ObjectStorageArtifactStore`, `LocalArtifactStore`), `apps/api/src/webguard_api/secret_provider.py`, `apps/api/src/webguard_api/service.py:3296` (`download_report`), `apps/api/src/webguard_api/executor.py:246-260` | Traced by direct code reading, not executed against a real S3 bucket or Secrets Manager instance (none exists); no test currently proves a caller cannot pass a mismatched reference, since no current caller does, so there is nothing to reproduce a failure against yet | a real S3 bucket and Secrets Manager instance to evaluate whether per-tenant bucket policy conditions or resource tagging are practical, which this session has no access to provision | future architecture slice, same shape as P1-2's RLS+FORCE activation | Severity assessed as Medium: real today, single point of failure, no currently known exploit path (every caller is correct), but no independent backstop exists even in principle without new infrastructure work. Closure requires either an explicit, documented decision to accept this residual (matching P1-12-R1's own precedent) or a real per-tenant enforcement layer built and adversarially proven the way RLS was for Postgres |
 | Phase H | Mandate §7 | Convert ordinary PostgreSQL repository callers to set tenant context before query; classify pre-auth/cross-tenant/callback paths separately | IMPLEMENTED_UNVERIFIED (classification complete; control-function wiring complete, 9 of 13 functions converted and proven, 4 documented as blocked pending a real design decision; ordinary-method tenant-context-setting complete, 13 of 13 files converted) | 13 `postgres_*.py` repository files, ~115 public methods, all classified 2026-09-11 and converted across PRs #30-#46. Every method that carries or can resolve a real `organization_id` runs under its correct restricted role via `tenant_connection`; every method that cannot (no `organization_id` in its own signature) runs role-only via `role_scoped_connection`. 9 documented, unclosed gaps remain, each with a precise docstring explaining exactly why it cannot be converted today: `get_password_hash`, `consume_identity_token` (missing ACL/control-function support); `get_scope`, `get_job_permit_binding`, `get` (worker has zero grant on the table it needs); `enqueue_due_schedule` (control function's return shape too narrow); `get_schedule_permit_binding` (scheduler has zero grant); `record_observation` (no role has EXECUTE, by Phase F's own deliberate design); `revoke_registration` (zero live callers, so no UPDATE grant exists for any role) | the runtime role-switching mechanism and every ordinary tenant-data method across all 13 files are proven against a real disposable Postgres; nothing yet against RLS+FORCE actually enabled | RLS+FORCE activation in a real, non-disposable environment | complete this session | Every ordinary tenant-data method sets context before query (done); adversarial cross-tenant test passes under real runtime credentials (done, disposable Postgres); moves to VERIFIED once RLS+FORCE is activated in real infrastructure and re-tested there |
-| Platform expansion | Owner handoff, `docs/audit/OPENHUNTX_THREE_MODULE_PLATFORM_HANDOFF_2026-09.md` | Expand OpenHuntX from WebGuard-only into three modules (WebGuard, SOC, Compliance) sharing one entity/evidence/authority substrate | IN_PROGRESS (reconciliation and ledger setup complete; module entitlement designed, not yet implemented; no SOC or Compliance feature work started) | `docs/PLATFORM_SCOPE.md`, `docs/adr/0033-platform-expansion-module-boundaries.md`, `docs/CONNECTOR_CAPABILITIES.md`, `docs/RELEASE_EVIDENCE.md` | none yet for SOC/Compliance code; WebGuard's own Phase H/Coverage Truth Map work is the proof pattern this expansion follows | SOC connectors need real Microsoft tenant credentials (blocked); Compliance framework packs need authoritative legal-text verification (blocked); RLS+FORCE activation needs a real environment (blocked, tracked under P1-2, not duplicated here) | multi-session, started 2026-09-12 | Module entitlement implemented and tested; first SOC connector contract (Entra) designed with fixtures even if live validation stays blocked; first Compliance assertion family designed with fixtures; the flagship cross-module scenario (handoff §14, first row) demonstrable in a lab environment |
+| Platform expansion | Owner handoff, `docs/audit/OPENHUNTX_THREE_MODULE_PLATFORM_HANDOFF_2026-09.md` | Expand OpenHuntX from WebGuard-only into three modules (WebGuard, SOC, Compliance) sharing one entity/evidence/authority substrate | IN_PROGRESS (module entitlement implemented and tested, PR #52; all three named SOC connector manifests contract-designed, PRs #53/#55/#57; Compliance framework catalog, applicability, and technical assertion catalog implemented, PRs #54/#56/#58; no live SOC client, no real Compliance control content, no cross-module workflow yet; see per-PR entries below for full detail. This summary row was stale from 2026-09-12 through 2026-09-15 while those five PRs shipped) | `docs/PLATFORM_SCOPE.md`, `docs/adr/0033-platform-expansion-module-boundaries.md`, `docs/CONNECTOR_CAPABILITIES.md`, `docs/RELEASE_EVIDENCE.md`, `apps/api/src/webguard_api/soc_connectors.py`, `apps/api/src/webguard_api/technical_assertions.py` | Contract suite 90/90; full Postgres integration regression sequence; both production E2E files clean; full local unit suite 1820/1820 as of PR #57 (see per-PR entries below) | SOC connectors need real Microsoft tenant credentials (blocked); Compliance framework packs need authoritative legal-text verification (blocked); RLS+FORCE activation needs a real environment (blocked, tracked under P1-2, not duplicated here) | multi-session, started 2026-09-12 | Module entitlement implemented and tested (met); first SOC connector contract (Entra) designed with fixtures even if live validation stays blocked (met, and extended to all three named connectors); first Compliance assertion family designed with fixtures (met); the flagship cross-module scenario (handoff §14, first row) demonstrable in a lab environment (not yet attempted: no code path connects any WebGuard record to any SOC or Compliance record in either direction) |
 
 ## Phase H: repository inventory (discovery, 2026-09-11)
 
@@ -731,9 +862,9 @@ This is genuinely tenant data (`organization_id` present, unlike the catalog it 
 
 Remaining Compliance work, not started: the other six status dimensions (collection, test execution, assertion, control assessment, treatment, assurance review) and the assertion/evidence records they govern, loading any framework's real legally-reviewed control content (blocked pending legal-text verification), the ~40-60 initial technical assertion catalogue (handoff §10.3), and the governance/privacy/vendor/audit workflows (handoff §10.4).
 
-## Platform expansion: SOC's third connector contract, Microsoft Sentinel (2026-09-16)
+## Platform expansion: SOC's third connector contract, Microsoft Sentinel (2026-09-14)
 
-Third and last of the handoff's named Microsoft-first connectors (section 9.1: Sentinel, Defender XDR, Entra). Unlike the first two, Sentinel's classic incident/analytics-rule/data-connector surface is not Microsoft Graph at all: it is Azure Resource Manager, `Microsoft.SecurityInsights`, authorized by an Azure RBAC role assignment (`Microsoft Sentinel Reader`, Microsoft's own least-privileged role for this) on the workspace's resource group, not by a Graph permission an admin consents to. Verified 2026-09-16 against Microsoft's own current documentation, the same live-verification discipline as the first two connectors.
+Third and last of the handoff's named Microsoft-first connectors (section 9.1: Sentinel, Defender XDR, Entra). Unlike the first two, Sentinel's classic incident/analytics-rule/data-connector surface is not Microsoft Graph at all: it is Azure Resource Manager, `Microsoft.SecurityInsights`, authorized by an Azure RBAC role assignment (`Microsoft Sentinel Reader`, Microsoft's own least-privileged role for this) on the workspace's resource group, not by a Graph permission an admin consents to. Verified 2026-09-14 against Microsoft's own current documentation, the same live-verification discipline as the first two connectors.
 
 This connector forced the schema question the Defender XDR PR's own `known_limitations` predicted ("the schema extension needed to represent a connector spanning more than one API family/OAuth resource... should be designed once, for both, rather than bent to fit Defender XDR alone") to actually get answered. `soc_connectors.py` gained `ConnectorPermissionType.AZURE_RBAC_ROLE` and a new `ConnectorApiScheme` enum (`MICROSOFT_GRAPH`/`AZURE_RESOURCE_MANAGER`) on `ConnectorEndpoint`, with `api_version` validated against Graph's `v1.0`/`beta` monikers or ARM's dated `YYYY-MM-DD`(`-preview`) format depending on which scheme an endpoint declares. `api_scheme` defaults to `MICROSOFT_GRAPH`, so Entra's and Defender XDR's existing endpoint definitions needed no change at all: their validation is exactly what it was before this manifest existed, proven by two new regression tests (`test_graph_endpoint_still_rejects_arm_style_api_version`, alongside `test_arm_endpoint_rejects_graph_style_api_version` proving the new branch is real, not decorative).
 
@@ -746,7 +877,7 @@ Two more facts surfaced by verification and recorded as first-class `known_limit
 `docs/CONNECTOR_CAPABILITIES.md`'s Sentinel row moved from `not_started` to `contract_designed`, with the verified role, API surface, and every limitation above recorded there too.
 
 All three named handoff connectors (Sentinel, Defender XDR, Entra) now have contract-designed manifests. Remaining SOC connector work, not started: the actual live HTTP client for any connector (blocked on real Microsoft tenant credentials for all three, plus for Sentinel specifically an actual Azure role assignment), fixtures for failure-mode testing (source silence, connector outage, parse rejection, clock skew, collection lag, missing fields, query failure per handoff §9.1), the schema/design work for Defender for Endpoint's own non-ARM, non-Graph, unversioned device-inventory API (still a distinct, unresolved gap from `ConnectorApiScheme`'s two current values), Splunk (explicitly sequenced after this Microsoft subset), and the tenant-scoped connector-instance table once a live client exists to populate it.
-## Platform expansion: Compliance's third slice, the technical assertion catalog (2026-09-16)
+## Platform expansion: Compliance's third slice, the technical assertion catalog (2026-09-14)
 
 Third Compliance slice, and the necessary anchor for handoff section 10.2's remaining status dimensions. Applicability (#56) already attaches to a scoped control implementation directly; collection, test execution, and assertion status cannot honestly attach to anything until there is a real, named technical assertion to run, per section 10.1's own model order (framework requirements, master controls, scoped implementations, **assertions/tests**, evidence, mappings). Jumping straight to a "collection status" record without this catalog would have meant either inventing an assertion concept informally inside that record, or attaching collection state directly to a control in a way that cannot distinguish one control's several independent assertions from each other. This slice builds the catalog first, the same order the framework catalog (#54) preceded scoped control implementation (#56).
 

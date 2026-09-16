@@ -1,5 +1,7 @@
 # OpenHuntX WebGuard Roadmap
 
+> **This document is historical, marked so 2026-09-15.** It describes WebGuard as it existed before Milestone 1.32: no PostgreSQL, no tenant isolation, no web frontend, no organizations/RBAC, no OpenHuntX SOC or Compliance. All of that has since been built. Several items this roadmap lists as "planned" have since shipped, including: production asset registration and ownership verification (`target_verification.py`, both well-known-file and DNS TXT methods), a hosted web/API control plane (19-page frontend, `apps/web/`; PostgreSQL-backed `apps/api/`), KMS/HSM-backed TrustScan signing key custody (`signing.py`: KMS and CloudHSM providers, though neither is wired as the active signer yet), and coverage truth maps (Coverage Truth Map v1, `coverage_records`). For current, actively-maintained scope and status, use `docs/PLATFORM_SCOPE.md` (scope contract), `docs/PROJECT_EXECUTION_LEDGER.md` (requirement-level status), `docs/PRODUCT_VISION_TRACEABILITY.md` (WebGuard's ten-pillar vision status), and `docs/IMPLEMENTATION_STATUS.md` (layer-level rollup). The rest of this file is preserved unedited below as a historical record of the project's own early planning, not as a claim about current state.
+
 ## Status language
 
 This roadmap separates implemented capability from planned work. Planned items are not current product claims and may change as security, legal, customer, and engineering requirements evolve.
