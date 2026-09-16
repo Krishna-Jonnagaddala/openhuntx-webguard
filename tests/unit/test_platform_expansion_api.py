@@ -241,6 +241,86 @@ class PlatformExpansionApiTests(unittest.TestCase):
             {"webguard": "enabled", "soc": "disabled", "compliance": "disabled"},
         )
 
+    def test_register_account_does_not_double_grant_when_the_identity_backend_already_did(self) -> None:
+        # Regression test for a real bug this session shipped and CI
+        # caught: PostgresIdentityRepository.create_organization already
+        # calls grant_default_entitlements internally when constructed
+        # with a module_entitlements repository (production_startup.py
+        # always does). grant_default_entitlements itself is a plain
+        # INSERT with no ON CONFLICT handling -- calling it a second
+        # time for the same organization_id raises a unique-constraint
+        # violation against a real database, which broke registration
+        # outright (every Playwright spec that registers through the
+        # real HTTP route failed, CI caught it). This test builds a
+        # fake identity backend that reproduces exactly that
+        # already-granted-internally behavior (a plain dict cannot
+        # reproduce a unique-constraint violation, so the fake raises
+        # the same way Postgres would on a second call), and proves
+        # the real register_account -- not a reimplementation of its
+        # guard -- calls through cleanly.
+        from webguard_api.identity import IdentityStore
+
+        class AlreadyGrantsInternallyIdentityStore(IdentityStore):
+            def __init__(self, path, entitlements):
+                super().__init__(path)
+                self._entitlements = entitlements
+
+            def create_organization(self, name, *, now, organization_id=None):
+                organization = super().create_organization(name, now=now, organization_id=organization_id)
+                # Mirrors PostgresIdentityRepository.create_organization
+                # exactly: grants immediately, unconditionally, as part
+                # of creating the organization itself.
+                self._entitlements.grant_default_entitlements(organization.organization_id, now=now)
+                return organization
+
+        entitlements = InMemoryModuleEntitlementRepository()
+        original_grant = entitlements.grant_default_entitlements
+        seen_organizations: set[str] = set()
+
+        def grant_or_raise_on_duplicate(organization_id, *, now):
+            if organization_id in seen_organizations:
+                raise AssertionError(
+                    "grant_default_entitlements called twice for the same organization -- "
+                    "this is the exact real-database unique-constraint violation this test guards against."
+                )
+            seen_organizations.add(organization_id)
+            return original_grant(organization_id, now=now)
+
+        entitlements.grant_default_entitlements = grant_or_raise_on_duplicate
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        store = ScanJobStore(root / "jobs.sqlite3")
+        identity = AlreadyGrantsInternallyIdentityStore(store.path, entitlements)
+        service = WebGuardJobService(
+            store=store,
+            authorizations=AuthorizationRepository(root / "authorizations"),
+            identity=identity,
+            clock=lambda: NOW,
+            module_entitlements=entitlements,
+        )
+
+        # Must not raise: register_account's own call has to see the
+        # row create_organization already inserted and skip granting
+        # again, not blindly call through and hit the same violation a
+        # real Postgres unique constraint would raise.
+        context, _issued = service.register_account(
+            {
+                "organization_name": "Acme",
+                "display_name": "Ada",
+                "email": "ada2@acme.test",
+                "password": "CorrectHorseBattery9!",
+            },
+            request_id=_rid(), user_agent="test", ip_address="127.0.0.1",
+        )
+        payload = service.list_module_entitlements(context, request_id=_rid())
+        by_module = {row["module"]: row["status"] for row in payload["entitlements"]}
+        self.assertEqual(
+            by_module,
+            {"webguard": "enabled", "soc": "disabled", "compliance": "disabled"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

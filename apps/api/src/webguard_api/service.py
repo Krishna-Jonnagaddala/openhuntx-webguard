@@ -2302,13 +2302,23 @@ class WebGuardJobService:
         # every organization it registers. cli.py's local/lab IdentityStore
         # (SQLite-backed) has no module_entitlements wiring at all, so
         # local/lab registration left every organization with zero
-        # entitlement rows until this line. Calling it here too makes
-        # the guarantee unconditional regardless of which identity
-        # backend is wired in; against PostgresIdentityRepository this
-        # is a second, harmless call immediately after the first (no
-        # real toggle can happen in the instant between them), not a
-        # behavior change for production.
-        self.module_entitlements.grant_default_entitlements(organization.organization_id, now=now)
+        # entitlement rows until this line.
+        #
+        # Guarded by a read first: grant_default_entitlements is a
+        # plain INSERT with no ON CONFLICT handling (by design --
+        # PostgresModuleEntitlementRepository.grant_default_entitlements
+        # is meant to run exactly once per organization, at creation).
+        # Calling it unconditionally here would raise a unique-
+        # constraint violation for every organization whose identity
+        # backend (PostgresIdentityRepository) already granted defaults
+        # internally a few lines above -- confirmed the hard way: this
+        # broke registration outright against a real database (CI's
+        # Playwright E2E job, all three specs that register through the
+        # real HTTP route). Checking first makes this call a genuine
+        # backstop for a backend that did not already grant (local/lab),
+        # not a second write against one that did (production).
+        if not self.module_entitlements.list_entitlements(organization.organization_id):
+            self.module_entitlements.grant_default_entitlements(organization.organization_id, now=now)
         self.identity.set_password_hash(
             principal.principal_id, algorithm="argon2id", password_hash=hash_password(password), now=now
         )
