@@ -36,15 +36,15 @@ Authorize. Observe. Validate. Remediate. Prove. TrustScan is WebGuard's authorit
 
 1. Reconcile current work and preserve existing WebGuard contracts. (Done, 2026-09-12; see `docs/PROJECT_EXECUTION_LEDGER.md`.)
 2. Finish critical shared security foundations. (Done: Phase H runtime tenant-context conversion, PRs #30-47. RLS+FORCE activation in a real environment remains open and is infrastructure-gated, tracked as P1-2.)
-3. Unify entity/evidence/authority contracts across modules. (In progress; see `docs/adr/0033-platform-expansion-module-boundaries.md` and the module-entitlement slice.)
-4. Deliver federated observation (the Microsoft connector subset: Sentinel, Defender XDR, Entra). Blocked on real tenant credentials; contracts/fixtures/permission manifests can proceed without them.
-5. Deliver the full three-module lab workflow: an authorized WebGuard assessment flows through SOC validation to scoped Compliance evidence and independent export verification.
+3. Unify entity/evidence/authority contracts across modules. (Module entitlement shipped and wired into organization creation; see `docs/adr/0033-platform-expansion-module-boundaries.md`.)
+4. Deliver federated observation (the Microsoft connector subset: Sentinel, Defender XDR, Entra). All three named connectors now have contract-designed manifests with verified permissions/RBAC roles (PRs #53, #55, #57); live HTTP clients remain blocked on real tenant credentials.
+5. Deliver the full three-module lab workflow: an authorized WebGuard assessment flows through SOC validation to scoped Compliance evidence and independent export verification. Not started: no code path yet connects a WebGuard finding to a SOC or Compliance record in either direction. Compliance's own foundation for this (framework/master-control catalog, PR #54; scoped control implementation/applicability, PR #56; technical assertion catalog, PR #58) is in place, but nothing has executed against it yet.
 6. Complete reviewer workflows: investigations, audit requests, exceptions, historical views, privacy/vendor registers, comparable retest closure.
 7. Introduce governed actions: shadow evaluation first, then explicit approval execution with independent postcondition checking.
 8. Harden for scoped enterprise use: live connector proof, operational limits, restore tests, deployment evidence, design-partner assessment.
 9. Expand validated content: more ecosystems, assertion families, customer-hosted options, through the same gates.
 
-Steps 1-2 are complete. Step 3 is the current work. Do not read step numbers as a claim that later steps have zero work started; contracts and fixtures for blocked items (step 4's connectors, step 6's framework packs) can and do proceed in parallel where the work itself needs no missing credential or missing legal text.
+Steps 1-3 are substantially complete. Step 4's contract/fixture work is complete for all three named connectors; step 5's Compliance-side foundation exists but nothing has run end to end yet. Do not read step numbers as a claim that later steps have zero work started; contracts and fixtures for blocked items (step 4's connectors, step 6's framework packs) can and do proceed in parallel where the work itself needs no missing credential or missing legal text. This section was last reconciled against actual repository state on 2026-09-15 (see the OpenHuntX Scope & Progress Audit, 2026-09-14, and `docs/PROJECT_EXECUTION_LEDGER.md`'s per-PR narrative entries); the previous version of this section was written 2026-09-12 and had not been updated across the seven PRs that shipped since.
 
 ## Explicitly deferred (not silently dropped)
 
@@ -70,6 +70,7 @@ Steps 1-2 are complete. Step 3 is the current work. Do not read step numbers as 
 - **SOC connectors** (Sentinel, Defender XDR, Entra): need real Microsoft tenant credentials. Contracts, fixtures, and permission manifests proceed without them; live validation is marked blocked, never claimed production-verified against a fixture.
 - **Compliance framework packs** (SOC 2, ISO/IEC 27001:2022 + 2024 amendment, HIPAA, GDPR, UK GDPR): need authoritative legal-text verification before any legal claim ships. The source handoff itself could not fully retrieve EUR-Lex GDPR or UK legislation pages; do not ship exact statutory dates from the draft without independent verification.
 - **RLS+FORCE activation** (P1-2's remaining half): needs a real, non-disposable Postgres environment this session has no standing authorization to provision or touch.
+- **Object storage and secret-provider tenant isolation** (P1-13): report artifacts and authenticated-scanning secret material are both isolated by construction only (a caller-derived reference string from an already tenant-scoped database read), never independently re-enforced by the layer that actually holds the data. Traced 2026-09-15: every current caller is correct, but there is no compensating control if that discipline ever lapses in a future change. Severity Medium; a per-tenant enforcement layer versus an explicitly accepted residual is a real, unmade decision. See `docs/PROJECT_EXECUTION_LEDGER.md`'s P1-13 row for the full trace.
 
 ## Governance note
 

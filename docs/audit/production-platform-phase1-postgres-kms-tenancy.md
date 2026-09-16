@@ -1,5 +1,7 @@
 # Production Platform Phase 1: PostgreSQL, KMS Signing & Tenant Isolation
 
+> **Correction added 2026-09-15, historical record below preserved unchanged**: this document's "AWS KMS Ed25519 gap" section states AWS KMS has no Ed25519 key spec. That was correct when this slice was built; AWS has since added one (`ECC_NIST_EDWARDS25519`, GA since 2025-11-07). This project's code was not changed in response: `KmsSigningProvider` still targets `ECDSA_SHA_256`, unmodified. See `docs/production/TRUSTSCAN_PRODUCTION_SIGNING.md`'s 2026-09 correction note for what this means for the CloudHSM recommendation that followed from this slice's finding.
+
 ## Status
 
 Scanner v1 is feature-frozen (Slice 11). This slice closes the two
