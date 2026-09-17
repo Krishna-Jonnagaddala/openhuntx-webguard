@@ -3228,6 +3228,87 @@ class WebGuardJobService:
             ]
         }
 
+    def set_module_entitlement(
+        self, context: AuthContext, module_id: str, body: dict, *, request_id: str
+    ) -> dict:
+        """Turns SOC or Compliance on or off for this organization.
+        Owner-only (MODULE_ENTITLEMENTS_MANAGE): the administrator
+        exclusion set in auth.py carves this out for the same reason
+        it carves out PERMIT_ISSUE_ACTIVE and the AUTHENTICATION_CONTEXT_*
+        permissions. WebGuard itself is not manageable through this
+        route at all. It is the platform's foundational module,
+        always enabled, so "webguard" in the URL is rejected outright
+        rather than accepted and silently ignored."""
+
+        self._require(
+            context, ApiPermission.MODULE_ENTITLEMENTS_MANAGE, request_id=request_id,
+            action="module_entitlements.manage", resource_type="organization",
+            resource_id=context.organization_id,
+        )
+        # resource_id is the module itself (mirrors update_asset's
+        # resource_id=target_id / update_team_member's resource_id=
+        # principal_id: the specific object mutated, not its parent
+        # organization). Without this, two SUCCEEDED audit rows for the
+        # same organization are indistinguishable -- SOC disabled twice,
+        # or SOC once and Compliance once, defeating the "reconstruct
+        # who changed what" point of auditing this action at all.
+        if module_id == "webguard":
+            self._audit(
+                context, request_id=request_id, action="module_entitlements.manage",
+                resource_type="module_entitlement", resource_id=module_id,
+                outcome=AuditOutcome.DENIED, detail_code="module_entitlement_not_manageable",
+            )
+            raise ApiServiceError(
+                "module_entitlement_not_manageable",
+                "The webguard module is always enabled and cannot be changed.",
+                status=400,
+            )
+        if module_id not in ("soc", "compliance"):
+            self._audit(
+                context, request_id=request_id, action="module_entitlements.manage",
+                resource_type="module_entitlement", resource_id=module_id,
+                outcome=AuditOutcome.DENIED, detail_code="module_entitlement_unknown",
+            )
+            raise ApiServiceError(
+                "module_entitlement_unknown", f"{module_id!r} is not a known module.", status=400
+            )
+        if not isinstance(body, dict) or body.get("status") not in ("enabled", "disabled"):
+            self._audit(
+                context, request_id=request_id, action="module_entitlements.manage",
+                resource_type="module_entitlement", resource_id=module_id,
+                outcome=AuditOutcome.DENIED, detail_code="module_entitlement_body_invalid",
+            )
+            raise ApiServiceError(
+                "module_entitlement_body_invalid", "status must be 'enabled' or 'disabled'.", status=400
+            )
+        from .module_entitlements import ModuleEntitlementError
+        from webguard_contracts import ModuleEntitlementStatus, PlatformModule
+
+        try:
+            entitlement = self.module_entitlements.set_entitlement(
+                context.organization_id, PlatformModule(module_id),
+                status=ModuleEntitlementStatus(body["status"]),
+                now=self.clock(), changed_by=context.principal_id,
+            )
+        except ModuleEntitlementError as exc:
+            self._audit(
+                context, request_id=request_id, action="module_entitlements.manage",
+                resource_type="module_entitlement", resource_id=module_id,
+                outcome=AuditOutcome.DENIED, detail_code=exc.code,
+            )
+            raise ApiServiceError(exc.code, exc.message, status=404) from exc
+        self._audit(
+            context, request_id=request_id, action="module_entitlements.manage",
+            resource_type="module_entitlement", resource_id=module_id,
+            outcome=AuditOutcome.SUCCEEDED, detail_code=entitlement.status.value,
+        )
+        return {
+            "module": entitlement.module.value,
+            "status": entitlement.status.value,
+            "updated_at": entitlement.updated_at.isoformat(),
+            "enabled_at": entitlement.enabled_at.isoformat() if entitlement.enabled_at else None,
+        }
+
     def list_soc_connectors(self, context: AuthContext, *, request_id: str) -> dict:
         """SOC connector manifests (soc_connectors.py): what this
         codebase's own connector contracts declare, not any

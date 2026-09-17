@@ -105,6 +105,9 @@ const STATUS_TONE: Record<string, "success" | "warning" | "danger" | "info" | "n
   completed_with_errors: "warning",
   open: "info",
   reopened: "danger",
+  enabled: "success",
+  disabled: "neutral",
+  trial: "warning",
 };
 
 const TONE_STYLES: Record<string, string> = {

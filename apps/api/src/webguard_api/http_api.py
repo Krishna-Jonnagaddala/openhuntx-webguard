@@ -47,6 +47,10 @@ _ASSET_COVERAGE_PATH = re.compile(r"^/v1/assets/([0-9a-f-]{36})/coverage$")
 _COMPLIANCE_ASSERTION_COLLECTIONS_PATH = re.compile(
     r"^/v1/compliance/assertions/([a-z0-9_]+)/collections$"
 )
+# Deliberately permissive on the module name: set_module_entitlement
+# itself is what rejects "webguard" and unknown names, with a real 400
+# and a message, rather than a generic 404 route-not-found.
+_MODULE_ENTITLEMENT_PATH = re.compile(r"^/v1/module-entitlements/([a-z]+)$")
 _TEAM_MEMBER_PATH = re.compile(r"^/v1/team/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _API_KEY_PATH = re.compile(r"^/v1/api-keys/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 _PERMIT_REVOKE_PATH = re.compile(r"^/v1/permits/([0-9a-f-]{36})/revoke$")
@@ -1540,6 +1544,26 @@ def build_handler(
                             "team_update_body_invalid", "Request body must be a JSON object.", status=400
                         )
                     payload = service.update_team_member(context, team_match.group(1), body, request_id=request_id)
+                    self._send_json(
+                        200, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
+                    )
+                    return
+                module_entitlement_match = _MODULE_ENTITLEMENT_PATH.fullmatch(path)
+                if module_entitlement_match:
+                    raw_body = self._read_json_body()
+                    try:
+                        body = json.loads(raw_body)
+                    except json.JSONDecodeError as exc:
+                        raise ApiTransportError(
+                            "module_entitlement_body_invalid", "Request body must be valid JSON.", status=400
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ApiTransportError(
+                            "module_entitlement_body_invalid", "Request body must be a JSON object.", status=400
+                        )
+                    payload = service.set_module_entitlement(
+                        context, module_entitlement_match.group(1), body, request_id=request_id
+                    )
                     self._send_json(
                         200, payload, request_id=request_id, extra_headers=self._rate_headers(decision)
                     )

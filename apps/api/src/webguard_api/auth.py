@@ -46,6 +46,7 @@ class ApiPermission(str, Enum):
     TEAM_READ = "team.read"
     TEAM_MANAGE = "team.manage"
     MODULE_ENTITLEMENTS_READ = "module_entitlements.read"
+    MODULE_ENTITLEMENTS_MANAGE = "module_entitlements.manage"
     SOC_CONNECTOR_READ = "soc.connectors.read"
     COMPLIANCE_CATALOG_READ = "compliance.catalog.read"
     COMPLIANCE_ASSERTION_READ = "compliance.assertions.read"
@@ -67,6 +68,7 @@ _ROLE_PERMISSIONS = {
         ApiPermission.AUTHORIZATION_COMPARISON_REGISTER,
         ApiPermission.AUTHORIZATION_COMPARISON_READ,
         ApiPermission.AUTHORIZATION_COMPARISON_REVOKE,
+        ApiPermission.MODULE_ENTITLEMENTS_MANAGE,
     },
     OrganizationRole.ANALYST: frozenset(
         {

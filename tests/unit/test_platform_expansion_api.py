@@ -21,6 +21,8 @@ from webguard_api.module_entitlements import InMemoryModuleEntitlementRepository
 from webguard_contracts import ModuleEntitlementStatus, OrganizationRole, PlatformModule
 
 from tests.unit.service_test_support import (
+    ADMINISTRATOR_ID,
+    ADMINISTRATOR_TOKEN_ID,
     NOW,
     VIEWER_ID,
     VIEWER_TOKEN_ID,
@@ -65,6 +67,111 @@ class PlatformExpansionApiTests(unittest.TestCase):
             by_module,
             {"webguard": "enabled", "soc": "disabled", "compliance": "disabled"},
         )
+
+    def test_owner_can_enable_then_disable_soc(self) -> None:
+        self.entitlements.grant_default_entitlements(self.owner.organization_id, now=NOW)
+
+        enabled = self.service.set_module_entitlement(
+            self.owner, "soc", {"status": "enabled"}, request_id=_rid()
+        )
+        self.assertEqual(enabled["module"], "soc")
+        self.assertEqual(enabled["status"], "enabled")
+        self.assertIsNotNone(enabled["enabled_at"])
+        listed = self.service.list_module_entitlements(self.owner, request_id=_rid())
+        by_module = {row["module"]: row["status"] for row in listed["entitlements"]}
+        self.assertEqual(by_module["soc"], "enabled")
+
+        disabled = self.service.set_module_entitlement(
+            self.owner, "soc", {"status": "disabled"}, request_id=_rid()
+        )
+        self.assertEqual(disabled["status"], "disabled")
+        # enabled_at records the last time the module *was* enabled, not
+        # whether it is currently enabled, so it stays set through a
+        # disable (ModuleEntitlement itself has no separate "was ever
+        # enabled" flag to clear).
+        self.assertIsNotNone(disabled["enabled_at"])
+        listed = self.service.list_module_entitlements(self.owner, request_id=_rid())
+        by_module = {row["module"]: row["status"] for row in listed["entitlements"]}
+        self.assertEqual(by_module["soc"], "disabled")
+
+    def test_owner_can_enable_compliance(self) -> None:
+        self.entitlements.grant_default_entitlements(self.owner.organization_id, now=NOW)
+        payload = self.service.set_module_entitlement(
+            self.owner, "compliance", {"status": "enabled"}, request_id=_rid()
+        )
+        self.assertEqual(payload, {
+            "module": "compliance",
+            "status": "enabled",
+            "updated_at": payload["updated_at"],
+            "enabled_at": payload["enabled_at"],
+        })
+        self.assertIsNotNone(payload["enabled_at"])
+
+    def test_webguard_is_rejected_as_not_manageable(self) -> None:
+        self.entitlements.grant_default_entitlements(self.owner.organization_id, now=NOW)
+        with self.assertRaises(Exception) as ctx:
+            self.service.set_module_entitlement(
+                self.owner, "webguard", {"status": "disabled"}, request_id=_rid()
+            )
+        self.assertEqual(ctx.exception.code, "module_entitlement_not_manageable")
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_unknown_module_name_is_rejected_with_a_distinct_error_from_webguard(self) -> None:
+        # "webguard" and an actually-unknown name are different failures
+        # with different meanings; they must not share webguard's own
+        # error message (a caller asking about "xyz" should never be
+        # told "the webguard module is always enabled").
+        self.entitlements.grant_default_entitlements(self.owner.organization_id, now=NOW)
+        with self.assertRaises(Exception) as ctx:
+            self.service.set_module_entitlement(
+                self.owner, "xyz", {"status": "enabled"}, request_id=_rid()
+            )
+        self.assertEqual(ctx.exception.code, "module_entitlement_unknown")
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertIn("xyz", ctx.exception.message)
+
+    def test_invalid_status_value_is_rejected(self) -> None:
+        self.entitlements.grant_default_entitlements(self.owner.organization_id, now=NOW)
+        with self.assertRaises(Exception) as ctx:
+            self.service.set_module_entitlement(
+                self.owner, "soc", {"status": "trial"}, request_id=_rid()
+            )
+        self.assertEqual(ctx.exception.code, "module_entitlement_body_invalid")
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_viewer_and_administrator_cannot_manage_module_entitlements(self) -> None:
+        self.entitlements.grant_default_entitlements(self.owner.organization_id, now=NOW)
+
+        with self.assertRaises(Exception) as ctx:
+            self.service.set_module_entitlement(
+                self.viewer, "soc", {"status": "enabled"}, request_id=_rid()
+            )
+        self.assertEqual(ctx.exception.code, "permission_denied")
+        self.assertEqual(ctx.exception.status, 403)
+
+        _, administrator, _ = create_identity_fixture(
+            self.service.store.path,
+            role=OrganizationRole.ADMINISTRATOR,
+            principal_id=ADMINISTRATOR_ID,
+            token_id=ADMINISTRATOR_TOKEN_ID,
+        )
+        with self.assertRaises(Exception) as ctx:
+            self.service.set_module_entitlement(
+                administrator, "compliance", {"status": "disabled"}, request_id=_rid()
+            )
+        self.assertEqual(ctx.exception.code, "permission_denied")
+        self.assertEqual(ctx.exception.status, 403)
+
+    def test_manage_404s_for_an_organization_with_no_entitlement_rows(self) -> None:
+        # Mirrors test_collect_assertion_denied_without_an_entitlement_row:
+        # self.entitlements starts with zero rows granted in setUp, and
+        # this must fail closed with 404, never silently create a row.
+        with self.assertRaises(Exception) as ctx:
+            self.service.set_module_entitlement(
+                self.owner, "soc", {"status": "enabled"}, request_id=_rid()
+            )
+        self.assertEqual(ctx.exception.code, "module_entitlement_not_found")
+        self.assertEqual(ctx.exception.status, 404)
 
     def test_soc_connectors_lists_all_three_real_manifests_sorted(self) -> None:
         payload = self.service.list_soc_connectors(self.owner, request_id=_rid())
