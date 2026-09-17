@@ -120,6 +120,32 @@ def _persisted_integer(value: object) -> int:
     return value
 
 
+def _no_earlier_than(candidate: datetime, floor: datetime) -> datetime:
+    """Never returns a value earlier than `floor`.
+
+    A caller's `now` (worker.py's `self.clock()`, read once at the top
+    of `run_once()`) is captured before this store even attempts to
+    acquire the SQLite write lock for the transaction that will read
+    and update a job row. Because SQLite serializes writers, that
+    attempt can block until a concurrent transaction -- e.g. a job
+    submission that reads its own, later `now` for `submitted_at` --
+    commits first. Once unblocked, the row this call selects or
+    updates can carry a `submitted_at` later than the `now` this call
+    started with, even though nothing about either clock reading was
+    itself wrong. `ScanJobRecord.__post_init__` enforces that
+    `updated_at`/`started_at` can never precede a job's own
+    `submitted_at`; flooring the value written for those columns to
+    the row's own `submitted_at` keeps that true by construction
+    rather than by assuming a `now` read before a lock wait is still
+    fresh once the wait ends. This only ever raises the value used,
+    never lowers it -- it does not fabricate an earlier event as
+    having happened later for any other purpose (permit validity
+    windows, lease-expiry filtering, and similar checks all keep using
+    the caller's real `now` untouched)."""
+
+    return candidate if candidate >= floor else floor
+
+
 class ScanJobStore:
     """A small transactional queue using one SQLite database file."""
 
@@ -1759,17 +1785,26 @@ class ScanJobStore:
         ).fetchone()
 
     def claim_next(self, *, now: datetime) -> ScanJobRecord | None:
-        timestamp = _timestamp(now)
+        select_timestamp = _timestamp(now)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = self._select_claimable_row(
                 connection,
-                timestamp=timestamp,
+                timestamp=select_timestamp,
             )
             if row is None:
                 connection.execute("COMMIT")
                 return None
+            # See _no_earlier_than's own docstring: `now` was read
+            # before this call could even try to acquire SQLite's
+            # write lock, so the row this select just found can belong
+            # to a submission that raced ahead of it and committed a
+            # later submitted_at first.
+            row_submitted_at = _parse_timestamp(row["submitted_at"])
+            claim_timestamp = _timestamp(
+                now if row_submitted_at is None else _no_earlier_than(now, row_submitted_at)
+            )
             revision = _persisted_integer(
                 row["revision"]
             ) + 1
@@ -1781,8 +1816,8 @@ class ScanJobStore:
                 """,
                 (
                     ScanJobState.RUNNING.value,
-                    timestamp,
-                    timestamp,
+                    claim_timestamp,
+                    claim_timestamp,
                     revision,
                     row["job_id"],
                     ScanJobState.QUEUED.value,
@@ -1829,20 +1864,30 @@ class ScanJobStore:
 
         effective_worker_id = self._worker_id(worker_id)
         duration = self._lease_seconds(lease_seconds)
-        timestamp = _timestamp(now)
-        expires_at = now + timedelta(seconds=duration)
-        expires_text = _timestamp(expires_at)
+        select_timestamp = _timestamp(now)
         lease_token = str(uuid4())
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = self._select_claimable_row(
                 connection,
-                timestamp=timestamp,
+                timestamp=select_timestamp,
             )
             if row is None:
                 connection.execute("COMMIT")
                 return None
+            # See _no_earlier_than's own docstring: `now` was read
+            # before this call could even try to acquire SQLite's
+            # write lock, so the row this select just found can belong
+            # to a submission that raced ahead of it and committed a
+            # later submitted_at first. The lease itself is derived
+            # from the same floored moment, so a job's lease always
+            # runs lease_seconds from when it could actually have
+            # started, not from a stale pre-lock-wait reading.
+            row_submitted_at = _parse_timestamp(row["submitted_at"])
+            claim_now = now if row_submitted_at is None else _no_earlier_than(now, row_submitted_at)
+            claim_timestamp = _timestamp(claim_now)
+            expires_text = _timestamp(claim_now + timedelta(seconds=duration))
             revision = _persisted_integer(
                 row["revision"]
             ) + 1
@@ -1856,13 +1901,13 @@ class ScanJobStore:
                 """,
                 (
                     ScanJobState.RUNNING.value,
-                    timestamp,
-                    timestamp,
+                    claim_timestamp,
+                    claim_timestamp,
                     revision,
                     effective_worker_id,
                     lease_token,
                     expires_text,
-                    timestamp,
+                    claim_timestamp,
                     row["job_id"],
                     ScanJobState.QUEUED.value,
                     row["revision"],
@@ -1910,8 +1955,6 @@ class ScanJobStore:
 
         effective_worker_id = self._worker_id(worker_id)
         duration = self._lease_seconds(lease_seconds)
-        timestamp = _timestamp(now)
-        expires_text = _timestamp(now + timedelta(seconds=duration))
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -1927,6 +1970,15 @@ class ScanJobStore:
                 lease_token=lease_token,
                 now=now,
             )
+            # See _no_earlier_than's own docstring. This row is already
+            # RUNNING, so its existing updated_at is already >=
+            # submitted_at; flooring here defends the same invariant
+            # against the same class of stale-`now` race, not a defect
+            # specific to renewal.
+            row_submitted_at = _parse_timestamp(row["submitted_at"])
+            renew_now = now if row_submitted_at is None else _no_earlier_than(now, row_submitted_at)
+            timestamp = _timestamp(renew_now)
+            expires_text = _timestamp(renew_now + timedelta(seconds=duration))
             revision = _persisted_integer(row["revision"]) + 1
             updated = connection.execute(
                 """
@@ -2004,8 +2056,21 @@ class ScanJobStore:
             ).fetchall()
             for row in rows:
                 revision = _persisted_integer(row["revision"]) + 1
+                # See _no_earlier_than's own docstring. `timestamp`
+                # above is the true `now` used to find expired leases
+                # (a genuine elapsed-time filter, left untouched); the
+                # value actually WRITTEN to this row's own timestamp
+                # columns is floored to its own submitted_at instead,
+                # per row, since a batch recovery sweep can touch jobs
+                # submitted at different times.
+                row_submitted_at = _parse_timestamp(row["submitted_at"])
+                row_timestamp = (
+                    timestamp
+                    if row_submitted_at is None
+                    else _timestamp(_no_earlier_than(now, row_submitted_at))
+                )
                 common = (
-                    timestamp,
+                    row_timestamp,
                     revision,
                     row["job_id"],
                     ScanJobState.RUNNING.value,
@@ -2022,7 +2087,7 @@ class ScanJobStore:
                         WHERE job_id = ? AND state = ? AND revision = ?
                             AND lease_token = ?
                         """,
-                        (ScanJobState.CANCELLED.value, timestamp, *common),
+                        (ScanJobState.CANCELLED.value, row_timestamp, *common),
                     )
                     cancelled += result.rowcount
                 elif _persisted_integer(row["attempt_count"]) >= limit:
@@ -2038,8 +2103,8 @@ class ScanJobStore:
                         """,
                         (
                             ScanJobState.FAILED.value,
-                            timestamp,
-                            timestamp,
+                            row_timestamp,
+                            row_timestamp,
                             revision,
                             "worker_lease_attempts_exhausted",
                             "The scan job exceeded the permitted worker recovery attempts.",
@@ -2062,7 +2127,7 @@ class ScanJobStore:
                         """,
                         (
                             ScanJobState.QUEUED.value,
-                            timestamp,
+                            row_timestamp,
                             revision,
                             row["job_id"],
                             ScanJobState.RUNNING.value,
@@ -2401,7 +2466,6 @@ class ScanJobStore:
         effective_worker_id = (
             None if worker_id is None else self._worker_id(worker_id)
         )
-        timestamp = _timestamp(now)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -2417,6 +2481,19 @@ class ScanJobStore:
                     "job_state_transition_invalid",
                     "Only running jobs can enter a terminal worker state.",
                 )
+            # See _no_earlier_than's own docstring. ScanJobRecord also
+            # requires completed_at not precede the job's start
+            # boundary (started_at if set, else submitted_at) -- floor
+            # against whichever of the two is later so both that check
+            # and the updated_at/submitted_at one hold regardless of
+            # whether this row's own `now` reading raced a concurrent
+            # write. This row is already RUNNING, so its own
+            # started_at/updated_at are already consistent with that
+            # boundary; this defends the same invariant class against
+            # the same stale-`now` race, not a defect specific to
+            # terminal writes.
+            terminal_floor = record.started_at or record.request.submitted_at
+            timestamp = _timestamp(_no_earlier_than(now, terminal_floor))
             if row["lease_token"] is not None:
                 if effective_worker_id is None or lease_token is None:
                     raise JobStoreError(
