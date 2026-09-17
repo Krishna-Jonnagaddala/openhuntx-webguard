@@ -7,17 +7,30 @@ corrected column-level ACL (tenant_isolation_acl.sql), end to end,
 through a disposable LOGIN role that inherits nothing beyond that
 role's own privileges.
 
-Two things are deliberately out of scope here, left to a later,
+One thing is deliberately still out of scope here, left to a later,
 not-yet-scoped repository-conversion phase:
 
-* ``get_password_hash`` and the read half of ``consume_identity_token``
-  (its own initial 8-column ``SELECT`` by ``token_id``) are pre-
-  authentication reads that belong to a future ``identity_function_owner``
-  resolver, not this ordinary tenant-scoped role. This correction never
-  grants them, and the tests below confirm they still fail.
+* the read half of ``consume_identity_token`` (its own initial
+  8-column ``SELECT`` by ``token_id``) is a pre-authentication read
+  that belongs to ``identity_function_owner``'s
+  ``webguard_control.resolve_identity_token``, not this ordinary
+  tenant-scoped role, and this correction never grants direct table
+  access for it, so ``IdentityTokensWriteShapeTests`` below only ever
+  reproduces the method's own post-resolution ``UPDATE``.
 * Row-level security is a separate phase (P1-C2-G); every test here
   runs with RLS never enabled at all, so nothing here is a tenant-
   isolation claim.
+
+``get_password_hash`` WAS in the list above until P1-2 Phase H's
+method-level gap closure (2026-09-17): it now succeeds through
+``webguard_control.resolve_password_hash``, a new principal_id-keyed
+SECURITY DEFINER function. See
+``PasswordCredentialsWriteShapeTests.test_get_password_hash_now_succeeds_via_resolver``,
+whose ``setUpClass`` applies ``tenant_isolation_function_acl.sql`` and
+``tenant_isolation_control_functions.sql`` in addition to the two files
+below, specifically to prove this end to end. api_tenant_data still
+has no direct table-level SELECT on ``password_credentials``: the
+function is the only path.
 
 The rollback tests reproduce the exact production SQL statement text
 over a raw psycopg connection under the same restricted role, rather
@@ -51,6 +64,14 @@ RUN_POSTGRES_TESTS = RUN_INTEGRATION and bool(POSTGRES_TEST_DSN)
 _BOOTSTRAP_DIR = Path(__file__).resolve().parent.parent.parent / "infra" / "postgres" / "bootstrap"
 ROLES_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_roles.sql"
 ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_acl.sql"
+# P1-2 Phase H gap closure, 2026-09-17: PasswordCredentialsWriteShapeTests
+# now also applies these two so its get_password_hash test can prove
+# the closed gap (see that test's own docstring). IdentityTokensWriteShapeTests
+# below does not need them, since its own consume_identity_token test
+# only ever reproduces the method's raw post-resolution UPDATE text,
+# never calls webguard_control.resolve_identity_token at all.
+FUNCTION_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_function_acl.sql"
+CONTROL_FUNCTIONS_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_control_functions.sql"
 
 ALL_BOOTSTRAP_ROLES = [
     "api_tenant_data",
@@ -105,6 +126,12 @@ class PasswordCredentialsWriteShapeTests(unittest.TestCase):
             connection.execute(ROLES_SQL_PATH.read_text(encoding="utf-8"))
             connection.commit()
             connection.execute(ACL_SQL_PATH.read_text(encoding="utf-8"))
+            connection.commit()
+            # P1-2 Phase H gap closure, 2026-09-17: needed for
+            # test_get_password_hash_now_succeeds_via_resolver below.
+            connection.execute(FUNCTION_ACL_SQL_PATH.read_text(encoding="utf-8"))
+            connection.commit()
+            connection.execute(CONTROL_FUNCTIONS_SQL_PATH.read_text(encoding="utf-8"))
             connection.commit()
 
         with psycopg.connect(cls._db_dsn, autocommit=True) as connection:
@@ -197,17 +224,35 @@ class PasswordCredentialsWriteShapeTests(unittest.TestCase):
         result = self.identity.set_password_hash(self.principal_id, algorithm="scrypt", password_hash="hash-1", now=now)
         self.assertIsNone(result, "set_password_hash's own return value is unchanged by the write-shape rewrite")
 
-    def test_get_password_hash_correctly_denied_to_this_role(self) -> None:
-        """get_password_hash's read is identity_function_owner's future
-        resolver domain, not api_tenant_data's -- this correction never
-        grants it, and must not accidentally have."""
-
-        from webguard_api.db_errors import DatabaseAuthorizationDeniedError
+    def test_get_password_hash_now_succeeds_via_resolver(self) -> None:
+        """P1-2 Phase H gap closed, 2026-09-17: get_password_hash used
+        to be correctly denied here (api_tenant_data never held direct
+        SELECT on password_credentials, and this correction's own ACL
+        never granted it, per Section 13/Phase D's own output-minimization
+        principle). It now succeeds through
+        webguard_control.resolve_password_hash, a new principal_id-keyed
+        SECURITY DEFINER function owned by identity_function_owner,
+        granted EXECUTE to api_tenant_data (this class's setUpClass now
+        also applies tenant_isolation_function_acl.sql and
+        tenant_isolation_control_functions.sql to prove it end to end
+        under the real disposable LOGIN caller, not just a superuser
+        connection). Still no direct table-level SELECT on
+        password_credentials for api_tenant_data: the function is the
+        only path, and it returns only password_hash."""
 
         now = datetime.now(timezone.utc)
         self.identity.set_password_hash(self.principal_id, algorithm="scrypt", password_hash="hash-1", now=now)
-        with self.assertRaises(DatabaseAuthorizationDeniedError):
-            self.identity.get_password_hash(self.principal_id)
+        self.assertEqual(self.identity.get_password_hash(self.principal_id), "hash-1")
+        self.assertIsNone(self.identity.get_password_hash(str(uuid.uuid4())))
+
+        import psycopg
+
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+            with self._connect() as connection:
+                connection.execute(
+                    "SELECT password_hash FROM password_credentials WHERE principal_id = %s",
+                    (self.principal_id,),
+                )
 
     # -- concurrency ---------------------------------------------------------
 

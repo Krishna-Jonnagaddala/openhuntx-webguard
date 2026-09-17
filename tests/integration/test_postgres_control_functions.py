@@ -100,14 +100,29 @@ EXPECTED_FUNCTIONS = {
         "p_schedule_id uuid, p_expected_revision integer, p_error_code text, "
         "p_now timestamp with time zone",
     ),
-    # callback has NO external Phase-F EXECUTE grantee (corrected):
-    # callback_function_owner is the privileged owner, not a caller-
-    # facing capability role. None is the expected grantee here; a
-    # dedicated test below asserts no role at all can EXECUTE it.
+    # P1-2 Phase H gap closure, 2026-09-17: callback_function_owner
+    # remains the privileged owner (not a caller-facing role), but the
+    # deferred "future deployment phase that actually wires a LOGIN
+    # identity to this path" (Section 9's own words) has arrived.
+    # callback_receiver is that identity. See
+    # test_callback_function_execute_grantee_is_exactly_callback_receiver
+    # for the dedicated no-other-role-can-execute-it proof.
     "resolve_and_record_callback_observation": (
         "callback_function_owner",
-        None,
+        "callback_receiver",
         "p_token_value text, p_method text, p_source_class text, p_observed_at timestamp with time zone",
+    ),
+    # P1-2 Phase H gap closure, 2026-09-17: six new functions, none
+    # of Phase F's original 13.
+    "resolve_password_hash": ("identity_function_owner", "api_tenant_data", "p_principal_id uuid"),
+    "resolve_job_scope": ("worker_function_owner", "worker_tenant_data", "p_job_id uuid"),
+    "resolve_job_cancellation_requested": ("worker_function_owner", "worker_tenant_data", "p_job_id uuid"),
+    "resolve_job_permit_binding": ("worker_function_owner", "worker_tenant_data", "p_job_id uuid"),
+    "resolve_schedule_permit_binding": (
+        "scheduler_function_owner", "scheduler_tenant_data", "p_schedule_id uuid",
+    ),
+    "resolve_schedule_request_shape": (
+        "scheduler_function_owner", "scheduler_tenant_data", "p_schedule_id uuid",
     ),
 }
 
@@ -136,16 +151,25 @@ class ControlFunctionsFileStructureTests(unittest.TestCase):
         )
 
     def test_each_function_created_inside_its_owner_set_role_window(self) -> None:
+        # Marker deliberately matches both "CREATE FUNCTION" and
+        # "CREATE OR REPLACE FUNCTION": resolve_identity_token and
+        # enqueue_due_schedule (P1-2 Phase H gap closure, 2026-09-17)
+        # use DROP FUNCTION IF EXISTS + CREATE FUNCTION instead of
+        # CREATE OR REPLACE, since PostgreSQL refuses to let CREATE OR
+        # REPLACE FUNCTION widen an existing RETURNS TABLE (confirmed
+        # directly against this project's own disposable Postgres 16).
+        # Every other function here is still plain CREATE OR REPLACE
+        # FUNCTION, and this marker matches either form identically.
         sql = CONTROL_FUNCTIONS_SQL_PATH.read_text(encoding="utf-8")
         for name, (expected_owner, _grantee, _args) in EXPECTED_FUNCTIONS.items():
             set_role_marker = f"SET ROLE {expected_owner};"
-            create_marker = f"CREATE OR REPLACE FUNCTION webguard_control.{name}("
+            create_marker = f"FUNCTION webguard_control.{name}("
             set_index = sql.index(set_role_marker)
             reset_index = sql.index("RESET ROLE;", set_index)
             create_index = sql.index(create_marker)
             self.assertTrue(
                 set_index < create_index < reset_index,
-                f"{name}'s CREATE OR REPLACE FUNCTION must fall between "
+                f"{name}'s CREATE [OR REPLACE] FUNCTION must fall between "
                 f"'{set_role_marker}' and the 'RESET ROLE;' that closes its block, "
                 f"so it is created while CURRENT_USER is {expected_owner}",
             )
@@ -253,7 +277,11 @@ class ControlFunctionBootstrapTests(unittest.TestCase):
 
     # -- Section 29: complete function inventory --------------------------
 
-    def test_exactly_thirteen_functions_with_correct_metadata(self) -> None:
+    def test_exactly_nineteen_functions_with_correct_metadata(self) -> None:
+        # 13 from Phase F, plus 6 from P1-2 Phase H's method-level gap
+        # closure (2026-09-17): resolve_password_hash, resolve_job_scope,
+        # resolve_job_cancellation_requested, resolve_job_permit_binding,
+        # resolve_schedule_permit_binding, resolve_schedule_request_shape.
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -265,7 +293,7 @@ class ControlFunctionBootstrapTests(unittest.TestCase):
                 """
             ).fetchall()
 
-        self.assertEqual(len(rows), 13, f"expected exactly 13 functions, found {len(rows)}: {rows}")
+        self.assertEqual(len(rows), 19, f"expected exactly 19 functions, found {len(rows)}: {rows}")
         by_name = {name: (args, secdef, owner, config) for name, args, secdef, owner, config in rows}
         self.assertEqual(set(by_name), set(EXPECTED_FUNCTIONS), "unexpected function name set")
 
@@ -373,7 +401,7 @@ class ControlFunctionBootstrapTests(unittest.TestCase):
             ).fetchall()
 
         self.assertEqual(before, after, "a second control-functions bootstrap run must change nothing")
-        self.assertEqual(len(after), 13, "second run must not create duplicate overloads")
+        self.assertEqual(len(after), 19, "second run must not create duplicate overloads")
 
     # -- Section 26: search_path hijack resistance --------------------------
 
@@ -1157,14 +1185,15 @@ class ControlFunctionBootstrapTests(unittest.TestCase):
     # -- Section 1/9 correction: callback has NO external Phase-F ----------
     # -- EXECUTE grantee -----------------------------------------------------
 
-    def test_callback_function_has_no_external_execute_grantee(self) -> None:
+    def test_callback_function_execute_grantee_is_exactly_callback_receiver(self) -> None:
         """callback_function_owner is the privileged SECURITY DEFINER
-        owner, not a caller-facing capability role. No role -- not a
-        fresh no-grant probe, not any of the three ordinary tenant-
-        data roles, not even callback_function_owner itself as a
-        distinct 'grantee' concept -- may EXECUTE this function in
-        Phase F. The capability is deferred entirely to a future
-        runtime-role phase."""
+        owner, not a caller-facing capability role: unchanged. P1-2
+        Phase H gap closure, 2026-09-17: callback_receiver is now the
+        ONE role granted EXECUTE (Section 9's own deferred "future
+        deployment phase" has arrived). Every other role, a fresh
+        no-grant probe, and all three ordinary tenant-data roles, none
+        of which should ever need this pre-authentication-only
+        function, must still be unable to execute it."""
 
         signature = "webguard_control.resolve_and_record_callback_observation(text, text, text, timestamptz)"
         with self._connect() as connection:
@@ -1172,6 +1201,11 @@ class ControlFunctionBootstrapTests(unittest.TestCase):
             connection.execute('DROP ROLE IF EXISTS "test_no_grant_probe_cb"')
             connection.execute('CREATE ROLE "test_no_grant_probe_cb" NOLOGIN')
             try:
+                can_execute = connection.execute(
+                    "SELECT has_function_privilege('callback_receiver', %s, 'EXECUTE')", (signature,)
+                ).fetchone()[0]
+                self.assertTrue(can_execute, "callback_receiver must be able to EXECUTE the callback function")
+
                 for role in (
                     "test_no_grant_probe_cb",
                     "api_tenant_data",
@@ -1211,6 +1245,12 @@ class ControlFunctionBootstrapTests(unittest.TestCase):
                     ("worker_function_owner", True, False),
                     ("scheduler_function_owner", True, False),
                     ("callback_function_owner", True, False),
+                    # P1-2 Phase H gap closure, 2026-09-17: callback_receiver
+                    # needs USAGE to resolve resolve_and_record_callback_observation
+                    # by its schema-qualified name; it is never granted
+                    # CREATE (it holds exactly one privilege, EXECUTE on
+                    # that one function).
+                    ("callback_receiver", True, False),
                     ("test_unrelated_probe", False, False),
                 ]:
                     usage = connection.execute(
@@ -1518,7 +1558,7 @@ class NonSuperuserOwnershipTransferTests(unittest.TestCase):
         with psycopg.connect(self._actor_dsn) as actor_connection:
             before = self._capture_metadata(actor_connection)
 
-        self.assertEqual(len(before["functions"]), 13, "expected exactly 13 functions after the first run")
+        self.assertEqual(len(before["functions"]), 19, "expected exactly 19 functions after the first run")
         # row shape: (proname, args, prosecdef, owner, proconfig, proacl)
         owners_by_name = {row[0]: row[3] for row in before["functions"]}
         for name, (expected_owner, _grantee, _args) in EXPECTED_FUNCTIONS.items():
@@ -1545,7 +1585,7 @@ class NonSuperuserOwnershipTransferTests(unittest.TestCase):
             "a second control-functions bootstrap run by the SAME non-superuser actor must leave "
             "function metadata, schema ACL, and function-owner CREATE state byte-identical",
         )
-        self.assertEqual(len(after["functions"]), 13, "second run must not create duplicate overloads")
+        self.assertEqual(len(after["functions"]), 19, "second run must not create duplicate overloads")
 
         # -- Section 6/8/9 spot checks under the non-superuser actor --------
         with psycopg.connect(self._actor_dsn) as actor_connection:

@@ -450,7 +450,15 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
 
         def faulty_execute(self_conn, query, params=None, **kwargs):
             text = query if isinstance(query, str) else query.as_string(self_conn)
-            if not state["failed_once"] and "INSERT INTO callback_observations" in text:
+            # P1-2 Phase H gap closure, 2026-09-17: record_observation
+            # now persists through one call to
+            # webguard_control.resolve_and_record_callback_observation
+            # (running as the new callback_receiver role) instead of a
+            # literal client-issued "INSERT INTO callback_observations".
+            # The INSERT now happens server-side, inside that
+            # function's own body. Matching on the function call text
+            # is this test's equivalent fault-injection point.
+            if not state["failed_once"] and "resolve_and_record_callback_observation" in text:
                 state["failed_once"] = True
                 raise psycopg.OperationalError("simulated one-time connection failure (P1-12 E2E proof)")
             return real_execute(self_conn, query, params, **kwargs)
@@ -480,7 +488,11 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
 
         def always_faulty_execute(self_conn, query, params=None, **kwargs):
             text = query if isinstance(query, str) else query.as_string(self_conn)
-            if "INSERT INTO callback_observations" in text:
+            # See test_ssrf_confirmed_despite_a_transient_persistence_failure_within_retry_budget's
+            # own comment: record_observation's persistence now happens
+            # inside one webguard_control.resolve_and_record_callback_observation
+            # call, not a literal client-issued INSERT.
+            if "resolve_and_record_callback_observation" in text:
                 raise psycopg.OperationalError("simulated permanent connection failure (P1-12 E2E proof)")
             return real_execute(self_conn, query, params, **kwargs)
 
