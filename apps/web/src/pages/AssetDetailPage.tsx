@@ -460,43 +460,43 @@ export function AssetDetailPage() {
         ]}
       />
       <div>
-      <PageHeader title={asset.label ?? asset.url} description={asset.url} />
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <VerificationPanel targetId={asset.target_id} />
-        <Card className="p-4">
-          <h2 className="mb-2 text-sm font-semibold text-[var(--color-text-primary)]">Authorization</h2>
-          {asset.authorization ? (
-            <div className="text-sm text-[var(--color-text-secondary)]">
-              <p className="mb-1">
-                Status: <StatusBadge status={asset.authorization.state} />
-              </p>
-              <p>Expires {new Date(asset.authorization.expires_at).toLocaleString()}</p>
-            </div>
-          ) : (
-            <p className="text-sm text-[var(--color-text-secondary)]">No authorization currently assigned to this URL.</p>
-          )}
-        </Card>
-        <StartScanPanel targetId={asset.target_id} />
-        <Card className="p-4">
-          <h2 className="mb-2 text-sm font-semibold text-[var(--color-text-primary)]">Findings summary</h2>
-          {!asset.finding_counts || Object.keys(asset.finding_counts).length === 0 ? (
-            <p className="text-sm text-[var(--color-text-secondary)]">No findings recorded for this asset.</p>
-          ) : (
-            <ul className="space-y-1 text-sm text-[var(--color-text-secondary)]">
-              {Object.entries(asset.finding_counts).map(([severity, count]) => (
-                <li key={severity} className="flex justify-between capitalize">
-                  <span>{severity}</span>
-                  <span className="font-medium text-[var(--color-text-primary)]">{count}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-          <Link to={`/app/webguard/findings?asset=${encodeURIComponent(asset.url)}`} className="mt-3 inline-block text-sm text-[var(--color-accent)] hover:underline">
-            View findings for this asset →
-          </Link>
-        </Card>
-        <CoveragePanel targetId={asset.target_id} />
-      </div>
+        <PageHeader title={asset.label ?? asset.url} description={asset.url} />
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <VerificationPanel targetId={asset.target_id} />
+          <Card className="p-4">
+            <h2 className="mb-2 text-sm font-semibold text-[var(--color-text-primary)]">Authorization</h2>
+            {asset.authorization ? (
+              <div className="text-sm text-[var(--color-text-secondary)]">
+                <p className="mb-1">
+                  Status: <StatusBadge status={asset.authorization.state} />
+                </p>
+                <p>Expires {new Date(asset.authorization.expires_at).toLocaleString()}</p>
+              </div>
+            ) : (
+              <p className="text-sm text-[var(--color-text-secondary)]">No authorization currently assigned to this URL.</p>
+            )}
+          </Card>
+          <StartScanPanel targetId={asset.target_id} />
+          <Card className="p-4">
+            <h2 className="mb-2 text-sm font-semibold text-[var(--color-text-primary)]">Findings summary</h2>
+            {!asset.finding_counts || Object.keys(asset.finding_counts).length === 0 ? (
+              <p className="text-sm text-[var(--color-text-secondary)]">No findings recorded for this asset.</p>
+            ) : (
+              <ul className="space-y-1 text-sm text-[var(--color-text-secondary)]">
+                {Object.entries(asset.finding_counts).map(([severity, count]) => (
+                  <li key={severity} className="flex justify-between capitalize">
+                    <span>{severity}</span>
+                    <span className="font-medium text-[var(--color-text-primary)]">{count}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <Link to={`/app/webguard/findings?asset=${encodeURIComponent(asset.url)}`} className="mt-3 inline-block text-sm text-[var(--color-accent)] hover:underline">
+              View findings for this asset →
+            </Link>
+          </Card>
+          <CoveragePanel targetId={asset.target_id} />
+        </div>
       </div>
     </>
   );
