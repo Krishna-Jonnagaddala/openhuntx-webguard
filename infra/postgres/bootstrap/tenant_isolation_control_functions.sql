@@ -231,7 +231,8 @@ REVOKE CREATE, USAGE ON SCHEMA webguard_control FROM PUBLIC;
 GRANT USAGE ON SCHEMA webguard_control
     TO identity_function_owner, worker_function_owner,
        scheduler_function_owner, callback_function_owner,
-       api_tenant_data, worker_tenant_data, scheduler_tenant_data;
+       api_tenant_data, worker_tenant_data, scheduler_tenant_data,
+       callback_receiver;
 
 -- Non-superuser, RDS-compatible ownership mechanics (see the file
 -- header): claim the SET option on this function-owner role (using
@@ -1891,28 +1892,29 @@ REVOKE ALL ON FUNCTION webguard_control.resolve_and_record_callback_observation(
     text, text, text, timestamptz
 ) FROM PUBLIC;
 
--- CALLBACK IS SPECIAL (Section 9): there is no callback tenant-data
--- capability role, and none is created here. The public callback
--- receiver process has no organization_id to scope by until a token
--- resolves, so it cannot run as any of the three existing tenant-data
--- roles (each of those already carries ordinary tenant-scoped table
--- privileges this pre-authentication path has no business holding).
---
--- callback_function_owner is the privileged SECURITY DEFINER owner of
--- this function, not a caller-facing capability role -- granting it
--- EXECUTE on its own function would not create a usable, unprivileged
--- invocation path for anything, since nothing else is, or should be,
--- a member of callback_function_owner. This file grants EXECUTE to
--- NO role at all: PUBLIC EXECUTE is revoked above, and no other
--- GRANT EXECUTE follows. The function is fully created, owned, and
--- hardened, but genuinely unreachable by any current role -- correct
--- for a phase that must not invent a new NOLOGIN role (Section 9
--- explicitly requires stopping and reporting that gap rather than
--- silently closing it). Deciding what the eventual unprivileged
--- caller identity for public callback ingress should be (a new
--- execution-only NOLOGIN role, most likely, distinct from
--- callback_function_owner) is deferred to the future deployment phase
--- that actually wires a LOGIN identity to this path.
+-- CALLBACK IS SPECIAL (Section 9), gap closed 2026-09-17: the future
+-- deployment phase this section originally deferred to has arrived.
+-- callback_receiver (tenant_isolation_roles.sql) is that new,
+-- execution-only, directly-connectable LOGIN identity, distinct from
+-- callback_function_owner (the function's own privileged SECURITY
+-- DEFINER owner, still not a caller-facing role: nothing is, or should
+-- be, a member of it) and distinct from the three NOLOGIN tenant-data
+-- roles (each already carries ordinary tenant-scoped table privileges
+-- this pre-authentication path has no business holding, per this
+-- section's own original reasoning, which is unchanged). EXECUTE on
+-- this one function is the ONLY privilege callback_receiver is ever
+-- granted, here or anywhere else in this bootstrap chain: no table
+-- grant, no other function, no membership in any other role, no
+-- BYPASSRLS. The public callback-service process authenticates
+-- directly as this role (its own dedicated DSN, not
+-- WEBGUARD_DATABASE_URL's "webguard" identity), so even a bug that
+-- reused its connection for some other query would hit "permission
+-- denied," never an ambient "webguard" privilege. See
+-- postgres_callback_service.py's own docstring and postgres_pool.py's
+-- CALLBACK_RECEIVER_ROLE for the Python side of this wiring.
+GRANT EXECUTE ON FUNCTION webguard_control.resolve_and_record_callback_observation(
+    text, text, text, timestamptz
+) TO callback_receiver;
 
 RESET ROLE;
 
