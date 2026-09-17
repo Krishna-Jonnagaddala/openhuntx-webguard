@@ -85,8 +85,8 @@ POSTGRES_TEST_DSN = os.environ.get("WEBGUARD_POSTGRES_TEST_DSN")
 RUN_PRODUCTION_E2E = RUN_INTEGRATION and bool(POSTGRES_TEST_DSN)
 
 # See _run_job_and_get_findings's own comment on its GET-result polling
-# loop for why this is 1.0s and not the tighter interval it used to be
-# -- tests/unit/test_ssrf_e2e_polling_rate_limit_budget.py checks this
+# loop for why this is 1.0s and not the tighter interval it used to be.
+# tests/unit/test_ssrf_e2e_polling_rate_limit_budget.py checks this
 # exact value against the production rate limiter's budget.
 RESULT_POLL_INTERVAL_SECONDS = 1.0
 
@@ -352,8 +352,8 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
                 # checked per `context.token_id` in http_api.py's
                 # `_authenticate`). At the previous 0.1s interval, a
                 # `completion_timeout_seconds=60` wait alone could issue
-                # up to ~600 GET requests -- five times the token's
-                # entire 60-second budget -- so the loop reliably
+                # up to ~600 GET requests, five times the token's
+                # entire 60-second budget, so the loop reliably
                 # exhausted its own quota partway through polling and
                 # then had to wait, blocked on HTTP 429s, for whatever
                 # was left of that unrelated 60-second wall-clock window
@@ -362,9 +362,9 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
                 # the intermittent near-60s and >60s runs traced for
                 # this test (confirmed by instrumenting job-claim/execute
                 # timestamps: the SSRF-callback pipeline itself
-                # consistently completes in ~20s -- see the worst-case
-                # trace below -- while the *test* sat waiting out its own
-                # rate limit). 1.0s keeps this loop's own request count
+                # consistently completes in ~20s (see the worst-case
+                # trace below) while the *test* sat waiting out its own
+                # rate limit. 1.0s keeps this loop's own request count
                 # (completion_timeout_seconds / 1.0, i.e. at most 60 GETs
                 # here) comfortably under the 120-request budget even at
                 # the full timeout, with headroom to spare for the
@@ -489,7 +489,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         # (/fetch-vulnerable, /fetch-safe, /reflect-only), run one at a
         # time (run_ssrf_callback_detector's own candidate loop is
         # sequential, not concurrent), and under this patch NONE of
-        # their observations can ever persist -- so every one of them
+        # their observations can ever persist, so every one of them
         # pays its full per-candidate cost rather than resolving in a
         # couple of poll cycles like the already-recorded or
         # fails-once-then-succeeds cases do. Traced per candidate, from
@@ -501,8 +501,8 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         # candidates = 18.0s hard floor, plus register/probe/page-fetch
         # network overhead. Empirically (instrumented job-claim/execute
         # timestamps against the real Postgres container this test
-        # requires) the whole pipeline -- claim, passive scan, all three
-        # candidates, terminal-state write -- consistently completes in
+        # requires) the whole pipeline (claim, passive scan, all three
+        # candidates, terminal-state write) consistently completes in
         # ~20s. 60s leaves roughly 3x headroom over that traced/measured
         # figure, which is generous margin, not a marginal budget.
         #
@@ -521,8 +521,8 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         # production_startup.py), keyed per token and reset on a
         # wall-clock-aligned 60-second boundary, not a per-client
         # sliding window. Polling at 0.1s exhausts that 120-request
-        # budget in ~12 seconds -- well before this job's own ~20s
-        # completion -- and every following poll then received HTTP 429
+        # budget in ~12 seconds, well before this job's own ~20s
+        # completion, and every following poll then received HTTP 429
         # until the *unrelated* 60-second window happened to roll over,
         # which could be anywhere from a few seconds to nearly 60
         # depending purely on what wall-clock second the test started

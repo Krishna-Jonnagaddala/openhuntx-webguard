@@ -8,12 +8,12 @@ IMMEDIATE" then has to acquire SQLite's single-writer lock, which can
 block behind a concurrent job-submission transaction that reads its
 own, later `now` for `ScanJobRequest.submitted_at` and commits first.
 `_select_claimable_row` has no `submitted_at <= now` filter at all, so
-once unblocked, the worker can still select and claim that row -- and
+once unblocked, the worker can still select and claim that row, and
 before this fix, it stamped `updated_at`/`started_at` with its own
 now-stale `now`, which can be earlier than the row's own
 `submitted_at`. `ScanJobRecord.__post_init__` (scan_jobs.py) then
 raises `ScanJobValidationError: updated_at cannot precede
-submitted_at` while building the return value -- *after* the claim's
+submitted_at` while building the return value, *after* the claim's
 own COMMIT already succeeded (see claim_next_leased/claim_next: COMMIT
 happens before `_lease_from_row`/`_record_from_row` is called) and
 uncaught by any of `claim_next_leased`'s own exception handlers (it is
@@ -24,8 +24,8 @@ store.py's `get_scoped()` -> the same `_record_from_row`) in the
 reported CI failure.
 
 This test reproduces the underlying condition directly and
-deterministically -- a `now` earlier than an already-persisted job's
-`submitted_at` -- without needing real thread timing, since the
+deterministically, using a `now` earlier than an already-persisted
+job's `submitted_at`, without needing real thread timing, since the
 observable defect is a pure function of the values passed to the
 store, not of scheduling luck. It does not attempt to reproduce the
 SQLite lock-contention timing itself (that is what makes the race rare
@@ -128,7 +128,7 @@ class StaleClockClaimTests(unittest.TestCase):
         parameter: its WHERE clause only ever selects rows whose
         `lease_expires_at <= now`, and `lease_expires_at` is itself
         always >= submitted_at once claim_next_leased/renew_lease
-        floor it correctly -- so `now >= lease_expires_at >=
+        floor it correctly, so `now >= lease_expires_at >=
         submitted_at` is already guaranteed structurally, before this
         method's own defensive floor ever has anything to correct.
         This test (unlike its siblings in this file) passes both

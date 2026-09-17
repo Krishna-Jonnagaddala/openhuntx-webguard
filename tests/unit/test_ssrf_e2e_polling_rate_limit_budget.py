@@ -9,7 +9,7 @@ creation, and `build_production_components` wires a real
 production_startup.py) that every authenticated request is checked
 against, keyed by token (http_api.py's `_authenticate`). A polling
 loop too aggressive for that budget does not make the underlying job
-run any slower -- it makes the *test* exhaust its own rate-limit quota
+run any slower: it makes the *test* exhaust its own rate-limit quota
 and then sit blocked on HTTP 429 responses until an unrelated
 wall-clock 60-second window happens to roll over. That, not a slow
 scan, is what produced the intermittent ~21s-60s runtimes traced for
@@ -79,7 +79,7 @@ class SsrfE2ePollingRateLimitBudgetTests(unittest.TestCase):
         uses blows through the 120-request/60s budget well before that
         job can finish (it needs on the order of 20s in practice, but
         even the full 60s timeout is itself the polling loop's own
-        window -- the budget is exhausted in about 12s of 0.1s polling
+        window: the budget is exhausted in about 12s of 0.1s polling
         regardless)."""
 
         self.assertFalse(

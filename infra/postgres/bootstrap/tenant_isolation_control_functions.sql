@@ -535,7 +535,7 @@ SET ROLE worker_function_owner;
 -- read in Python before this function is even called, so a submission
 -- that commits a later submitted_at while this call's own row lock
 -- was queued behind it can otherwise leave p_now earlier than the row
--- it just claimed -- scan_jobs.py's ScanJobRecord then refuses to
+-- it just claimed, and scan_jobs.py's ScanJobRecord then refuses to
 -- construct (updated_at/started_at cannot precede submitted_at). The
 -- claimable-row predicate itself still has no submitted_at <= p_now
 -- filter (unchanged, see above); only the value written for these
@@ -638,11 +638,11 @@ BEGIN
     -- statement runs: this call's own row lock can queue behind a
     -- concurrent submission that reads its own, later `now` for
     -- submitted_at and commits first, and the SELECT above has no
-    -- submitted_at <= p_now filter (by design -- see this function's
+    -- submitted_at <= p_now filter (by design, see this function's
     -- own header comment). GREATEST() floors the moment actually
     -- written (and the lease derived from it) to this row's own
     -- submitted_at, so ScanJobRecord's invariant (started_at/
-    -- updated_at cannot precede submitted_at -- scan_jobs.py) holds
+    -- updated_at cannot precede submitted_at, in scan_jobs.py) holds
     -- by construction. This mirrors store.py's _no_earlier_than fix
     -- for the identical race in the SQLite-backed job store.
     v_effective_now := GREATEST(p_now, v_submitted_at);
@@ -718,10 +718,10 @@ BEGIN
         -- p_now >= lease_expires_at >= submitted_at (once claim_next_job/
         -- renew_lease correctly floor lease_expires_at against
         -- submitted_at) for every row reached here, so this floor is
-        -- defense-in-depth rather than an independently reachable gap
-        -- -- applied for the same reason store.py's SQLite equivalent
-        -- applies it to every write site, not because this one is
-        -- known to be exploitable on its own.
+        -- defense-in-depth rather than an independently reachable gap.
+        -- It is applied for the same reason store.py's SQLite
+        -- equivalent applies it to every write site, not because this
+        -- one is known to be exploitable on its own.
         v_effective_now := GREATEST(p_now, v_row.submitted_at);
         IF v_row.cancellation_requested THEN
             UPDATE public.scan_jobs
@@ -1116,8 +1116,8 @@ BEGIN
 
     -- See claim_next_job's own comment on this exact race/fix.
     -- ScanJobRecord also requires completed_at not precede the job's
-    -- start boundary (started_at if set, else submitted_at) --
-    -- floor against whichever of the two is later, exactly mirroring
+    -- start boundary (started_at if set, else submitted_at); floor
+    -- against whichever of the two is later, exactly mirroring
     -- store.py's _terminal_update.
     v_effective_now := GREATEST(p_now, COALESCE(v_started_at, v_submitted_at));
 

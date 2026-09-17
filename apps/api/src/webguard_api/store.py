@@ -127,8 +127,8 @@ def _no_earlier_than(candidate: datetime, floor: datetime) -> datetime:
     of `run_once()`) is captured before this store even attempts to
     acquire the SQLite write lock for the transaction that will read
     and update a job row. Because SQLite serializes writers, that
-    attempt can block until a concurrent transaction -- e.g. a job
-    submission that reads its own, later `now` for `submitted_at` --
+    attempt can block until a concurrent transaction (e.g. a job
+    submission that reads its own, later `now` for `submitted_at`)
     commits first. Once unblocked, the row this call selects or
     updates can carry a `submitted_at` later than the `now` this call
     started with, even though nothing about either clock reading was
@@ -138,7 +138,7 @@ def _no_earlier_than(candidate: datetime, floor: datetime) -> datetime:
     the row's own `submitted_at` keeps that true by construction
     rather than by assuming a `now` read before a lock wait is still
     fresh once the wait ends. This only ever raises the value used,
-    never lowers it -- it does not fabricate an earlier event as
+    never lowers it: it does not fabricate an earlier event as
     having happened later for any other purpose (permit validity
     windows, lease-expiry filtering, and similar checks all keep using
     the caller's real `now` untouched)."""
@@ -2483,7 +2483,7 @@ class ScanJobStore:
                 )
             # See _no_earlier_than's own docstring. ScanJobRecord also
             # requires completed_at not precede the job's start
-            # boundary (started_at if set, else submitted_at) -- floor
+            # boundary (started_at if set, else submitted_at); floor
             # against whichever of the two is later so both that check
             # and the updated_at/submitted_at one hold regardless of
             # whether this row's own `now` reading raced a concurrent
