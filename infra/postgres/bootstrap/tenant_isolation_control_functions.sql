@@ -430,22 +430,63 @@ CREATE OR REPLACE FUNCTION webguard_control.resolve_principal_by_email(
     WHERE p.email = p_email;
 $$;
 
--- resolve_identity_token: current source is postgres_identity.py's
--- consume_identity_token(). Current SQL: SELECT token_id,
--- principal_id, organization_id, purpose, secret_hash, created_at,
--- expires_at, used_at FROM identity_tokens WHERE token_id = %s.
--- Nothing calls this method's caller with a need for principal or
--- organization data from within the SAME lookup (every current caller
--- -- confirm_password_reset, confirm_email_verification,
--- accept_invitation -- fetches principal/organization separately,
--- through the ordinary tenant role, after the token has resolved
--- which organization_id to set as tenant context), so this resolver
--- stays narrower than the other three: identity_tokens only.
--- created_at is omitted (not used by any current validation decision,
--- Section 13); purpose/expires_at/used_at are returned because
--- current code checks all three (purpose match, used_at IS NOT NULL,
--- now >= expires_at) before accepting a token.
-CREATE OR REPLACE FUNCTION webguard_control.resolve_identity_token(
+-- resolve_password_hash: current source is postgres_identity.py's
+-- get_password_hash(). P1-2 Phase H gap closure: unlike the four
+-- functions above (each keyed by a bearer secret, a session, or an
+-- email address), this method's own two live callers, service.py's
+-- login() (already has a resolved Principal from
+-- resolve_principal_by_email, but that function deliberately drops
+-- its own password_hash column, Section 13 output minimization,
+-- since get_principal_by_email's own contract never returns it) and
+-- change_password() (only ever holds an already-authenticated
+-- context.principal_id, never an email at all), both key by a bare
+-- principal_id, which none of the 13 functions above resolve by.
+-- Returns ONLY password_hash, nothing else: no role, no organization,
+-- no display name, matching the same Section 13 output-minimization
+-- principle as every function above. Exact-match on principal_id
+-- (principals' own primary key), never a caller-controlled filter.
+-- NULL back (no such principal, or a principal with no
+-- password_credentials row at all) is not distinguished from any
+-- other failure by this function: login()'s own generic-
+-- invalid-credentials response and change_password()'s own
+-- current-password-incorrect response already collapse every failure
+-- shape the same way today, so this introduces no new oracle.
+CREATE OR REPLACE FUNCTION webguard_control.resolve_password_hash(
+    p_principal_id uuid
+) RETURNS text
+    LANGUAGE sql
+    STABLE
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+    AS $$
+    SELECT password_hash FROM public.password_credentials WHERE principal_id = p_principal_id;
+$$;
+
+-- resolve_identity_token: P1-2 Phase H gap closure, 2026-09-17,
+-- widened to add created_at, the one column consume_identity_token's
+-- own IdentityTokenRecord contract needs that this function did not
+-- yet return (its own original comment above already explains why it
+-- was left off: no caller needed it when this function was written,
+-- since every caller resolved principal/organization separately
+-- rather than resolving via consume_identity_token itself). Every
+-- other repository.py caller of this exact name was re-checked before
+-- this change: the only other reference anywhere in this codebase is
+-- tests/integration/test_postgres_control_functions.py's own
+-- `SELECT * FROM webguard_control.resolve_identity_token(%s)`, which
+-- reads columns by name/position from the SELECT * result and gains
+-- the new trailing column automatically. Adding a column at the end
+-- of a SELECT * result never breaks a caller that only reads the
+-- columns it already expects by position 0..6. PostgreSQL does not
+-- allow CREATE OR REPLACE FUNCTION to change an existing function's
+-- result type at all (confirmed directly against this project's own
+-- disposable Postgres 16: attempting it raises "cannot change return
+-- type of existing function" even when only appending a column), so
+-- this replacement is DROP FUNCTION then CREATE FUNCTION, not CREATE
+-- OR REPLACE. The REVOKE/GRANT EXECUTE below re-establishes the
+-- exact same grant DROP FUNCTION removes, so the net privilege state
+-- after this file finishes is unchanged from before.
+DROP FUNCTION IF EXISTS webguard_control.resolve_identity_token(uuid);
+CREATE FUNCTION webguard_control.resolve_identity_token(
     p_token_id uuid
 ) RETURNS TABLE (
     token_id uuid,
@@ -454,7 +495,8 @@ CREATE OR REPLACE FUNCTION webguard_control.resolve_identity_token(
     purpose text,
     secret_hash text,
     expires_at timestamptz,
-    used_at timestamptz
+    used_at timestamptz,
+    created_at timestamptz
 )
     LANGUAGE sql
     STABLE
@@ -468,7 +510,8 @@ CREATE OR REPLACE FUNCTION webguard_control.resolve_identity_token(
         t.purpose,
         t.secret_hash,
         t.expires_at,
-        t.used_at
+        t.used_at,
+        t.created_at
     FROM public.identity_tokens AS t
     WHERE t.token_id = p_token_id;
 $$;
@@ -477,11 +520,13 @@ REVOKE ALL ON FUNCTION webguard_control.resolve_api_token(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.resolve_browser_session(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.resolve_principal_by_email(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.resolve_identity_token(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION webguard_control.resolve_password_hash(uuid) FROM PUBLIC;
 
 GRANT EXECUTE ON FUNCTION webguard_control.resolve_api_token(uuid) TO api_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.resolve_browser_session(uuid) TO api_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.resolve_principal_by_email(text) TO api_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.resolve_identity_token(uuid) TO api_tenant_data;
+GRANT EXECUTE ON FUNCTION webguard_control.resolve_password_hash(uuid) TO api_tenant_data;
 
 RESET ROLE;
 
@@ -921,6 +966,90 @@ CREATE OR REPLACE FUNCTION webguard_control.resolve_job_organization(
     SELECT organization_id FROM public.scan_jobs WHERE job_id = p_job_id;
 $$;
 
+-- resolve_job_scope: current source is postgres_jobs.py's get_scope().
+-- P1-2 Phase H gap closure: get_scope's own contract needs
+-- submitted_by as well as organization_id, which resolve_job_organization
+-- (above) deliberately never returned (Section 13: it exists only
+-- for organization_id_for_job's own scalar need). Rather than widen
+-- resolve_job_organization itself, a scalar-returning function
+-- (RETURNS uuid), not RETURNS TABLE, so turning it into a two-column
+-- table would be a return-type change breaking its five existing call
+-- sites (organization_id_for_job itself, plus four direct callers
+-- across test_postgres_control_functions.py and
+-- test_postgres_rls_policies.py that all call it as a scalar) for no
+-- benefit to organization_id_for_job, which still only ever needs the
+-- scalar, this is a separate, purpose-built function, so
+-- organization_id_for_job's own already-closed conversion (2026-09-16)
+-- is untouched. Exact-match on job_id (scan_jobs' own primary key).
+CREATE OR REPLACE FUNCTION webguard_control.resolve_job_scope(
+    p_job_id uuid
+) RETURNS TABLE (
+    organization_id uuid,
+    submitted_by uuid
+)
+    LANGUAGE sql
+    STABLE
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+    AS $$
+    SELECT organization_id, submitted_by FROM public.scan_jobs WHERE job_id = p_job_id;
+$$;
+
+-- resolve_job_cancellation_requested: current source is
+-- postgres_jobs.py's is_cancellation_requested(), which previously
+-- delegated to get(job_id): a full-row, unrestricted-connection
+-- read, purely to check one boolean. get()'s own docstring already
+-- rules out running its full-row query under any restricted role for
+-- this caller (worker_tenant_data has no scan_jobs grant at all, and
+-- api_tenant_data would misrepresent which process is asking). This
+-- function returns ONLY cancellation_requested, nothing else. NULL
+-- back means no such job_id (scan_jobs.cancellation_requested is
+-- itself NOT NULL, migration 0004), which is how
+-- is_cancellation_requested distinguishes "not found" from "found,
+-- not cancelled": get()'s own job_not_found error is raised in
+-- Python on that NULL, not inside this function.
+CREATE OR REPLACE FUNCTION webguard_control.resolve_job_cancellation_requested(
+    p_job_id uuid
+) RETURNS boolean
+    LANGUAGE sql
+    STABLE
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+    AS $$
+    SELECT cancellation_requested FROM public.scan_jobs WHERE job_id = p_job_id;
+$$;
+
+-- resolve_job_permit_binding: current source is postgres_jobs.py's
+-- get_job_permit_binding(). job_permits carries no organization_id
+-- column of its own (get_job_permit_binding_scoped's own docstring:
+-- tenant scope can only be proven by a join to scan_jobs), but this
+-- method's own real callers (both in executor.py, the worker) never
+-- need that join: they already hold a job_id the worker legitimately
+-- leased via claim_next_job's own SKIP LOCKED claim, the same
+-- already-trusted-job_id shape get()/resolve_job_cancellation_requested
+-- above rely on. Reuses worker_function_owner's EXISTING SELECT grant
+-- on job_permits (Phase E, originally for claim_next_job's own
+-- claimable-row query) rather than extending worker_tenant_data's own
+-- ACL with a new grant, which also means no new RLS policy is
+-- needed: worker_function_owner's job_permits SELECT already carries
+-- an unconditional (`USING (true)`) policy, for the same reason
+-- claim_next_job's own cross-tenant claim query needs one (job_permits
+-- has no tenant column to predicate a policy on in the first place).
+-- Exact-match on job_id.
+CREATE OR REPLACE FUNCTION webguard_control.resolve_job_permit_binding(
+    p_job_id uuid
+) RETURNS TABLE (
+    permit_id uuid,
+    permit_sha256 text
+)
+    LANGUAGE sql
+    STABLE
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+    AS $$
+    SELECT permit_id, permit_sha256 FROM public.job_permits WHERE job_id = p_job_id;
+$$;
+
 -- terminal_transition: current source is postgres_jobs.py's
 -- _terminal_update(), called from finish_result_leased()/
 -- fail_leased()/cancel_running_leased() for the FAILED/CANCELLED/
@@ -1174,6 +1303,9 @@ REVOKE ALL ON FUNCTION webguard_control.claim_next_job(text, numeric, timestampt
 REVOKE ALL ON FUNCTION webguard_control.recover_expired_leases(timestamptz, integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.renew_lease(uuid, text, text, timestamptz, numeric) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.resolve_job_organization(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION webguard_control.resolve_job_scope(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION webguard_control.resolve_job_cancellation_requested(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION webguard_control.resolve_job_permit_binding(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.terminal_transition(
     uuid, text, timestamptz, text, text, text, text, text, text, text, text, text, text
 ) FROM PUBLIC;
@@ -1182,6 +1314,9 @@ GRANT EXECUTE ON FUNCTION webguard_control.claim_next_job(text, numeric, timesta
 GRANT EXECUTE ON FUNCTION webguard_control.recover_expired_leases(timestamptz, integer) TO worker_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.renew_lease(uuid, text, text, timestamptz, numeric) TO worker_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.resolve_job_organization(uuid) TO worker_tenant_data;
+GRANT EXECUTE ON FUNCTION webguard_control.resolve_job_scope(uuid) TO worker_tenant_data;
+GRANT EXECUTE ON FUNCTION webguard_control.resolve_job_cancellation_requested(uuid) TO worker_tenant_data;
+GRANT EXECUTE ON FUNCTION webguard_control.resolve_job_permit_binding(uuid) TO worker_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.terminal_transition(
     uuid, text, timestamptz, text, text, text, text, text, text, text, text, text, text
 ) TO worker_tenant_data;
@@ -1210,6 +1345,71 @@ SET ROLE scheduler_function_owner;
 -- SCHEDULER (scheduler_function_owner) -- due-schedule discovery and
 -- materialization control plane.
 -- =========================================================================
+
+-- resolve_schedule_request_shape: new, P1-2 Phase H gap closure
+-- support function for enqueue_due_schedule's own Python caller.
+-- enqueue_due_schedule's SQL body (below) needs a caller-computed
+-- p_request_fingerprint, exactly like its original design (Section on
+-- request_fingerprint, below): Python owns the one canonical-JSON
+-- algorithm ScanJobRequest.fingerprint implements, and reimplementing
+-- it a second time in PL/pgSQL was already tried and reverted in an
+-- earlier draft. Computing that fingerprint needs target,
+-- authorization_id, and mode, immutable for a schedule's entire
+-- lifetime (no method anywhere in this codebase ever updates them
+-- after create_schedule), which postgres_schedules.py's
+-- enqueue_due_schedule must read BEFORE it can call
+-- webguard_control.enqueue_due_schedule, but scheduler_tenant_data has
+-- no table-level grant on scan_schedules at all. Reuses
+-- scheduler_function_owner's existing SELECT grant on scan_schedules
+-- (Phase E) and its existing unconditional RLS policy, so no ACL or
+-- RLS file needs touching. Exact-match on schedule_id; returns nothing
+-- else, not even organization_id (the caller never needs it for
+-- this specific purpose, Section 13 output minimization).
+CREATE OR REPLACE FUNCTION webguard_control.resolve_schedule_request_shape(
+    p_schedule_id uuid
+) RETURNS TABLE (
+    target text,
+    authorization_id text,
+    mode text
+)
+    LANGUAGE sql
+    STABLE
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+    AS $$
+    SELECT target, authorization_id, mode FROM public.scan_schedules WHERE schedule_id = p_schedule_id;
+$$;
+
+-- resolve_schedule_permit_binding: current source is
+-- postgres_schedules.py's get_schedule_permit_binding(). Same shape as
+-- worker_function_owner's resolve_job_permit_binding above:
+-- schedule_permits carries no organization_id column of its own
+-- (get_schedule_permit_binding_scoped's own docstring: tenant scope is
+-- proven by joining to scan_schedules), but this method's only caller
+-- anywhere in this codebase (scheduler.py) never needs that join --
+-- schedule_id here is a value the scheduler process already reads off
+-- its own list_due_schedules()/enqueue_due_schedule() results, not an
+-- unverified caller input. Reuses scheduler_function_owner's EXISTING
+-- SELECT grant on schedule_permits (Phase E, originally for
+-- enqueue_due_schedule's own binding check) rather than a new
+-- scheduler_tenant_data ACL grant, so no new RLS policy is needed
+-- either: that SELECT already carries an unconditional (`USING
+-- (true)`) policy, for the same reason enqueue_due_schedule's own
+-- binding check needs one (schedule_permits has no tenant column to
+-- predicate a policy on). Exact-match on schedule_id.
+CREATE OR REPLACE FUNCTION webguard_control.resolve_schedule_permit_binding(
+    p_schedule_id uuid
+) RETURNS TABLE (
+    permit_id uuid,
+    permit_sha256 text
+)
+    LANGUAGE sql
+    STABLE
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+    AS $$
+    SELECT permit_id, permit_sha256 FROM public.schedule_permits WHERE schedule_id = p_schedule_id;
+$$;
 
 -- list_due_schedules: current source is postgres_schedules.py's own
 -- method of that name. Preserves the exact eligibility (state =
@@ -1292,7 +1492,39 @@ $$;
 -- algorithm available, and stores it unchanged. A future repository-
 -- conversion phase continues using ScanJobRequest.fingerprint exactly
 -- as it does today; this function never computes or approximates it.
-CREATE OR REPLACE FUNCTION webguard_control.enqueue_due_schedule(
+-- P1-2 Phase H gap closure, 2026-09-17: RETURNS TABLE widened from the
+-- original 8-column outcome summary (outcome, schedule_id,
+-- schedule_state, schedule_revision, schedule_next_run_at, job_id,
+-- job_state, job_submitted_at, kept as the first 8 columns, in the
+-- same order, so every existing caller that reads them positionally
+-- keeps working unchanged) to every column postgres_schedules.py's
+-- ScanScheduleRecord/ScanJobRecord reconstruction needs. Chosen over
+-- the alternative (narrowing enqueue_due_schedule's own Python
+-- contract to the one field scheduler.py's run_once actually reads,
+-- job_id) after reading run_once in full: this repository method's
+-- return type is shared across the SQLite and PostgreSQL backends of
+-- the same repository_contracts.py interface, and
+-- tests/unit/test_schedule_store.py, test_phase3_revocation_cancellation_races.py,
+-- test_phase3_transaction_schedule_safety.py, and
+-- test_phase4_scheduler_authority_toc.py all exercise the full
+-- ScanScheduleRecord/ScanJobRecord pair this method promises against
+-- the SQLite backend, and narrowing only the Postgres backend's return
+-- shape would make the two backends silently diverge on a method nothing
+-- currently forces them to keep in lockstep except convention. Widening
+-- the SQL function's own output, leaving its transactional logic
+-- (the FOR UPDATE read, the revision CAS, the idempotency-key INSERT
+-- race handling, the schedule-advancement UPDATE) completely
+-- unchanged, keeps both backends' contracts identical instead.
+--
+-- Like resolve_identity_token above, this is DROP FUNCTION then CREATE
+-- FUNCTION, not CREATE OR REPLACE: PostgreSQL does not allow
+-- CREATE OR REPLACE FUNCTION to change an existing function's result
+-- type, including appending a RETURNS TABLE column (confirmed directly
+-- against this project's own disposable Postgres 16). The REVOKE/GRANT
+-- EXECUTE below re-establishes the exact same grant DROP FUNCTION
+-- removes.
+DROP FUNCTION IF EXISTS webguard_control.enqueue_due_schedule(uuid, integer, text, uuid, text, timestamptz, text);
+CREATE FUNCTION webguard_control.enqueue_due_schedule(
     p_schedule_id uuid,
     p_expected_revision integer,
     p_authorization_sha256 text,
@@ -1308,7 +1540,37 @@ CREATE OR REPLACE FUNCTION webguard_control.enqueue_due_schedule(
     schedule_next_run_at timestamptz,
     job_id uuid,
     job_state text,
-    job_submitted_at timestamptz
+    job_submitted_at timestamptz,
+    schedule_organization_id uuid,
+    schedule_created_by uuid,
+    schedule_name text,
+    schedule_target text,
+    schedule_authorization_id text,
+    schedule_authorization_sha256 text,
+    schedule_mode text,
+    schedule_interval_seconds integer,
+    schedule_created_at timestamptz,
+    schedule_updated_at timestamptz,
+    schedule_last_enqueued_at timestamptz,
+    schedule_last_job_id uuid,
+    schedule_last_error_code text,
+    schedule_last_error_at timestamptz,
+    job_target text,
+    job_authorization_id text,
+    job_authorization_sha256 text,
+    job_mode text,
+    job_revision integer,
+    job_cancellation_requested boolean,
+    job_updated_at timestamptz,
+    job_started_at timestamptz,
+    job_completed_at timestamptz,
+    job_scan_id text,
+    job_result_status text,
+    job_report_ref text,
+    job_audit_ref text,
+    job_error_code text,
+    job_error_message text,
+    job_idempotency_key text
 )
     LANGUAGE plpgsql
     SECURITY DEFINER
@@ -1343,13 +1605,23 @@ BEGIN
 
     IF NOT FOUND THEN
         RETURN QUERY SELECT 'not_due', p_schedule_id, NULL::text, NULL::integer, NULL::timestamptz,
-            NULL::uuid, NULL::text, NULL::timestamptz;
+            NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::uuid, NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer,
+            NULL::timestamptz, NULL::timestamptz, NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer, NULL::boolean, NULL::timestamptz,
+            NULL::timestamptz, NULL::timestamptz, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+            NULL::text, NULL::text;
         RETURN;
     END IF;
 
     IF v_state <> 'active' OR v_revision <> p_expected_revision OR v_next_run_at > p_now THEN
         RETURN QUERY SELECT 'not_due', p_schedule_id, NULL::text, NULL::integer, NULL::timestamptz,
-            NULL::uuid, NULL::text, NULL::timestamptz;
+            NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::uuid, NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer,
+            NULL::timestamptz, NULL::timestamptz, NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer, NULL::boolean, NULL::timestamptz,
+            NULL::timestamptz, NULL::timestamptz, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+            NULL::text, NULL::text;
         RETURN;
     END IF;
 
@@ -1358,7 +1630,12 @@ BEGIN
         WHERE organization_id = v_organization_id AND authorization_id = v_authorization_id
     ) THEN
         RETURN QUERY SELECT 'authorization_not_assigned', p_schedule_id, NULL::text, NULL::integer,
-            NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz;
+            NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::uuid, NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer,
+            NULL::timestamptz, NULL::timestamptz, NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer, NULL::boolean, NULL::timestamptz,
+            NULL::timestamptz, NULL::timestamptz, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+            NULL::text, NULL::text;
         RETURN;
     END IF;
 
@@ -1368,7 +1645,12 @@ BEGIN
     IF v_binding_permit_id IS NULL
        OR v_binding_permit_id <> p_permit_id OR v_binding_permit_sha256 <> p_permit_sha256 THEN
         RETURN QUERY SELECT 'binding_changed', p_schedule_id, NULL::text, NULL::integer,
-            NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz;
+            NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::uuid, NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer,
+            NULL::timestamptz, NULL::timestamptz, NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer, NULL::boolean, NULL::timestamptz,
+            NULL::timestamptz, NULL::timestamptz, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+            NULL::text, NULL::text;
         RETURN;
     END IF;
 
@@ -1380,7 +1662,12 @@ BEGIN
 
     IF v_permit_ok IS NOT TRUE THEN
         RETURN QUERY SELECT 'permit_invalid', p_schedule_id, NULL::text, NULL::integer,
-            NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz;
+            NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::uuid, NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer,
+            NULL::timestamptz, NULL::timestamptz, NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer, NULL::boolean, NULL::timestamptz,
+            NULL::timestamptz, NULL::timestamptz, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+            NULL::text, NULL::text;
         RETURN;
     END IF;
 
@@ -1399,7 +1686,12 @@ BEGIN
         );
     EXCEPTION WHEN unique_violation THEN
         RETURN QUERY SELECT 'raced', p_schedule_id, NULL::text, NULL::integer, NULL::timestamptz,
-            NULL::uuid, NULL::text, NULL::timestamptz;
+            NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::uuid, NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer,
+            NULL::timestamptz, NULL::timestamptz, NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer, NULL::boolean, NULL::timestamptz,
+            NULL::timestamptz, NULL::timestamptz, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+            NULL::text, NULL::text;
         RETURN;
     END;
 
@@ -1422,12 +1714,24 @@ BEGIN
 
     IF v_updated <> 1 THEN
         RETURN QUERY SELECT 'schedule_conflict', p_schedule_id, NULL::text, NULL::integer,
-            NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz;
+            NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::uuid, NULL::uuid, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer,
+            NULL::timestamptz, NULL::timestamptz, NULL::timestamptz, NULL::uuid, NULL::text, NULL::timestamptz,
+            NULL::text, NULL::text, NULL::text, NULL::text, NULL::integer, NULL::boolean, NULL::timestamptz,
+            NULL::timestamptz, NULL::timestamptz, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+            NULL::text, NULL::text;
         RETURN;
     END IF;
 
     RETURN QUERY
-    SELECT 'ok', s.schedule_id, s.state, s.revision, s.next_run_at, j.job_id, j.state, j.submitted_at
+    SELECT
+        'ok', s.schedule_id, s.state, s.revision, s.next_run_at, j.job_id, j.state, j.submitted_at,
+        s.organization_id, s.created_by, s.name, s.target, s.authorization_id, s.authorization_sha256,
+        s.mode, s.interval_seconds, s.created_at, s.updated_at, s.last_enqueued_at, s.last_job_id,
+        s.last_error_code, s.last_error_at,
+        j.target, j.authorization_id, j.authorization_sha256, j.mode, j.revision, j.cancellation_requested,
+        j.updated_at, j.started_at, j.completed_at, j.scan_id, j.result_status, j.report_ref, j.audit_ref,
+        j.error_code, j.error_message, j.idempotency_key
     FROM public.scan_schedules AS s
     JOIN public.scan_jobs AS j ON j.job_id = v_new_job_id
     WHERE s.schedule_id = p_schedule_id;
@@ -1493,12 +1797,16 @@ BEGIN
 END;
 $$;
 
+REVOKE ALL ON FUNCTION webguard_control.resolve_schedule_request_shape(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION webguard_control.resolve_schedule_permit_binding(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.list_due_schedules(timestamptz, integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.enqueue_due_schedule(
     uuid, integer, text, uuid, text, timestamptz, text
 ) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.block_due_schedule(uuid, integer, text, timestamptz) FROM PUBLIC;
 
+GRANT EXECUTE ON FUNCTION webguard_control.resolve_schedule_request_shape(uuid) TO scheduler_tenant_data;
+GRANT EXECUTE ON FUNCTION webguard_control.resolve_schedule_permit_binding(uuid) TO scheduler_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.list_due_schedules(timestamptz, integer) TO scheduler_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.enqueue_due_schedule(
     uuid, integer, text, uuid, text, timestamptz, text

@@ -395,27 +395,23 @@ class PostgresIdentityRepository:
                 )
 
     def get_password_hash(self, principal_id: str) -> str | None:
-        """P1-2 Phase H gap, not yet closed: unlike get_principal_by_email
-        (which the same login() caller uses right before this one and
-        which now resolves through webguard_control.resolve_principal_by_email),
-        this method has no control-function counterpart. Phase F's 13
-        functions are keyed by token, session, or email, none by a
-        bare principal_id, and this method's second caller
-        (service.py's change_password, using context.principal_id from
-        an already-authenticated session, not an email) could not use
-        resolve_principal_by_email even if this one did. api_tenant_data
-        has zero SELECT granted on password_credentials at all (Phase
-        D's own correction), so this raw query only works today because
-        every WebGuard process still runs as webguard, unrestricted; it
-        will fail outright, for both callers, the moment either process
-        actually runs this query under api_tenant_data. Closing this
-        needs a new principal_id-keyed SECURITY DEFINER function with
-        the same design scrutiny Phase F's other 13 got, not a
-        unilateral addition here."""
+        """P1-2 Phase H gap closed: webguard_control.resolve_password_hash
+        is a new principal_id-keyed SECURITY DEFINER function (none of
+        Phase F's original 13 were keyed by a bare principal_id:
+        login() already has a resolved Principal from
+        get_principal_by_email, but that function deliberately never
+        returns password_hash, and change_password() only ever holds
+        an already-authenticated context.principal_id, never an
+        email). Returns only password_hash, matching this method's own
+        return shape exactly. Both real callers (service.py's login()
+        and change_password()) run inside the API serve process, which
+        is exactly api_tenant_data's own domain, and neither needs
+        organization_id for this specific lookup, since principal_id is
+        already a global unique key."""
 
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                "SELECT password_hash FROM password_credentials WHERE principal_id = %s",
+                "SELECT webguard_control.resolve_password_hash(%s)",
                 (principal_id,),
             ).fetchone()
         return None if row is None else row[0]
@@ -455,46 +451,41 @@ class PostgresIdentityRepository:
     def consume_identity_token(
         self, token: object, *, purpose: IdentityTokenPurpose, now: datetime
     ) -> IdentityTokenRecord:
-        """P1-2 Phase H gap, not yet closed: webguard_control.resolve_identity_token
-        exists and correctly resolves everything this method validates
-        against (purpose, used_at, expires_at, secret_hash), but the
-        pattern that converted authenticate_token and
-        get_principal_by_email (resolve via the function, then an
-        ordinary tenant-scoped query for whatever the function
-        deliberately omits) does not extend here. tenant_isolation_acl.sql
-        grants api_tenant_data only a 4-column SELECT on identity_tokens
-        (token_id, principal_id, purpose, used_at): no created_at, and
-        no organization_id, so there is no ordinary query under this
-        role that can either read created_at back or scope the
-        post-resolution UPDATE by organization_id the way
-        authenticate_token's last_used_at write now does. This raw
-        query works today only because every WebGuard process still
-        runs as webguard, unrestricted; closing this gap needs
-        resolve_identity_token's own RETURNS TABLE extended to include
-        created_at (a change to Phase F's already-reviewed SQL, not a
-        wiring change), not a unilateral addition here."""
+        """P1-2 Phase H gap closed: webguard_control.resolve_identity_token's
+        RETURNS TABLE now includes created_at, appended after the
+        original 7 columns (see the SQL file's own comment on why
+        this needed DROP FUNCTION/CREATE FUNCTION, not CREATE OR
+        REPLACE): the one column this method's own IdentityTokenRecord
+        contract needed that the function did not yet return. Now
+        follows the same pattern authenticate_token/get_principal_by_email
+        already use: resolve via the function under api_tenant_data,
+        then (once organization_id is known) set_tenant_context on the
+        same connection before the post-resolution UPDATE, so that
+        UPDATE runs correctly scoped once a future phase force-enables
+        identity_tokens' own tenant-predicated RLS policy. secret_hash/
+        purpose/used_at/expires_at verification, and their exact error
+        codes and ordering, are completely unchanged. Only the
+        connection/privilege plumbing underneath moved."""
 
         token_id, secret = _parse_prefixed_secret(
             token, prefix=IDENTITY_TOKEN_PREFIX, error_code="identity_token_invalid"
         )
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                """
-                SELECT token_id, principal_id, organization_id, purpose, secret_hash,
-                       created_at, expires_at, used_at
-                FROM identity_tokens WHERE token_id = %s
-                """,
+                "SELECT * FROM webguard_control.resolve_identity_token(%s)",
                 (token_id,),
             ).fetchone()
             if row is None or not _verify_secret(secret, row[4]):
                 raise IdentityStoreError("identity_token_invalid", "Token is invalid.")
             if row[3] != purpose.value:
                 raise IdentityStoreError("identity_token_invalid", "Token is invalid.")
-            if row[7] is not None:
+            if row[6] is not None:
                 raise IdentityStoreError("identity_token_used", "Token has already been used.")
-            expires_at = row[6].astimezone(timezone.utc)
+            expires_at = row[5].astimezone(timezone.utc)
             if now.astimezone(timezone.utc) >= expires_at:
                 raise IdentityStoreError("identity_token_expired", "Token has expired.")
+            organization_id = row[2]
+            set_tenant_context(connection, organization_id)
             connection.execute(
                 "UPDATE identity_tokens SET used_at = %s WHERE token_id = %s",
                 (now, token_id),
@@ -502,9 +493,9 @@ class PostgresIdentityRepository:
         return IdentityTokenRecord(
             token_id=str(row[0]),
             principal_id=str(row[1]),
-            organization_id=str(row[2]),
+            organization_id=str(organization_id),
             purpose=IdentityTokenPurpose(row[3]),
-            created_at=row[5].astimezone(timezone.utc),
+            created_at=row[7].astimezone(timezone.utc),
             expires_at=expires_at,
             used_at=now,
         )
