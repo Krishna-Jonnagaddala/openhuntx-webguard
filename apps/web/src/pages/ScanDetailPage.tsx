@@ -1,5 +1,5 @@
 import { Link, useParams } from "react-router-dom";
-import { Button, Card, ErrorState, LoadingState, PageHeader, StatusBadge } from "../components/ui/primitives";
+import { Breadcrumb, Button, Card, ErrorState, LoadingState, PageHeader, StatusBadge } from "../components/ui/primitives";
 import { useCreateReport, useFindings, useReports, useScan } from "../hooks/queries";
 import { ApiError } from "../lib/api";
 
@@ -44,7 +44,15 @@ export function ScanDetailPage() {
   if (!scan) return null;
 
   return (
-    <div>
+    <>
+      <Breadcrumb
+        items={[
+          { label: "WebGuard", to: "/app/webguard" },
+          { label: "Scans", to: "/app/webguard/scans" },
+          { label: scan.target },
+        ]}
+      />
+      <div>
       <PageHeader title={scan.target} description={`Scan ${scan.scan_id}`} actions={<StatusBadge status={scan.status} />} />
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card className="p-4">
@@ -103,6 +111,7 @@ export function ScanDetailPage() {
           )}
         </Card>
       </div>
-    </div>
+      </div>
+    </>
   );
 }

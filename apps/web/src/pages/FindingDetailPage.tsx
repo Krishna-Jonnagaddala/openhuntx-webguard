@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useParams } from "react-router-dom";
-import { Button, Card, ErrorState, LoadingState, PageHeader, SeverityBadge, StatusBadge } from "../components/ui/primitives";
+import { Breadcrumb, Button, Card, ErrorState, LoadingState, PageHeader, SeverityBadge, StatusBadge } from "../components/ui/primitives";
 import { useFinding, useFindingEvents, useUpdateFindingStatus } from "../hooks/queries";
 import { ApiError } from "../lib/api";
 import { useAuth } from "../lib/auth";
@@ -43,7 +43,15 @@ export function FindingDetailPage() {
   }
 
   return (
-    <div>
+    <>
+      <Breadcrumb
+        items={[
+          { label: "WebGuard", to: "/app/webguard" },
+          { label: "Findings", to: "/app/webguard/findings" },
+          { label: finding.title },
+        ]}
+      />
+      <div>
       <PageHeader
         title={finding.title}
         description={`${finding.check_id} · ${finding.asset}${finding.endpoint}`}
@@ -194,6 +202,7 @@ export function FindingDetailPage() {
           </Card>
         </div>
       </div>
-    </div>
+      </div>
+    </>
   );
 }

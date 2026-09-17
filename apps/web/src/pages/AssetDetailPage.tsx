@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
+  Breadcrumb,
   Button,
   Card,
   ErrorState,
@@ -450,7 +451,15 @@ export function AssetDetailPage() {
   if (!asset) return null;
 
   return (
-    <div>
+    <>
+      <Breadcrumb
+        items={[
+          { label: "WebGuard", to: "/app/webguard" },
+          { label: "Assets", to: "/app/webguard/assets" },
+          { label: asset.label ?? asset.url },
+        ]}
+      />
+      <div>
       <PageHeader title={asset.label ?? asset.url} description={asset.url} />
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <VerificationPanel targetId={asset.target_id} />
@@ -488,6 +497,7 @@ export function AssetDetailPage() {
         </Card>
         <CoveragePanel targetId={asset.target_id} />
       </div>
-    </div>
+      </div>
+    </>
   );
 }
