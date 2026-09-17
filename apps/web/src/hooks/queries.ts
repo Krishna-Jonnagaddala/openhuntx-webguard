@@ -17,7 +17,7 @@ import {
   socApi,
   teamApi,
 } from "../lib/api";
-import type { VerificationMethod } from "../lib/api";
+import type { ModuleEntitlementStatus, PlatformModuleId, VerificationMethod } from "../lib/api";
 
 export function useChangePassword() {
   return useMutation({
@@ -283,6 +283,15 @@ export function useSettings() {
 
 export function useModuleEntitlements() {
   return useQuery({ queryKey: ["module-entitlements"], queryFn: moduleEntitlementsApi.list });
+}
+
+export function useSetModuleEntitlement() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ module, status }: { module: PlatformModuleId; status: ModuleEntitlementStatus }) =>
+      moduleEntitlementsApi.set(module, status),
+    onSuccess: () => client.invalidateQueries({ queryKey: ["module-entitlements"] }),
+  });
 }
 
 export function useSocConnectors() {

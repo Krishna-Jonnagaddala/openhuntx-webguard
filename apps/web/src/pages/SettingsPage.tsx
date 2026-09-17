@@ -1,8 +1,21 @@
 import { useState, type FormEvent } from "react";
 import { Button, Card, ErrorState, LoadingState, PageHeader, StatusBadge } from "../components/ui/primitives";
-import { useChangePassword, useRequestEmailVerification, useSettings, useSignOutAllSessions } from "../hooks/queries";
-import { ApiError } from "../lib/api";
+import {
+  useChangePassword,
+  useModuleEntitlements,
+  useRequestEmailVerification,
+  useSetModuleEntitlement,
+  useSettings,
+  useSignOutAllSessions,
+} from "../hooks/queries";
+import { ApiError, type ModuleEntitlementStatus, type PlatformModuleId } from "../lib/api";
 import { useAuth } from "../lib/auth";
+
+const MODULE_ORDER: Array<{ id: PlatformModuleId; label: string }> = [
+  { id: "webguard", label: "WebGuard" },
+  { id: "soc", label: "SOC" },
+  { id: "compliance", label: "Compliance" },
+];
 
 function ChangePasswordCard() {
   const [currentPassword, setCurrentPassword] = useState("");
@@ -162,6 +175,90 @@ function EmailVerificationCard({ email, verifiedAt }: { email: string | null; ve
   );
 }
 
+/** One row, one independent useSetModuleEntitlement() instance. Each
+ * module's pending/error state must never leak into another's: an
+ * earlier version shared a single mutation plus a "which module is
+ * this for" variable across every row, so clicking a second module's
+ * button while the first was still in flight silently reassigned the
+ * first row's own pending/error display to the second module,
+ * dropping the first request's outcome on the floor. Giving every row
+ * its own mutation instance removes the shared variable entirely. */
+function ModuleRow({
+  id,
+  label,
+  status,
+  isOwner,
+}: {
+  id: PlatformModuleId;
+  label: string;
+  status: ModuleEntitlementStatus;
+  isOwner: boolean;
+}) {
+  const setEntitlement = useSetModuleEntitlement();
+  const wouldEnable = status === "disabled";
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--color-border)] pb-3 last:border-b-0 last:pb-0">
+      <div className="flex items-center gap-2">
+        <span className="text-sm text-[var(--color-text-primary)]">{label}</span>
+        <StatusBadge status={status} />
+      </div>
+      <div className="flex flex-col items-end gap-1">
+        {id === "webguard" ? (
+          <span className="text-xs text-[var(--color-text-tertiary)]">Always enabled</span>
+        ) : isOwner ? (
+          <Button
+            variant={wouldEnable ? "secondary" : "danger"}
+            disabled={setEntitlement.isPending}
+            onClick={() => setEntitlement.mutate({ module: id, status: wouldEnable ? "enabled" : "disabled" })}
+          >
+            {setEntitlement.isPending
+              ? wouldEnable
+                ? "Enabling…"
+                : "Disabling…"
+              : wouldEnable
+                ? "Enable"
+                : "Disable"}
+          </Button>
+        ) : (
+          <span className="text-xs text-[var(--color-text-tertiary)]">Only an organization owner can change this.</span>
+        )}
+        {setEntitlement.isError ? (
+          <p role="alert" className="text-xs text-[var(--color-danger)]">
+            {setEntitlement.error instanceof ApiError ? setEntitlement.error.message : "Unable to update this module."}
+          </p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ModulesCard() {
+  const { session } = useAuth();
+  const { data, isLoading, error } = useModuleEntitlements();
+
+  const isOwner = session?.role === "owner";
+
+  return (
+    <Card className="p-4 lg:col-span-2">
+      <h2 className="mb-3 text-sm font-semibold text-[var(--color-text-primary)]">Modules</h2>
+      {isLoading ? (
+        <LoadingState label="Loading modules…" />
+      ) : error ? (
+        <ErrorState message={error instanceof ApiError ? error.message : "Unable to load modules."} />
+      ) : !data ? null : (
+        <div className="space-y-3">
+          {MODULE_ORDER.map(({ id, label }) => {
+            const entitlement = data.entitlements.find((item) => item.module === id);
+            const status: ModuleEntitlementStatus = id === "webguard" ? "enabled" : (entitlement?.status ?? "disabled");
+            return <ModuleRow key={id} id={id} label={label} status={status} isOwner={isOwner} />;
+          })}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 export function SettingsPage() {
   const { data, isLoading, error } = useSettings();
 
@@ -209,6 +306,7 @@ export function SettingsPage() {
         <EmailVerificationCard email={data.account.email} verifiedAt={data.account.email_verified_at} />
         <ChangePasswordCard />
         <SessionsCard />
+        <ModulesCard />
       </div>
     </div>
   );

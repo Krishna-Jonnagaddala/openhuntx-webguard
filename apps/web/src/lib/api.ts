@@ -596,6 +596,8 @@ export interface ModuleEntitlement {
 
 export const moduleEntitlementsApi = {
   list: () => api.get<{ entitlements: ModuleEntitlement[] }>("/v1/module-entitlements"),
+  set: (module: PlatformModuleId, status: ModuleEntitlementStatus) =>
+    api.patch<ModuleEntitlement>(`/v1/module-entitlements/${module}`, { status }),
 };
 
 export type ConnectorLiveValidationState =

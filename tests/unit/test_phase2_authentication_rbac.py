@@ -343,6 +343,10 @@ class Phase2AuthenticationAndRbacTests(unittest.TestCase):
             ApiPermission.AUTHORIZATION_COMPARISON_REGISTER,
             ApiPermission.AUTHORIZATION_COMPARISON_READ,
             ApiPermission.AUTHORIZATION_COMPARISON_REVOKE,
+            # Turning SOC/Compliance on or off is an owner-only billing
+            # decision, not something an administrator can do. See
+            # PlatformExpansionApiTests.test_viewer_and_administrator_cannot_manage_module_entitlements.
+            ApiPermission.MODULE_ENTITLEMENTS_MANAGE,
         }
         for permission in ApiPermission:
             if permission in _OWNER_ONLY_PERMISSIONS:

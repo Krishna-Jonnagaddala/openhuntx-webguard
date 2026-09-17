@@ -802,6 +802,64 @@ class CustomerPlatformApiTests(unittest.TestCase):
         self.assertEqual(status, 403, payload)
         self.assertEqual(payload["error"]["code"], "compliance_module_not_entitled")
 
+    def test_module_entitlement_patch_route_enables_soc_end_to_end(self) -> None:
+        self.service.module_entitlements.grant_default_entitlements(self.context.organization_id, now=NOW)
+        status, _, payload = self.json_request(
+            "PATCH", "/v1/module-entitlements/soc", {"status": "enabled"}
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(
+            payload,
+            {
+                "module": "soc",
+                "status": "enabled",
+                "updated_at": payload["updated_at"],
+                "enabled_at": payload["enabled_at"],
+            },
+        )
+        self.assertIsNotNone(payload["enabled_at"])
+
+        status, _, listing = self.json_request("GET", "/v1/module-entitlements")
+        self.assertEqual(status, 200, listing)
+        by_module = {row["module"]: row["status"] for row in listing["entitlements"]}
+        self.assertEqual(by_module["soc"], "enabled")
+
+    def test_module_entitlement_patch_route_denies_a_non_owner(self) -> None:
+        self.service.module_entitlements.grant_default_entitlements(self.viewer_context.organization_id, now=NOW)
+        status, _, payload = self.json_request(
+            "PATCH", "/v1/module-entitlements/soc", {"status": "enabled"}, token="viewer"
+        )
+        self.assertEqual(status, 403, payload)
+        self.assertEqual(payload["error"]["code"], "permission_denied")
+
+    def test_module_entitlement_patch_route_rejects_webguard_over_real_http(self) -> None:
+        self.service.module_entitlements.grant_default_entitlements(self.context.organization_id, now=NOW)
+        status, _, payload = self.json_request(
+            "PATCH", "/v1/module-entitlements/webguard", {"status": "disabled"}
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["error"]["code"], "module_entitlement_not_manageable")
+
+    def test_module_entitlement_patch_route_rejects_invalid_status_over_real_http(self) -> None:
+        self.service.module_entitlements.grant_default_entitlements(self.context.organization_id, now=NOW)
+        status, _, payload = self.json_request(
+            "PATCH", "/v1/module-entitlements/soc", {"status": "trial"}
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["error"]["code"], "module_entitlement_body_invalid")
+
+    def test_module_entitlement_patch_route_404s_with_no_entitlement_rows_over_real_http(self) -> None:
+        # This fixture's organization has never been granted any
+        # module entitlement row at all (create_identity_fixture does
+        # not call grant_default_entitlements), proving the route
+        # fails closed with 404 through the real HTTP transport layer,
+        # not just at the service layer.
+        status, _, payload = self.json_request(
+            "PATCH", "/v1/module-entitlements/soc", {"status": "enabled"}
+        )
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload["error"]["code"], "module_entitlement_not_found")
+
     def test_compliance_collect_route_succeeds_once_entitled_and_then_appears_in_history(self) -> None:
         from webguard_contracts import ModuleEntitlementStatus, PlatformModule
 
