@@ -84,6 +84,12 @@ RUN_INTEGRATION = os.environ.get("WEBGUARD_RUN_INTEGRATION") == "1"
 POSTGRES_TEST_DSN = os.environ.get("WEBGUARD_POSTGRES_TEST_DSN")
 RUN_PRODUCTION_E2E = RUN_INTEGRATION and bool(POSTGRES_TEST_DSN)
 
+# See _run_job_and_get_findings's own comment on its GET-result polling
+# loop for why this is 1.0s and not the tighter interval it used to be
+# -- tests/unit/test_ssrf_e2e_polling_rate_limit_budget.py checks this
+# exact value against the production rate limiter's budget.
+RESULT_POLL_INTERVAL_SECONDS = 1.0
+
 # P1-2 Phase H: create_target now runs under api_tenant_data (see
 # postgres_pool.py's tenant_connection and postgres_targets.py's own
 # methods), so this real build_production_components-backed E2E needs
@@ -337,6 +343,32 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
                 self.assertEqual(response.status, 201, created)
                 job_id = created["job_id"]
 
+                # Poll interval: this loop shares the job's own bearer
+                # token with the permit/job-creation calls above, and
+                # every authenticated request against `build_production_components`'s
+                # real wiring is charged against the same
+                # `FixedWindowRateLimiter(requests=120, window_seconds=60)`
+                # (see production_startup.py's `build_production_components`,
+                # checked per `context.token_id` in http_api.py's
+                # `_authenticate`). At the previous 0.1s interval, a
+                # `completion_timeout_seconds=60` wait alone could issue
+                # up to ~600 GET requests -- five times the token's
+                # entire 60-second budget -- so the loop reliably
+                # exhausted its own quota partway through polling and
+                # then had to wait, blocked on HTTP 429s, for whatever
+                # was left of that unrelated 60-second wall-clock window
+                # to roll over, regardless of how quickly the job itself
+                # had actually finished. That is what actually produced
+                # the intermittent near-60s and >60s runs traced for
+                # this test (confirmed by instrumenting job-claim/execute
+                # timestamps: the SSRF-callback pipeline itself
+                # consistently completes in ~20s -- see the worst-case
+                # trace below -- while the *test* sat waiting out its own
+                # rate limit). 1.0s keeps this loop's own request count
+                # (completion_timeout_seconds / 1.0, i.e. at most 60 GETs
+                # here) comfortably under the 120-request budget even at
+                # the full timeout, with headroom to spare for the
+                # permit/job-creation/findings calls around it.
                 deadline = time.monotonic() + completion_timeout_seconds
                 result_payload = None
                 while time.monotonic() < deadline:
@@ -348,7 +380,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
                     if response.status == 200:
                         result_payload = payload
                         break
-                    time.sleep(0.1)
+                    time.sleep(RESULT_POLL_INTERVAL_SECONDS)
                 self.assertIsNotNone(result_payload, "job did not complete in time")
                 self.assertEqual(result_payload["state"], "completed", result_payload)
 
@@ -454,14 +486,52 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
 
         # This scenario is structurally slower than every sibling test
         # in this file, not flaky: the fixture probes three candidates
-        # (/fetch-vulnerable, /fetch-safe, /reflect-only), and under
-        # this patch NONE of their observations can ever persist -- so
-        # every one of them waits out the full primary+grace window
-        # (3s + 2s, see CallbackPolicy's production defaults) rather
-        # than resolving in a couple of poll cycles like the
-        # already-recorded or fails-once-then-succeeds cases do. A
-        # generous, explicit budget here reflects that real, structural
-        # cost, not system-load tolerance.
+        # (/fetch-vulnerable, /fetch-safe, /reflect-only), run one at a
+        # time (run_ssrf_callback_detector's own candidate loop is
+        # sequential, not concurrent), and under this patch NONE of
+        # their observations can ever persist -- so every one of them
+        # pays its full per-candidate cost rather than resolving in a
+        # couple of poll cycles like the already-recorded or
+        # fails-once-then-succeeds cases do. Traced per candidate, from
+        # ActiveDetectionPolicy's own default (active_detection.py) and
+        # CallbackPolicy's production defaults (callback_broker.py):
+        # 1.0s minimum_delay_seconds (the inter-probe throttle, applied
+        # once per candidate after the probe request succeeds) + 3.0s
+        # maximum_wait_seconds + 2.0s grace_seconds = 6.0s, times 3
+        # candidates = 18.0s hard floor, plus register/probe/page-fetch
+        # network overhead. Empirically (instrumented job-claim/execute
+        # timestamps against the real Postgres container this test
+        # requires) the whole pipeline -- claim, passive scan, all three
+        # candidates, terminal-state write -- consistently completes in
+        # ~20s. 60s leaves roughly 3x headroom over that traced/measured
+        # figure, which is generous margin, not a marginal budget.
+        #
+        # A first pass at reproducing this test's reported CI failure
+        # found runs finishing anywhere from ~21s to ~60s with no code
+        # change at all, which looked like exactly the load-driven
+        # flakiness this comment used to (incorrectly) wave at. Adding
+        # timestamps at job-claim/execute-return/each-result-poll showed
+        # the SSRF pipeline itself was the ~20s above on every run; the
+        # variance was entirely in `_run_job_and_get_findings`'s own
+        # result-polling loop, which used to poll every 0.1s. That loop
+        # shares this test's bearer token with the permit/job-creation
+        # calls, and every one of those requests is charged against
+        # `build_production_components`'s real
+        # `FixedWindowRateLimiter(requests=120, window_seconds=60)` (see
+        # production_startup.py), keyed per token and reset on a
+        # wall-clock-aligned 60-second boundary, not a per-client
+        # sliding window. Polling at 0.1s exhausts that 120-request
+        # budget in ~12 seconds -- well before this job's own ~20s
+        # completion -- and every following poll then received HTTP 429
+        # until the *unrelated* 60-second window happened to roll over,
+        # which could be anywhere from a few seconds to nearly 60
+        # depending purely on what wall-clock second the test started
+        # polling in. That wait, not a slow scan, is what made this
+        # test's runtime hug the timeout. The fix is the polling
+        # interval itself (see `_run_job_and_get_findings`'s own
+        # comment on its GET-result loop), not a wider timeout here;
+        # 60s already comfortably covers this scenario's real,
+        # traced cost once the test stops self-throttling.
         run_started_at = _utc_now()
         with patch.object(psycopg.Connection, "execute", always_faulty_execute):
             findings = self._run_job_and_get_findings(["active.ssrf.callback"], completion_timeout_seconds=60)
