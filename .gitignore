@@ -67,6 +67,8 @@ infra/terraform/*.tfstate
 infra/terraform/*.tfstate.*
 infra/terraform/*.tfvars
 infra/terraform/*.tfvars.json
+scripts/staging/staging.tfvars
+scripts/staging/staging.tfvars.json
 
 # Assistant working state and unrelated scratch content -- never
 # staged, never scanned, never part of this project's own tree
