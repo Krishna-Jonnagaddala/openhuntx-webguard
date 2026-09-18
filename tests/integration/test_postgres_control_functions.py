@@ -115,6 +115,10 @@ EXPECTED_FUNCTIONS = {
     # P1-2 Phase H gap closure, 2026-09-17: six new functions, none
     # of Phase F's original 13.
     "resolve_password_hash": ("identity_function_owner", "api_tenant_data", "p_principal_id uuid"),
+    # P1-2 Phase H follow-up, 2026-09-18: get_principal had the same
+    # tenant-context gap set_password_hash did, found while proving
+    # that fix end to end; this seventh function closes it.
+    "resolve_principal_organization": ("identity_function_owner", "api_tenant_data", "p_principal_id uuid"),
     "resolve_job_scope": ("worker_function_owner", "worker_tenant_data", "p_job_id uuid"),
     "resolve_job_cancellation_requested": ("worker_function_owner", "worker_tenant_data", "p_job_id uuid"),
     "resolve_job_permit_binding": ("worker_function_owner", "worker_tenant_data", "p_job_id uuid"),
@@ -277,11 +281,15 @@ class ControlFunctionBootstrapTests(unittest.TestCase):
 
     # -- Section 29: complete function inventory --------------------------
 
-    def test_exactly_nineteen_functions_with_correct_metadata(self) -> None:
-        # 13 from Phase F, plus 6 from P1-2 Phase H's method-level gap
-        # closure (2026-09-17): resolve_password_hash, resolve_job_scope,
-        # resolve_job_cancellation_requested, resolve_job_permit_binding,
-        # resolve_schedule_permit_binding, resolve_schedule_request_shape.
+    def test_exactly_twenty_functions_with_correct_metadata(self) -> None:
+        # 13 from Phase F, plus 6 from P1-2 Phase H's 2026-09-17
+        # method-level gap closure (resolve_password_hash,
+        # resolve_job_scope, resolve_job_cancellation_requested,
+        # resolve_job_permit_binding, resolve_schedule_permit_binding,
+        # resolve_schedule_request_shape), plus 1 more from the
+        # 2026-09-18 follow-up (resolve_principal_organization, closing
+        # the identical gap found in get_principal while proving the
+        # first fix end to end).
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -293,7 +301,7 @@ class ControlFunctionBootstrapTests(unittest.TestCase):
                 """
             ).fetchall()
 
-        self.assertEqual(len(rows), 19, f"expected exactly 19 functions, found {len(rows)}: {rows}")
+        self.assertEqual(len(rows), 20, f"expected exactly 20 functions, found {len(rows)}: {rows}")
         by_name = {name: (args, secdef, owner, config) for name, args, secdef, owner, config in rows}
         self.assertEqual(set(by_name), set(EXPECTED_FUNCTIONS), "unexpected function name set")
 
@@ -401,7 +409,7 @@ class ControlFunctionBootstrapTests(unittest.TestCase):
             ).fetchall()
 
         self.assertEqual(before, after, "a second control-functions bootstrap run must change nothing")
-        self.assertEqual(len(after), 19, "second run must not create duplicate overloads")
+        self.assertEqual(len(after), 20, "second run must not create duplicate overloads")
 
     # -- Section 26: search_path hijack resistance --------------------------
 
@@ -1558,7 +1566,7 @@ class NonSuperuserOwnershipTransferTests(unittest.TestCase):
         with psycopg.connect(self._actor_dsn) as actor_connection:
             before = self._capture_metadata(actor_connection)
 
-        self.assertEqual(len(before["functions"]), 19, "expected exactly 19 functions after the first run")
+        self.assertEqual(len(before["functions"]), 20, "expected exactly 20 functions after the first run")
         # row shape: (proname, args, prosecdef, owner, proconfig, proacl)
         owners_by_name = {row[0]: row[3] for row in before["functions"]}
         for name, (expected_owner, _grantee, _args) in EXPECTED_FUNCTIONS.items():
@@ -1585,7 +1593,7 @@ class NonSuperuserOwnershipTransferTests(unittest.TestCase):
             "a second control-functions bootstrap run by the SAME non-superuser actor must leave "
             "function metadata, schema ACL, and function-owner CREATE state byte-identical",
         )
-        self.assertEqual(len(after["functions"]), 19, "second run must not create duplicate overloads")
+        self.assertEqual(len(after["functions"]), 20, "second run must not create duplicate overloads")
 
         # -- Section 6/8/9 spot checks under the non-superuser actor --------
         with psycopg.connect(self._actor_dsn) as actor_connection:

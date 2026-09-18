@@ -701,6 +701,110 @@ class PhaseHGapClosureTests(unittest.TestCase):
         finally:
             worker_pool.close()
 
+    def test_callback_receiver_has_exactly_one_privilege_anywhere(self) -> None:
+        """2026-09-18 follow-up: the existing callback_receiver test
+        above spot-checks that this role cannot read
+        callback_registrations/organizations directly and cannot
+        SET ROLE to a different tenant-data role. This test proves the
+        stronger, exhaustive claim tenant_isolation_roles.sql's own
+        comment makes ("EXECUTE on this one function is the ONLY
+        privilege callback_receiver is ever granted, here or anywhere
+        else"): it cannot EXECUTE any of the other 19 webguard_control
+        functions, cannot SET ROLE to any of the other 7 bootstrap
+        roles (not just worker_tenant_data), has no table-level grant
+        on anything in pg_catalog's own grant tables, and has no
+        membership in any role at all (pg_auth_members)."""
+
+        with self._admin_connect() as connection:
+            other_functions = connection.execute(
+                """
+                SELECT p.oid, p.proname
+                FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = 'webguard_control'
+                  AND p.proname != 'resolve_and_record_callback_observation'
+                """
+            ).fetchall()
+            self.assertEqual(len(other_functions), 19, "expected exactly 19 OTHER functions to check against")
+            for oid, name in other_functions:
+                # has_function_privilege's oid-taking overload sidesteps
+                # having to reconstruct a parseable signature string
+                # from pg_get_function_identity_arguments (which, on
+                # this PostgreSQL version, returns parameter names
+                # alongside types, not a bare type list
+                # has_function_privilege's text-signature overload
+                # actually accepts).
+                can_execute = connection.execute(
+                    "SELECT has_function_privilege('callback_receiver', %s, 'EXECUTE')",
+                    (oid,),
+                ).fetchone()[0]
+                self.assertFalse(can_execute, f"callback_receiver must not be able to EXECUTE {name}")
+
+            for other_role in ALL_BOOTSTRAP_ROLES:
+                if other_role == "callback_receiver":
+                    continue
+                is_member = connection.execute(
+                    "SELECT pg_has_role('callback_receiver', %s, 'MEMBER')", (other_role,)
+                ).fetchone()[0]
+                self.assertFalse(is_member, f"callback_receiver must not be a member of {other_role}")
+
+            # No direct membership in ANY role at all (pg_auth_members
+            # lists both directions; this checks callback_receiver as
+            # the member, not the group).
+            memberships = connection.execute(
+                """
+                SELECT r.rolname FROM pg_auth_members m
+                JOIN pg_roles r ON r.oid = m.roleid
+                JOIN pg_roles member ON member.oid = m.member
+                WHERE member.rolname = 'callback_receiver'
+                """
+            ).fetchall()
+            self.assertEqual(memberships, [], f"callback_receiver must have zero role memberships: {memberships}")
+
+            # No table/sequence/schema grant of any kind, in either
+            # direction of PostgreSQL's two ACL representations
+            # (explicit information_schema grants, and the lower-level
+            # aclexplode of every relation's own ACL list).
+            explicit_grants = connection.execute(
+                "SELECT table_schema, table_name, privilege_type FROM information_schema.role_table_grants "
+                "WHERE grantee = 'callback_receiver'"
+            ).fetchall()
+            self.assertEqual(explicit_grants, [], f"callback_receiver must have zero table grants: {explicit_grants}")
+            acl_grants = connection.execute(
+                """
+                SELECT c.relname, acl.privilege_type
+                FROM pg_class c
+                CROSS JOIN LATERAL aclexplode(c.relacl) AS acl
+                JOIN pg_roles r ON r.oid = acl.grantee
+                WHERE r.rolname = 'callback_receiver'
+                """
+            ).fetchall()
+            self.assertEqual(acl_grants, [], f"callback_receiver must have zero relation ACL entries: {acl_grants}")
+
+            # Schema USAGE on webguard_control is a necessary, already-
+            # reviewed prerequisite for EXECUTE to work at all (this
+            # file's own tenant_isolation_control_functions.sql comment:
+            # "EXECUTE on a function requires USAGE on its schema too"),
+            # explicitly granted to callback_receiver alongside the
+            # three tenant-data roles, not a leak, and not itself the
+            # privilege boundary. The boundary this test actually proves
+            # is per-function EXECUTE (checked exhaustively above): USAGE
+            # alone grants no ability to read or write any table, and the
+            # table-grant checks above already confirm there are none.
+            # (PUBLIC's own default USAGE on the *public* schema, where
+            # every real table lives, is an unrelated, repository-wide
+            # PostgreSQL default this project has never revoked for any
+            # role, true of every role in this database, not a
+            # callback_receiver-specific finding, and irrelevant on its
+            # own without a table-level grant to go with it.)
+            control_schema_usage = connection.execute(
+                "SELECT has_schema_privilege('callback_receiver', 'webguard_control', 'USAGE')"
+            ).fetchone()[0]
+            self.assertTrue(
+                control_schema_usage,
+                "callback_receiver is expected to hold USAGE on webguard_control, "
+                "the documented prerequisite for its one EXECUTE grant to work at all",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

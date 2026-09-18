@@ -295,9 +295,12 @@ def run_production_stack(
             )
             issued_token = components.identity.create_token(owner.principal_id, label="dev-bootstrap", now=now)
             components.identity.set_password_hash(
-                owner.principal_id, algorithm="argon2id", password_hash=hash_password(owner_password), now=now
+                owner.principal_id, organization.organization_id,
+                algorithm="argon2id", password_hash=hash_password(owner_password), now=now,
             )
-            components.identity.set_principal_email_verified(owner.principal_id, now=now)
+            components.identity.set_principal_email_verified(
+                owner.principal_id, organization.organization_id, now=now
+            )
 
             server = create_server(
                 "127.0.0.1",

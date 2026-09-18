@@ -196,7 +196,7 @@ class PasswordCredentialsWriteShapeTests(unittest.TestCase):
 
     def test_fresh_credential_uses_insert_path(self) -> None:
         now = datetime.now(timezone.utc)
-        self.identity.set_password_hash(self.principal_id, algorithm="scrypt", password_hash="hash-1", now=now)
+        self.identity.set_password_hash(self.principal_id, self.organization_id, algorithm="scrypt", password_hash="hash-1", now=now)
 
         with self._connect() as connection:
             row = connection.execute(
@@ -207,10 +207,10 @@ class PasswordCredentialsWriteShapeTests(unittest.TestCase):
 
     def test_existing_credential_uses_conditional_update_path(self) -> None:
         created = datetime.now(timezone.utc)
-        self.identity.set_password_hash(self.principal_id, algorithm="scrypt", password_hash="hash-1", now=created)
+        self.identity.set_password_hash(self.principal_id, self.organization_id, algorithm="scrypt", password_hash="hash-1", now=created)
 
         updated = created + timedelta(hours=1)
-        self.identity.set_password_hash(self.principal_id, algorithm="scrypt", password_hash="hash-2", now=updated)
+        self.identity.set_password_hash(self.principal_id, self.organization_id, algorithm="scrypt", password_hash="hash-2", now=updated)
 
         with self._connect() as connection:
             row = connection.execute(
@@ -221,7 +221,7 @@ class PasswordCredentialsWriteShapeTests(unittest.TestCase):
 
     def test_caller_visible_behavior_unchanged(self) -> None:
         now = datetime.now(timezone.utc)
-        result = self.identity.set_password_hash(self.principal_id, algorithm="scrypt", password_hash="hash-1", now=now)
+        result = self.identity.set_password_hash(self.principal_id, self.organization_id, algorithm="scrypt", password_hash="hash-1", now=now)
         self.assertIsNone(result, "set_password_hash's own return value is unchanged by the write-shape rewrite")
 
     def test_get_password_hash_now_succeeds_via_resolver(self) -> None:
@@ -241,7 +241,7 @@ class PasswordCredentialsWriteShapeTests(unittest.TestCase):
         only path, and it returns only password_hash."""
 
         now = datetime.now(timezone.utc)
-        self.identity.set_password_hash(self.principal_id, algorithm="scrypt", password_hash="hash-1", now=now)
+        self.identity.set_password_hash(self.principal_id, self.organization_id, algorithm="scrypt", password_hash="hash-1", now=now)
         self.assertEqual(self.identity.get_password_hash(self.principal_id), "hash-1")
         self.assertIsNone(self.identity.get_password_hash(str(uuid.uuid4())))
 
@@ -266,7 +266,7 @@ class PasswordCredentialsWriteShapeTests(unittest.TestCase):
                 barrier.wait(timeout=10)
                 now = datetime.now(timezone.utc).replace(microsecond=0)
                 self.identity.set_password_hash(
-                    self.principal_id, algorithm="scrypt", password_hash=f"writer-{now.hour}", now=now
+                    self.principal_id, self.organization_id, algorithm="scrypt", password_hash=f"writer-{now.hour}", now=now
                 )
             except BaseException as exc:  # noqa: BLE001 - collected and re-raised on the main thread
                 errors.append(exc)
@@ -292,7 +292,7 @@ class PasswordCredentialsWriteShapeTests(unittest.TestCase):
 
     def test_concurrent_existing_row_write_race(self) -> None:
         created = datetime.now(timezone.utc)
-        self.identity.set_password_hash(self.principal_id, algorithm="scrypt", password_hash="seed", now=created)
+        self.identity.set_password_hash(self.principal_id, self.organization_id, algorithm="scrypt", password_hash="seed", now=created)
 
         writer_count = 6
         barrier = threading.Barrier(writer_count)
@@ -303,7 +303,7 @@ class PasswordCredentialsWriteShapeTests(unittest.TestCase):
                 barrier.wait(timeout=10)
                 now = datetime.now(timezone.utc).replace(microsecond=0)
                 self.identity.set_password_hash(
-                    self.principal_id, algorithm="scrypt", password_hash=f"writer-{now.hour}", now=now
+                    self.principal_id, self.organization_id, algorithm="scrypt", password_hash=f"writer-{now.hour}", now=now
                 )
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
@@ -353,7 +353,7 @@ class PasswordCredentialsWriteShapeTests(unittest.TestCase):
 
     def test_rollback_existing_row_update_path_restores_original(self) -> None:
         created = datetime.now(timezone.utc)
-        self.identity.set_password_hash(self.principal_id, algorithm="scrypt", password_hash="original", now=created)
+        self.identity.set_password_hash(self.principal_id, self.organization_id, algorithm="scrypt", password_hash="original", now=created)
 
         with self._connect() as connection:
             connection.execute(
@@ -389,7 +389,7 @@ class PasswordCredentialsWriteShapeTests(unittest.TestCase):
         import psycopg
 
         now = datetime.now(timezone.utc)
-        self.identity.set_password_hash(self.principal_id, algorithm="scrypt", password_hash="hash-1", now=now)
+        self.identity.set_password_hash(self.principal_id, self.organization_id, algorithm="scrypt", password_hash="hash-1", now=now)
 
         with self._connect() as connection:
             with self.assertRaises(psycopg.errors.InsufficientPrivilege):
@@ -518,7 +518,7 @@ class IdentityTokensWriteShapeTests(unittest.TestCase):
         )
 
         self.identity.invalidate_identity_tokens(
-            self.principal_id, purpose=IdentityTokenPurpose.PASSWORD_RESET, now=now
+            self.principal_id, self.organization_id, purpose=IdentityTokenPurpose.PASSWORD_RESET, now=now
         )
 
         with self._connect() as connection:

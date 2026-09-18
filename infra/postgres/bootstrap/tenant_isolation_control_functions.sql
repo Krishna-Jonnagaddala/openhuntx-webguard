@@ -1,8 +1,18 @@
 -- P1-2 (docs/audit/WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md): Phase F of
 -- the tenant-isolation plumbing. Creates the webguard_control schema
--- and the 13 SECURITY DEFINER control functions the four function-
--- owner roles (Phase C) already have exactly the table privileges
--- for (Phase E). Run this file only after tenant_isolation_roles.sql,
+-- and its SECURITY DEFINER control functions, each owned by one of
+-- the four function-owner roles (Phase C), which already have exactly
+-- the table privileges each function needs (Phase E). Phase F itself
+-- shipped 13; the 2026-09-17/18 Phase H gap-closure passes added 7
+-- more (resolve_password_hash, resolve_job_permit_binding,
+-- resolve_job_cancellation_requested, resolve_job_scope,
+-- resolve_schedule_permit_binding, resolve_schedule_request_shape,
+-- resolve_principal_organization) and widened two existing ones
+-- (resolve_identity_token, enqueue_due_schedule) rather than replacing
+-- them -- 20 functions total as of this comment; grep
+-- "^CREATE (OR REPLACE )?FUNCTION webguard_control\." in this file for
+-- the current, authoritative count rather than trusting this number to
+-- stay in sync by hand. Run this file only after tenant_isolation_roles.sql,
 -- tenant_isolation_acl.sql, and tenant_isolation_function_acl.sql:
 -- every role granted EXECUTE here must already exist with its Phase-E
 -- table ACL already in place.
@@ -517,17 +527,49 @@ CREATE FUNCTION webguard_control.resolve_identity_token(
     WHERE t.token_id = p_token_id;
 $$;
 
+-- resolve_principal_organization: P1-2 Phase H follow-up (2026-09-18),
+-- found while proving set_password_hash's own fix against a real
+-- forced-RLS database: get_principal(principal_id) had the identical
+-- gap (role_scoped_connection, no tenant context at all), and unlike
+-- set_password_hash, its callers cannot all be given a trusted
+-- organization_id to pass in -- create_token(principal_id, ...) (its
+-- only input is principal_id) and BrowserSessionAuthenticator.authenticate
+-- call it specifically to discover which organization a principal
+-- belongs to, so requiring organization_id as a parameter would be
+-- circular for those two. Deliberately minimal, mirroring
+-- resolve_job_organization exactly: returns only organization_id,
+-- nothing else -- no display name, no role, no email. get_principal
+-- itself now calls this first (still under api_tenant_data, still no
+-- tenant context, exactly like get_principal_by_email's own resolve
+-- step), then set_tenant_context once the organization is known, then
+-- reads the full row as an ordinary, now-tenant-scoped query on the
+-- same connection -- the identical two-phase shape
+-- get_principal_by_email/authenticate_token/consume_identity_token
+-- already use, not a new pattern.
+CREATE OR REPLACE FUNCTION webguard_control.resolve_principal_organization(
+    p_principal_id uuid
+) RETURNS uuid
+    LANGUAGE sql
+    STABLE
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+    AS $$
+    SELECT organization_id FROM public.principals WHERE principal_id = p_principal_id;
+$$;
+
 REVOKE ALL ON FUNCTION webguard_control.resolve_api_token(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.resolve_browser_session(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.resolve_principal_by_email(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.resolve_identity_token(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION webguard_control.resolve_password_hash(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION webguard_control.resolve_principal_organization(uuid) FROM PUBLIC;
 
 GRANT EXECUTE ON FUNCTION webguard_control.resolve_api_token(uuid) TO api_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.resolve_browser_session(uuid) TO api_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.resolve_principal_by_email(text) TO api_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.resolve_identity_token(uuid) TO api_tenant_data;
 GRANT EXECUTE ON FUNCTION webguard_control.resolve_password_hash(uuid) TO api_tenant_data;
+GRANT EXECUTE ON FUNCTION webguard_control.resolve_principal_organization(uuid) TO api_tenant_data;
 
 RESET ROLE;
 
