@@ -527,6 +527,19 @@ SET ROLE worker_function_owner;
 -- check is not reproduced (lower security relevance than worker_id
 -- shape, and make_interval() already rejects a negative value on its
 -- own with a native error).
+--
+-- One deliberate deviation from "exact reproduction": started_at,
+-- updated_at, heartbeat_at, and the lease_expires_at derived from them
+-- are floored to the claimed row's own submitted_at (GREATEST(p_now,
+-- submitted_at)) rather than using p_now unconditionally. p_now is
+-- read in Python before this function is even called, so a submission
+-- that commits a later submitted_at while this call's own row lock
+-- was queued behind it can otherwise leave p_now earlier than the row
+-- it just claimed, and scan_jobs.py's ScanJobRecord then refuses to
+-- construct (updated_at/started_at cannot precede submitted_at). The
+-- claimable-row predicate itself still has no submitted_at <= p_now
+-- filter (unchanged, see above); only the value written for these
+-- four columns is floored.
 CREATE OR REPLACE FUNCTION webguard_control.claim_next_job(
     p_worker_id text,
     p_lease_seconds numeric,
@@ -563,8 +576,10 @@ CREATE OR REPLACE FUNCTION webguard_control.claim_next_job(
 DECLARE
     v_job_id uuid;
     v_revision integer;
+    v_submitted_at timestamptz;
+    v_effective_now timestamptz;
     v_lease_token text := gen_random_uuid()::text;
-    v_lease_expires_at timestamptz := p_now + make_interval(secs => p_lease_seconds);
+    v_lease_expires_at timestamptz;
     v_updated integer;
     v_trimmed_worker_id text;
 BEGIN
@@ -576,8 +591,8 @@ BEGIN
         RAISE EXCEPTION 'job_worker_id_invalid: worker_id must contain 1 to 128 visible ASCII characters';
     END IF;
 
-    SELECT jobs.job_id, jobs.revision
-    INTO v_job_id, v_revision
+    SELECT jobs.job_id, jobs.revision, jobs.submitted_at
+    INTO v_job_id, v_revision, v_submitted_at
     FROM public.scan_jobs AS jobs
     LEFT JOIN public.job_permits AS binding ON binding.job_id = jobs.job_id
     WHERE jobs.state = 'queued'
@@ -618,10 +633,25 @@ BEGIN
         RETURN;
     END IF;
 
+    -- p_now is read in Python (ScanJobWorker.run_once) before this
+    -- function is even called, so it can be stale by the time this
+    -- statement runs: this call's own row lock can queue behind a
+    -- concurrent submission that reads its own, later `now` for
+    -- submitted_at and commits first, and the SELECT above has no
+    -- submitted_at <= p_now filter (by design, see this function's
+    -- own header comment). GREATEST() floors the moment actually
+    -- written (and the lease derived from it) to this row's own
+    -- submitted_at, so ScanJobRecord's invariant (started_at/
+    -- updated_at cannot precede submitted_at, in scan_jobs.py) holds
+    -- by construction. This mirrors store.py's _no_earlier_than fix
+    -- for the identical race in the SQLite-backed job store.
+    v_effective_now := GREATEST(p_now, v_submitted_at);
+    v_lease_expires_at := v_effective_now + make_interval(secs => p_lease_seconds);
+
     UPDATE public.scan_jobs
-    SET state = 'running', started_at = p_now, updated_at = p_now, revision = v_revision + 1,
+    SET state = 'running', started_at = v_effective_now, updated_at = v_effective_now, revision = v_revision + 1,
         worker_id = v_trimmed_worker_id, lease_token = v_lease_token, lease_expires_at = v_lease_expires_at,
-        heartbeat_at = p_now, attempt_count = scan_jobs.attempt_count + 1
+        heartbeat_at = v_effective_now, attempt_count = scan_jobs.attempt_count + 1
     WHERE scan_jobs.job_id = v_job_id AND scan_jobs.state = 'queued' AND scan_jobs.revision = v_revision;
     GET DIAGNOSTICS v_updated = ROW_COUNT;
 
@@ -674,29 +704,40 @@ DECLARE
     v_failed integer := 0;
     v_row RECORD;
     v_updated integer;
+    v_effective_now timestamptz;
 BEGIN
     FOR v_row IN
-        SELECT job_id, revision, lease_token, cancellation_requested, attempt_count
+        SELECT job_id, revision, lease_token, cancellation_requested, attempt_count, submitted_at
         FROM public.scan_jobs
         WHERE state = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= p_now
         ORDER BY lease_expires_at, job_id
         FOR UPDATE SKIP LOCKED
     LOOP
+        -- See claim_next_job's own comment on this exact race/fix.
+        -- Structurally, this loop's own WHERE clause already implies
+        -- p_now >= lease_expires_at >= submitted_at (once claim_next_job/
+        -- renew_lease correctly floor lease_expires_at against
+        -- submitted_at) for every row reached here, so this floor is
+        -- defense-in-depth rather than an independently reachable gap.
+        -- It is applied for the same reason store.py's SQLite
+        -- equivalent applies it to every write site, not because this
+        -- one is known to be exploitable on its own.
+        v_effective_now := GREATEST(p_now, v_row.submitted_at);
         IF v_row.cancellation_requested THEN
             UPDATE public.scan_jobs
-            SET state = 'cancelled', completed_at = p_now, updated_at = p_now, revision = revision + 1,
+            SET state = 'cancelled', completed_at = v_effective_now, updated_at = v_effective_now, revision = revision + 1,
                 worker_id = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL
             WHERE job_id = v_row.job_id AND state = 'running' AND revision = v_row.revision
               AND lease_token = v_row.lease_token;
             GET DIAGNOSTICS v_updated = ROW_COUNT;
             v_cancelled := v_cancelled + v_updated;
             IF v_updated > 0 THEN
-                UPDATE public.scan_records SET status = 'cancelled', completed_at = COALESCE(completed_at, p_now)
+                UPDATE public.scan_records SET status = 'cancelled', completed_at = COALESCE(completed_at, v_effective_now)
                 WHERE job_id = v_row.job_id AND completed_at IS NULL;
             END IF;
         ELSIF v_row.attempt_count >= p_maximum_attempts THEN
             UPDATE public.scan_jobs
-            SET state = 'failed', completed_at = p_now, updated_at = p_now, revision = revision + 1,
+            SET state = 'failed', completed_at = v_effective_now, updated_at = v_effective_now, revision = revision + 1,
                 worker_id = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
                 error_code = 'worker_lease_attempts_exhausted',
                 error_message = 'The scan job exceeded the permitted worker recovery attempts.'
@@ -705,12 +746,12 @@ BEGIN
             GET DIAGNOSTICS v_updated = ROW_COUNT;
             v_failed := v_failed + v_updated;
             IF v_updated > 0 THEN
-                UPDATE public.scan_records SET status = 'failed', completed_at = COALESCE(completed_at, p_now)
+                UPDATE public.scan_records SET status = 'failed', completed_at = COALESCE(completed_at, v_effective_now)
                 WHERE job_id = v_row.job_id AND completed_at IS NULL;
             END IF;
         ELSE
             UPDATE public.scan_jobs
-            SET state = 'queued', started_at = NULL, updated_at = p_now, revision = revision + 1,
+            SET state = 'queued', started_at = NULL, updated_at = v_effective_now, revision = revision + 1,
                 worker_id = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL
             WHERE job_id = v_row.job_id AND state = 'running' AND revision = v_row.revision
               AND lease_token = v_row.lease_token;
@@ -781,7 +822,9 @@ DECLARE
     v_lease_token text;
     v_lease_expires_at timestamptz;
     v_revision integer;
-    v_new_expires_at timestamptz := p_now + make_interval(secs => p_lease_seconds);
+    v_submitted_at timestamptz;
+    v_effective_now timestamptz;
+    v_new_expires_at timestamptz;
     v_updated integer;
     v_trimmed_worker_id text;
 BEGIN
@@ -797,8 +840,8 @@ BEGIN
     END IF;
 
     SELECT scan_jobs.state, scan_jobs.worker_id, scan_jobs.lease_token, scan_jobs.lease_expires_at,
-           scan_jobs.revision
-    INTO v_state, v_worker_id, v_lease_token, v_lease_expires_at, v_revision
+           scan_jobs.revision, scan_jobs.submitted_at
+    INTO v_state, v_worker_id, v_lease_token, v_lease_expires_at, v_revision, v_submitted_at
     FROM public.scan_jobs
     WHERE scan_jobs.job_id = p_job_id;
 
@@ -827,8 +870,16 @@ BEGIN
         RETURN;
     END IF;
 
+    -- See claim_next_job's own comment on this exact race/fix. This
+    -- row is already RUNNING (already claimed), so its existing
+    -- updated_at is already >= submitted_at; this floor defends the
+    -- same invariant against the same stale-p_now class, not a defect
+    -- specific to renewal.
+    v_effective_now := GREATEST(p_now, v_submitted_at);
+    v_new_expires_at := v_effective_now + make_interval(secs => p_lease_seconds);
+
     UPDATE public.scan_jobs
-    SET heartbeat_at = p_now, lease_expires_at = v_new_expires_at, updated_at = p_now, revision = v_revision + 1
+    SET heartbeat_at = v_effective_now, lease_expires_at = v_new_expires_at, updated_at = v_effective_now, revision = v_revision + 1
     WHERE scan_jobs.job_id = p_job_id AND scan_jobs.state = 'running' AND scan_jobs.revision = v_revision
       AND scan_jobs.worker_id = v_trimmed_worker_id AND scan_jobs.lease_token = p_lease_token;
     GET DIAGNOSTICS v_updated = ROW_COUNT;
@@ -948,6 +999,9 @@ DECLARE
     v_lease_token text;
     v_lease_expires_at timestamptz;
     v_revision integer;
+    v_submitted_at timestamptz;
+    v_started_at timestamptz;
+    v_effective_now timestamptz;
     v_updated integer;
     v_has_lease_predicate boolean := p_worker_id IS NOT NULL;
     v_trimmed_worker_id text;
@@ -1009,8 +1063,8 @@ BEGIN
     END IF;
 
     SELECT scan_jobs.state, scan_jobs.worker_id, scan_jobs.lease_token, scan_jobs.lease_expires_at,
-           scan_jobs.revision
-    INTO v_state, v_worker_id, v_lease_token, v_lease_expires_at, v_revision
+           scan_jobs.revision, scan_jobs.submitted_at, scan_jobs.started_at
+    INTO v_state, v_worker_id, v_lease_token, v_lease_expires_at, v_revision, v_submitted_at, v_started_at
     FROM public.scan_jobs
     WHERE scan_jobs.job_id = p_job_id;
 
@@ -1060,9 +1114,16 @@ BEGIN
         RETURN;
     END IF;
 
+    -- See claim_next_job's own comment on this exact race/fix.
+    -- ScanJobRecord also requires completed_at not precede the job's
+    -- start boundary (started_at if set, else submitted_at); floor
+    -- against whichever of the two is later, exactly mirroring
+    -- store.py's _terminal_update.
+    v_effective_now := GREATEST(p_now, COALESCE(v_started_at, v_submitted_at));
+
     IF v_has_lease_predicate THEN
         UPDATE public.scan_jobs
-        SET state = p_state, completed_at = p_now, updated_at = p_now, revision = v_revision + 1,
+        SET state = p_state, completed_at = v_effective_now, updated_at = v_effective_now, revision = v_revision + 1,
             scan_id = p_scan_id, result_status = p_result_status, report_ref = p_report_ref,
             audit_ref = p_audit_ref, error_code = p_error_code, error_message = p_error_message,
             worker_id = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL
@@ -1070,7 +1131,7 @@ BEGIN
           AND scan_jobs.worker_id = v_trimmed_worker_id AND scan_jobs.lease_token = p_lease_token;
     ELSE
         UPDATE public.scan_jobs
-        SET state = p_state, completed_at = p_now, updated_at = p_now, revision = v_revision + 1,
+        SET state = p_state, completed_at = v_effective_now, updated_at = v_effective_now, revision = v_revision + 1,
             scan_id = p_scan_id, result_status = p_result_status, report_ref = p_report_ref,
             audit_ref = p_audit_ref, error_code = p_error_code, error_message = p_error_message,
             worker_id = NULL, lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL
@@ -1089,13 +1150,13 @@ BEGIN
 
     IF p_state IN ('failed', 'cancelled') THEN
         UPDATE public.scan_records
-        SET status = p_state, completed_at = COALESCE(scan_records.completed_at, p_now)
+        SET status = p_state, completed_at = COALESCE(scan_records.completed_at, v_effective_now)
         WHERE scan_records.job_id = p_job_id AND scan_records.completed_at IS NULL;
     END IF;
 
     IF p_safety_receipt_ref IS NOT NULL THEN
         INSERT INTO public.job_safety_receipts (job_id, receipt_ref, receipt_sha256, created_at)
-        VALUES (p_job_id, p_safety_receipt_ref, p_safety_receipt_sha256, p_now);
+        VALUES (p_job_id, p_safety_receipt_ref, p_safety_receipt_sha256, v_effective_now);
     END IF;
 
     RETURN QUERY

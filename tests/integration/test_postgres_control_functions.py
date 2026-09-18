@@ -640,6 +640,84 @@ class ControlFunctionBootstrapTests(unittest.TestCase):
         self.assertEqual(rows, [], "a job with an unassigned authorization must not be claimable")
         self.assertEqual(state, "queued", "the unclaimable job must remain untouched")
 
+    def test_claim_next_job_with_a_stale_p_now_floors_to_submitted_at(self) -> None:
+        """Postgres-side counterpart to
+        tests/unit/test_job_store_stale_clock_claim.py's
+        test_claim_next_leased_with_a_now_earlier_than_submitted_at_...:
+        this exact race (a caller's p_now, read before a lock wait,
+        precedes the row's own submitted_at once unblocked) is
+        structurally identical in postgres_jobs.py/claim_next_job, and
+        until this test, only the SQLite side had direct regression
+        coverage for it. Proves the SQL function's own GREATEST(p_now,
+        submitted_at) floor (this function's header comment) engages
+        the same way store.py's _no_earlier_than does: updated_at/
+        started_at land on submitted_at, not on the stale, earlier
+        p_now, and the lease still runs the full duration from the
+        floored moment."""
+
+        with self._connect() as connection:
+            org_id, principal_id = self._fresh_org_and_principal(connection)
+            auth_id = self._assign_authorization(connection, org_id, principal_id)
+            job_id = self._insert_queued_job(connection, org_id, principal_id, auth_id, "stale-clock-claim")
+            connection.commit()
+            stale_now = self.now - timedelta(seconds=5)
+            claimed = connection.execute(
+                "SELECT * FROM webguard_control.claim_next_job(%s, %s::numeric, %s)",
+                ("stale-clock-worker", 30.0, stale_now),
+            ).fetchone()
+            connection.commit()
+
+        self.assertIsNotNone(claimed, "a stale p_now must not make the claimable row unclaimable")
+        self.assertEqual(str(claimed[0]), job_id)
+        self.assertEqual(claimed[9], self.now, "updated_at must be floored to submitted_at, not the stale p_now")
+        self.assertEqual(claimed[10], self.now, "started_at must be floored to submitted_at, not the stale p_now")
+        self.assertEqual(
+            claimed[21], self.now + timedelta(seconds=30),
+            "the lease must run the full duration from the floored moment, not from the stale p_now",
+        )
+
+    def test_renew_lease_and_terminal_transition_with_a_stale_p_now_floor_to_submitted_at(self) -> None:
+        """Same defect class as the claim_next_job test above, for the
+        other two SQL functions this commit's own fix touched:
+        renew_lease and terminal_transition both floor the moment they
+        write to the row's own submitted_at (terminal_transition floors
+        to started_at, its own start boundary, matching store.py's
+        _terminal_update) rather than trusting a p_now that could have
+        gone stale behind a lock wait."""
+
+        with self._connect() as connection:
+            org_id, principal_id = self._fresh_org_and_principal(connection)
+            auth_id = self._assign_authorization(connection, org_id, principal_id)
+            job_id = self._insert_queued_job(connection, org_id, principal_id, auth_id, "stale-clock-renew")
+            connection.commit()
+            claimed = connection.execute(
+                "SELECT * FROM webguard_control.claim_next_job(%s, %s::numeric, %s)",
+                ("stale-clock-worker", 30.0, self.now),
+            ).fetchone()
+            connection.commit()
+            worker_id, lease_token = claimed[19], claimed[20]
+
+            stale_now = self.now - timedelta(seconds=5)
+            renewed = connection.execute(
+                "SELECT * FROM webguard_control.renew_lease(%s, %s, %s, %s, %s::numeric)",
+                (job_id, worker_id, lease_token, stale_now, 30.0),
+            ).fetchone()
+            connection.commit()
+            self.assertEqual(renewed[0], "ok")
+            self.assertEqual(renewed[10], self.now, "renew_lease's updated_at must be floored to submitted_at")
+
+            finished = connection.execute(
+                "SELECT * FROM webguard_control.terminal_transition(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (job_id, "failed", stale_now, worker_id, lease_token, None, None, None, None,
+                 "boom", "it broke", None, None),
+            ).fetchone()
+
+        self.assertEqual(finished[0], "ok")
+        self.assertEqual(finished[10], self.now, "terminal_transition's updated_at must be floored to the start boundary")
+        self.assertGreaterEqual(
+            finished[12], finished[11], "completed_at must never precede started_at, even with a stale p_now"
+        )
+
     # -- Worker: renew_lease CAS (Section 16) --------------------------------
 
     def test_renew_lease_ownership_and_token_are_enforced(self) -> None:
