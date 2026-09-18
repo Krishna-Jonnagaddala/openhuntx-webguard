@@ -16,7 +16,7 @@
 # Usage:
 #   VPC_ID=vpc-xxx SUBNET_ID=subnet-xxx ./provision-staging-bastion.sh
 #
-# Prints the created security group ID on success -- pass that as
+# Prints the created security group ID on success. Pass that as
 # application_security_group_id when applying postgres.tf.
 
 set -euo pipefail

@@ -37,7 +37,7 @@ aws iam remove-role-from-instance-profile \
   --role-name "$BASTION_IAM_ROLE_NAME" || true
 aws iam delete-instance-profile --instance-profile-name "$BASTION_INSTANCE_PROFILE_NAME" || true
 
-# Detach every attached policy before deleting the role -- IAM refuses
+# Detach every attached policy before deleting the role. IAM refuses
 # to delete a role with policies still attached.
 for policy_arn in $(aws iam list-attached-role-policies \
   --role-name "$BASTION_IAM_ROLE_NAME" \
@@ -67,7 +67,7 @@ echo "Next, from infra/terraform:" >&2
 echo "  terraform destroy -var-file=../../scripts/staging/staging.tfvars" >&2
 echo "" >&2
 echo "This deletes aws_db_instance.webguard (a final snapshot is taken" >&2
-echo "automatically unless postgres.tf is changed to skip it -- leave" >&2
+echo "automatically unless postgres.tf is changed to skip it. Leave" >&2
 echo "that default in place for a validation run), plus the VPC/subnet/" >&2
 echo "security-group networking resources, and their KMS key (subject to" >&2
 echo "AWS's mandatory 7-30 day deletion window)." >&2
