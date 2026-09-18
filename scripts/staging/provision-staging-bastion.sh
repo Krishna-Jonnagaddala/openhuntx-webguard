@@ -9,9 +9,17 @@
 #
 # Reached over AWS Systems Manager Session Manager, not SSH: no key
 # pair to generate or leak, no inbound security-group rule needed beyond
-# what SSM's own VPC endpoint traffic requires. Requires the AWS CLI,
-# valid credentials, and that the VPC/subnet/security-group networking
-# resources from infra/terraform (networking.tf) already exist.
+# what SSM's own traffic requires. Requires the AWS CLI, valid
+# credentials, and that the networking resources from infra/terraform
+# (networking.tf, applied with -var create_staging_bastion_networking=true)
+# already exist: SUBNET_ID must be one of the two PRIVATE subnets, which
+# only have a route to the internet at all because that flag also
+# provisioned a NAT Gateway/internet gateway/public subnet. Launching
+# this instance into a private subnet from a plain networking.tf apply
+# (the default, create_staging_bastion_networking=false) leaves it with
+# no path to SSM, Secrets Manager, or any package repository; see
+# networking.tf's own header comment for why a security group's default
+# egress rule alone does not fix that.
 #
 # Usage:
 #   VPC_ID=vpc-xxx SUBNET_ID=subnet-xxx ./provision-staging-bastion.sh
@@ -35,10 +43,14 @@ SG_ID=$(aws ec2 create-security-group \
   --vpc-id "$VPC_ID" \
   --query 'GroupId' --output text)
 
-# Explicitly no ingress rules are added. SSM Session Manager needs only
-# outbound HTTPS to the SSM service endpoints (the default egress rule
-# every new security group has already permits this), never an inbound
-# rule of any kind.
+# Explicitly no ingress rules are added: SSM Session Manager, package
+# installation, and Secrets Manager access all only ever need outbound
+# HTTPS, never an inbound rule of any kind. The default egress rule
+# every new security group already has permits that traffic to LEAVE
+# the instance; it does not by itself give the instance's subnet a
+# route to reach anything. That route comes from
+# create_staging_bastion_networking's NAT Gateway (this script's own
+# header comment), not from anything this security group does.
 echo "Security group created: $SG_ID (no inbound rules)" >&2
 
 AMI_ID=$(aws ec2 describe-images \
