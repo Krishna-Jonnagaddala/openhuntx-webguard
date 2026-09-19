@@ -59,11 +59,18 @@ Findings, established here rather than assumed:
 Requires a real database (WEBGUARD_RUN_INTEGRATION=1 and a reachable
 WEBGUARD_POSTGRES_TEST_DSN) with a connecting role holding CREATE ROLE
 and CREATE DATABASE privilege, exactly like every other Postgres
-integration test in this suite. Also requires this file to be able to
-run `git show 19cc604:<path>` from within the repository (the "old"
-bootstrap chain is read from that pre-existing commit, not
-duplicated by hand as a second copy that could drift from the real
-history).
+integration test in this suite.
+
+The "old" bootstrap chain is read from
+fixtures/pre_phase_h_bootstrap/, a byte-for-byte copy of
+tenant_isolation_roles.sql/tenant_isolation_control_functions.sql as
+they stood at commit 19cc604 (confirmed via `diff` against `git show
+19cc604:<path>` when these fixtures were captured), not read live via
+`git show` at test time: CI's checkout is shallow by default (a fixed
+`fetch-depth`), so an older commit can be genuinely absent from the
+local object database even though it exists in the repository's real
+history, and this test's own correctness should not depend on the
+checkout-depth policy of whatever CI configuration happens to run it.
 """
 
 from __future__ import annotations
@@ -90,26 +97,20 @@ TENANT_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_acl.sql"
 FUNCTION_ACL_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_function_acl.sql"
 CONTROL_FUNCTIONS_SQL_PATH = _BOOTSTRAP_DIR / "tenant_isolation_control_functions.sql"
 
-# The last commit on this branch before Phase H's gap-closure work
-# started widening resolve_identity_token/enqueue_due_schedule --
-# i.e. the bootstrap chain a real, already-deployed environment would
-# have been running if it had been stood up any time before this pass.
-_PRE_PHASE_H_GAP_CLOSURE_SHA = "19cc604"
+# Byte-for-byte copies of the bootstrap chain as it stood immediately
+# before Phase H's gap-closure work started widening
+# resolve_identity_token/enqueue_due_schedule (commit 19cc604): the
+# chain a real, already-deployed environment would have been running
+# if it had been stood up any time before this pass.
+_OLD_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "pre_phase_h_bootstrap"
+_OLD_ROLES_SQL_PATH = _OLD_FIXTURES_DIR / "tenant_isolation_roles.sql"
+_OLD_CONTROL_FUNCTIONS_SQL_PATH = _OLD_FIXTURES_DIR / "tenant_isolation_control_functions.sql"
 
 ALL_BOOTSTRAP_ROLES = (
     "api_tenant_data", "worker_tenant_data", "scheduler_tenant_data",
     "identity_function_owner", "worker_function_owner", "scheduler_function_owner",
     "callback_function_owner", "callback_receiver",
 )
-
-
-def _git_show(sha: str, relative_path: Path) -> str:
-    result = subprocess.run(
-        ["git", "show", f"{sha}:{relative_path.relative_to(_REPO_ROOT)}"],
-        cwd=_REPO_ROOT, capture_output=True, text=True,
-    )
-    assert result.returncode == 0, result.stderr
-    return result.stdout
 
 
 @unittest.skipUnless(
@@ -146,8 +147,8 @@ class SchemaUpgradeCompatibilityTests(unittest.TestCase):
         )
         assert migration_result.returncode == 0, migration_result.stderr
 
-        cls._old_roles_sql = _git_show(_PRE_PHASE_H_GAP_CLOSURE_SHA, ROLES_SQL_PATH)
-        cls._old_control_functions_sql = _git_show(_PRE_PHASE_H_GAP_CLOSURE_SHA, CONTROL_FUNCTIONS_SQL_PATH)
+        cls._old_roles_sql = _OLD_ROLES_SQL_PATH.read_text(encoding="utf-8")
+        cls._old_control_functions_sql = _OLD_CONTROL_FUNCTIONS_SQL_PATH.read_text(encoding="utf-8")
         # acl.sql/function_acl.sql are byte-identical between the old
         # commit and HEAD (confirmed via `git diff 19cc604..HEAD --
         # infra/postgres/bootstrap/tenant_isolation_acl.sql
