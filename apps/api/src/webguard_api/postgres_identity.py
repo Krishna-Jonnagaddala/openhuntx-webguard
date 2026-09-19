@@ -210,7 +210,37 @@ class PostgresIdentityRepository:
         return value
 
     def get_principal(self, principal_id: str) -> Principal:
+        """P1-2 Phase H follow-up (2026-09-18): this method ran under
+        role_scoped_connection with no tenant context at all: the
+        identical gap set_password_hash had, found while proving that
+        fix against a real forced-RLS database (this method is on the
+        critical path of literally every flow tested there: it is
+        create_token's own way of discovering a principal's
+        organization, and BrowserSessionAuthenticator.authenticate's
+        way of resolving a session's principal). Unlike
+        set_password_hash, this method's callers cannot all be given a
+        trusted organization_id to pass in (create_token's only input
+        is principal_id; discovering the organization IS what calling
+        this is for), so widening its signature would be circular for
+        them. Fixed the same way get_principal_by_email already is:
+        resolve organization_id first, under api_tenant_data with no
+        tenant context (via webguard_control.resolve_principal_organization,
+        the identical minimal SECURITY DEFINER shape resolve_job_organization
+        already established), then set_tenant_context on the same
+        connection, then read the full row as an ordinary, now-tenant-
+        scoped query. No signature change; every existing caller
+        (create_token, assign_authorization, get_principal_scoped,
+        BrowserSessionAuthenticator, and every service.py call site)
+        needed zero changes."""
+
         with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+            organization_row = connection.execute(
+                "SELECT webguard_control.resolve_principal_organization(%s)",
+                (principal_id,),
+            ).fetchone()
+            if organization_row is None or organization_row[0] is None:
+                raise IdentityStoreError("principal_not_found", "Principal was not found.")
+            set_tenant_context(connection, organization_row[0])
             row = connection.execute(
                 f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals WHERE principal_id = %s",  # noqa: S608
                 (principal_id,),
@@ -333,9 +363,14 @@ class PostgresIdentityRepository:
             last_login_at=principal.last_login_at,
         )
 
-    def set_principal_email_verified(self, principal_id: str, *, now: datetime) -> Principal:
+    def set_principal_email_verified(self, principal_id: str, organization_id: str, *, now: datetime) -> Principal:
+        # P1-2 Phase H follow-up (2026-09-18): same tenant-context gap
+        # as set_password_hash, same fix shape. Every real caller
+        # (service.py's confirm_email_verification and accept_invitation)
+        # already has organization_id from the IdentityTokenRecord
+        # consume_identity_token just returned.
         principal = self.get_principal(principal_id)
-        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 "UPDATE principals SET email_verified_at = %s WHERE principal_id = %s",
                 (now, principal_id),
@@ -353,14 +388,36 @@ class PostgresIdentityRepository:
             last_login_at=principal.last_login_at,
         )
 
-    def touch_last_login(self, principal_id: str, *, now: datetime) -> None:
-        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+    def touch_last_login(self, principal_id: str, organization_id: str, *, now: datetime) -> None:
+        # P1-2 Phase H follow-up (2026-09-18): same gap, same fix.
+        # login()'s only two callers already have the just-resolved
+        # Principal's own organization_id in scope.
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 "UPDATE principals SET last_login_at = %s WHERE principal_id = %s",
                 (now, principal_id),
             )
 
-    def set_password_hash(self, principal_id: str, *, algorithm: str, password_hash: str, now: datetime) -> None:
+    def set_password_hash(
+        self, principal_id: str, organization_id: str, *, algorithm: str, password_hash: str, now: datetime
+    ) -> None:
+        # P1-2 Phase H gap closed 2026-09-18: this method ran under
+        # role_scoped_connection (API_TENANT_DATA_ROLE) with no tenant
+        # context set at all, converted correctly to a restricted role
+        # in an earlier Phase H slice but never given the organization_id
+        # its own RLS policy needs. password_credentials' INSERT/UPDATE
+        # policies (tenant_isolation_rls_policies.sql) are both predicated
+        # on EXISTS(... principals ... organization_id = webguard_current_tenant()),
+        # since the table carries no organization_id column of its own.
+        # Every real caller already has a server-resolved organization_id
+        # in scope before it ever calls this method (service.py's
+        # register_account has the just-created Organization; login's
+        # rehash path and change_password have it on the Principal/
+        # AuthContext they already authenticated; confirm_password_reset
+        # and accept_invitation have it on the IdentityTokenRecord
+        # consume_identity_token just returned); none of the five call
+        # sites needed to look anything up newly to supply this.
+        #
         # Two statements, one transaction (this method's own connection
         # checkout is the transaction boundary, unchanged): INSERT ...
         # ON CONFLICT DO NOTHING first, then a conditional UPDATE only
@@ -368,14 +425,14 @@ class PostgresIdentityRepository:
         # UPDATE: that shape's DO UPDATE SET clause would have to
         # reference EXCLUDED.password_hash, and PostgreSQL requires
         # SELECT privilege on any target-table column a DO UPDATE
-        # clause references this way -- which would force api_tenant_data
+        # clause references this way, which would force api_tenant_data
         # to hold direct SELECT on the password hash column just to
         # write it. This shape's UPDATE assigns caller-supplied
         # parameters directly, never EXCLUDED or the row's own existing
         # values, so it only ever needs SELECT on principal_id (the
-        # WHERE-clause column) -- see tenant_isolation_acl.sql's own
+        # WHERE-clause column); see tenant_isolation_acl.sql's own
         # comment on this grant for the full empirical trace.
-        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO password_credentials (principal_id, algorithm, password_hash, created_at, updated_at)
@@ -395,27 +452,23 @@ class PostgresIdentityRepository:
                 )
 
     def get_password_hash(self, principal_id: str) -> str | None:
-        """P1-2 Phase H gap, not yet closed: unlike get_principal_by_email
-        (which the same login() caller uses right before this one and
-        which now resolves through webguard_control.resolve_principal_by_email),
-        this method has no control-function counterpart. Phase F's 13
-        functions are keyed by token, session, or email, none by a
-        bare principal_id, and this method's second caller
-        (service.py's change_password, using context.principal_id from
-        an already-authenticated session, not an email) could not use
-        resolve_principal_by_email even if this one did. api_tenant_data
-        has zero SELECT granted on password_credentials at all (Phase
-        D's own correction), so this raw query only works today because
-        every WebGuard process still runs as webguard, unrestricted; it
-        will fail outright, for both callers, the moment either process
-        actually runs this query under api_tenant_data. Closing this
-        needs a new principal_id-keyed SECURITY DEFINER function with
-        the same design scrutiny Phase F's other 13 got, not a
-        unilateral addition here."""
+        """P1-2 Phase H gap closed: webguard_control.resolve_password_hash
+        is a new principal_id-keyed SECURITY DEFINER function (none of
+        Phase F's original 13 were keyed by a bare principal_id:
+        login() already has a resolved Principal from
+        get_principal_by_email, but that function deliberately never
+        returns password_hash, and change_password() only ever holds
+        an already-authenticated context.principal_id, never an
+        email). Returns only password_hash, matching this method's own
+        return shape exactly. Both real callers (service.py's login()
+        and change_password()) run inside the API serve process, which
+        is exactly api_tenant_data's own domain, and neither needs
+        organization_id for this specific lookup, since principal_id is
+        already a global unique key."""
 
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                "SELECT password_hash FROM password_credentials WHERE principal_id = %s",
+                "SELECT webguard_control.resolve_password_hash(%s)",
                 (principal_id,),
             ).fetchone()
         return None if row is None else row[0]
@@ -455,46 +508,41 @@ class PostgresIdentityRepository:
     def consume_identity_token(
         self, token: object, *, purpose: IdentityTokenPurpose, now: datetime
     ) -> IdentityTokenRecord:
-        """P1-2 Phase H gap, not yet closed: webguard_control.resolve_identity_token
-        exists and correctly resolves everything this method validates
-        against (purpose, used_at, expires_at, secret_hash), but the
-        pattern that converted authenticate_token and
-        get_principal_by_email (resolve via the function, then an
-        ordinary tenant-scoped query for whatever the function
-        deliberately omits) does not extend here. tenant_isolation_acl.sql
-        grants api_tenant_data only a 4-column SELECT on identity_tokens
-        (token_id, principal_id, purpose, used_at): no created_at, and
-        no organization_id, so there is no ordinary query under this
-        role that can either read created_at back or scope the
-        post-resolution UPDATE by organization_id the way
-        authenticate_token's last_used_at write now does. This raw
-        query works today only because every WebGuard process still
-        runs as webguard, unrestricted; closing this gap needs
-        resolve_identity_token's own RETURNS TABLE extended to include
-        created_at (a change to Phase F's already-reviewed SQL, not a
-        wiring change), not a unilateral addition here."""
+        """P1-2 Phase H gap closed: webguard_control.resolve_identity_token's
+        RETURNS TABLE now includes created_at, appended after the
+        original 7 columns (see the SQL file's own comment on why
+        this needed DROP FUNCTION/CREATE FUNCTION, not CREATE OR
+        REPLACE): the one column this method's own IdentityTokenRecord
+        contract needed that the function did not yet return. Now
+        follows the same pattern authenticate_token/get_principal_by_email
+        already use: resolve via the function under api_tenant_data,
+        then (once organization_id is known) set_tenant_context on the
+        same connection before the post-resolution UPDATE, so that
+        UPDATE runs correctly scoped once a future phase force-enables
+        identity_tokens' own tenant-predicated RLS policy. secret_hash/
+        purpose/used_at/expires_at verification, and their exact error
+        codes and ordering, are completely unchanged. Only the
+        connection/privilege plumbing underneath moved."""
 
         token_id, secret = _parse_prefixed_secret(
             token, prefix=IDENTITY_TOKEN_PREFIX, error_code="identity_token_invalid"
         )
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                """
-                SELECT token_id, principal_id, organization_id, purpose, secret_hash,
-                       created_at, expires_at, used_at
-                FROM identity_tokens WHERE token_id = %s
-                """,
+                "SELECT * FROM webguard_control.resolve_identity_token(%s)",
                 (token_id,),
             ).fetchone()
             if row is None or not _verify_secret(secret, row[4]):
                 raise IdentityStoreError("identity_token_invalid", "Token is invalid.")
             if row[3] != purpose.value:
                 raise IdentityStoreError("identity_token_invalid", "Token is invalid.")
-            if row[7] is not None:
+            if row[6] is not None:
                 raise IdentityStoreError("identity_token_used", "Token has already been used.")
-            expires_at = row[6].astimezone(timezone.utc)
+            expires_at = row[5].astimezone(timezone.utc)
             if now.astimezone(timezone.utc) >= expires_at:
                 raise IdentityStoreError("identity_token_expired", "Token has expired.")
+            organization_id = row[2]
+            set_tenant_context(connection, organization_id)
             connection.execute(
                 "UPDATE identity_tokens SET used_at = %s WHERE token_id = %s",
                 (now, token_id),
@@ -502,28 +550,36 @@ class PostgresIdentityRepository:
         return IdentityTokenRecord(
             token_id=str(row[0]),
             principal_id=str(row[1]),
-            organization_id=str(row[2]),
+            organization_id=str(organization_id),
             purpose=IdentityTokenPurpose(row[3]),
-            created_at=row[5].astimezone(timezone.utc),
+            created_at=row[7].astimezone(timezone.utc),
             expires_at=expires_at,
             used_at=now,
         )
 
     def invalidate_identity_tokens(
-        self, principal_id: str, *, purpose: IdentityTokenPurpose, now: datetime
+        self, principal_id: str, organization_id: str, *, purpose: IdentityTokenPurpose, now: datetime
     ) -> None:
         """Mark every still-usable token of this purpose for this
         principal as used, without needing its secret -- used when a new
         token supersedes an older, still-pending one (e.g. requesting a
-        second password reset invalidates the first). P1-2 Phase H:
-        principal_id, purpose, and used_at are exactly the columns
-        tenant_isolation_acl.sql grants api_tenant_data SELECT on for
-        identity_tokens (proven necessary for this statement's own
-        WHERE clause), so this runs under api_tenant_data via
-        role_scoped_connection, unlike consume_identity_token, which
-        also needs created_at and organization_id and stays blocked."""
+        second password reset invalidates the first). principal_id,
+        purpose, and used_at are exactly the columns tenant_isolation_acl.sql
+        grants api_tenant_data SELECT on for identity_tokens (proven
+        necessary for this statement's own WHERE clause).
 
-        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+        P1-2 Phase H follow-up (2026-09-18): this ran under
+        role_scoped_connection with no tenant context, the same gap
+        set_password_hash had. identity_tokens' own UPDATE policy is
+        predicated on organization_id = webguard_current_tenant()
+        directly (the table carries the column itself, unlike
+        password_credentials), so it needed the same tenant_connection
+        fix once forced RLS was actually exercised end to end. Both real
+        callers (service.py's request_password_reset and
+        request_email_verification) already have organization_id on the
+        Principal they just resolved."""
+
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             connection.execute(
                 """
                 UPDATE identity_tokens SET used_at = %s
@@ -532,8 +588,11 @@ class PostgresIdentityRepository:
                 (now, principal_id, purpose.value),
             )
 
-    def list_tokens_for_principal(self, principal_id: str) -> tuple[ApiTokenMetadata, ...]:
-        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+    def list_tokens_for_principal(self, principal_id: str, organization_id: str) -> tuple[ApiTokenMetadata, ...]:
+        # P1-2 Phase H follow-up (2026-09-18): same gap, same fix.
+        # service.py's list_api_keys already has context.organization_id
+        # (self-service, authenticated).
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             rows = connection.execute(
                 """
                 SELECT token_id, organization_id, principal_id, label,
@@ -556,8 +615,12 @@ class PostgresIdentityRepository:
             for row in rows
         )
 
-    def revoke_token_owned(self, token_id: str, *, principal_id: str, now: datetime) -> ApiTokenMetadata:
-        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+    def revoke_token_owned(
+        self, token_id: str, organization_id: str, *, principal_id: str, now: datetime
+    ) -> ApiTokenMetadata:
+        # P1-2 Phase H follow-up (2026-09-18): same gap, same fix.
+        # service.py's revoke_api_key already has context.organization_id.
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
                 """
                 SELECT token_id, organization_id, principal_id, label,

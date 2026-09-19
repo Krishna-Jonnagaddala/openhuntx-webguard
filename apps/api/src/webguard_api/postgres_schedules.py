@@ -324,21 +324,19 @@ class PostgresScheduleRepository:
         ``get_schedule_permit_binding_scoped`` for the customer/
         service-facing equivalent.
 
-        P1-2 Phase H gap, not yet closed: this method's only caller
-        anywhere in this codebase is scheduler.py, the scheduler
-        process. schedule_permits has no scheduler_tenant_data grant
-        at all (only api_tenant_data has SELECT), so there is no
-        restricted role that is both this method's true caller and
-        actually able to run the query. This raw query works only
-        because every WebGuard process still runs as webguard,
-        unrestricted. Closing this needs either a narrow SECURITY
-        DEFINER resolver granted to scheduler_tenant_data or an ACL
-        change extending it a SELECT on this table, not a unilateral
-        addition here."""
+        P1-2 Phase H gap closed: webguard_control.resolve_schedule_permit_binding
+        is a new SECURITY DEFINER function, the same shape as
+        postgres_jobs.py's resolve_job_permit_binding: owned by
+        scheduler_function_owner, reusing its existing SELECT grant on
+        schedule_permits (Phase E, originally for enqueue_due_schedule's
+        own binding check) and that grant's existing unconditional RLS
+        policy, since schedule_permits has no organization_id column to
+        predicate a tenant-scoped policy on. Granted EXECUTE to
+        scheduler_tenant_data, its one true caller (scheduler.py)."""
 
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(SCHEDULER_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                "SELECT permit_id, permit_sha256 FROM schedule_permits WHERE schedule_id = %s",
+                "SELECT * FROM webguard_control.resolve_schedule_permit_binding(%s)",
                 (schedule_id,),
             ).fetchone()
         return None if row is None else (str(row[0]), row[1])
@@ -382,15 +380,6 @@ class PostgresScheduleRepository:
             ).fetchall()
         return tuple(self._record_from_row(row) for row in rows)
 
-    @staticmethod
-    def _next_schedule_time(scheduled_for: datetime, *, interval_seconds: int, now: datetime) -> datetime:
-        interval = timedelta(seconds=interval_seconds)
-        next_run = scheduled_for + interval
-        if next_run > now:
-            return next_run
-        intervals = ((now - scheduled_for) // interval) + 1
-        return scheduled_for + (interval * intervals)
-
     def enqueue_due_schedule(
         self,
         schedule_id: str,
@@ -411,138 +400,105 @@ class PostgresScheduleRepository:
         (``ScanScheduleCoordinator``) treats that as "raced" or "blocked"
         exactly as it already does for the SQLite backend.
 
-        P1-2 Phase H gap, not yet closed: webguard_control.enqueue_due_schedule
-        exists and reproduces this method's exact sequence, but its own
-        RETURNS TABLE is a deliberately minimized 8-column summary
-        (outcome, schedule_id, schedule_state, schedule_revision,
-        schedule_next_run_at, job_id, job_state, job_submitted_at),
-        enough for this method's own live caller (scheduler.py's
-        run_once, which only ever reads the returned job record's
-        job_id) but not enough to reconstruct the full
-        ScanScheduleRecord/ScanJobRecord this method's own contract
-        promises. scheduler_tenant_data has no table-level grant on
-        scan_schedules, scan_jobs, schedule_permits, or job_permits at
-        all, so there is no ordinary-refetch fallback to fill the
-        remaining fields the way authenticate_token's does. Closing
-        this needs either widening the function's own return columns
-        (a change to Phase F's already-reviewed SQL) or narrowing this
-        method's own return contract to match what its one real caller
-        actually uses, both real design decisions, not a wiring change
-        made unilaterally here."""
+        P1-2 Phase H gap closed: webguard_control.enqueue_due_schedule's
+        own RETURNS TABLE is now widened (DROP FUNCTION/CREATE FUNCTION,
+        not CREATE OR REPLACE, see the SQL file's own comment on why)
+        to every column this method's ScanScheduleRecord/ScanJobRecord
+        reconstruction needs, appended after the original 8-column
+        outcome summary so scheduler.py's run_once and every existing
+        test call site that reads those first 8 columns positionally
+        keeps working unchanged. Widening the SQL function's own return
+        columns was chosen over narrowing this method's Python contract
+        to what run_once alone reads (job_id): this repository method's
+        return type is shared, by convention, with the SQLite backend
+        of the same repository_contracts.py interface, and
+        tests/unit/test_schedule_store.py and this project's
+        transaction/race/authority contract tests
+        (test_phase3_revocation_cancellation_races.py,
+        test_phase3_transaction_schedule_safety.py,
+        test_phase4_scheduler_authority_toc.py) all exercise the full
+        pair against that backend, and narrowing only the Postgres
+        backend's shape would make the two backends silently diverge.
+        The function's own transactional logic (the FOR UPDATE read,
+        the revision CAS, the idempotency-key race handling, the
+        schedule-advancement UPDATE) is completely unchanged, so the
+        existing concurrency tests for it keep proving what they always
+        proved. outcome branches to the exact same return-or-raise
+        shape this method always had: 'not_due' / 'authorization_not_assigned'
+        / 'permit_invalid' / 'raced' return None; 'binding_changed'
+        raises trustscan_schedule_binding_changed;
+        'schedule_conflict' raises schedule_enqueue_conflict; 'ok'
+        returns the full (ScanScheduleRecord, ScanJobRecord) pair."""
 
-        with self._pool.connection() as connection:
-            row = connection.execute(
-                f"SELECT {_COLUMNS} FROM scan_schedules WHERE schedule_id = %s FOR UPDATE",  # noqa: S608
+        with self._pool.role_scoped_connection(SCHEDULER_TENANT_DATA_ROLE) as connection:
+            # request_fingerprint must be computed in Python (the one
+            # reviewed implementation of ScanJobRequest's canonical-JSON
+            # algorithm; see the SQL function's own comment on why
+            # this is not reimplemented in PL/pgSQL), which needs
+            # target/authorization_id/mode. Those are immutable for a
+            # schedule's entire lifetime (no method anywhere in this
+            # codebase ever changes them after create_schedule), but
+            # scheduler_tenant_data has no table-level grant on
+            # scan_schedules to read them directly, hence this small,
+            # dedicated resolver, called before the main function.
+            shape = connection.execute(
+                "SELECT * FROM webguard_control.resolve_schedule_request_shape(%s)",
                 (schedule_id,),
             ).fetchone()
-            if row is None:
+            if shape is None:
                 return None
-            schedule = self._record_from_row(row)
-            if (
-                schedule.state is not ScanScheduleState.ACTIVE
-                or schedule.revision != expected_revision
-                or schedule.next_run_at > now
-            ):
-                return None
-
-            assignment = connection.execute(
-                "SELECT 1 FROM organization_authorizations WHERE organization_id = %s AND authorization_id = %s",
-                (schedule.organization_id, schedule.authorization_id),
-            ).fetchone()
-            if assignment is None:
-                return None
-
-            binding = connection.execute(
-                "SELECT permit_id, permit_sha256 FROM schedule_permits WHERE schedule_id = %s",
-                (schedule.schedule_id,),
-            ).fetchone()
-            if binding is None or str(binding[0]) != permit_id or binding[1] != permit_sha256:
-                raise JobStoreError(
-                    "trustscan_schedule_binding_changed",
-                    "TrustScan schedule permit binding changed before enqueue.",
-                )
-
-            permit_row = connection.execute(
-                """
-                SELECT permit_id FROM scan_permits
-                WHERE permit_id = %s AND organization_id = %s AND permit_sha256 = %s
-                  AND revoked_at IS NULL AND not_before <= %s AND %s < expires_at
-                """,
-                (permit_id, schedule.organization_id, permit_sha256, now, now),
-            ).fetchone()
-            if permit_row is None:
-                return None
-
-            scheduled_for = schedule.next_run_at
-            scheduled_for_key = (
-                scheduled_for.astimezone(timezone.utc)
-                .isoformat(timespec="microseconds")
-                .replace("+00:00", "Z")
-            )
-            idempotency_key = f"schedule:{schedule.schedule_id}:{scheduled_for_key}"
             request = ScanJobRequest(
-                idempotency_key=idempotency_key,
-                target=schedule.target,
-                authorization_id=schedule.authorization_id,
+                # Only used transiently to compute .fingerprint below;
+                # never persisted, since the SQL function computes and
+                # stores its own idempotency_key internally, from the
+                # schedule's actual next_run_at.
+                idempotency_key=f"schedule:{schedule_id}:fingerprint-only",
+                target=shape[0],
+                authorization_id=shape[1],
                 authorization_sha256=authorization_sha256,
-                mode=schedule.mode,
+                mode=ScanJobMode(shape[2]),
                 submitted_at=now,
             )
-            job_id = str(uuid4())
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO scan_jobs (
-                        job_id, organization_id, submitted_by, idempotency_key,
-                        request_fingerprint, target, authorization_id, authorization_sha256,
-                        mode, submitted_at, state, updated_at, revision, cancellation_requested
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, FALSE)
-                    """,
-                    (
-                        job_id, schedule.organization_id, schedule.created_by,
-                        request.idempotency_key, request.fingerprint, request.target,
-                        request.authorization_id, request.authorization_sha256,
-                        request.mode.value, now, ScanJobState.QUEUED.value, now,
-                    ),
-                )
-            except DatabaseIntegrityError:
-                # The unique idempotency-key index rejected a duplicate
-                # occurrence -- a second layer of protection behind the
-                # revision CAS above (requirement 4). Whoever inserted
-                # first wins; this caller sees "raced," identically to a
-                # lost revision race.
-                return None
-            connection.execute(
-                "INSERT INTO job_permits (job_id, permit_id, permit_sha256) VALUES (%s, %s, %s)",
-                (job_id, permit_id, permit_sha256),
-            )
-            next_run_at = self._next_schedule_time(
-                scheduled_for, interval_seconds=schedule.interval_seconds, now=now
-            )
-            updated = connection.execute(
+            row = connection.execute(
                 """
-                UPDATE scan_schedules
-                SET authorization_sha256 = %s, updated_at = %s, next_run_at = %s,
-                    revision = revision + 1, last_enqueued_at = %s, last_job_id = %s,
-                    last_error_code = NULL, last_error_at = NULL
-                WHERE schedule_id = %s AND revision = %s AND state = %s
+                SELECT
+                    outcome,
+                    schedule_id, schedule_organization_id, schedule_created_by, schedule_name,
+                    schedule_target, schedule_authorization_id, schedule_authorization_sha256,
+                    schedule_mode, schedule_interval_seconds, schedule_state, schedule_created_at,
+                    schedule_updated_at, schedule_next_run_at, schedule_revision,
+                    schedule_last_enqueued_at, schedule_last_job_id, schedule_last_error_code,
+                    schedule_last_error_at,
+                    job_id, job_target, job_authorization_id, job_authorization_sha256, job_mode,
+                    job_state, job_revision, job_cancellation_requested, job_submitted_at,
+                    job_updated_at, job_started_at, job_completed_at, job_scan_id,
+                    job_result_status, job_report_ref, job_audit_ref, job_error_code,
+                    job_error_message, job_idempotency_key
+                FROM webguard_control.enqueue_due_schedule(%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    authorization_sha256, now, next_run_at, now, job_id,
-                    schedule.schedule_id, expected_revision, ScanScheduleState.ACTIVE.value,
+                    schedule_id, expected_revision, authorization_sha256, permit_id,
+                    permit_sha256, now, request.fingerprint,
                 ),
-            )
-            if updated.rowcount != 1:
-                # Lost the CAS despite the row lock above -- unreachable
-                # under `FOR UPDATE` in practice, but fail closed rather
-                # than assert it can never happen.
-                raise JobStoreError(
-                    "schedule_enqueue_conflict", "The scheduled run conflicts with an existing job."
-                )
-            job_row = connection.execute(
-                f"SELECT {_JOB_COLUMNS} FROM scan_jobs WHERE job_id = %s", (job_id,)  # noqa: S608
             ).fetchone()
-        return self.get_schedule_scoped(schedule.schedule_id, schedule.organization_id), _job_record_from_row(job_row)
+
+        outcome = row[0]
+        if outcome == "binding_changed":
+            raise JobStoreError(
+                "trustscan_schedule_binding_changed",
+                "TrustScan schedule permit binding changed before enqueue.",
+            )
+        if outcome == "schedule_conflict":
+            raise JobStoreError(
+                "schedule_enqueue_conflict", "The scheduled run conflicts with an existing job."
+            )
+        if outcome != "ok":
+            # not_due / authorization_not_assigned / permit_invalid / raced.
+            return None
+
+        schedule_record = self._record_from_row(tuple(row[1:19]))
+        job_record = _job_record_from_row(tuple(row[19:38]))
+        return schedule_record, job_record
 
     def block_due_schedule(
         self, schedule_id: str, *, expected_revision: int, error_code: str, now: datetime

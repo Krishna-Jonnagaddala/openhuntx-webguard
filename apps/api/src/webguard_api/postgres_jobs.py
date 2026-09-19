@@ -276,20 +276,21 @@ class PostgresJobRepository:
         ``get_job_permit_binding_scoped`` for the customer/service-facing
         equivalent, which is what ``service.py`` must use).
 
-        P1-2 Phase H gap, not yet closed: this method's only callers
-        anywhere in this codebase are both in executor.py, the worker.
-        job_permits has no worker_tenant_data grant at all (only
-        api_tenant_data has SELECT), so there is no restricted role
-        that is both this method's true caller and actually able to
-        run the query. This raw query works only because every
-        WebGuard process still runs as webguard, unrestricted.
-        Closing this needs either a narrow SECURITY DEFINER resolver
-        granted to worker_tenant_data or an ACL change extending it a
-        SELECT on this table, not a unilateral addition here."""
+        P1-2 Phase H gap closed: webguard_control.resolve_job_permit_binding
+        is a new SECURITY DEFINER function owned by worker_function_owner,
+        reusing that role's existing SELECT grant on job_permits (Phase
+        E, originally for claim_next_job's own claimable-row query) and
+        its existing unconditional RLS policy on the same table:
+        job_permits has no organization_id column to predicate a
+        tenant-scoped policy on at all, which is exactly why this
+        method's own callers (both in executor.py, the worker, for a
+        job_id it already legitimately leased) never needed tenant
+        scoping here either. Granted EXECUTE to worker_tenant_data, its
+        one true caller."""
 
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(WORKER_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                "SELECT permit_id, permit_sha256 FROM job_permits WHERE job_id = %s",
+                "SELECT * FROM webguard_control.resolve_job_permit_binding(%s)",
                 (job_id,),
             ).fetchone()
         return None if row is None else (str(row[0]), row[1])
@@ -548,21 +549,23 @@ class PostgresJobRepository:
         return self._record_from_row(row), True
 
     def get(self, job_id: str) -> ScanJobRecord:
-        """P1-2 Phase H gap, not yet closed: this method has no caller
-        in the API serve process at all. Its only reachable path is
-        through is_cancellation_requested, called exclusively from
-        worker.py's own run loop. worker_tenant_data has no grant on
-        scan_jobs whatsoever, the same restriction get_scope's own
-        docstring documents, so there is no role that is both this
-        method's true caller and actually able to run the query.
-        Running it under api_tenant_data would misrepresent which
-        process is doing the reading, so this stays on the
-        unrestricted connection rather than picking a role that would
-        only happen to work in this sandbox. Closing this needs either
-        a narrow SECURITY DEFINER resolver granted to worker_tenant_data
-        (returning just cancellation_requested by job_id) or an ACL
-        change extending it a column-limited SELECT, not a unilateral
-        addition here."""
+        """P1-2 Phase H gap closed, differently from the other 8: this
+        method itself has no caller anywhere in the API serve process,
+        and its one former reachable path, is_cancellation_requested,
+        called exclusively from worker.py's own run loop, was
+        converted to call webguard_control.resolve_job_cancellation_requested
+        directly instead of routing through this method's full-row
+        read (see is_cancellation_requested's own docstring). That
+        leaves get() with zero production callers left, the same shape
+        this codebase's own stated principle addresses for
+        revoke_token/assign_authorization/revoke_registration ("if a
+        privilege cannot be tied to a live current method, do not
+        grant it"): there is no real caller to design a restricted
+        role's privilege against, so get() stays on the unrestricted
+        connection rather than picking a role that would only happen
+        to work in a test sandbox. Retained for repository-contract
+        parity with the SQLite backend (ScanJobStore.get) and any test
+        that exercises the full ScanJobRecord shape directly."""
 
         with self._pool.connection() as connection:
             row = connection.execute(
@@ -573,25 +576,22 @@ class PostgresJobRepository:
         return self._record_from_row(row)
 
     def get_scope(self, job_id: str) -> tuple[str, str] | None:
-        """P1-2 Phase H gap, not yet closed: webguard_control.resolve_job_organization
-        exists and is exactly what this method's own current live
-        caller (executor.py, which only ever reads the organization_id
-        half) needs, but this method's own contract also returns
-        submitted_by, which that function does not. worker_tenant_data
-        has zero table-level grant on scan_jobs at all (unlike
-        api_tenant_data's identity tables, there is no ordinary
-        tenant-scoped refetch available here either), so there is no
-        way to resolve submitted_by under the restricted role today.
-        This raw query works only because every WebGuard process still
-        runs as webguard, unrestricted. organization_id_for_job (the
-        one caller that only needs the scalar this function already
-        returns) could convert standalone without this constraint, but
-        has no external caller of its own to prove the conversion
-        against."""
+        """P1-2 Phase H gap closed: webguard_control.resolve_job_scope is
+        a new SECURITY DEFINER function, separate from
+        resolve_job_organization (that one is a scalar function,
+        RETURNS uuid, not RETURNS TABLE), so widening it into a
+        two-column table would have been a return-type change breaking
+        its own five existing call sites (organization_id_for_job plus
+        four direct test call sites) for no benefit to
+        organization_id_for_job, which still only ever needs the
+        scalar. resolve_job_scope instead returns exactly
+        (organization_id, submitted_by), owned by worker_function_owner
+        (reusing its existing scan_jobs SELECT grant and unconditional
+        RLS policy), granted to worker_tenant_data."""
 
-        with self._pool.connection() as connection:
+        with self._pool.role_scoped_connection(WORKER_TENANT_DATA_ROLE) as connection:
             row = connection.execute(
-                "SELECT organization_id, submitted_by FROM scan_jobs WHERE job_id = %s",
+                "SELECT * FROM webguard_control.resolve_job_scope(%s)",
                 (job_id,),
             ).fetchone()
         if row is None or row[0] is None:
@@ -737,7 +737,29 @@ class PostgresJobRepository:
         return self._record_from_row(updated)
 
     def is_cancellation_requested(self, job_id: str) -> bool:
-        return self.get(job_id).cancellation_requested
+        """P1-2 Phase H gap closed: previously ``self.get(job_id).
+        cancellation_requested``, a full-row, unrestricted-connection
+        read purely to check one boolean. get()'s own docstring already
+        rules out running its full-row query under any restricted role
+        for this caller (worker_tenant_data has no scan_jobs grant at
+        all, and api_tenant_data would misrepresent which process is
+        asking), so this method now calls
+        webguard_control.resolve_job_cancellation_requested directly:
+        a narrow function returning ONLY cancellation_requested, owned
+        by worker_function_owner, granted to worker_tenant_data, and it
+        no longer touches get() at all. NULL back means no such job_id
+        (scan_jobs.cancellation_requested is itself NOT NULL), which is
+        how this raises the identical job_not_found error get() used to
+        raise for the same condition."""
+
+        with self._pool.role_scoped_connection(WORKER_TENANT_DATA_ROLE) as connection:
+            row = connection.execute(
+                "SELECT webguard_control.resolve_job_cancellation_requested(%s)",
+                (job_id,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            raise JobStoreError("job_not_found", "Scan job was not found.")
+        return bool(row[0])
 
     # -- leases ----------------------------------------------------------
 

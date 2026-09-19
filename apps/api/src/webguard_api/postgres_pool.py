@@ -64,6 +64,24 @@ _RUNTIME_ROLES = frozenset(
     {API_TENANT_DATA_ROLE, WORKER_TENANT_DATA_ROLE, SCHEDULER_TENANT_DATA_ROLE}
 )
 
+# P1-2 Phase H gap closure (record_observation): unlike the three roles
+# above, callback_receiver is never reached via SET LOCAL ROLE from a
+# "webguard"-authenticated connection. It is a genuinely separate
+# LOGIN identity (tenant_isolation_roles.sql) that the callback-service
+# process authenticates as directly, over its own dedicated DSN, never
+# WEBGUARD_DATABASE_URL's "webguard" identity. Deliberately NOT a
+# member of `_RUNTIME_ROLES`/usable with `role_scoped_connection`: a
+# `WebGuardPostgresPool` constructed against a DSN that already
+# authenticates as this role needs no further role-narrowing
+# statement, and adding it to `_RUNTIME_ROLES` would wrongly imply a
+# "webguard" connection can `SET LOCAL ROLE` into it, which it never
+# should be able to (no membership grant exists for that, by design;
+# see tenant_isolation_control_functions.sql's CALLBACK section). This
+# constant exists purely so callback-service wiring code (cli.py) and
+# this module's own docstrings share one literal rather than repeating
+# the role name as a bare string.
+CALLBACK_RECEIVER_ROLE = "callback_receiver"
+
 
 def _canonical_organization_id(organization_id: str | uuid.UUID) -> str:
     """Validates ``organization_id`` as a real UUID and returns its
@@ -312,6 +330,7 @@ class WebGuardPostgresPool:
 
 __all__ = [
     "API_TENANT_DATA_ROLE",
+    "CALLBACK_RECEIVER_ROLE",
     "DEFAULT_CONNECTION_TIMEOUT_SECONDS",
     "DEFAULT_MAXIMUM_CONNECTIONS",
     "DEFAULT_MINIMUM_CONNECTIONS",

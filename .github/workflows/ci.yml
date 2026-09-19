@@ -282,6 +282,9 @@ jobs:
           python -m unittest tests.integration.test_postgres_control_functions -v
           python -m unittest tests.integration.test_postgres_rls_policies -v
           python -m unittest tests.integration.test_postgres_tenant_isolation_slice13 -v
+          python -m unittest tests.integration.test_postgres_phase_h_gap_closure -v
+          python -m unittest tests.integration.test_postgres_password_hash_tenant_context -v
+          python -m unittest tests.integration.test_postgres_schema_upgrade_compatibility -v
           python -m unittest tests.integration.test_postgres_sessions -v
           python -m unittest tests.integration.test_signing_service_e2e -v
           python -m unittest tests.integration.test_production_mode_e2e -v

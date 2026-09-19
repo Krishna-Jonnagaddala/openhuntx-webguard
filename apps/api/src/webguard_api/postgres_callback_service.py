@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import secrets
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
 
 from webguard_scanner.callback_broker import CallbackPolicy
 
@@ -63,14 +62,20 @@ class PostgresCallbackRegistrationRepository:
     postgres_callback_broker.PostgresCallbackBroker, which is itself
     wired only into executor.py's ScanJobExecutor. register and
     get_registration both run under worker_tenant_data via
-    tenant_connection, matching their true, sole caller. revoke_registration
-    has zero live callers anywhere in this codebase (see
-    tenant_isolation_acl.sql's own header comment on this exact
-    method), and callback_registrations has no UPDATE grant for any
-    tenant-data role, so it stays on the unrestricted connection
-    rather than being narrowed to a role that could not run its own
-    UPDATE. record_observation's own docstring covers its separate,
-    architecturally blocked gap."""
+    tenant_connection, matching their true, sole caller.
+    revoke_registration has zero live callers anywhere in this
+    codebase (see tenant_isolation_acl.sql's own header comment on
+    this exact method, and revoke_registration's own docstring below
+    for this claim re-verified on 2026-09-17), and callback_registrations
+    has no UPDATE grant for any tenant-data role, so it stays on the
+    unrestricted connection rather than being narrowed to a role that
+    could not run its own UPDATE. record_observation's own gap closed
+    2026-09-17: a THIRD, separate instance of this class is
+    constructed only by cli.py's `_callback_service_command`, with a
+    pool that connects as the new callback_receiver LOGIN role
+    (its own dedicated DSN) instead of worker_tenant_data or the
+    unrestricted "webguard" identity; see record_observation's own
+    docstring."""
 
     def __init__(self, pool: WebGuardPostgresPool) -> None:
         self._pool = pool
@@ -179,7 +184,18 @@ class PostgresCallbackRegistrationRepository:
         today even though organization_id is a real parameter here.
         Stays on the unrestricted connection; closing this needs
         either a live caller to prove the grant against or a
-        deliberate decision to grant it anyway ahead of one existing."""
+        deliberate decision to grant it anyway ahead of one existing.
+
+        Re-verified 2026-09-17 (P1-2 Phase H gap-closure pass): still
+        zero live callers. Grepped ``\\.revoke_registration\\(`` and
+        ``broker\\.revoke_registration`` across service.py, http_api.py,
+        cli.py, scheduler.py, worker.py, and executor.py: the only
+        match anywhere in production code is
+        postgres_callback_broker.py's own wrapper *definition*
+        (``PostgresCallbackBroker.revoke_registration``, which forwards
+        to this method); nothing calls that wrapper either. Conclusion
+        unchanged: no privilege granted here, per this file's own
+        stated principle."""
 
         moment = now or datetime.now(timezone.utc)
         with self._pool.connection() as connection:
@@ -208,40 +224,40 @@ class PostgresCallbackRegistrationRepository:
         source_class: str = "external",
         now: datetime | None = None,
     ) -> bool:
-        """P1-2 Phase H, genuinely blocked, not a wiring gap: unlike
-        every other method this phase found a gap in,
-        webguard_control.resolve_and_record_callback_observation has
-        no capability role at all to call it through. Its own SQL
-        comment (Section 9) explains why: the public callback receiver
-        has no organization_id to scope by until a token resolves, so
-        it cannot run as api_tenant_data/worker_tenant_data/
-        scheduler_tenant_data (each already carries ordinary
-        tenant-scoped privileges this pre-authentication path has no
-        business holding), and callback_function_owner is the
-        function's own privileged SECURITY DEFINER owner, not a
-        caller-facing identity. Phase F's own review deliberately
-        granted EXECUTE to no role at all rather than invent a new
-        NOLOGIN role unreviewed, and explicitly deferred that decision
-        to "the future deployment phase that actually wires a LOGIN
-        identity to this path." This raw query is not a stopgap
-        pending a wiring change; it is the only thing that can run
-        until that architecture decision is made."""
+        """P1-2 Phase H gap closed: the future deployment phase Section 9
+        deferred to has arrived. callback_receiver
+        (tenant_isolation_roles.sql) is a new, genuinely separate LOGIN
+        identity, granted EXECUTE on
+        webguard_control.resolve_and_record_callback_observation and
+        NOTHING else (no table grant, no membership in
+        api_tenant_data/worker_tenant_data/scheduler_tenant_data or any
+        other role, no BYPASSRLS). This repository is constructed once
+        for the standalone `webguard-api callback-service` process
+        (cli.py's `_callback_service_command`) with a
+        ``WebGuardPostgresPool`` built from its own dedicated DSN
+        (``WEBGUARD_CALLBACK_DATABASE_URL``), never
+        ``WEBGUARD_DATABASE_URL``'s "webguard" identity, so
+        ``self._pool.connection()`` here already authenticates AS
+        callback_receiver directly; there is no broader ambient role to
+        narrow away from, and no ``SET LOCAL ROLE`` is needed the way
+        the three tenant-data roles need one. If this connection's
+        query path were ever reused for some other statement by
+        mistake, callback_receiver's own lack of any table grant makes
+        that fail with "permission denied," not a silent cross-tenant
+        read (see the SQL function's own hardening: fixed
+        search_path, SECURITY DEFINER, single atomic statement closing
+        the same TOCTOU window this method's own single transaction
+        always closed). Preserves the exact eligibility check and the
+        exact boolean return, matching current code's own generic
+        False for "unknown token" / "expired" / "revoked" alike
+        (Section 23: no new oracle)."""
         moment = now or datetime.now(timezone.utc)
         with self._pool.connection() as connection:
             row = connection.execute(
-                "SELECT revoked_at, expires_at FROM callback_registrations WHERE token_value = %s",
-                (token_value,),
+                "SELECT webguard_control.resolve_and_record_callback_observation(%s, %s, %s, %s)",
+                (token_value, method, source_class, moment),
             ).fetchone()
-            if row is None or row[0] is not None or row[1].astimezone(timezone.utc) <= moment:
-                return False
-            connection.execute(
-                """
-                INSERT INTO callback_observations (observation_id, token_value, method, source_class, observed_at)
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (str(uuid4()), token_value, method, source_class, moment),
-            )
-        return True
+        return bool(row[0])
 
     @staticmethod
     def _registration_from_row(row: tuple) -> ScopedCallbackRegistration:
