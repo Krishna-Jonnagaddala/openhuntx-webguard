@@ -71,6 +71,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+# webguard_production_harness.py is a plain sibling file in this
+# directory, never pip-installed (unlike webguard_api/webguard_contracts,
+# which CI's install-locked-dependencies.sh installs as real packages).
+# `python -m unittest tests.integration.test_postgres_password_hash_tenant_context`
+# from the repo root does not put this directory on sys.path, so the
+# bare `from webguard_production_harness import ...` import inside
+# _stack() below would fail in CI (though not in a local run that
+# happens to already have this directory on PYTHONPATH). Mirrors the
+# identical fix webguard_e2e_server.py's own header already uses for
+# the same import.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 RUN_INTEGRATION = os.environ.get("WEBGUARD_RUN_INTEGRATION") == "1"
 POSTGRES_TEST_DSN = os.environ.get("WEBGUARD_POSTGRES_TEST_DSN")
 RUN_POSTGRES_TESTS = RUN_INTEGRATION and bool(POSTGRES_TEST_DSN)
