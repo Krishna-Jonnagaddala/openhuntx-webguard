@@ -621,6 +621,69 @@ class ControlFunctionBootstrapTests(unittest.TestCase):
         self.assertEqual(row[3], "email_verification")
         self.assertIsNone(row[6])  # used_at
 
+    def test_resolve_password_hash_matches_current_lookup_shape(self) -> None:
+        with self._connect() as connection:
+            org_id, principal_id = self._fresh_org_and_principal(connection)
+            connection.execute(
+                "INSERT INTO password_credentials (principal_id, algorithm, password_hash, created_at, "
+                "updated_at) VALUES (%s,%s,%s,%s,%s)",
+                (principal_id, "argon2id", "the-hash", self.now, self.now),
+            )
+            found = connection.execute(
+                "SELECT webguard_control.resolve_password_hash(%s)", (principal_id,)
+            ).fetchone()[0]
+            missing = connection.execute(
+                "SELECT webguard_control.resolve_password_hash(%s)", (str(uuid.uuid4()),)
+            ).fetchone()[0]
+        self.assertEqual(found, "the-hash")
+        self.assertIsNone(missing, "a principal_id with no password_credentials row must yield NULL")
+
+    def test_resolve_password_hash_has_no_tenant_filter_by_design(self) -> None:
+        """This function is keyed on principal_id alone, like
+        resolve_api_token/resolve_browser_session/resolve_identity_token
+        above -- it does not, and structurally cannot, check that the
+        caller belongs to the same organization as the principal it
+        resolves. That is by design, matching Phase F's original
+        precedent for every other secret-returning resolver: the
+        authorization boundary is which Python call sites are allowed
+        to invoke it, not a SQL-level tenant check. postgres_identity.py's
+        get_password_hash has exactly two real callers (service.py's
+        login and change_password), and both pass a principal_id the
+        server itself already resolved (via get_principal_by_email, or
+        via the caller's own authenticated session), never a value an
+        attacker supplies directly in a request body. This test proves
+        the boundary is exactly as broad as documented, not narrower
+        (which would break those two callers) or wider than assumed."""
+
+        with self._connect() as connection:
+            org_a, principal_a = self._fresh_org_and_principal(connection)
+            _, principal_b = self._fresh_org_and_principal(connection)
+            connection.execute(
+                "INSERT INTO password_credentials (principal_id, algorithm, password_hash, created_at, "
+                "updated_at) VALUES (%s,%s,%s,%s,%s)",
+                (principal_b, "argon2id", "other-org-hash", self.now, self.now),
+            )
+            # principal_a's own organization (org_a) is never referenced
+            # below -- resolving principal_b's hash needs only its
+            # principal_id, proving no implicit tenant scoping exists.
+            del org_a
+            row = connection.execute(
+                "SELECT webguard_control.resolve_password_hash(%s)", (principal_b,)
+            ).fetchone()[0]
+        self.assertEqual(row, "other-org-hash")
+
+    def test_resolve_principal_organization_matches_current_lookup_shape(self) -> None:
+        with self._connect() as connection:
+            org_id, principal_id = self._fresh_org_and_principal(connection)
+            found = connection.execute(
+                "SELECT webguard_control.resolve_principal_organization(%s)", (principal_id,)
+            ).fetchone()[0]
+            missing = connection.execute(
+                "SELECT webguard_control.resolve_principal_organization(%s)", (str(uuid.uuid4()),)
+            ).fetchone()[0]
+        self.assertEqual(str(found), org_id)
+        self.assertIsNone(missing, "an unknown principal_id must yield NULL, not raise")
+
     # -- Worker: claim_next_job concurrency (Section 14) --------------------
 
     def test_claim_next_job_two_concurrent_callers_claim_at_most_one_job(self) -> None:
