@@ -8,8 +8,8 @@ generic contract-level `FindingIdentity.fingerprint` tests in
 never from a timestamp, a per-probe marker, a callback token, or a
 session token. This module proves that property survives the full
 detector pipeline for XSS, SQLi, path traversal, command injection,
-IDOR, SSRF, XXE, and open redirect: running the identical detector twice
-against an
+IDOR, SSRF, XXE, open redirect, and LDAP injection: running the
+identical detector twice against an
 identical (mocked) target produces the same fingerprint despite each
 run generating a fresh, high-entropy probe marker/callback token
 internally, and running against a different endpoint/parameter
@@ -34,6 +34,7 @@ from webguard_scanner import (
     AuthorizationResourcePair,
     run_command_injection_detector,
     run_idor_authorization_detector,
+    run_ldap_injection_detector,
     run_open_redirect_detector,
     run_path_traversal_detector,
     run_reflected_xss_detector,
@@ -101,6 +102,13 @@ from tests.unit.test_open_redirect_detector import (
     _context as _openredirect_context,
     _redirect_to as _openredirect_redirect_to,
     _target as _openredirect_target,
+)
+from tests.unit.test_ldap_injection_detector import (
+    _FakeResponse as _LdapFakeResponse,
+    _ScriptedConnection as _LdapScriptedConnection,
+    _candidate as _ldap_candidate,
+    _context as _ldap_context,
+    _target as _ldap_target,
 )
 
 
@@ -444,6 +452,37 @@ class OpenRedirectFingerprintDeterminismTests(unittest.TestCase):
         first = self._run().findings[0]
         second = self._run(
             candidate=_openredirect_candidate(url="http://example.com/other")
+        ).findings[0]
+        self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+
+class LdapInjectionFingerprintDeterminismTests(unittest.TestCase):
+    def _responder(self, value):
+        if value.endswith(")"):
+            return _LdapFakeResponse(b"bad search filter", status=500)
+        return _LdapFakeResponse(b"<html>ok</html>", status=200)
+
+    def _run(self, candidate=None):
+        connection = _LdapScriptedConnection(self._responder)
+        with patch(
+            "webguard_scanner.safe_http._make_connection", return_value=connection
+        ):
+            return run_ldap_injection_detector(
+                _ldap_target(),
+                (candidate or _ldap_candidate(),),
+                _ldap_context(),
+                policy=ActiveDetectionPolicy(minimum_delay_seconds=0.0),
+            )
+
+    def test_same_vulnerability_two_runs_same_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run().findings[0]
+        self.assertEqual(first.fingerprint, second.fingerprint)
+
+    def test_different_endpoint_different_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run(
+            candidate=_ldap_candidate(url="http://example.com/other")
         ).findings[0]
         self.assertNotEqual(first.fingerprint, second.fingerprint)
 

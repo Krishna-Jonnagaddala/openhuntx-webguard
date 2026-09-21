@@ -140,6 +140,12 @@ from .open_redirect_detector import (
     OpenRedirectOutcome,
     run_open_redirect_detector,
 )
+from .ldap_injection_detector import (
+    LdapInjectionDetectorRunRecord,
+    LdapInjectionDetectorRunResult,
+    LdapInjectionOutcome,
+    run_ldap_injection_detector,
+)
 from .authentication import (
     MAXIMUM_BEARER_TOKEN_BYTES,
     MAXIMUM_COOKIES,
@@ -370,6 +376,10 @@ __all__ = [
     "OpenRedirectDetectorRunResult",
     "OpenRedirectOutcome",
     "run_open_redirect_detector",
+    "LdapInjectionDetectorRunRecord",
+    "LdapInjectionDetectorRunResult",
+    "LdapInjectionOutcome",
+    "run_ldap_injection_detector",
     "BeforeRequestHook",
     "AfterRequestHook",
     "AnalyzerPipelineResult",

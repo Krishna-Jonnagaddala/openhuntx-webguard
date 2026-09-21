@@ -58,6 +58,7 @@ TRUSTSCAN_PROHIBITED_OPERATIONS = (
 KNOWN_TRUSTSCAN_ACTIVE_CHECKS = (
     "active.authorization.idor",
     "active.cmdi.marker",
+    "active.ldapi.error",
     "active.openredirect.location",
     "active.pathtraversal.disclosure",
     "active.sqli.error",

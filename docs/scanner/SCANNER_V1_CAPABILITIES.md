@@ -10,6 +10,8 @@ This is the authoritative, audited inventory of what OpenHuntX WebGuard's scanne
 
 **Slice 14 addendum:** a fourth post-freeze active detector, open redirect (section 16 below), was added the same way. Unlike section 15's XXE, it fits `ACTIVE_DETECTOR_REGISTRY`'s generic calling convention exactly, the same as sections 13-14.
 
+**Slice 15 addendum:** a fifth post-freeze active detector, LDAP injection (section 17 below), was added the same way. Unlike CWE-90's predecessors in this addendum, it was never previously named in `docs/CWE_COVERAGE.md`'s own "Planned" list at all.
+
 **PROVEN** means a named unit test, integration test, or real-network/E2E test currently passes and exercises exactly that claim. **PARTIAL** means some real capability exists but with a stated, real restriction. **NOT SUPPORTED** means the capability does not exist in code at all, not merely undocumented.
 
 ## 1. Target authorization & scope safety
@@ -219,6 +221,22 @@ Open Redirect (Location header only)
 ```
 
 Fits `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention exactly, unlike SSRF/XXE: one request per candidate, no `CallbackBroker`, no wait. Confirmation requires the diagnostic response's status to be one of the five codes browsers actually auto-follow (301/302/303/307/308) with exactly one `Location` header resolving, via `urlsplit(...).hostname`, to this probe's own fresh marker host; response body is never inspected. A drafted classification design was adversarially reviewed by three independent lenses before implementation, finding no false-positive path but three real bugs fixed before any code was written: duplicate-`Location`-header ambiguity, trailing-dot FQDN normalization, and narrowing the accepted status set to the browser-auto-followed five. Candidate reach inherits this codebase's existing discovery-pipeline restrictions (crawl-mode's per-page path filter, the shared state-changing-keyword safety classification) in a way that costs this technique specifically more than the others, since redirect-controlling parameters are classically discovered via a link to a different endpoint or present only in the entry URL's own query string; both are named directly in the detector module's own docstring. This slice also threads a new `allow_redirect_status` keyword-only argument (defaulted False) through `issue_probe` and `issue_templated_request`, so a 3xx response can be read intact instead of becoming a `redirect_blocked` error; every existing caller is unaffected. Authentication support: full. Evidence sanitization and fingerprint determinism: PROVEN (`test_open_redirect_detector.py`, `test_finding_fingerprint_determinism.py::OpenRedirectFingerprintDeterminismTests`). Real-network validation and true end-to-end test: NOT DONE. See `docs/audit/active-detection-phase14-open-redirect.md`.
+
+## 17. LDAP injection (`active.ldapi.error`, CWE-90, Slice 15, post-freeze)
+
+```
+LDAP Injection (filter-syntax-error induction only)
+├── GET query                          PARTIAL   (unit-tested against a mocked connection only)
+├── GET form                           PARTIAL   (same evidence)
+├── POST form                          PARTIAL   (Slice 6 mutation engine, same evidence)
+├── JSON body                          PARTIAL   (same evidence)
+├── DN-injection variant                NOT SUPPORTED  (different metacharacters, corrupts a distinguished name rather than a search filter, structurally distinct technique)
+├── Boolean-based blind detection        NOT SUPPORTED  (no always-true/always-false comparison attempted)
+├── Time-based detection                 NOT SUPPORTED
+└── Node.js ldapjs targets               PARTIAL, WITH A REAL RISK  (this exact payload can crash the target process via a documented, uncaught exception in that library's own filter parser, not merely error one request; see the module's own docstring)
+```
+
+Fits `ACTIVE_DETECTOR_REGISTRY`'s generic calling convention exactly, structurally near-identical to `active.sqli.error`'s own two-request baseline/diagnostic/signature-matching architecture, reused unchanged apart from the payload (a single closing parenthesis appended to the baseline value, not a bare replacement) and the 13-entry signature list. Before implementation, the signature list and payload were fact-checked and stress-tested by three independent lenses against real client-library source and real production incident reports (not assumed from memory): all originally-drafted signatures checked out accurate, 4 more were added to close real coverage gaps (Python's two major LDAP clients, the Apache Directory API stack, Node.js's ldapjs), and one real design ambiguity was caught and resolved in code before it became a bug (the module explicitly appends the payload to the baseline value, never a bare replacement constant, unlike its SQLi/path-traversal siblings). Confirmation requires a specific, implementation-attributable signature (a function name or fully-qualified exception class name, never a bare word) to newly appear in the diagnostic response, absent from the baseline, mirroring SQLi's own classification discipline exactly. One signature, `"bad search filter"`, is the sole bare, non-attributable entry in the list, kept because no false-positive evidence was found against it but named as the first suspect if one is ever reported. Authentication support: full. Evidence sanitization and fingerprint determinism: PROVEN (`test_ldap_injection_detector.py`, `test_finding_fingerprint_determinism.py::LdapInjectionFingerprintDeterminismTests`). Real-network validation and true end-to-end test: NOT DONE. See `docs/audit/active-detection-phase15-ldap-injection.md`.
 
 ## Cross-references
 
