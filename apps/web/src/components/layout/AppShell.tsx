@@ -4,6 +4,7 @@ import { OpenHuntXLockup, ProductLockup, type PlatformProductName } from "../bra
 import { useAuth } from "../../lib/auth";
 import { useModuleEntitlements } from "../../hooks/queries";
 import type { ModuleEntitlementStatus, PlatformModuleId } from "../../lib/api";
+import { IconButton } from "../ui/primitives";
 
 interface ModuleDefinition {
   id: PlatformModuleId;
@@ -156,17 +157,16 @@ export function AppShell() {
       <header className="shrink-0 border-b border-[var(--color-border)] bg-[var(--color-surface)]">
         <div className="flex h-14 items-center justify-between px-4">
           <div className="flex items-center gap-3">
-            <button
-              type="button"
-              className="rounded-md p-2 text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] lg:hidden"
-              aria-label={mobileNavOpen ? "Close navigation menu" : "Open navigation menu"}
+            <IconButton
+              label={mobileNavOpen ? "Close navigation menu" : "Open navigation menu"}
               aria-expanded={mobileNavOpen}
               onClick={() => setMobileNavOpen((open) => !open)}
+              className="lg:hidden"
             >
               <svg viewBox="0 0 20 20" className="h-5 w-5" fill="none" aria-hidden="true">
                 <path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
               </svg>
-            </button>
+            </IconButton>
             <Link to="/app" aria-label="OpenHuntX home">
               <OpenHuntXLockup />
             </Link>
@@ -188,13 +188,7 @@ export function AppShell() {
                 {session.organization_name}
               </span>
             ) : null}
-            <button
-              aria-label="Notifications (no unread notifications)"
-              className="rounded-md p-2 text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]"
-              type="button"
-              disabled
-              title="Notifications are not yet implemented"
-            >
+            <IconButton label="Notifications (no unread notifications)" title="Notifications are not yet implemented" disabled>
               <svg viewBox="0 0 20 20" className="h-5 w-5" fill="none" aria-hidden="true">
                 <path
                   d="M10 3a4 4 0 0 0-4 4v2.2c0 .5-.15 1-.44 1.4L4.5 12.5a1 1 0 0 0 .8 1.6h9.4a1 1 0 0 0 .8-1.6l-1.06-1.9a2.4 2.4 0 0 1-.44-1.4V7a4 4 0 0 0-4-4Z"
@@ -203,7 +197,7 @@ export function AppShell() {
                 />
                 <path d="M8.2 16a1.8 1.8 0 0 0 3.6 0" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
               </svg>
-            </button>
+            </IconButton>
             <div className="relative" ref={menuRef}>
               <button
                 type="button"

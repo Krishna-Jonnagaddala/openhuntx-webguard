@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   Button,
   Card,
@@ -21,6 +21,7 @@ import {
 } from "../hooks/queries";
 import { ApiError } from "../lib/api";
 import type { AssertionCollection, AssertionOutcome, TechnicalAssertion } from "../lib/api";
+import { useAuth } from "../lib/auth";
 
 const OUTCOME_LABEL: Record<AssertionOutcome, { label: string; className: string }> = {
   satisfied: { label: "Satisfied", className: "text-[var(--color-success)] bg-[var(--color-success-bg)]" },
@@ -199,6 +200,7 @@ function AssertionDetail({
   canCollect: boolean;
 }) {
   const { data, isLoading, error } = useAssertionCollections(assertion.assertion_id);
+  const { session } = useAuth();
   const [dialogOpen, setDialogOpen] = useState(false);
 
   return (
@@ -225,8 +227,17 @@ function AssertionDetail({
       {assertion.evaluatable && !canCollect ? (
         <div className="mt-4">
           <InDevelopmentNotice>
-            Compliance is not enabled for your organization, so running a new collection is disabled. Any history
-            below is still visible.
+            {session?.role === "owner" ? (
+              <>
+                Compliance is not enabled for your organization yet. <Link to="/app/settings" className="underline">Enable it from Settings</Link> to run a
+                new collection. Any history below is still visible.
+              </>
+            ) : (
+              <>
+                Compliance is not enabled for your organization, so running a new collection is disabled. Any history
+                below is still visible.
+              </>
+            )}
           </InDevelopmentNotice>
         </div>
       ) : null}
