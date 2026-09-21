@@ -127,6 +127,13 @@ from .ssrf_callback_detector import (
     run_ssrf_callback_detector,
     select_ssrf_candidates,
 )
+from .xxe_callback_detector import (
+    XxeDetectionOutcome,
+    XxeDetectorRunResult,
+    XxeProbeRecord,
+    run_xxe_callback_detector,
+    select_xxe_candidates,
+)
 from .authentication import (
     MAXIMUM_BEARER_TOKEN_BYTES,
     MAXIMUM_COOKIES,
@@ -348,6 +355,11 @@ __all__ = [
     "is_ssrf_candidate_parameter",
     "run_ssrf_callback_detector",
     "select_ssrf_candidates",
+    "XxeDetectionOutcome",
+    "XxeDetectorRunResult",
+    "XxeProbeRecord",
+    "run_xxe_callback_detector",
+    "select_xxe_candidates",
     "BeforeRequestHook",
     "AfterRequestHook",
     "AnalyzerPipelineResult",

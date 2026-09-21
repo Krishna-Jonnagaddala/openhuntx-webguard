@@ -4,14 +4,20 @@ generic contract-level `FindingIdentity.fingerprint` tests in
 `test_findings_contract.py`.
 
 `FindingIdentity.fingerprint` is computed from `rule_id`, `asset`,
-`path`, `method`, and `parameter` only (`webguard_contracts/findings.py`)
--- never from a timestamp, a per-probe marker, a callback token, or a
+`path`, `method`, and `parameter` only (`webguard_contracts/findings.py`),
+never from a timestamp, a per-probe marker, a callback token, or a
 session token. This module proves that property survives the full
-detector pipeline for XSS, SQLi, IDOR, and SSRF: running the identical
-detector twice against an identical (mocked) target produces the same
-fingerprint despite each run generating a fresh, high-entropy probe
-marker/callback token internally, and running against a different
-endpoint/parameter produces a different fingerprint.
+detector pipeline for XSS, SQLi, path traversal, command injection,
+IDOR, SSRF, and XXE: running the identical detector twice against an
+identical (mocked) target produces the same fingerprint despite each
+run generating a fresh, high-entropy probe marker/callback token
+internally, and running against a different endpoint/parameter
+produces a different fingerprint. XXE's fingerprint never includes
+`parameter` at all (it is always `None` for this detector, see
+`xxe_callback_detector.py`'s own module docstring), so its determinism
+claim is narrower and checked separately from the others: same
+endpoint/method twice is the same fingerprint, a different endpoint is
+a different one.
 
 This is required before any production finding-lifecycle/deduplication
 feature (matching a finding across two scans) could be built safely.
@@ -31,6 +37,7 @@ from webguard_scanner import (
     run_reflected_xss_detector,
     run_sqli_error_detector,
     run_ssrf_callback_detector,
+    run_xxe_callback_detector,
 )
 from webguard_scanner.callback_broker import InMemoryCallbackBroker
 
@@ -77,6 +84,13 @@ from tests.unit.test_ssrf_callback_detector import (
     _context as _ssrf_context,
     _target as _ssrf_target,
     _template as _ssrf_template,
+)
+from tests.unit.test_xxe_callback_detector import (
+    _ScriptedConnection as _XxeScriptedConnection,
+    _context as _xxe_context,
+    _post_policy as _xxe_policy,
+    _target as _xxe_target,
+    _template as _xxe_template,
 )
 
 
@@ -342,6 +356,51 @@ class SsrfFingerprintDeterminismTests(unittest.TestCase):
         first = self._run().findings[0]
         second = self._run(
             template=_ssrf_template(endpoint="http://example.com/fetch-vulnerable-2")
+        ).findings[0]
+        self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+
+class XxeFingerprintDeterminismTests(unittest.TestCase):
+    def _run(self, template=None):
+        broker = InMemoryCallbackBroker(base_url="http://127.0.0.1:9/")
+        connection = _XxeScriptedConnection(status=200, body=b"ok")
+
+        original_register = broker.register
+
+        def register_and_deliver(**kwargs):
+            token = original_register(**kwargs)
+            broker.record_observation(token.value, method="GET")
+            return token
+
+        broker.register = register_and_deliver  # type: ignore[method-assign]
+
+        with patch(
+            "webguard_scanner.safe_http._make_connection", return_value=connection
+        ):
+            return run_xxe_callback_detector(
+                _xxe_target(),
+                (template or _xxe_template(endpoint="http://example.com/upload-vulnerable"),),
+                _xxe_context(),
+                callback_broker=broker,
+                policy=_xxe_policy(),
+            )
+
+    def test_same_vulnerability_two_runs_same_fingerprint(self) -> None:
+        # Each run registers a fresh, independent, high-entropy callback
+        # token, and the fingerprint must not depend on it.
+        first = self._run().findings[0]
+        second = self._run().findings[0]
+        self.assertEqual(first.fingerprint, second.fingerprint)
+        self.assertIsNone(first.identity.parameter)
+        self.assertNotEqual(
+            [e.summary for e in first.evidence],
+            [e.summary for e in second.evidence],
+        )
+
+    def test_different_endpoint_different_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run(
+            template=_xxe_template(endpoint="http://example.com/upload-vulnerable-2")
         ).findings[0]
         self.assertNotEqual(first.fingerprint, second.fingerprint)
 

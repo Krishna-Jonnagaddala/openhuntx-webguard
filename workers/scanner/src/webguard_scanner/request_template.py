@@ -74,6 +74,11 @@ class ContentType:
     NONE = ""
     FORM_URLENCODED = "application/x-www-form-urlencoded"
     JSON = "application/json"
+    # Named for readability only (Slice 13's XXE detector): mutate()
+    # has no XML-body branch and never produces this content type;
+    # nothing in this module validates against it, the same as the
+    # three constants above it.
+    XML = "application/xml"
 
 
 @dataclass(frozen=True, slots=True)

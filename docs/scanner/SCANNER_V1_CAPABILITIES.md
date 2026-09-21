@@ -6,6 +6,8 @@ This is the authoritative, audited inventory of what OpenHuntX WebGuard's scanne
 
 **Slice 12 addendum:** two more active detectors were added after this freeze, at the user's explicit request (sections 13-14 below). They follow the identical registry/permit architecture sections 6-9 describe, but are marked PARTIAL rather than PROVEN for the end-to-end and live-target claims sections 6-9 carry, since that verification has not been done for them yet. Sections 1-12 below describe the state as of Slice 11 and are unchanged by Slice 12 except where a section explicitly says otherwise.
 
+**Slice 13 addendum:** a third post-freeze active detector, XXE (section 15 below), was added the same way. Unlike sections 13-14, it does not use `ACTIVE_DETECTOR_REGISTRY` at all: like SSRF, it needs a `CallbackBroker` wait, so it lives in `CALLBACK_ACTIVE_CHECK_IDS` and its own executor function instead.
+
 **PROVEN** means a named unit test, integration test, or real-network/E2E test currently passes and exercises exactly that claim. **PARTIAL** means some real capability exists but with a stated, real restriction. **NOT SUPPORTED** means the capability does not exist in code at all, not merely undocumented.
 
 ## 1. Target authorization & scope safety
@@ -183,6 +185,21 @@ OS Command Injection
 ```
 
 Confirmation requires a fresh, unique marker to appear in the diagnostic response *and* the full raw diagnostic payload to be absent, specifically to rule out a target reflecting the unexecuted payload verbatim (a real false positive found and fixed during this slice, not caught later). Severity is CRITICAL, the highest this project assigns, for a technique proven so far only against a scripted fake connection, not a real shell. Authentication support: full. Evidence sanitization and fingerprint determinism: PROVEN (`test_command_injection_detector.py`, `test_finding_fingerprint_determinism.py::CommandInjectionFingerprintDeterminismTests`). Real-network validation and true end-to-end test: NOT DONE. See `docs/audit/active-detection-phase12-command-injection.md`.
+
+## 15. XXE (`active.xxe.callback`, CWE-611, Slice 13, post-freeze)
+
+```
+XML External Entity injection (out-of-band/blind only)
+├── POST form endpoint, whole-body XML override   PARTIAL  (unit-tested against a mocked connection and the real in-memory CallbackBroker only)
+├── JSON body endpoint, whole-body XML override    PARTIAL  (same evidence)
+├── GET-only endpoints                              NOT SUPPORTED  (no body to replace; never selected)
+├── In-band file disclosure (reflected entity value) NOT SUPPORTED  (see the module's own docstring for why this was ruled out, not just deferred)
+├── In-band error-signature detection                NOT SUPPORTED  (ruled out: a hardened parser's own safe-rejection error often uses the same vocabulary a vulnerable parser's failure could)
+├── Parameter-entity two-stage exfiltration           NOT SUPPORTED  (would require inducing the target to actually read and transmit its own file, the exact risk this detector is built to avoid)
+└── DNS-only out-of-band channel                      NOT SUPPORTED  (only a completed inbound HTTP request at WebGuard's receiver counts as proof)
+```
+
+Unlike path traversal and command injection, this detector does not fit `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention: like SSRF, it requires a `CallbackBroker` registration and a bounded wait for an out-of-band observation, so it lives in `CALLBACK_ACTIVE_CHECK_IDS` and its own `executor._apply_xxe_callback_detection`, a close mirror of `_apply_ssrf_callback_detection`. Confirmation requires a genuine callback observation correlated to a token embedded in the probe's SYSTEM identifier, exactly SSRF's own confirmation logic; response text is never inspected, so there is no in-band signature for a hardened parser's own rejection message to be misread as. Candidate selection dedupes by (endpoint, method) rather than by parameter, since the crafted document replaces the whole request body regardless of which field discovered the endpoint. Authentication support: full, reuses the identical `authentication_material` threading every other detector uses. Evidence sanitization and fingerprint determinism: PROVEN (`test_xxe_callback_detector.py`, `test_finding_fingerprint_determinism.py::XxeFingerprintDeterminismTests`). Real-network validation and true end-to-end test: NOT DONE. See `docs/audit/active-detection-phase13-xxe-callback.md`.
 
 ## Cross-references
 

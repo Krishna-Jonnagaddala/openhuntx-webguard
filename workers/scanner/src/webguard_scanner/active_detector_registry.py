@@ -29,6 +29,12 @@ out-of-band callback" step that does not fit the generic synchronous
 calling convention either. It is tracked in its own
 ``CALLBACK_ACTIVE_CHECK_IDS`` set and executed through
 ``executor._apply_ssrf_callback_detection``.
+
+``active.xxe.callback`` (Slice 13) needs the identical treatment for
+the identical reason: it also confirms through a ``CallbackBroker``
+wait, not a synchronous per-page response. It joins
+``CALLBACK_ACTIVE_CHECK_IDS`` and is executed through
+``executor._apply_xxe_callback_detection``.
 """
 
 from __future__ import annotations
@@ -46,7 +52,7 @@ ACTIVE_DETECTOR_REGISTRY = {
 }
 
 COMPARISON_ACTIVE_CHECK_IDS = frozenset({"active.authorization.idor"})
-CALLBACK_ACTIVE_CHECK_IDS = frozenset({"active.ssrf.callback"})
+CALLBACK_ACTIVE_CHECK_IDS = frozenset({"active.ssrf.callback", "active.xxe.callback"})
 
 KNOWN_ACTIVE_DETECTOR_IDS = (
     frozenset(ACTIVE_DETECTOR_REGISTRY)

@@ -62,6 +62,7 @@ KNOWN_TRUSTSCAN_ACTIVE_CHECKS = (
     "active.sqli.error",
     "active.ssrf.callback",
     "active.xss.reflected",
+    "active.xxe.callback",
 )
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
