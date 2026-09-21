@@ -175,8 +175,8 @@ class CrawlScanTests(unittest.TestCase):
         self.assertEqual(len(result.pages), 1)
         self.assertEqual(result.coverage.pages_succeeded, 1)
         self.assertEqual(result.coverage.requests_attempted, 1)
-        self.assertEqual(result.coverage.check_executions_planned, 40)
-        self.assertEqual(result.coverage.check_executions_executed, 32)
+        self.assertEqual(result.coverage.check_executions_planned, 41)
+        self.assertEqual(result.coverage.check_executions_executed, 33)
         self.assertEqual(result.coverage.check_executions_skipped, 8)
         self.assertEqual(result.findings, ())
         crawl_mock.assert_called_once()
@@ -405,7 +405,7 @@ class CrawlScanTests(unittest.TestCase):
         )
         self.assertEqual(
             result.coverage.check_executions_planned,
-            40,
+            41,
         )
         crawl_mock.assert_called_once()
 

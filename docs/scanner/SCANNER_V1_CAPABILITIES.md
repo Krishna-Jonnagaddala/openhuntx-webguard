@@ -12,6 +12,8 @@ This is the authoritative, audited inventory of what OpenHuntX WebGuard's scanne
 
 **Slice 15 addendum:** a fifth post-freeze active detector, LDAP injection (section 17 below), was added the same way. Unlike CWE-90's predecessors in this addendum, it was never previously named in `docs/CWE_COVERAGE.md`'s own "Planned" list at all.
 
+**Slice 16 addendum:** a sixth post-freeze addition, CSRF (section 18 below), is not an active detector at all: it is a passive heuristic inside `html_analyzer.py`, since true active CSRF confirmation would require completing a real state-changing action, which `ROADMAP.md` excludes as destructive testing. It carries `docs/CWE_COVERAGE.md`'s PARTIAL status, not IMPLEMENTED (active).
+
 **PROVEN** means a named unit test, integration test, or real-network/E2E test currently passes and exercises exactly that claim. **PARTIAL** means some real capability exists but with a stated, real restriction. **NOT SUPPORTED** means the capability does not exist in code at all, not merely undocumented.
 
 ## 1. Target authorization & scope safety
@@ -237,6 +239,24 @@ LDAP Injection (filter-syntax-error induction only)
 ```
 
 Fits `ACTIVE_DETECTOR_REGISTRY`'s generic calling convention exactly, structurally near-identical to `active.sqli.error`'s own two-request baseline/diagnostic/signature-matching architecture, reused unchanged apart from the payload (a single closing parenthesis appended to the baseline value, not a bare replacement) and the 13-entry signature list. Before implementation, the signature list and payload were fact-checked and stress-tested by three independent lenses against real client-library source and real production incident reports (not assumed from memory): all originally-drafted signatures checked out accurate, 4 more were added to close real coverage gaps (Python's two major LDAP clients, the Apache Directory API stack, Node.js's ldapjs), and one real design ambiguity was caught and resolved in code before it became a bug (the module explicitly appends the payload to the baseline value, never a bare replacement constant, unlike its SQLi/path-traversal siblings). Confirmation requires a specific, implementation-attributable signature (a function name or fully-qualified exception class name, never a bare word) to newly appear in the diagnostic response, absent from the baseline, mirroring SQLi's own classification discipline exactly. One signature, `"bad search filter"`, is the sole bare, non-attributable entry in the list, kept because no false-positive evidence was found against it but named as the first suspect if one is ever reported. Authentication support: full. Evidence sanitization and fingerprint determinism: PROVEN (`test_ldap_injection_detector.py`, `test_finding_fingerprint_determinism.py::LdapInjectionFingerprintDeterminismTests`). Real-network validation and true end-to-end test: NOT DONE. See `docs/audit/active-detection-phase15-ldap-injection.md`.
+
+## 18. CSRF (`web.html.csrf_token`, CWE-352, Slice 16, post-freeze, passive not active)
+
+```
+CSRF (anti-CSRF token field naming heuristic only)
+├── POST form, recognized token name + real value   PROVEN   (suppresses the finding)
+├── POST form, no recognized token name              PROVEN   (produces a MEDIUM/LOW finding)
+├── POST form, recognized name but empty/placeholder value   PROVEN   (does not suppress -- value-awareness check)
+├── GET form                                          NOT CHECKED  (assumed side-effect-free per ordinary HTTP semantics)
+├── SameSite-cookie-based protection                   NOT VISIBLE TO THIS CHECK  (checked separately: CWE-1275, cookie_analyzer.py)
+├── Origin/Referer header validation                   NOT VISIBLE TO THIS CHECK  (server-side logic, not observable in static HTML)
+├── Custom-header/double-submit-cookie (SPA) pattern    NOT VISIBLE TO THIS CHECK  (token lives in a cookie, attached by JS; never a form field)
+├── <meta>-tag-plus-fetch pattern                       NOT VISIBLE TO THIS CHECK  (token lives outside any <form>, sent by a JS-issued fetch/XHR)
+├── Deliberately renamed token field (WordPress/Drupal's own guidance)   NOT VISIBLE TO THIS CHECK  (a false "absent" reading, not a false positive)
+└── True active confirmation (submit without a valid token, observe)     NOT ATTEMPTED  (unavoidably destructive; excluded by ROADMAP.md, not by choice of technique)
+```
+
+Unlike every other post-freeze addition, this is a passive check inside the existing `html_analyzer.py`, not a new active detector: confirming CSRF the active way this project's other detectors work (a deliberately non-destructive diagnostic payload) is not possible for this specific weakness, since a genuine positive result requires the state-changing action to actually complete. `_BoundedHtmlParser`'s existing form-tracking (`_FormRecord`, already used for the password-transport and cross-origin-action checks) is extended to also track hidden-input names/values; a POST form with none matching one of 9 real, pre-verified anti-CSRF naming conventions (fact-checked by two independent lenses, one using live web search against current framework source/docs, the other stress-testing false positives against the actual parser code) produces a MEDIUM-severity, LOW-confidence finding. The bare word `token` (Apache Struts 2's own default) is deliberately excluded from the recognized-name list: both lenses independently confirmed it collides with unrelated one-time-link fields (`reset_token`, `api_token`) in the dangerous direction. A name match also requires a non-empty, non-template-placeholder value, closing a real gap the review found (a name-only check would silently trust a stale or broken template). Evidence sanitization: PROVEN (12 new unit tests, `tests/unit/test_html_analyzer.py`). Real-network validation and true end-to-end test: not applicable, this is a passive check with no active probe. See `docs/audit/active-detection-phase16-csrf-token-heuristic.md`.
 
 ## Cross-references
 

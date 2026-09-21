@@ -125,7 +125,7 @@ class CrawlScanLabIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             result.coverage.completion_percent,
-            80.0,
+            80.49,
         )
 
         root_origin = (

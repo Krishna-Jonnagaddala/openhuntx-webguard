@@ -63,7 +63,7 @@ def rules(findings) -> set[str]:
 class HtmlAnalyzerTests(unittest.TestCase):
     def test_check_registry_is_canonical(self) -> None:
         self.assertEqual(HTML_CHECKS, tuple(sorted(HTML_CHECKS)))
-        self.assertEqual(len(HTML_CHECKS), 9)
+        self.assertEqual(len(HTML_CHECKS), 10)
 
     def test_non_html_response_is_not_parsed(self) -> None:
         findings = analyze_html_security(
@@ -147,9 +147,17 @@ class HtmlAnalyzerTests(unittest.TestCase):
         self.assertNotIn("do-not-store", repr(findings))
 
     def test_https_post_password_form_is_not_reported(self) -> None:
+        # A recognized CSRF token field is included so this test stays
+        # scoped to the password-transport/method checks; the CSRF check
+        # itself is covered by its own dedicated tests below.
         findings = analyze_html_security(
             target(),
-            response("<form method='post'><input type='password'></form>"),
+            response(
+                "<form method='post'>"
+                "<input type='password'>"
+                "<input type='hidden' name='_token' value='abc123'>"
+                "</form>"
+            ),
         )
         self.assertEqual(findings, ())
 
@@ -219,6 +227,149 @@ class HtmlAnalyzerTests(unittest.TestCase):
             "web.html.form_action.cross_origin",
             rules(findings),
         )
+
+    def test_post_form_with_no_token_field_is_reported(self) -> None:
+        findings = analyze_html_security(
+            target(),
+            response("<form method='POST' action='/update'><input name='email'></form>"),
+        )
+        self.assertEqual(rules(findings), {"web.html.csrf_token.absent"})
+        finding = findings[0]
+        self.assertIs(finding.severity, Severity.MEDIUM)
+        self.assertIs(finding.confidence, Confidence.LOW)
+        self.assertEqual(
+            [i.value for i in finding.identifiers], ["CWE-352"],
+        )
+
+    def test_get_form_is_never_checked_for_a_csrf_token(self) -> None:
+        findings = analyze_html_security(
+            target(),
+            response("<form method='GET' action='/search'><input name='q'></form>"),
+        )
+        self.assertEqual(findings, ())
+
+    def test_substring_token_name_suppresses_the_finding(self) -> None:
+        # Django's csrfmiddlewaretoken, matched via the substring pattern.
+        findings = analyze_html_security(
+            target(),
+            response(
+                "<form method='POST' action='/update'>"
+                "<input type='hidden' name='csrfmiddlewaretoken' value='abc123'>"
+                "</form>"
+            ),
+        )
+        self.assertEqual(findings, ())
+
+    def test_exact_token_name_suppresses_the_finding(self) -> None:
+        # Laravel/Symfony's bare "_token", matched via the exact-name set,
+        # never the substring pattern (it contains none of those words).
+        findings = analyze_html_security(
+            target(),
+            response(
+                "<form method='POST' action='/update'>"
+                "<input type='hidden' name='_token' value='abc123'>"
+                "</form>"
+            ),
+        )
+        self.assertEqual(findings, ())
+
+    def test_wordpress_nonce_field_suppresses_the_finding(self) -> None:
+        findings = analyze_html_security(
+            target(),
+            response(
+                "<form method='POST' action='/comment'>"
+                "<input type='hidden' name='_wpnonce' value='xyz'>"
+                "</form>"
+            ),
+        )
+        self.assertEqual(findings, ())
+
+    def test_unrelated_token_suffixed_field_is_not_mistaken_for_csrf(self) -> None:
+        # "reset_token"/"api_token" are real, common non-CSRF field names
+        # that share a suffix with "_token": the exact-match rule (never
+        # a substring match) exists specifically so these do not suppress
+        # the finding, matching this project's own reasoning for keeping
+        # the check narrow rather than broad.
+        for field_name in ("reset_token", "api_token", "invite_token"):
+            with self.subTest(field_name=field_name):
+                findings = analyze_html_security(
+                    target(),
+                    response(
+                        "<form method='POST' action='/update'>"
+                        f"<input type='hidden' name='{field_name}' value='abc'>"
+                        "</form>"
+                    ),
+                )
+                self.assertEqual(rules(findings), {"web.html.csrf_token.absent"})
+
+    def test_empty_token_value_does_not_suppress_the_finding(self) -> None:
+        findings = analyze_html_security(
+            target(),
+            response(
+                "<form method='POST' action='/update'>"
+                "<input type='hidden' name='csrf_token' value=''>"
+                "</form>"
+            ),
+        )
+        self.assertEqual(rules(findings), {"web.html.csrf_token.absent"})
+
+    def test_unrendered_template_placeholder_value_does_not_suppress_the_finding(
+        self,
+    ) -> None:
+        findings = analyze_html_security(
+            target(),
+            response(
+                "<form method='POST' action='/update'>"
+                "<input type='hidden' name='csrf_token' value='{{ csrf_token }}'>"
+                "</form>"
+            ),
+        )
+        self.assertEqual(rules(findings), {"web.html.csrf_token.absent"})
+
+    def test_visible_input_with_a_matching_name_does_not_count(self) -> None:
+        # Only a hidden field counts as a plausible anti-CSRF token; a
+        # visible text input happening to share a matching name is not
+        # evidence of protection.
+        findings = analyze_html_security(
+            target(),
+            response(
+                "<form method='POST' action='/update'>"
+                "<input type='text' name='csrf_token' value='abc123'>"
+                "</form>"
+            ),
+        )
+        self.assertEqual(rules(findings), {"web.html.csrf_token.absent"})
+
+    def test_csrf_finding_evidence_never_contains_field_names_or_values(
+        self,
+    ) -> None:
+        findings = analyze_html_security(
+            target(),
+            response(
+                "<form method='POST' action='/update'>"
+                "<input name='super_secret_field_name' value='super-secret-value'>"
+                "</form>"
+            ),
+        )
+        evidence_text = findings[0].evidence[0].summary
+        self.assertNotIn("super_secret_field_name", evidence_text)
+        self.assertNotIn("super-secret-value", evidence_text)
+
+    def test_multiple_forms_are_classified_independently_for_csrf(self) -> None:
+        findings = analyze_html_security(
+            target(),
+            response(
+                "<form method='POST' action='/a'>"
+                "<input type='hidden' name='_token' value='abc'>"
+                "</form>"
+                "<form method='POST' action='/b'></form>"
+            ),
+        )
+        csrf_findings = [
+            f for f in findings if f.identity.rule_id == "web.html.csrf_token.absent"
+        ]
+        self.assertEqual(len(csrf_findings), 1)
+        self.assertEqual(csrf_findings[0].identity.parameter, "form:2")
 
     def test_http_script_on_https_page_is_reported(self) -> None:
         findings = analyze_html_security(

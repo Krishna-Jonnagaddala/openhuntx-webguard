@@ -34,6 +34,7 @@ MAXIMUM_HTML_COMMENT_CHARACTERS = 65_536
 MAXIMUM_HTML_VISIBLE_TEXT_CHARACTERS = 262_144
 
 HTML_CHECKS = (
+    "web.html.csrf_token",
     "web.html.debug_exposure",
     "web.html.directory_listing",
     "web.html.form_action",
@@ -69,6 +70,62 @@ _DIRECTORY_TITLE = re.compile(
     re.IGNORECASE,
 )
 
+# Hidden-input name conventions recognised as an anti-CSRF token, surveyed
+# and fact-checked against current framework source/docs before this check
+# was written (see docs/audit/active-detection-phase16-csrf-token-heuristic.md).
+# Split into a substring pattern (safe because none of these strings occur
+# as an English word or common abbreviation for anything else) and an exact-
+# match set. The exact set is deliberately NOT substring-matched: "_token"
+# as a substring would also match an unrelated one-time-link field like
+# "reset_token" or "api_token", which is exactly why Apache Struts 2's own
+# default field name, the bare word "token", is left out of this list
+# entirely rather than added as a convenience: it collides with that same
+# class of unrelated field and neither lens in this check's own pre-
+# implementation review could find a way to narrow it safely.
+#
+# Named limits, not silently assumed: "authenticity_token" is Rails' real
+# default but is also ordinary English, so it can coincidentally match an
+# unrelated identity/document-authenticity form; WordPress's and Drupal's
+# own security guidance recommends renaming the token field away from its
+# default specifically so an attacker (or this heuristic) cannot rely on
+# it, so a miss on either platform can mean "correctly hardened" rather
+# than "vulnerable"; Symfony's Form component usually namespaces its field
+# as "<form_name>[_token]" rather than the bare "_token" this list checks
+# for, a gap left open rather than widened into a substring match that
+# would reopen the reset_token/api_token collision; and Joomla generates
+# a token whose *name*, not just its value, rotates per request, which no
+# fixed name list can ever recognise. None of this makes the absence
+# finding proof of vulnerability, which is why it always carries LOW
+# confidence, never higher.
+_CSRF_TOKEN_NAME_SUBSTRINGS = re.compile(
+    r"csrf|xsrf|authenticity_token|requestverificationtoken",
+    re.IGNORECASE,
+)
+_CSRF_TOKEN_EXACT_NAMES = frozenset(
+    {
+        "_token",  # Laravel; Symfony's un-namespaced form CSRF field
+        "form_token",  # Drupal core Form API
+        "form_key",  # Magento 1/2
+        "_wpnonce",  # WordPress core (wp_nonce_field)
+        "__token__",  # ThinkPHP
+    }
+)
+
+# A name match alone is not enough: a stale cache, a broken templating
+# pipeline, or a static export can ship the right field name with an empty
+# or never-rendered placeholder value, which is not a live, session-bound
+# token. Any of these substrings in the value means "not actually rendered".
+_UNRESOLVED_TEMPLATE_MARKERS = ("{{", "{%", "<%", "${")
+
+
+def _is_recognized_csrf_token_field(name: str, value: str) -> bool:
+    if not value or any(marker in value for marker in _UNRESOLVED_TEMPLATE_MARKERS):
+        return False
+    lowered_name = name.lower()
+    if lowered_name in _CSRF_TOKEN_EXACT_NAMES:
+        return True
+    return _CSRF_TOKEN_NAME_SUBSTRINGS.search(lowered_name) is not None
+
 _SECRET_COMMENT_PATTERNS = (
     ("password assignment", re.compile(r"\b(?:password|passwd|pwd)\s*[:=]", re.I)),
     ("secret assignment", re.compile(r"\bsecret\s*[:=]", re.I)),
@@ -102,6 +159,7 @@ class _FormRecord:
     method: str
     action: str
     has_password: bool = False
+    has_recognized_csrf_token: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,8 +239,13 @@ class _BoundedHtmlParser(HTMLParser):
             self._form_stack.append(len(self.forms) - 1)
 
         elif tag_name == "input" and self._form_stack:
-            if attributes.get("type", "text").lower() == "password":
+            input_type = attributes.get("type", "text").lower()
+            if input_type == "password":
                 self.forms[self._form_stack[-1]].has_password = True
+            if input_type == "hidden" and _is_recognized_csrf_token_field(
+                attributes.get("name", ""), attributes.get("value", "")
+            ):
+                self.forms[self._form_stack[-1]].has_recognized_csrf_token = True
 
         if tag_name == "meta":
             if attributes.get("http-equiv", "").lower() == "refresh":
@@ -670,6 +733,51 @@ def analyze_html_security(
                         "https://owasp.org/www-project-web-security-testing-guide/",
                     ),
                     tags=("forms", "cross-origin"),
+                )
+            )
+
+        if form.method == "POST" and not form.has_recognized_csrf_token:
+            findings.append(
+                _finding(
+                    target=target,
+                    parameter=parameter,
+                    rule_id="web.html.csrf_token.absent",
+                    source_rule_id="012",
+                    title="POST form has no recognized anti-CSRF token field",
+                    description=(
+                        "This form submits with POST and no hidden field "
+                        "matching a recognized anti-CSRF token naming "
+                        "convention was found. This does not confirm the "
+                        "form is exploitable: it may still be protected by "
+                        "a SameSite cookie attribute (checked separately "
+                        "by this scanner under CWE-1275), by Origin/"
+                        "Referer validation, by a custom header attached "
+                        "by JavaScript before submission, or by a token "
+                        "field whose name this check does not yet "
+                        "recognize. Absence of a recognized name is a "
+                        "weak, heuristic signal, not proof of absence of "
+                        "protection."
+                    ),
+                    severity=Severity.MEDIUM,
+                    confidence=Confidence.LOW,
+                    remediation=(
+                        "Protect every state-changing POST endpoint with a "
+                        "server-validated, session-bound anti-CSRF token, "
+                        "or an equally strong mechanism (a strict "
+                        "SameSite cookie plus origin validation). Verify "
+                        "the token is actually checked server-side, not "
+                        "merely present in the form."
+                    ),
+                    evidence_summary=(
+                        "No hidden input matching a recognized anti-CSRF "
+                        "token naming convention was found in this POST "
+                        "form. Field names and values were not retained."
+                    ),
+                    identifiers=(ExternalIdentifier("CWE", "CWE-352"),),
+                    references=(
+                        "https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html",
+                    ),
+                    tags=("forms", "csrf", "heuristic"),
                 )
             )
 

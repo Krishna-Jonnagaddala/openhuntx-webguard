@@ -64,6 +64,16 @@ Detected today by the passive analyzers (`workers/scanner/src/webguard_scanner/`
 
 **9 CWEs implemented as active detectors, registered and unit-tested; the original 4 are also end-to-end verified through the full permit/executor pipeline and, for CWE-639, against a live target. The 5 added after the v1 freeze are not yet taken through that same end-to-end and live-target verification: see each row's own note.**
 
+## Partial
+
+Detected by a passive, heuristic-only check: real evidence when it fires, but absence of the signal is never proof of absence of the weakness. See the linked audit doc for exactly what the heuristic can and cannot see.
+
+| CWE | Name | Detected by | Notes |
+|---|---|---|---|
+| CWE-352 | Cross-Site Request Forgery (CSRF) | `html_analyzer.py` | **Passive, name-based heuristic only, deliberately not an active detector.** True active confirmation would require actually completing a real state-changing action without a valid token, an unavoidably destructive test this project's own `ROADMAP.md` excludes by design; every other active detector's diagnostic payload in this codebase is deliberately non-destructive regardless of vulnerability status, a property CSRF confirmation structurally cannot share. Instead, every discovered POST form is checked for a hidden input matching one of 9 real, fact-checked anti-CSRF token naming conventions (Django, Rails, ASP.NET, Laravel/Symfony, Spring Security, WordPress, Drupal, Magento, ThinkPHP); a match also requires a non-empty, non-template-placeholder value, so a stale or broken template does not silently suppress the finding. No match produces a MEDIUM-severity, LOW-confidence finding, explicitly worded as a weak signal, not proof: the check cannot see SameSite-cookie-based protection (already checked separately under CWE-1275), Origin/Referer validation, a custom header attached by JavaScript, a `<meta>`-tag-plus-fetch pattern, or a deliberately renamed token field (WordPress's and Drupal's own security guidance recommends exactly that rename). Apache Struts 2's own default field name, the bare word `token`, is deliberately excluded from the list: both lenses of this check's own pre-implementation review confirmed it collides with unrelated one-time-link fields (`reset_token`, `api_token`) in the dangerous direction (falsely suppressing a real finding). Evidence sanitization is PROVEN by a dedicated unit test. See `docs/audit/active-detection-phase16-csrf-token-heuristic.md`. |
+
+**1 CWE partial.**
+
 ## Planned
 
 The remaining active-detection target set (see `ROADMAP.md`'s "Coverage growth" section), gated behind a valid TrustScan permit and the `SecurityCheck` interface described there. Not yet implemented.
@@ -71,11 +81,10 @@ The remaining active-detection target set (see `ROADMAP.md`'s "Coverage growth" 
 | CWE | Name | Category |
 |---|---|---|
 | CWE-502 | Deserialization of Untrusted Data | Injection |
-| CWE-352 | Cross-Site Request Forgery (CSRF) | CSRF |
 | CWE-287 | Improper Authentication | Authentication |
 | CWE-862 | Missing Authorization | Authorization |
 
-**4 CWEs planned.** CWE-601 moved to Implemented (active) this slice.
+**3 CWEs planned.** CWE-601 moved to Implemented (active) in an earlier slice; CWE-352 moved to Partial this slice.
 
 ## Not yet classified
 
@@ -86,8 +95,8 @@ Every other CWE, including the full breadth of the reference catalog consulted w
 ```
 18 Implemented (passive, in orchestration)
  9 Implemented (active, permit-gated, integrated into orchestration)
- 0 Partial
- 4 Planned
+ 1 Partial
+ 3 Planned
 ```
 
 ## Non-CWE identifiers
@@ -133,3 +142,15 @@ Before writing any code, a drafted signature list and payload were fact-checked 
 The review also surfaced a real, disclosed-not-mitigated safety consideration materially different in kind from anything this project has shipped before: on a target built with the Node.js `ldapjs` library, this exact payload can crash the target's entire process via a documented, uncaught synchronous exception in that library's own filter parser, rather than merely produce an error response. Every other active detector's diagnostic payload, including this one's own siblings, can at most produce an unusual response; none of them can crash the target process outright. This is stated plainly in the detector's own docstring rather than softened, matching this project's own rule that a safety claim names the actual mechanism rather than a wrapper of hedged language.
 
 Registered, contract-synced (`test_active_detector_registry.py` passes unmodified aside from the new set membership), and unit-tested (classification logic, append-not-replace payload construction, every documented signature confirmed matched, evidence sanitization, fingerprint determinism, and the same-origin/budget/cancellation/hook safety-boundary suite every other active detector already requires), but not yet taken through the CLI → HTTP API → worker → executor end-to-end path, and not yet run against any live target. See `docs/audit/active-detection-phase15-ldap-injection.md`.
+
+## Slice 16: CSRF added as a passive check, not an active detector
+
+A sixth post-freeze addition, at the user's continued request, but a different shape from every one before it: `web.html.csrf_token` for CWE-352 is a passive check added to the existing `html_analyzer.py`, not a new active detector.
+
+The reason is structural, not a style preference. Every active detector added in Slices 12-15 (path traversal, command injection, XXE, open redirect, LDAP injection) sends a diagnostic payload deliberately engineered to be non-destructive regardless of whether the target is vulnerable: a syntax-breaking character, a callback to WebGuard's own infrastructure, a redirect the transport never follows. Confirming CSRF the same active way would require actually submitting a well-formed state-changing request without a valid token and observing whether the action completes; if the target is genuinely vulnerable, that observation IS the action completing for real. There is no payload shape that makes this non-destructive, which is exactly the "active exploitation... destructive testing... not part of the current initial release scope" line `ROADMAP.md` already states. Read directly, `attack_surface.py`'s own `_classify_safety` keyword list also does not fully block this (only endpoints matching specific keywords like "payment" or "delete" are excluded; a great many real state-changing forms aren't caught by that list and remain reachable), which confirms the exclusion here is about what the *technique* requires, not merely about which endpoints discovery happens to reach.
+
+Instead, this slice extends `html_analyzer.py`'s existing form-parsing (`_BoundedHtmlParser`/`_FormRecord`, already used for the password-transport and cross-origin-form-action checks) to track hidden-input fields and flag a POST form with no field matching a recognized anti-CSRF token naming convention. Before writing any code, the token-naming-convention list and the matching approach were surveyed and adversarially stress-tested by two independent lenses: one researching real, current default field names across mainstream frameworks (using live web search, not memory), the other hunting specifically for false positives given the actual parser code, not just the design's prose. Both converged on the same core verdict: the exact-match-not-substring choice for ambiguous short names (`_token`, and the three names added from this review: `form_token`, `form_key`, `_wpnonce`, plus `__token__`) correctly avoids colliding with unrelated one-time-link fields like `reset_token`/`api_token`, and Apache Struts 2's own default field name, the bare word `token`, is deliberately left out of the list entirely because both lenses independently confirmed it collides with exactly that class of field. The review also caught a real gap in the original draft, the matcher only inspected field names and never values, meaning a stale cache or broken template could ship the right field name with an empty or unrendered placeholder value and wrongly suppress the finding; the shipped check requires a non-empty, non-placeholder value before treating a name match as evidence of protection.
+
+Confidence is LOW (this project's weakest tier), severity MEDIUM, and the finding's own description states plainly that absence of a recognized name is not proof of absence of protection: the check cannot see SameSite-cookie-based defenses (already covered separately by `cookie_analyzer.py` under CWE-1275), Origin/Referer validation, a custom header attached by JavaScript, or a `<meta>`-tag-plus-fetch double-submit pattern, and two of the highest-market-share platforms on the web, WordPress and Drupal, both publish their own security guidance recommending developers rename the token field away from the very defaults this check recognizes, specifically so neither an attacker nor a scanner like this one can rely on them. None of this is hedging for its own sake: it is the honest ceiling of what a static, name-based heuristic can ever claim, stated directly rather than smoothed over.
+
+Unit-tested (12 new tests covering the naming-convention matches, the value-placeholder guard, the reset_token/api_token collision-avoidance the exact-match choice exists for, evidence sanitization, and per-form independence), with the pre-existing `html_analyzer.py` suite updated where a test's own scope predated this check (one test now includes a token field so it stays scoped to the password checks it was written to prove, not incidentally exercising the new one). See `docs/audit/active-detection-phase16-csrf-token-heuristic.md`.
