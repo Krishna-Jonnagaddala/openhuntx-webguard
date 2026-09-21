@@ -45,15 +45,27 @@ variable "availability_zones" {
   }
 }
 
+variable "create_staging_bastion_networking" {
+  description = "Provisions one public subnet, an internet gateway, a single-AZ NAT Gateway, and the routes that give the private subnets outbound internet access. Default false: a production apply of this configuration provisions none of this, exactly as before this variable existed. Set true only for docs/production/STAGING_ENVIRONMENT_PROVISIONING.md's temporary validation bastion, which needs this path to reach AWS Systems Manager, Secrets Manager, and an OS package repository; see networking.tf's own header for why a security group's default egress rule is not, by itself, enough."
+  type        = bool
+  default     = false
+}
+
+variable "public_subnet_cidr_block" {
+  description = "CIDR block for the one public subnet created when create_staging_bastion_networking is true. Must be within vpc_cidr_block and must not overlap private_subnet_cidr_blocks. Unused (and not created) otherwise."
+  type        = string
+  default     = "10.42.0.128/26"
+}
+
 variable "application_security_group_id" {
   description = "Security group ID of the compute (ECS task, EC2 instance, etc.) that will connect to PostgreSQL. PostgreSQL's security group only permits inbound traffic on 5432 from this security group -- never from 0.0.0.0/0. Left as a required variable (no default) since this configuration does not provision compute itself."
   type        = string
 }
 
 variable "postgres_engine_version" {
-  description = "PostgreSQL major.minor version for RDS. Pin explicitly rather than defaulting to \"latest\" so a provider-side default change never silently changes what gets provisioned."
+  description = "PostgreSQL major.minor version for RDS. Pin explicitly rather than defaulting to \"latest\" so a provider-side default change never silently changes what gets provisioned. 16.15 is the latest 16.x minor RDS was offering new instances as of the 2026-08 RDS PostgreSQL minor-version announcement (18.6/17.11/16.15/15.19/14.24); this default was previously pinned to 16.4, which predates that by roughly two years of minor releases and should not be assumed still available for new-instance creation. Confirm with `aws rds describe-db-engine-versions --engine postgres --engine-version 16.15 --region <region>` before relying on this default in a real apply, since AWS periodically retires individual old minor versions from new-instance creation independent of major-version end-of-life."
   type        = string
-  default     = "16.4"
+  default     = "16.15"
 }
 
 variable "postgres_instance_class" {
