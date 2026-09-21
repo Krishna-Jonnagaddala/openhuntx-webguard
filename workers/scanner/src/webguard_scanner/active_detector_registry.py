@@ -40,6 +40,7 @@ wait, not a synchronous per-page response. It joins
 from __future__ import annotations
 
 from .command_injection_detector import run_command_injection_detector
+from .open_redirect_detector import run_open_redirect_detector
 from .path_traversal_detector import run_path_traversal_detector
 from .sqli_error_detector import run_sqli_error_detector
 from .xss_reflected_detector import run_reflected_xss_detector
@@ -49,6 +50,7 @@ ACTIVE_DETECTOR_REGISTRY = {
     "active.xss.reflected": run_reflected_xss_detector,
     "active.pathtraversal.disclosure": run_path_traversal_detector,
     "active.cmdi.marker": run_command_injection_detector,
+    "active.openredirect.location": run_open_redirect_detector,
 }
 
 COMPARISON_ACTIVE_CHECK_IDS = frozenset({"active.authorization.idor"})

@@ -8,7 +8,8 @@ generic contract-level `FindingIdentity.fingerprint` tests in
 never from a timestamp, a per-probe marker, a callback token, or a
 session token. This module proves that property survives the full
 detector pipeline for XSS, SQLi, path traversal, command injection,
-IDOR, SSRF, and XXE: running the identical detector twice against an
+IDOR, SSRF, XXE, and open redirect: running the identical detector twice
+against an
 identical (mocked) target produces the same fingerprint despite each
 run generating a fresh, high-entropy probe marker/callback token
 internally, and running against a different endpoint/parameter
@@ -33,6 +34,7 @@ from webguard_scanner import (
     AuthorizationResourcePair,
     run_command_injection_detector,
     run_idor_authorization_detector,
+    run_open_redirect_detector,
     run_path_traversal_detector,
     run_reflected_xss_detector,
     run_sqli_error_detector,
@@ -91,6 +93,14 @@ from tests.unit.test_xxe_callback_detector import (
     _post_policy as _xxe_policy,
     _target as _xxe_target,
     _template as _xxe_template,
+)
+from tests.unit.test_open_redirect_detector import (
+    _FakeResponse as _OpenRedirectFakeResponse,
+    _ScriptedConnection as _OpenRedirectScriptedConnection,
+    _candidate as _openredirect_candidate,
+    _context as _openredirect_context,
+    _redirect_to as _openredirect_redirect_to,
+    _target as _openredirect_target,
 )
 
 
@@ -401,6 +411,39 @@ class XxeFingerprintDeterminismTests(unittest.TestCase):
         first = self._run().findings[0]
         second = self._run(
             template=_xxe_template(endpoint="http://example.com/upload-vulnerable-2")
+        ).findings[0]
+        self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+
+class OpenRedirectFingerprintDeterminismTests(unittest.TestCase):
+    def _run(self, candidate=None):
+        def responder(value):
+            return _openredirect_redirect_to(value, location=value)
+
+        connection = _OpenRedirectScriptedConnection(responder)
+        with patch(
+            "webguard_scanner.safe_http._make_connection", return_value=connection
+        ):
+            return run_open_redirect_detector(
+                _openredirect_target(),
+                (candidate or _openredirect_candidate(),),
+                _openredirect_context(),
+                policy=ActiveDetectionPolicy(minimum_delay_seconds=0.0),
+            )
+
+    def test_same_vulnerability_two_runs_same_fingerprint(self) -> None:
+        # Each run generates a fresh, independent probe marker/host, and
+        # the evidence text deliberately never retains it (see
+        # _build_finding's provenance string), so the fingerprint must
+        # not depend on it either.
+        first = self._run().findings[0]
+        second = self._run().findings[0]
+        self.assertEqual(first.fingerprint, second.fingerprint)
+
+    def test_different_endpoint_different_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run(
+            candidate=_openredirect_candidate(url="http://example.com/other")
         ).findings[0]
         self.assertNotEqual(first.fingerprint, second.fingerprint)
 

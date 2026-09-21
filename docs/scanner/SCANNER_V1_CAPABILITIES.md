@@ -8,6 +8,8 @@ This is the authoritative, audited inventory of what OpenHuntX WebGuard's scanne
 
 **Slice 13 addendum:** a third post-freeze active detector, XXE (section 15 below), was added the same way. Unlike sections 13-14, it does not use `ACTIVE_DETECTOR_REGISTRY` at all: like SSRF, it needs a `CallbackBroker` wait, so it lives in `CALLBACK_ACTIVE_CHECK_IDS` and its own executor function instead.
 
+**Slice 14 addendum:** a fourth post-freeze active detector, open redirect (section 16 below), was added the same way. Unlike section 15's XXE, it fits `ACTIVE_DETECTOR_REGISTRY`'s generic calling convention exactly, the same as sections 13-14.
+
 **PROVEN** means a named unit test, integration test, or real-network/E2E test currently passes and exercises exactly that claim. **PARTIAL** means some real capability exists but with a stated, real restriction. **NOT SUPPORTED** means the capability does not exist in code at all, not merely undocumented.
 
 ## 1. Target authorization & scope safety
@@ -200,6 +202,23 @@ XML External Entity injection (out-of-band/blind only)
 ```
 
 Unlike path traversal and command injection, this detector does not fit `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention: like SSRF, it requires a `CallbackBroker` registration and a bounded wait for an out-of-band observation, so it lives in `CALLBACK_ACTIVE_CHECK_IDS` and its own `executor._apply_xxe_callback_detection`, a close mirror of `_apply_ssrf_callback_detection`. Confirmation requires a genuine callback observation correlated to a token embedded in the probe's SYSTEM identifier, exactly SSRF's own confirmation logic; response text is never inspected, so there is no in-band signature for a hardened parser's own rejection message to be misread as. Candidate selection dedupes by (endpoint, method) rather than by parameter, since the crafted document replaces the whole request body regardless of which field discovered the endpoint. Authentication support: full, reuses the identical `authentication_material` threading every other detector uses. Evidence sanitization and fingerprint determinism: PROVEN (`test_xxe_callback_detector.py`, `test_finding_fingerprint_determinism.py::XxeFingerprintDeterminismTests`). Real-network validation and true end-to-end test: NOT DONE. See `docs/audit/active-detection-phase13-xxe-callback.md`.
+
+## 16. Open redirect (`active.openredirect.location`, CWE-601, Slice 14, post-freeze)
+
+```
+Open Redirect (Location header only)
+├── GET query                                PARTIAL   (unit-tested against a mocked connection only)
+├── GET form                                 PARTIAL   (same evidence)
+├── POST form                                PARTIAL   (Slice 6 mutation engine, same evidence)
+├── JSON body                                PARTIAL   (same evidence)
+├── HTTP Refresh response header             NOT SUPPORTED  (a second, real, non-JS redirect mechanism; only Location on a 3xx is checked)
+├── HTML meta-refresh tag                    NOT SUPPORTED  (pre-existing html_analyzer.py gap, not this detector's to close)
+├── Client-side JS redirect                  NOT SUPPORTED  (black-box HTTP scanner, no JS execution)
+├── Store-now-redirect-later (post-login/SSO) NOT SUPPORTED  (single request per candidate, no follow-up action; a real, common shape for this weakness, not a rare corner case)
+└── Alternate payload encodings               NOT SUPPORTED  (protocol-relative input, backslash tricks, double-encoding not attempted)
+```
+
+Fits `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention exactly, unlike SSRF/XXE: one request per candidate, no `CallbackBroker`, no wait. Confirmation requires the diagnostic response's status to be one of the five codes browsers actually auto-follow (301/302/303/307/308) with exactly one `Location` header resolving, via `urlsplit(...).hostname`, to this probe's own fresh marker host; response body is never inspected. A drafted classification design was adversarially reviewed by three independent lenses before implementation, finding no false-positive path but three real bugs fixed before any code was written: duplicate-`Location`-header ambiguity, trailing-dot FQDN normalization, and narrowing the accepted status set to the browser-auto-followed five. Candidate reach inherits this codebase's existing discovery-pipeline restrictions (crawl-mode's per-page path filter, the shared state-changing-keyword safety classification) in a way that costs this technique specifically more than the others, since redirect-controlling parameters are classically discovered via a link to a different endpoint or present only in the entry URL's own query string; both are named directly in the detector module's own docstring. This slice also threads a new `allow_redirect_status` keyword-only argument (defaulted False) through `issue_probe` and `issue_templated_request`, so a 3xx response can be read intact instead of becoming a `redirect_blocked` error; every existing caller is unaffected. Authentication support: full. Evidence sanitization and fingerprint determinism: PROVEN (`test_open_redirect_detector.py`, `test_finding_fingerprint_determinism.py::OpenRedirectFingerprintDeterminismTests`). Real-network validation and true end-to-end test: NOT DONE. See `docs/audit/active-detection-phase14-open-redirect.md`.
 
 ## Cross-references
 

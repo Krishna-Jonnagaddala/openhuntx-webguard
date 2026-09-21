@@ -134,6 +134,12 @@ from .xxe_callback_detector import (
     run_xxe_callback_detector,
     select_xxe_candidates,
 )
+from .open_redirect_detector import (
+    OpenRedirectDetectorRunRecord,
+    OpenRedirectDetectorRunResult,
+    OpenRedirectOutcome,
+    run_open_redirect_detector,
+)
 from .authentication import (
     MAXIMUM_BEARER_TOKEN_BYTES,
     MAXIMUM_COOKIES,
@@ -360,6 +366,10 @@ __all__ = [
     "XxeProbeRecord",
     "run_xxe_callback_detector",
     "select_xxe_candidates",
+    "OpenRedirectDetectorRunRecord",
+    "OpenRedirectDetectorRunResult",
+    "OpenRedirectOutcome",
+    "run_open_redirect_detector",
     "BeforeRequestHook",
     "AfterRequestHook",
     "AnalyzerPipelineResult",
