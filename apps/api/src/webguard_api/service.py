@@ -2320,7 +2320,8 @@ class WebGuardJobService:
         if not self.module_entitlements.list_entitlements(organization.organization_id):
             self.module_entitlements.grant_default_entitlements(organization.organization_id, now=now)
         self.identity.set_password_hash(
-            principal.principal_id, algorithm="argon2id", password_hash=hash_password(password), now=now
+            principal.principal_id, organization.organization_id,
+            algorithm="argon2id", password_hash=hash_password(password), now=now,
         )
         verification = self.identity.create_identity_token(
             principal.principal_id, organization.organization_id,
@@ -2340,7 +2341,7 @@ class WebGuardJobService:
             idle_ttl=self.session_idle_timeout, absolute_ttl=self.session_absolute_timeout,
             user_agent=user_agent, ip_address=ip_address,
         )
-        self.identity.touch_last_login(principal.principal_id, now=now)
+        self.identity.touch_last_login(principal.principal_id, organization.organization_id, now=now)
         context = self._issue_session_context(principal, organization, issued)
         self._audit(
             context, request_id=request_id, action="auth.register", resource_type="principal",
@@ -2387,7 +2388,8 @@ class WebGuardJobService:
             raise generic_failure
         if needs_rehash(stored_hash):
             self.identity.set_password_hash(
-                principal.principal_id, algorithm="argon2id", password_hash=hash_password(password), now=now
+                principal.principal_id, principal.organization_id,
+                algorithm="argon2id", password_hash=hash_password(password), now=now,
             )
         organization = self.identity.get_organization(principal.organization_id)
         issued = self.sessions.create_session(
@@ -2395,7 +2397,7 @@ class WebGuardJobService:
             idle_ttl=self.session_idle_timeout, absolute_ttl=self.session_absolute_timeout,
             user_agent=user_agent, ip_address=ip_address,
         )
-        self.identity.touch_last_login(principal.principal_id, now=now)
+        self.identity.touch_last_login(principal.principal_id, organization.organization_id, now=now)
         context = self._issue_session_context(principal, organization, issued)
         self._audit(
             context, request_id=request_id, action="auth.login", resource_type="principal",
@@ -2452,7 +2454,8 @@ class WebGuardJobService:
             raise ApiServiceError(exc.code, exc.message, status=400) from exc
         now = self.clock()
         self.identity.set_password_hash(
-            context.principal_id, algorithm="argon2id", password_hash=hash_password(body["new_password"]), now=now
+            context.principal_id, context.organization_id,
+            algorithm="argon2id", password_hash=hash_password(body["new_password"]), now=now,
         )
         except_session = context.token_id if context.auth_method == "browser_session" else None
         self.sessions.revoke_all_sessions_for_principal(
@@ -2494,7 +2497,8 @@ class WebGuardJobService:
         if principal is None or not principal.active:
             return generic_response
         self.identity.invalidate_identity_tokens(
-            principal.principal_id, purpose=IdentityTokenPurpose.PASSWORD_RESET, now=now
+            principal.principal_id, principal.organization_id,
+            purpose=IdentityTokenPurpose.PASSWORD_RESET, now=now,
         )
         issued = self.identity.create_identity_token(
             principal.principal_id, principal.organization_id,
@@ -2541,7 +2545,8 @@ class WebGuardJobService:
         except IdentityStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=400) from exc
         self.identity.set_password_hash(
-            record.principal_id, algorithm="argon2id", password_hash=hash_password(body["new_password"]), now=now
+            record.principal_id, record.organization_id,
+            algorithm="argon2id", password_hash=hash_password(body["new_password"]), now=now,
         )
         self.sessions.revoke_all_sessions_for_principal(record.principal_id, now=now)
         principal = self.identity.get_principal(record.principal_id)
@@ -2574,7 +2579,8 @@ class WebGuardJobService:
         if principal.email_verified_at is not None:
             return {"message": "Email address is already verified."}
         self.identity.invalidate_identity_tokens(
-            principal.principal_id, purpose=IdentityTokenPurpose.EMAIL_VERIFICATION, now=now
+            principal.principal_id, principal.organization_id,
+            purpose=IdentityTokenPurpose.EMAIL_VERIFICATION, now=now,
         )
         issued = self.identity.create_identity_token(
             principal.principal_id, context.organization_id,
@@ -2609,7 +2615,7 @@ class WebGuardJobService:
             )
         except IdentityStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=400) from exc
-        self.identity.set_principal_email_verified(record.principal_id, now=now)
+        self.identity.set_principal_email_verified(record.principal_id, record.organization_id, now=now)
         self._audit_identity_event(
             organization_id=record.organization_id, principal_id=record.principal_id,
             request_id=request_id, action="auth.email_verified", resource_type="principal",
@@ -2644,13 +2650,14 @@ class WebGuardJobService:
         except IdentityStoreError as exc:
             raise ApiServiceError(exc.code, exc.message, status=400) from exc
         self.identity.set_password_hash(
-            record.principal_id, algorithm="argon2id", password_hash=hash_password(body["password"]), now=now
+            record.principal_id, record.organization_id,
+            algorithm="argon2id", password_hash=hash_password(body["password"]), now=now,
         )
         # Accepting an emailed invitation link is itself proof of
         # control of that mailbox -- a second, separate verification
         # round-trip would confirm nothing a working invitation flow
         # has not already confirmed.
-        self.identity.set_principal_email_verified(record.principal_id, now=now)
+        self.identity.set_principal_email_verified(record.principal_id, record.organization_id, now=now)
         principal = self.identity.get_principal(record.principal_id)
         organization = self.identity.get_organization(record.organization_id)
         issued = self.sessions.create_session(
@@ -2658,7 +2665,7 @@ class WebGuardJobService:
             idle_ttl=self.session_idle_timeout, absolute_ttl=self.session_absolute_timeout,
             user_agent=user_agent, ip_address=ip_address,
         )
-        self.identity.touch_last_login(principal.principal_id, now=now)
+        self.identity.touch_last_login(principal.principal_id, organization.organization_id, now=now)
         context = self._issue_session_context(principal, organization, issued)
         self._audit(
             context, request_id=request_id, action="auth.invitation_accepted", resource_type="principal",
@@ -3711,7 +3718,7 @@ class WebGuardJobService:
         }
 
     def list_api_keys(self, context: AuthContext, *, request_id: str) -> dict:
-        tokens = self.identity.list_tokens_for_principal(context.principal_id)
+        tokens = self.identity.list_tokens_for_principal(context.principal_id, context.organization_id)
         self._audit(
             context, request_id=request_id, action="api_keys.list", resource_type="principal",
             resource_id=context.principal_id, outcome=AuditOutcome.SUCCEEDED,
@@ -3744,7 +3751,7 @@ class WebGuardJobService:
     def revoke_api_key(self, context: AuthContext, token_id: str, *, request_id: str) -> dict:
         try:
             metadata = self.identity.revoke_token_owned(
-                token_id, principal_id=context.principal_id, now=self.clock()
+                token_id, context.organization_id, principal_id=context.principal_id, now=self.clock()
             )
         except IdentityStoreError as exc:
             self._audit(

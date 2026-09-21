@@ -10,17 +10,26 @@
 -- objects, so they do not belong in it.
 --
 -- Every role created here is inert: no table grant, no schema CREATE
--- privilege, no function EXECUTE grant, and no LOGIN capability.
--- Running this file does not change how the existing application
--- connects to or uses the database in any way -- WEBGUARD_DATABASE_URL,
--- the existing development/application role, and every current
--- table's ownership are all untouched.
+-- privilege, and no function EXECUTE grant. Running this file does not
+-- change how the existing application connects to or uses the
+-- database in any way -- WEBGUARD_DATABASE_URL, the existing
+-- development/application role, and every current table's ownership
+-- are all untouched.
 --
 -- Deliberately flat: no role created here is a member of any other
 -- role created here, and none inherits from an existing role. A
 -- later phase will grant exactly the specific table/function
 -- privileges each of these needs; Phase C's only job is to make the
 -- identities exist, safely.
+--
+-- One later addition to this file (P1-2 Phase H gap closure,
+-- callback_receiver, below) is deliberately LOGIN, unlike the seven
+-- roles this section creates -- see its own block for why the public
+-- callback-ingress path needs a directly-connectable identity rather
+-- than another NOLOGIN-plus-membership role. It is still just as
+-- inert on creation (no table grant, no schema CREATE, no function
+-- EXECUTE, no membership) until a later file grants it exactly one
+-- EXECUTE privilege.
 --
 -- BYPASSRLS is not, and must never be, granted to any of these
 -- roles -- deliberately not even written as an explicit NOBYPASSRLS
@@ -84,5 +93,80 @@ BEGIN
             END IF;
         END IF;
     END LOOP;
+END;
+$$;
+
+-- P1-2 Phase H gap closure (record_observation, the callback-service
+-- ingress path): callback_receiver is the one deliberate exception to
+-- every claim in the file header above -- it is the only role this
+-- file ever creates WITH LOGIN. Every other role here is reached only
+-- through role-membership-plus-SET-ROLE from "webguard" (see
+-- tenant_isolation_runtime_grant.sql), which means a session that
+-- somehow forgets to narrow its role still runs as "webguard" itself,
+-- broadly trusted by definition. The callback-service process is
+-- different in kind, not degree: it is the one WebGuard component a
+-- pre-authentication, unauthenticated network caller (a scanned
+-- target's own outbound SSRF probe) reaches directly, with no session,
+-- no API token, and no organization_id established yet. Giving it a
+-- genuinely separate LOGIN identity, authenticated with its own
+-- credential and never a member of "webguard" or of any other role
+-- here, means a bug in that one process's connection wiring cannot
+-- fall back to "webguard"'s own ambient privileges the way a bug in
+-- the api-serve/worker/scheduler processes theoretically could -- the
+-- TCP-level Postgres authentication itself never establishes a
+-- "webguard" session for this process at all. See
+-- tenant_isolation_control_functions.sql's own CALLBACK section for
+-- the one privilege this role is ever granted (EXECUTE on exactly one
+-- function, nothing else -- no table grant, no schema CREATE, no
+-- membership in any other role).
+--
+-- Deliberately created with NO PASSWORD here: CREATE ROLE ... LOGIN
+-- with no PASSWORD clause leaves rolpassword NULL, meaning password
+-- authentication as this role always fails until a separate,
+-- non-source-controlled step (an operator's ALTER ROLE, or a
+-- secrets-manager-driven deployment script -- never this checked-in
+-- SQL file) sets one. This mirrors how "webguard" itself already gets
+-- its own password (POSTGRES_PASSWORD in the disposable dev/CI
+-- container, the RDS master-password mechanism in a real deployment),
+-- never from bootstrap SQL. A disposable integration test sets a
+-- test-only password directly, the same way it already does for its
+-- own synthetic test_api_caller/test_worker_caller/test_scheduler_caller
+-- roles.
+--
+-- Same restrictive attribute profile as the seven roles above, LOGIN
+-- aside: NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION, and (per
+-- the file header's own reasoning) no explicit NOBYPASSRLS clause --
+-- CREATE ROLE's own default already leaves it BYPASSRLS false. Not a
+-- member of any other role, and no other role is ever made a member of
+-- it. Idempotent like the loop above, but with its own safe-attribute
+-- check: LOGIN is this role's REQUIRED, expected state, not an unsafe
+-- surprise, so unlike the flat loop's check, a pre-existing
+-- "callback_receiver" failing this check is one that is NOT LOGIN (or
+-- carries any of the other five unsafe attributes) -- proof someone or
+-- something other than this file created a role by this name.
+DO $$
+DECLARE
+    existing pg_roles%ROWTYPE;
+BEGIN
+    SELECT * INTO existing FROM pg_roles WHERE rolname = 'callback_receiver';
+
+    IF NOT FOUND THEN
+        CREATE ROLE callback_receiver LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    ELSE
+        IF NOT existing.rolcanlogin
+            OR existing.rolsuper
+            OR existing.rolbypassrls
+            OR existing.rolcreaterole
+            OR existing.rolcreatedb
+            OR existing.rolreplication
+        THEN
+            RAISE EXCEPTION
+                'role callback_receiver already exists with an unsafe attribute '
+                '(login=%, superuser=%, bypassrls=%, createrole=%, createdb=%, replication=%) '
+                '-- refusing to proceed',
+                existing.rolcanlogin, existing.rolsuper, existing.rolbypassrls,
+                existing.rolcreaterole, existing.rolcreatedb, existing.rolreplication;
+        END IF;
+    END IF;
 END;
 $$;

@@ -903,11 +903,34 @@ def _callback_service_command(args: argparse.Namespace) -> int:
     `_WINDOW_SECONDS`, default 60 requests/60s) protects that store's
     write capacity if this receiver is ever reachable from the public
     Internet (`callback.openhuntx.com`) -- see
-    docs/production/CALLBACK_SERVICE_DEPLOYMENT.md."""
+    docs/production/CALLBACK_SERVICE_DEPLOYMENT.md.
 
-    database_url = os.environ.get("WEBGUARD_DATABASE_URL", "").strip()
+    P1-2 Phase H gap closure: this process connects to the SAME
+    database as every other WebGuard process ("there is no separate
+    callback-service database", above, still true), but as a
+    DIFFERENT, genuinely separate role: `WEBGUARD_CALLBACK_DATABASE_URL`,
+    never `WEBGUARD_DATABASE_URL`. That DSN's own credential must
+    already authenticate as the `callback_receiver` role
+    (tenant_isolation_roles.sql), whose only privilege anywhere is
+    EXECUTE on webguard_control.resolve_and_record_callback_observation:
+    no table grant, no membership in api_tenant_data/
+    worker_tenant_data/scheduler_tenant_data or any other role. This is
+    deliberately a separate, required environment variable, not a
+    silent fallback to WEBGUARD_DATABASE_URL: this is the one WebGuard
+    process a pre-authentication, unauthenticated caller (a scanned
+    target's own outbound SSRF probe) reaches directly, and falling
+    back to the broad "webguard" identity on a missing config value
+    would quietly reintroduce the exact ambient-trust exposure this
+    gap closure exists to remove."""
+
+    database_url = os.environ.get("WEBGUARD_CALLBACK_DATABASE_URL", "").strip()
     if not database_url:
-        print("ERROR [callback_service_config_missing]: WEBGUARD_DATABASE_URL is required.", file=sys.stderr)
+        print(
+            "ERROR [callback_service_config_missing]: WEBGUARD_CALLBACK_DATABASE_URL is required "
+            "(a DSN authenticating as the callback_receiver role, never WEBGUARD_DATABASE_URL's "
+            "own broader identity).",
+            file=sys.stderr,
+        )
         return EXIT_FAILURE
     host = os.environ.get("WEBGUARD_CALLBACK_SERVICE_HOST", "127.0.0.1")
     port = int(os.environ.get("WEBGUARD_CALLBACK_SERVICE_PORT", "8767"))

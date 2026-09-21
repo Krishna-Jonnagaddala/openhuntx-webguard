@@ -1087,7 +1087,8 @@ class IdentityStore:
             connection.close()
         return None if row is None else self._principal(row)
 
-    def set_principal_email_verified(self, principal_id: str, *, now: datetime) -> Principal:
+    def set_principal_email_verified(self, principal_id: str, organization_id: str, *, now: datetime) -> Principal:
+        del organization_id  # accepted for signature parity with PostgresIdentityRepository; unused here
         principal = self.get_principal(principal_id)
         connection = self._connect()
         try:
@@ -1114,7 +1115,8 @@ class IdentityStore:
             last_login_at=principal.last_login_at,
         )
 
-    def touch_last_login(self, principal_id: str, *, now: datetime) -> None:
+    def touch_last_login(self, principal_id: str, organization_id: str, *, now: datetime) -> None:
+        del organization_id  # accepted for signature parity with PostgresIdentityRepository; unused here
         connection = self._connect()
         try:
             connection.execute(
@@ -1128,7 +1130,16 @@ class IdentityStore:
         finally:
             connection.close()
 
-    def set_password_hash(self, principal_id: str, *, algorithm: str, password_hash: str, now: datetime) -> None:
+    def set_password_hash(
+        self, principal_id: str, organization_id: str, *, algorithm: str, password_hash: str, now: datetime
+    ) -> None:
+        # organization_id is accepted, not used: this table has no
+        # organization_id column here either (matching Postgres's
+        # schema), and SQLite has no RLS/tenant-context concept for it
+        # to scope. The parameter exists only so this method's signature
+        # matches PostgresIdentityRepository's, which both service.py
+        # call sites rely on interchangeably regardless of backend.
+        del organization_id
         connection = self._connect()
         try:
             connection.execute(
@@ -1250,8 +1261,9 @@ class IdentityStore:
         )
 
     def invalidate_identity_tokens(
-        self, principal_id: str, *, purpose: IdentityTokenPurpose, now: datetime
+        self, principal_id: str, organization_id: str, *, purpose: IdentityTokenPurpose, now: datetime
     ) -> None:
+        del organization_id  # accepted for signature parity with PostgresIdentityRepository; unused here
         connection = self._connect()
         try:
             connection.execute(
@@ -1268,7 +1280,8 @@ class IdentityStore:
         finally:
             connection.close()
 
-    def list_tokens_for_principal(self, principal_id: str) -> tuple[ApiTokenMetadata, ...]:
+    def list_tokens_for_principal(self, principal_id: str, organization_id: str) -> tuple[ApiTokenMetadata, ...]:
+        del organization_id  # accepted for signature parity with PostgresIdentityRepository; unused here
         connection = self._connect()
         try:
             rows = connection.execute(
@@ -1279,7 +1292,10 @@ class IdentityStore:
             connection.close()
         return tuple(self._token_metadata(row) for row in rows)
 
-    def revoke_token_owned(self, token_id: str, *, principal_id: str, now: datetime) -> ApiTokenMetadata:
+    def revoke_token_owned(
+        self, token_id: str, organization_id: str, *, principal_id: str, now: datetime
+    ) -> ApiTokenMetadata:
+        del organization_id  # accepted for signature parity with PostgresIdentityRepository; unused here
         connection = self._connect()
         try:
             row = connection.execute(
