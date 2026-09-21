@@ -57,6 +57,8 @@ TRUSTSCAN_PROHIBITED_OPERATIONS = (
 # service"), so there is no deployed 1.0 permit this would break.
 KNOWN_TRUSTSCAN_ACTIVE_CHECKS = (
     "active.authorization.idor",
+    "active.cmdi.marker",
+    "active.pathtraversal.disclosure",
     "active.sqli.error",
     "active.ssrf.callback",
     "active.xss.reflected",

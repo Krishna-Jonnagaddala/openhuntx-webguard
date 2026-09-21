@@ -25,7 +25,9 @@ from unittest.mock import patch
 from webguard_scanner import (
     ActiveDetectionPolicy,
     AuthorizationResourcePair,
+    run_command_injection_detector,
     run_idor_authorization_detector,
+    run_path_traversal_detector,
     run_reflected_xss_detector,
     run_sqli_error_detector,
     run_ssrf_callback_detector,
@@ -54,6 +56,21 @@ from tests.unit.test_sqli_error_detector import (
     _candidate as _sqli_candidate,
     _context as _sqli_context,
     _target as _sqli_target,
+)
+from tests.unit.test_path_traversal_detector import (
+    _FakeResponse as _PathTraversalFakeResponse,
+    _ScriptedConnection as _PathTraversalScriptedConnection,
+    _candidate as _pathtraversal_candidate,
+    _context as _pathtraversal_context,
+    _target as _pathtraversal_target,
+    _TRAVERSAL_PAYLOAD,
+)
+from tests.unit.test_command_injection_detector import (
+    _FakeResponse as _CmdiFakeResponse,
+    _ScriptedConnection as _CmdiScriptedConnection,
+    _candidate as _cmdi_candidate,
+    _context as _cmdi_context,
+    _target as _cmdi_target,
 )
 from tests.unit.test_ssrf_callback_detector import (
     _ScriptedConnection as _SsrfScriptedConnection,
@@ -129,6 +146,77 @@ class SqliFingerprintDeterminismTests(unittest.TestCase):
         first = self._run().findings[0]
         second = self._run(
             candidate=_sqli_candidate(url="http://example.com/other")
+        ).findings[0]
+        self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+
+class PathTraversalFingerprintDeterminismTests(unittest.TestCase):
+    def _responder(self, value):
+        if value == _TRAVERSAL_PAYLOAD:
+            return _PathTraversalFakeResponse(
+                b"root:x:0:0:root:/root:/bin/bash", status=200
+            )
+        return _PathTraversalFakeResponse(b"<html>report.pdf</html>", status=404)
+
+    def _run(self, candidate=None):
+        connection = _PathTraversalScriptedConnection(self._responder)
+        with patch(
+            "webguard_scanner.safe_http._make_connection", return_value=connection
+        ):
+            return run_path_traversal_detector(
+                _pathtraversal_target(),
+                (candidate or _pathtraversal_candidate(),),
+                _pathtraversal_context(),
+                policy=ActiveDetectionPolicy(minimum_delay_seconds=0.0),
+            )
+
+    def test_same_vulnerability_two_runs_same_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run().findings[0]
+        self.assertEqual(first.fingerprint, second.fingerprint)
+
+    def test_different_endpoint_different_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run(
+            candidate=_pathtraversal_candidate(url="http://example.com/other")
+        ).findings[0]
+        self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+
+class CommandInjectionFingerprintDeterminismTests(unittest.TestCase):
+    """The marker is fresh and random on every single run (never reused,
+    not even across two runs against the identical candidate), which is
+    exactly the property this whole module exists to prove does not
+    leak into the fingerprint: FindingIdentity.fingerprint must ignore
+    it entirely."""
+
+    def _responder(self, value):
+        if "; echo wgcmdi" in value:
+            marker = value.split("echo ")[1].split(" #")[0]
+            return _CmdiFakeResponse(f"<html>{marker}</html>".encode(), status=200)
+        return _CmdiFakeResponse(b"<html>ok</html>", status=200)
+
+    def _run(self, candidate=None):
+        connection = _CmdiScriptedConnection(self._responder)
+        with patch(
+            "webguard_scanner.safe_http._make_connection", return_value=connection
+        ):
+            return run_command_injection_detector(
+                _cmdi_target(),
+                (candidate or _cmdi_candidate(),),
+                _cmdi_context(),
+                policy=ActiveDetectionPolicy(minimum_delay_seconds=0.0),
+            )
+
+    def test_same_vulnerability_two_runs_same_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run().findings[0]
+        self.assertEqual(first.fingerprint, second.fingerprint)
+
+    def test_different_endpoint_different_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run(
+            candidate=_cmdi_candidate(url="http://example.com/other")
         ).findings[0]
         self.assertNotEqual(first.fingerprint, second.fingerprint)
 

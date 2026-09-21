@@ -275,6 +275,18 @@ from .sqli_error_detector import (
     SqliDetectorRunResult,
     run_sqli_error_detector,
 )
+from .path_traversal_detector import (
+    PathTraversalOutcome,
+    PathTraversalDetectorRunRecord,
+    PathTraversalDetectorRunResult,
+    run_path_traversal_detector,
+)
+from .command_injection_detector import (
+    CommandInjectionOutcome,
+    CommandInjectionDetectorRunRecord,
+    CommandInjectionDetectorRunResult,
+    run_command_injection_detector,
+)
 from .authorization_resource import (
     AuthorizationResource,
     AuthorizationResourceError,
@@ -377,6 +389,12 @@ __all__ = [
     "SqliDetectionOutcome",
     "SqliDetectorRunRecord",
     "SqliDetectorRunResult",
+    "PathTraversalOutcome",
+    "PathTraversalDetectorRunRecord",
+    "PathTraversalDetectorRunResult",
+    "CommandInjectionOutcome",
+    "CommandInjectionDetectorRunRecord",
+    "CommandInjectionDetectorRunResult",
     "TemplatedProbeAttempt",
     "AuthorizationResource",
     "AuthorizationResourceError",
@@ -419,6 +437,8 @@ __all__ = [
     "fetch_same_origin_page",
     "run_reflected_xss_detector",
     "run_sqli_error_detector",
+    "run_path_traversal_detector",
+    "run_command_injection_detector",
     "AnalyzerRegistryError",
     "COOKIE_CHECKS",
     "CORS_CHECKS",

@@ -33,12 +33,16 @@ calling convention either. It is tracked in its own
 
 from __future__ import annotations
 
+from .command_injection_detector import run_command_injection_detector
+from .path_traversal_detector import run_path_traversal_detector
 from .sqli_error_detector import run_sqli_error_detector
 from .xss_reflected_detector import run_reflected_xss_detector
 
 ACTIVE_DETECTOR_REGISTRY = {
     "active.sqli.error": run_sqli_error_detector,
     "active.xss.reflected": run_reflected_xss_detector,
+    "active.pathtraversal.disclosure": run_path_traversal_detector,
+    "active.cmdi.marker": run_command_injection_detector,
 }
 
 COMPARISON_ACTIVE_CHECK_IDS = frozenset({"active.authorization.idor"})

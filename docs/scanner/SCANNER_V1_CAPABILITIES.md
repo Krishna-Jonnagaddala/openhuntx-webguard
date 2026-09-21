@@ -4,6 +4,8 @@
 
 This is the authoritative, audited inventory of what OpenHuntX WebGuard's scanner engine actually does, as of Slice 11 (the Scanner v1 feature freeze). It was compiled by cross-checking the actual registries (`ACTIVE_DETECTOR_REGISTRY`, `KNOWN_TRUSTSCAN_ACTIVE_CHECKS`, `DEFAULT_PASSIVE_ANALYZERS`), the actual detector/analyzer source code, and the actual test suite, not derived from prior documentation or roadmap intent. Every "PROVEN" claim below traces to a named, currently-passing test. Nothing here is marked proven on the strength of documentation alone.
 
+**Slice 12 addendum:** two more active detectors were added after this freeze, at the user's explicit request (sections 13-14 below). They follow the identical registry/permit architecture sections 6-9 describe, but are marked PARTIAL rather than PROVEN for the end-to-end and live-target claims sections 6-9 carry, since that verification has not been done for them yet. Sections 1-12 below describe the state as of Slice 11 and are unchanged by Slice 12 except where a section explicitly says otherwise.
+
 **PROVEN** means a named unit test, integration test, or real-network/E2E test currently passes and exercises exactly that claim. **PARTIAL** means some real capability exists but with a stated, real restriction. **NOT SUPPORTED** means the capability does not exist in code at all, not merely undocumented.
 
 ## 1. Target authorization & scope safety
@@ -151,6 +153,36 @@ See `docs/audit/scanner-v1-security-review.md` for the full finding-schema and f
 | Scheduling | PROVEN | `tests/unit/test_phase2_cross_tenant_schedules.py` and the scheduler test suite |
 | Unexpected detector/executor exception never crashes the worker | PROVEN, generically | `test_job_worker.py::test_unexpected_exception_is_redacted`: proven via a fake executor raising, not via a real detector raising through the full call chain. See Known Limitations. |
 | Redis/message-queue-backed dispatch | NOT SUPPORTED | SQLite-backed leases/polling only |
+
+## 13. Path traversal (`active.pathtraversal.disclosure`, CWE-22, Slice 12, post-freeze)
+
+```
+Path Traversal
+├── GET query          PARTIAL   (unit-tested against a mocked connection only)
+├── GET form           PARTIAL   (same evidence)
+├── POST form          PARTIAL   (Slice 6 mutation engine, same evidence)
+├── JSON body          PARTIAL   (same evidence)
+├── Windows targets     NOT SUPPORTED  (Unix/Linux /etc/passwd only this slice)
+├── Alternate depths    NOT SUPPORTED  (one fixed six-level payload only)
+└── Encoding bypasses   NOT SUPPORTED  (no URL-encoding/null-byte/absolute-path variants attempted)
+```
+
+Confirmation requires an `/etc/passwd` root-entry-line signature present in the diagnostic response and absent from the baseline: never a generic status-code change alone. Authentication support: full, reuses the identical `authentication_material` threading every other detector uses. Evidence sanitization and fingerprint determinism: PROVEN (`test_path_traversal_detector.py`, `test_finding_fingerprint_determinism.py::PathTraversalFingerprintDeterminismTests`). Real-network validation and true end-to-end test: NOT DONE. See `docs/audit/active-detection-phase11-path-traversal.md`.
+
+## 14. OS command injection (`active.cmdi.marker`, CWE-78, Slice 12, post-freeze)
+
+```
+OS Command Injection
+├── GET query               PARTIAL   (unit-tested against a mocked connection only)
+├── GET form                PARTIAL   (same evidence)
+├── POST form               PARTIAL   (Slice 6 mutation engine, same evidence)
+├── JSON body                PARTIAL   (same evidence)
+├── Other separators (| && ` $())  NOT SUPPORTED  (";"-plus-"#" POSIX chaining only)
+├── Windows cmd.exe/PowerShell      NOT SUPPORTED
+└── Quote-breaking injection contexts  NOT SUPPORTED
+```
+
+Confirmation requires a fresh, unique marker to appear in the diagnostic response *and* the full raw diagnostic payload to be absent, specifically to rule out a target reflecting the unexecuted payload verbatim (a real false positive found and fixed during this slice, not caught later). Severity is CRITICAL, the highest this project assigns, for a technique proven so far only against a scripted fake connection, not a real shell. Authentication support: full. Evidence sanitization and fingerprint determinism: PROVEN (`test_command_injection_detector.py`, `test_finding_fingerprint_determinism.py::CommandInjectionFingerprintDeterminismTests`). Real-network validation and true end-to-end test: NOT DONE. See `docs/audit/active-detection-phase12-command-injection.md`.
 
 ## Cross-references
 
