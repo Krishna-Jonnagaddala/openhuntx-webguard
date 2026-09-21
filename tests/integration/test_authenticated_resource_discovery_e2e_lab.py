@@ -566,6 +566,7 @@ class AuthenticatedResourceDiscoveryEndToEndLabTests(unittest.TestCase):
                             "active_checks": ["active.authorization.idor"],
                             "authentication_context_id": None,
                             "authorization_comparison_plan_id": comparison_plan_id,
+                            "missing_authentication_endpoints": [],
                         }
                     ).encode("utf-8")
                     connection = http.client.HTTPConnection(host, port, timeout=5)

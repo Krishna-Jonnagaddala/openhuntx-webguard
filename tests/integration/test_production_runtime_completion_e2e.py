@@ -346,6 +346,7 @@ class ProductionRuntimeCompletionEndToEndTests(unittest.TestCase):
                         "maximum_request_attempts": 15, "maximum_requests_per_second": 1.0, "maximum_concurrency": 1,
                         "active_checks": ["active.xss.reflected"], "authentication_context_id": authentication_context_id,
                         "authorization_comparison_plan_id": None,
+                        "missing_authentication_endpoints": [],
                     }
                 ).encode()
                 connection = http.client.HTTPConnection(host, port, timeout=5)
@@ -514,6 +515,7 @@ class ProductionRuntimeCompletionEndToEndTests(unittest.TestCase):
                         "maximum_request_attempts": 30, "maximum_requests_per_second": 2.0, "maximum_concurrency": 1,
                         "active_checks": ["active.authorization.idor"], "authentication_context_id": None,
                         "authorization_comparison_plan_id": comparison_plan_id,
+                        "missing_authentication_endpoints": [],
                     }
                 ).encode()
                 connection = http.client.HTTPConnection(host, port, timeout=5)
@@ -633,7 +635,7 @@ class ProductionRuntimeCompletionEndToEndTests(unittest.TestCase):
                         "not_before": not_before.isoformat(timespec="microseconds").replace("+00:00", "Z"),
                         "expires_at": (now + timedelta(days=7)).isoformat(timespec="microseconds").replace("+00:00", "Z"),
                         "maximum_request_attempts": 15, "maximum_requests_per_second": 1.0, "maximum_concurrency": 1,
-                        "active_checks": [], "authentication_context_id": None, "authorization_comparison_plan_id": None,
+                        "active_checks": [], "authentication_context_id": None, "authorization_comparison_plan_id": None, "missing_authentication_endpoints": [],
                     }
                 ).encode(),
                 request_id=str(uuid4()),
@@ -748,7 +750,7 @@ class ProductionRuntimeCompletionEndToEndTests(unittest.TestCase):
                         "not_before": (datetime.now(timezone.utc) + timedelta(milliseconds=500)).isoformat(timespec="microseconds").replace("+00:00", "Z"),
                         "expires_at": (now + timedelta(days=7)).isoformat(timespec="microseconds").replace("+00:00", "Z"),
                         "maximum_request_attempts": 15, "maximum_requests_per_second": 1.0, "maximum_concurrency": 1,
-                        "active_checks": [], "authentication_context_id": None, "authorization_comparison_plan_id": None,
+                        "active_checks": [], "authentication_context_id": None, "authorization_comparison_plan_id": None, "missing_authentication_endpoints": [],
                     }
                 ).encode()
                 connection = http.client.HTTPConnection(host, port, timeout=5)

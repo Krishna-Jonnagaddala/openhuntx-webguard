@@ -726,6 +726,7 @@ class WebGuardJobService:
                 active_checks=submission.active_checks,
                 authentication_context_id=submission.authentication_context_id,
                 authorization_comparison_plan_id=submission.authorization_comparison_plan_id,
+                missing_authentication_endpoints=submission.missing_authentication_endpoints,
             )
             signed = self.trustscan_signer.sign(claims)
             record = self.store.create_scan_permit(signed)
@@ -750,6 +751,12 @@ class WebGuardJobService:
                 (detail_code + "_and_comparison")
                 if detail_code
                 else "authorization_comparison_authorized"
+            )
+        if claims.missing_authentication_endpoints:
+            detail_code = (
+                (detail_code + "_and_missing_auth_scope")
+                if detail_code
+                else "missing_authentication_scope_authorized"
             )
         self._audit(
             context,

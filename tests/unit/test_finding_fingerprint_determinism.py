@@ -35,6 +35,7 @@ from webguard_scanner import (
     run_command_injection_detector,
     run_idor_authorization_detector,
     run_ldap_injection_detector,
+    run_missing_authentication_detector,
     run_open_redirect_detector,
     run_path_traversal_detector,
     run_reflected_xss_detector,
@@ -109,6 +110,15 @@ from tests.unit.test_ldap_injection_detector import (
     _candidate as _ldap_candidate,
     _context as _ldap_context,
     _target as _ldap_target,
+)
+from tests.unit.test_missing_authentication_detector import (
+    _IdentityAwareConnection as _MissingAuthConnection,
+    _context as _missing_auth_context,
+    _endpoint as _missing_auth_endpoint,
+    _material as _missing_auth_material,
+    _policy as _missing_auth_policy,
+    _respond as _missing_auth_respond,
+    _target as _missing_auth_target,
 )
 
 
@@ -483,6 +493,41 @@ class LdapInjectionFingerprintDeterminismTests(unittest.TestCase):
         first = self._run().findings[0]
         second = self._run(
             candidate=_ldap_candidate(url="http://example.com/other")
+        ).findings[0]
+        self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+
+class MissingAuthenticationFingerprintDeterminismTests(unittest.TestCase):
+    def _responder(self, path, token):
+        # Identical marked content regardless of who (or nobody) asks --
+        # deterministically CONFIRMED, so every run produces exactly one
+        # finding to compare.
+        return _missing_auth_respond(200, b'{"secret_marker":"leak"}')
+
+    def _run(self, endpoint=None):
+        connection = _MissingAuthConnection(self._responder)
+        with patch(
+            "webguard_scanner.safe_http._make_connection", return_value=connection
+        ):
+            return run_missing_authentication_detector(
+                _missing_auth_target(),
+                (endpoint or _missing_auth_endpoint(owner_marker="secret_marker"),),
+                _missing_auth_context(),
+                authentication_material=_missing_auth_material(),
+                policy=_missing_auth_policy(),
+            )
+
+    def test_same_vulnerability_two_runs_same_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run().findings[0]
+        self.assertEqual(first.fingerprint, second.fingerprint)
+
+    def test_different_endpoint_different_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run(
+            endpoint=_missing_auth_endpoint(
+                "/other", owner_marker="secret_marker"
+            )
         ).findings[0]
         self.assertNotEqual(first.fingerprint, second.fingerprint)
 

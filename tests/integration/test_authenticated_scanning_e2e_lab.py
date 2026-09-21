@@ -502,6 +502,7 @@ class AuthenticatedScanningEndToEndLabTests(unittest.TestCase):
                             "active_checks": ["active.xss.reflected"],
                             "authentication_context_id": authentication_context_id,
                             "authorization_comparison_plan_id": None,
+                            "missing_authentication_endpoints": [],
                         }
                     ).encode("utf-8")
                     connection = http.client.HTTPConnection(host, port, timeout=5)

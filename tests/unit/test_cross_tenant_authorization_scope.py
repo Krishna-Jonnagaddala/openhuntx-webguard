@@ -116,6 +116,7 @@ class CrossTenantAuthorizationScopeTests(unittest.TestCase):
                 "active_checks": [],
                 "authentication_context_id": None,
                 "authorization_comparison_plan_id": None,
+                "missing_authentication_endpoints": [],
             }
         ).encode("utf-8")
 

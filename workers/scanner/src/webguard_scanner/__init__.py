@@ -146,6 +146,13 @@ from .ldap_injection_detector import (
     LdapInjectionOutcome,
     run_ldap_injection_detector,
 )
+from .missing_authentication_detector import (
+    MissingAuthenticationDetectorRunResult,
+    MissingAuthenticationObservation,
+    MissingAuthenticationOutcome,
+    MissingAuthenticationRecord,
+    run_missing_authentication_detector,
+)
 from .authentication import (
     MAXIMUM_BEARER_TOKEN_BYTES,
     MAXIMUM_COOKIES,
@@ -380,6 +387,11 @@ __all__ = [
     "LdapInjectionDetectorRunResult",
     "LdapInjectionOutcome",
     "run_ldap_injection_detector",
+    "MissingAuthenticationDetectorRunResult",
+    "MissingAuthenticationObservation",
+    "MissingAuthenticationOutcome",
+    "MissingAuthenticationRecord",
+    "run_missing_authentication_detector",
     "BeforeRequestHook",
     "AfterRequestHook",
     "AnalyzerPipelineResult",

@@ -14,6 +14,8 @@ This is the authoritative, audited inventory of what OpenHuntX WebGuard's scanne
 
 **Slice 16 addendum:** a sixth post-freeze addition, CSRF (section 18 below), is not an active detector at all: it is a passive heuristic inside `html_analyzer.py`, since true active CSRF confirmation would require completing a real state-changing action, which `ROADMAP.md` excludes as destructive testing. It carries `docs/CWE_COVERAGE.md`'s PARTIAL status, not IMPLEMENTED (active).
 
+**Slice 17 addendum:** a seventh post-freeze addition, missing authentication (section 19 below), the precise CWE-306 child of the CWE-287 ("broken authentication") the user asked for. Unlike sections 13-17, this one IS marked PROVEN for the end-to-end and real-fixture claims, the same standard sections 6-9 carry: it required a signed-permit schema change (`1.3`→`1.4`) rather than staying self-contained in the scanner package, and got the corresponding full verification effort, including a true end-to-end lab test.
+
 **PROVEN** means a named unit test, integration test, or real-network/E2E test currently passes and exercises exactly that claim. **PARTIAL** means some real capability exists but with a stated, real restriction. **NOT SUPPORTED** means the capability does not exist in code at all, not merely undocumented.
 
 ## 1. Target authorization & scope safety
@@ -257,6 +259,22 @@ CSRF (anti-CSRF token field naming heuristic only)
 ```
 
 Unlike every other post-freeze addition, this is a passive check inside the existing `html_analyzer.py`, not a new active detector: confirming CSRF the active way this project's other detectors work (a deliberately non-destructive diagnostic payload) is not possible for this specific weakness, since a genuine positive result requires the state-changing action to actually complete. `_BoundedHtmlParser`'s existing form-tracking (`_FormRecord`, already used for the password-transport and cross-origin-action checks) is extended to also track hidden-input names/values; a POST form with none matching one of 9 real, pre-verified anti-CSRF naming conventions (fact-checked by two independent lenses, one using live web search against current framework source/docs, the other stress-testing false positives against the actual parser code) produces a MEDIUM-severity, LOW-confidence finding. The bare word `token` (Apache Struts 2's own default) is deliberately excluded from the recognized-name list: both lenses independently confirmed it collides with unrelated one-time-link fields (`reset_token`, `api_token`) in the dangerous direction. A name match also requires a non-empty, non-template-placeholder value, closing a real gap the review found (a name-only check would silently trust a stale or broken template). Evidence sanitization: PROVEN (12 new unit tests, `tests/unit/test_html_analyzer.py`). Real-network validation and true end-to-end test: not applicable, this is a passive check with no active probe. See `docs/audit/active-detection-phase16-csrf-token-heuristic.md`.
+
+## 19. Missing authentication (`active.authentication.missing`, CWE-306, Slice 17, post-freeze)
+
+```
+Missing authentication for critical function
+├── Operator-supplied endpoint list (permit claim, max 10)      PROVEN
+├── Authenticated baseline + fully anonymous probe               PROVEN
+├── CONFIRMED = exact fingerprint match AND owner_marker match   PROVEN  (bare fingerprint match alone is capped at PROBABLE -- no second identity to serve as a negative control)
+├── Redirect-to-login (3xx) classified from status alone          PROVEN  (never fingerprints a redirect body)
+├── Per-endpoint failure isolation (one bad URL != whole batch)   PROVEN
+├── Crawl-mode findings                                           NOT SUPPORTED (CrawlScanResult has no scan-wide findings field at all; this detector's candidates were never page-specific to begin with, so restricted to single-page scans same as sections 8/15/16)
+├── POST/PUT/DELETE endpoints                                     NOT SUPPORTED (v1 is GET-only, enforced both on the permit claim and independently in the detector)
+└── Credential-guessing / login-bypass confirmation (CWE-287)     NOT ATTEMPTED (destructive testing; excluded by ROADMAP.md, not by choice of technique)
+```
+
+The precise CWE-306 child of the CWE-287 ("broken authentication") the user asked for, the same precision discipline section 8 already applies to CWE-639-not-862. Required a signed-permit schema bump (`1.3`→`1.4`) to add `missing_authentication_endpoints` (a tuple of `MissingAuthenticationEndpoint`, mirroring `permitted_modes`'s enum-tuple shape), enforced bidirectionally and self-containedly in `TrustScanPermitClaims.__post_init__` (the check ID, a non-empty endpoint list, and a set `authentication_context_id` must all be present together, with no live-repository lookup needed, a stricter rule than IDOR's own analogous, issuance-time-only cross-check). Neither a resource-pair architecture like IDOR's nor a `CallbackBroker` wait like SSRF/XXE's fit this detector's shape (one real identity, flat endpoints, permit-scoped candidates), so it gets a fourth dispatch category, `FIXED_ENDPOINT_ACTIVE_CHECK_IDS`, alongside `ACTIVE_DETECTOR_REGISTRY`/`COMPARISON_ACTIVE_CHECK_IDS`/`CALLBACK_ACTIVE_CHECK_IDS`. A two-agent pre-implementation adversarial review found one blocking false-positive risk (fixed by requiring both the fingerprint match and the marker, not either alone, for CONFIRMED) and several should-fix issues (redirect handling, per-endpoint error isolation, the real reason crawl mode is out of scope) before any detector code was written; see `docs/CWE_COVERAGE.md`'s Slice 17 section for the full list. Real-network proven (a purpose-built local HTTPS fixture with a genuinely vulnerable endpoint and a properly-gated 401 endpoint, real sockets, self-signed cert) and full E2E proven (CLI → HTTP API → worker → executor → report, `tests/integration/test_missing_authentication_e2e_lab.py`). Not yet run against a live/public target. Fingerprint determinism and evidence sanitization: PROVEN (`test_missing_authentication_detector.py`). See `docs/audit/active-detection-phase17-missing-authentication.md`.
 
 ## Cross-references
 
