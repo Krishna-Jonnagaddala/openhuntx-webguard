@@ -51,6 +51,15 @@ genuinely different axis from what distinguishes
 authorized through ``active_checks`` like every other detector but
 executed through its own dedicated path
 (``executor._apply_missing_authentication_detection``).
+
+``active.xxe.disclosure`` (Slice 21) joins the generic registry
+directly, unlike its out-of-band sibling ``active.xxe.callback``: it
+needs no ``CallbackBroker`` and no asynchronous wait, only a synchronous
+baseline-plus-diagnostic pair against the page's own discovered
+candidates, the identical shape every other generic-registry detector
+already uses. See ``xxe_disclosure_detector.py``'s own docstring for why
+it still cannot use ``active.xxe.callback``'s ``select_xxe_candidates``
+directly (a private, per-module copy instead).
 """
 
 from __future__ import annotations
@@ -61,6 +70,7 @@ from .open_redirect_detector import run_open_redirect_detector
 from .path_traversal_detector import run_path_traversal_detector
 from .sqli_error_detector import run_sqli_error_detector
 from .xss_reflected_detector import run_reflected_xss_detector
+from .xxe_disclosure_detector import run_xxe_disclosure_detector
 
 ACTIVE_DETECTOR_REGISTRY = {
     "active.sqli.error": run_sqli_error_detector,
@@ -69,6 +79,7 @@ ACTIVE_DETECTOR_REGISTRY = {
     "active.cmdi.marker": run_command_injection_detector,
     "active.openredirect.location": run_open_redirect_detector,
     "active.ldapi.error": run_ldap_injection_detector,
+    "active.xxe.disclosure": run_xxe_disclosure_detector,
 }
 
 COMPARISON_ACTIVE_CHECK_IDS = frozenset({"active.authorization.idor"})

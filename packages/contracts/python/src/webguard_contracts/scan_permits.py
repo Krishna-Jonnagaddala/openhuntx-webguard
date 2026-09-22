@@ -66,6 +66,7 @@ KNOWN_TRUSTSCAN_ACTIVE_CHECKS = (
     "active.ssrf.callback",
     "active.xss.reflected",
     "active.xxe.callback",
+    "active.xxe.disclosure",
 )
 
 # Slice 17: bounded, operator-supplied resource list for

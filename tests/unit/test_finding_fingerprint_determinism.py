@@ -42,6 +42,7 @@ from webguard_scanner import (
     run_sqli_error_detector,
     run_ssrf_callback_detector,
     run_xxe_callback_detector,
+    run_xxe_disclosure_detector,
 )
 from webguard_scanner.callback_broker import InMemoryCallbackBroker
 
@@ -95,6 +96,15 @@ from tests.unit.test_xxe_callback_detector import (
     _post_policy as _xxe_policy,
     _target as _xxe_target,
     _template as _xxe_template,
+)
+from tests.unit.test_xxe_disclosure_detector import (
+    _FakeResponse as _XxeDisclosureFakeResponse,
+    _PASSWD_BODY as _XXE_DISCLOSURE_PASSWD_BODY,
+    _ScriptedConnection as _XxeDisclosureScriptedConnection,
+    _context as _xxedisclosure_context,
+    _post_policy as _xxedisclosure_policy,
+    _target as _xxedisclosure_target,
+    _template as _xxedisclosure_template,
 )
 from tests.unit.test_open_redirect_detector import (
     _FakeResponse as _OpenRedirectFakeResponse,
@@ -527,6 +537,45 @@ class MissingAuthenticationFingerprintDeterminismTests(unittest.TestCase):
         second = self._run(
             endpoint=_missing_auth_endpoint(
                 "/other", owner_marker="secret_marker"
+            )
+        ).findings[0]
+        self.assertNotEqual(first.fingerprint, second.fingerprint)
+
+
+class XxeDisclosureFingerprintDeterminismTests(unittest.TestCase):
+    """active.xxe.disclosure's parameter is also always None (the whole
+    body is replaced, see xxe_disclosure_detector.py's own module
+    docstring), the identical reasoning test_xxe_callback_detector's own
+    determinism class already checks for its sibling detector."""
+
+    def _responder(self, body: str):
+        if "file:///etc/passwd" in body:
+            return _XxeDisclosureFakeResponse(_XXE_DISCLOSURE_PASSWD_BODY, status=200)
+        return _XxeDisclosureFakeResponse(b"<html>upload accepted</html>", status=201)
+
+    def _run(self, template=None):
+        connection = _XxeDisclosureScriptedConnection(self._responder)
+        with patch(
+            "webguard_scanner.safe_http._make_connection", return_value=connection
+        ):
+            return run_xxe_disclosure_detector(
+                _xxedisclosure_target(),
+                (template or _xxedisclosure_template(endpoint="http://example.com/upload-vulnerable"),),
+                _xxedisclosure_context(),
+                policy=_xxedisclosure_policy(),
+            )
+
+    def test_same_vulnerability_two_runs_same_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run().findings[0]
+        self.assertEqual(first.fingerprint, second.fingerprint)
+        self.assertIsNone(first.identity.parameter)
+
+    def test_different_endpoint_different_fingerprint(self) -> None:
+        first = self._run().findings[0]
+        second = self._run(
+            template=_xxedisclosure_template(
+                endpoint="http://example.com/upload-vulnerable-2"
             )
         ).findings[0]
         self.assertNotEqual(first.fingerprint, second.fingerprint)

@@ -134,6 +134,12 @@ from .xxe_callback_detector import (
     run_xxe_callback_detector,
     select_xxe_candidates,
 )
+from .xxe_disclosure_detector import (
+    XxeDisclosureDetectorRunRecord,
+    XxeDisclosureDetectorRunResult,
+    XxeDisclosureOutcome,
+    run_xxe_disclosure_detector,
+)
 from .open_redirect_detector import (
     OpenRedirectDetectorRunRecord,
     OpenRedirectDetectorRunResult,
@@ -379,6 +385,10 @@ __all__ = [
     "XxeProbeRecord",
     "run_xxe_callback_detector",
     "select_xxe_candidates",
+    "XxeDisclosureDetectorRunRecord",
+    "XxeDisclosureDetectorRunResult",
+    "XxeDisclosureOutcome",
+    "run_xxe_disclosure_detector",
     "OpenRedirectDetectorRunRecord",
     "OpenRedirectDetectorRunResult",
     "OpenRedirectOutcome",
