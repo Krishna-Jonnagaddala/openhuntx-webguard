@@ -127,6 +127,38 @@ from .ssrf_callback_detector import (
     run_ssrf_callback_detector,
     select_ssrf_candidates,
 )
+from .xxe_callback_detector import (
+    XxeDetectionOutcome,
+    XxeDetectorRunResult,
+    XxeProbeRecord,
+    run_xxe_callback_detector,
+    select_xxe_candidates,
+)
+from .xxe_disclosure_detector import (
+    XxeDisclosureDetectorRunRecord,
+    XxeDisclosureDetectorRunResult,
+    XxeDisclosureOutcome,
+    run_xxe_disclosure_detector,
+)
+from .open_redirect_detector import (
+    OpenRedirectDetectorRunRecord,
+    OpenRedirectDetectorRunResult,
+    OpenRedirectOutcome,
+    run_open_redirect_detector,
+)
+from .ldap_injection_detector import (
+    LdapInjectionDetectorRunRecord,
+    LdapInjectionDetectorRunResult,
+    LdapInjectionOutcome,
+    run_ldap_injection_detector,
+)
+from .missing_authentication_detector import (
+    MissingAuthenticationDetectorRunResult,
+    MissingAuthenticationObservation,
+    MissingAuthenticationOutcome,
+    MissingAuthenticationRecord,
+    run_missing_authentication_detector,
+)
 from .authentication import (
     MAXIMUM_BEARER_TOKEN_BYTES,
     MAXIMUM_COOKIES,
@@ -275,6 +307,18 @@ from .sqli_error_detector import (
     SqliDetectorRunResult,
     run_sqli_error_detector,
 )
+from .path_traversal_detector import (
+    PathTraversalOutcome,
+    PathTraversalDetectorRunRecord,
+    PathTraversalDetectorRunResult,
+    run_path_traversal_detector,
+)
+from .command_injection_detector import (
+    CommandInjectionOutcome,
+    CommandInjectionDetectorRunRecord,
+    CommandInjectionDetectorRunResult,
+    run_command_injection_detector,
+)
 from .authorization_resource import (
     AuthorizationResource,
     AuthorizationResourceError,
@@ -336,6 +380,28 @@ __all__ = [
     "is_ssrf_candidate_parameter",
     "run_ssrf_callback_detector",
     "select_ssrf_candidates",
+    "XxeDetectionOutcome",
+    "XxeDetectorRunResult",
+    "XxeProbeRecord",
+    "run_xxe_callback_detector",
+    "select_xxe_candidates",
+    "XxeDisclosureDetectorRunRecord",
+    "XxeDisclosureDetectorRunResult",
+    "XxeDisclosureOutcome",
+    "run_xxe_disclosure_detector",
+    "OpenRedirectDetectorRunRecord",
+    "OpenRedirectDetectorRunResult",
+    "OpenRedirectOutcome",
+    "run_open_redirect_detector",
+    "LdapInjectionDetectorRunRecord",
+    "LdapInjectionDetectorRunResult",
+    "LdapInjectionOutcome",
+    "run_ldap_injection_detector",
+    "MissingAuthenticationDetectorRunResult",
+    "MissingAuthenticationObservation",
+    "MissingAuthenticationOutcome",
+    "MissingAuthenticationRecord",
+    "run_missing_authentication_detector",
     "BeforeRequestHook",
     "AfterRequestHook",
     "AnalyzerPipelineResult",
@@ -377,6 +443,12 @@ __all__ = [
     "SqliDetectionOutcome",
     "SqliDetectorRunRecord",
     "SqliDetectorRunResult",
+    "PathTraversalOutcome",
+    "PathTraversalDetectorRunRecord",
+    "PathTraversalDetectorRunResult",
+    "CommandInjectionOutcome",
+    "CommandInjectionDetectorRunRecord",
+    "CommandInjectionDetectorRunResult",
     "TemplatedProbeAttempt",
     "AuthorizationResource",
     "AuthorizationResourceError",
@@ -419,6 +491,8 @@ __all__ = [
     "fetch_same_origin_page",
     "run_reflected_xss_detector",
     "run_sqli_error_detector",
+    "run_path_traversal_detector",
+    "run_command_injection_detector",
     "AnalyzerRegistryError",
     "COOKIE_CHECKS",
     "CORS_CHECKS",

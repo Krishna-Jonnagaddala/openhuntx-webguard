@@ -74,6 +74,11 @@ class ContentType:
     NONE = ""
     FORM_URLENCODED = "application/x-www-form-urlencoded"
     JSON = "application/json"
+    # Named for readability only (Slice 13's XXE detector): mutate()
+    # has no XML-body branch and never produces this content type;
+    # nothing in this module validates against it, the same as the
+    # three constants above it.
+    XML = "application/xml"
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,6 +619,7 @@ def issue_templated_request(
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
     authentication_material: AuthenticationMaterial | None = None,
+    allow_redirect_status: bool = False,
 ) -> TemplatedProbeAttempt:
     """Send exactly one bounded request for a MutatedRequest.
 
@@ -625,6 +631,11 @@ def issue_templated_request(
 
     ``authentication_material`` (Slice 7): see
     ``active_detection.issue_probe``.
+
+    ``allow_redirect_status`` (Slice 14: open redirect): see
+    ``active_detection.issue_probe``'s identical parameter. Passed
+    straight through to ``fetch_once``; every existing caller leaves
+    this False and is unaffected.
     """
 
     _require_same_origin(base_target, mutated.url)
@@ -644,6 +655,7 @@ def issue_templated_request(
             body=mutated.body,
             content_type=mutated.content_type,
             extra_headers=extra_headers,
+            allow_redirect_status=allow_redirect_status,
         )
     except SafeRequestError as exc:
         if after_request is not None:

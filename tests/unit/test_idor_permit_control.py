@@ -78,6 +78,7 @@ def permit_body(**changes) -> bytes:
         "active_checks": [],
         "authentication_context_id": None,
         "authorization_comparison_plan_id": None,
+        "missing_authentication_endpoints": [],
     }
     values.update(changes)
     return json.dumps(values).encode("utf-8")

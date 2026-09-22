@@ -311,6 +311,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
                         "maximum_request_attempts": 30, "maximum_requests_per_second": 2.0, "maximum_concurrency": 1,
                         "active_checks": active_checks, "authentication_context_id": None,
                         "authorization_comparison_plan_id": None,
+                        "missing_authentication_endpoints": [],
                     }
                 ).encode()
                 connection = http.client.HTTPConnection(host, port, timeout=5)

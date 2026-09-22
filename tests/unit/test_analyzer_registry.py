@@ -208,7 +208,7 @@ class AnalyzerRegistryTests(unittest.TestCase):
             registered_checks(DEFAULT_PASSIVE_ANALYZERS),
             PASSIVE_CHECKS,
         )
-        self.assertEqual(len(PASSIVE_CHECKS), 40)
+        self.assertEqual(len(PASSIVE_CHECKS), 41)
 
     def test_rejects_empty_registry(self) -> None:
         with self.assertRaises(AnalyzerRegistryError) as context:

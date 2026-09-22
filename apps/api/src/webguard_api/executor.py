@@ -56,7 +56,9 @@ from webguard_scanner import (
     fetch_same_origin_page,
     run_authenticated_resource_discovery_crawl,
     run_idor_authorization_detector,
+    run_missing_authentication_detector,
     run_ssrf_callback_detector,
+    run_xxe_callback_detector,
     to_request_templates,
     validate_owned_target_preflight,
     validate_target_url,
@@ -956,6 +958,257 @@ def _apply_ssrf_callback_detection(
     )
 
 
+def _apply_xxe_callback_detection(
+    report: WebGuardReport,
+    *,
+    target: ValidatedTarget,
+    active_checks: tuple[str, ...],
+    scan_id: str,
+    organization_id: str,
+    authorization_id: str,
+    permit_id: str,
+    permit_fingerprint: str,
+    authentication_context_id: str | None,
+    authentication_contexts: AuthenticationContextRepository,
+    secret_provider: SecretProvider,
+    callback_repository: TenantScopedCallbackBroker,
+    fetch_policy: FetchPolicy,
+    safety: TrustScanRuntimeSafetyEngine,
+    cancellation_token: CrawlCancellationToken,
+    job_id: str | None = None,
+) -> WebGuardReport:
+    """Run the XXE-callback detector and merge findings into the
+    report. A near line-for-line mirror of
+    ``_apply_ssrf_callback_detection`` above (same discovery call, same
+    broker adapter, same single-page-only restriction, same
+    fail-closed permit gate), because out-of-band XXE confirmation
+    needs the identical ``CallbackBroker`` orchestration SSRF already
+    required, for the identical reason (see
+    ``active_detector_registry.py``'s module docstring).
+
+    Fails closed by construction: if ``active.xxe.callback`` is not in
+    ``active_checks``, this returns ``report`` completely unchanged.
+
+    Single-page scans only this slice, matching
+    ``_apply_ssrf_callback_detection``'s own restriction: XXE candidate
+    discovery here is not yet threaded through crawl-mode's per-page
+    restriction either.
+    """
+
+    if "active.xxe.callback" not in active_checks:
+        return report
+
+    if hasattr(report, "pages"):
+        return report
+
+    if report.status not in _ACTIVE_DETECTION_ELIGIBLE_STATUSES:
+        return report
+
+    def cancellation_check() -> bool:
+        return cancellation_token.is_cancelled
+
+    if cancellation_check():
+        return report
+
+    authentication_material = None
+    if authentication_context_id is not None:
+        try:
+            context_record = authentication_contexts.require_bound(
+                authentication_context_id,
+                organization_id=organization_id,
+                target=target.normalised_url,
+                authorization_id=authorization_id,
+                now=safety.clock(),
+            )
+            authentication_material = secret_provider.resolve(
+                context_record.secret_reference_id or authentication_context_id
+            )
+        except (AuthenticationContextError, SecretProviderError) as exc:
+            raise TrustScanRuntimeSafetyError(exc.code, exc.message) from exc
+
+    response = fetch_same_origin_page(
+        target,
+        target.normalised_url,
+        policy=ActiveDetectionPolicy(fetch_policy=fetch_policy),
+        before_request=safety.before_request,
+        after_request=safety.after_request,
+        authentication_material=authentication_material,
+    )
+    if response is None:
+        return report
+
+    surface = discover_page_attack_surface(
+        target, target.normalised_url, response.body, budget=AttackSurfaceBudget()
+    )
+    allow_post = "POST" in fetch_policy.allowed_methods
+    allow_json = allow_post
+    candidates = to_request_templates(
+        surface, allow_post=allow_post, allow_json=allow_json
+    )
+    if not candidates:
+        return report
+    candidates = candidates[:MAXIMUM_DISCOVERED_CANDIDATES]
+
+    context = ActiveDetectionContext(
+        scan_id=scan_id,
+        authorization_id=authorization_id,
+        permit_id=permit_id,
+        permit_fingerprint=permit_fingerprint,
+    )
+    policy = ActiveDetectionPolicy(
+        fetch_policy=fetch_policy,
+        maximum_probe_requests=MAXIMUM_DISCOVERED_CANDIDATES,
+    )
+    broker = _ScanScopedCallbackBroker(
+        callback_repository,
+        organization_id=organization_id,
+        target=target.normalised_url,
+        authorization_id=authorization_id,
+        job_id=job_id,
+        permit_id=permit_id,
+    )
+
+    try:
+        result = run_xxe_callback_detector(
+            target,
+            candidates,
+            context,
+            callback_broker=broker,
+            policy=policy,
+            callback_policy=callback_repository.policy,
+            before_request=safety.before_request,
+            after_request=safety.after_request,
+            authentication_material=authentication_material,
+            cancellation_check=cancellation_check,
+        )
+    except ActiveDetectionError:
+        return report
+
+    if not result.findings:
+        return report
+    return dataclasses_replace(
+        report, findings=report.findings + tuple(result.findings)
+    )
+
+
+def _apply_missing_authentication_detection(
+    report: WebGuardReport,
+    *,
+    target: ValidatedTarget,
+    active_checks: tuple[str, ...],
+    scan_id: str,
+    organization_id: str,
+    authorization_id: str,
+    permit_id: str,
+    permit_fingerprint: str,
+    authentication_context_id: str | None,
+    missing_authentication_endpoints: tuple,
+    authentication_contexts: AuthenticationContextRepository,
+    secret_provider: SecretProvider,
+    fetch_policy: FetchPolicy,
+    safety: TrustScanRuntimeSafetyEngine,
+    cancellation_token: CrawlCancellationToken,
+) -> WebGuardReport:
+    """Run the missing-authentication (CWE-306) detector and merge
+    findings into the report.
+
+    Fails closed by construction: if ``active.authentication.missing``
+    is not in ``active_checks``, or ``missing_authentication_endpoints``
+    is empty, or ``authentication_context_id`` is not set, this returns
+    ``report`` completely unchanged. The permit contract itself already
+    guarantees these three go together (see
+    ``scan_permits._validate_missing_authentication_binding``: the
+    check id, a non-empty endpoint list, and a set authentication
+    context are required together, bidirectionally, at issuance time) --
+    these are re-checked here anyway as defense in depth, the same
+    posture ``_apply_authorization_comparison`` takes toward its own
+    already-validated ``comparison_plan_id``.
+
+    Single-page scans only, for a reason unrelated to candidate
+    discovery (this detector's candidates are the permit's own fixed
+    endpoint list, not discovered from any page): ``CrawlScanResult``
+    has no scan-wide ``findings`` field to merge into at all -- see
+    ``missing_authentication_detector``'s own module docstring for the
+    full explanation of why that rules out crawl-mode support in v1
+    for every dedicated-path detector, not only this one.
+
+    The authenticated identity is resolved and validated exactly once,
+    here, before any endpoint is probed -- mirroring
+    ``_apply_active_detection``'s and every other dedicated-path
+    detector's identical pattern. A resolution failure (expired or
+    revoked context) raises ``TrustScanRuntimeSafetyError`` and
+    terminates the whole scan with a signed safety receipt; it is never
+    caught per-endpoint and downgraded to a quiet INCONCLUSIVE.
+    """
+
+    if (
+        "active.authentication.missing" not in active_checks
+        or not missing_authentication_endpoints
+        or authentication_context_id is None
+    ):
+        return report
+
+    if hasattr(report, "pages"):
+        return report
+
+    if report.status not in _ACTIVE_DETECTION_ELIGIBLE_STATUSES:
+        return report
+
+    def cancellation_check() -> bool:
+        return cancellation_token.is_cancelled
+
+    if cancellation_check():
+        return report
+
+    try:
+        context_record = authentication_contexts.require_bound(
+            authentication_context_id,
+            organization_id=organization_id,
+            target=target.normalised_url,
+            authorization_id=authorization_id,
+            now=safety.clock(),
+        )
+        authentication_material = secret_provider.resolve(
+            context_record.secret_reference_id or authentication_context_id
+        )
+    except (AuthenticationContextError, SecretProviderError) as exc:
+        raise TrustScanRuntimeSafetyError(exc.code, exc.message) from exc
+
+    context = ActiveDetectionContext(
+        scan_id=scan_id,
+        authorization_id=authorization_id,
+        permit_id=permit_id,
+        permit_fingerprint=permit_fingerprint,
+    )
+    policy = ActiveDetectionPolicy(
+        fetch_policy=fetch_policy,
+        maximum_probe_requests=max(
+            MAXIMUM_DISCOVERED_CANDIDATES,
+            len(missing_authentication_endpoints) * 2,
+        ),
+    )
+
+    try:
+        result = run_missing_authentication_detector(
+            target,
+            missing_authentication_endpoints,
+            context,
+            authentication_material=authentication_material,
+            policy=policy,
+            before_request=safety.before_request,
+            after_request=safety.after_request,
+            cancellation_check=cancellation_check,
+        )
+    except ActiveDetectionError:
+        return report
+
+    if not result.findings:
+        return report
+    return dataclasses_replace(
+        report, findings=report.findings + tuple(result.findings)
+    )
+
+
 class ScanJobExecutor:
     """Execute one validated, server-authorized passive scanner job."""
 
@@ -1442,6 +1695,43 @@ class ScanJobExecutor:
                 safety=safety,
                 cancellation_token=token,
                 job_id=record.job_id,
+            )
+            report = _apply_xxe_callback_detection(
+                report,
+                target=target,
+                active_checks=permit.permit.claims.active_checks,
+                scan_id=scan_id,
+                organization_id=scope[0],
+                authorization_id=record.request.authorization_id,
+                permit_id=permit.permit.claims.permit_id,
+                permit_fingerprint=permit.permit.fingerprint,
+                authentication_context_id=permit.permit.claims.authentication_context_id,
+                authentication_contexts=self.authentication_contexts,
+                secret_provider=self.secret_provider,
+                callback_repository=self.callback_repository,
+                fetch_policy=fetch_policy,
+                safety=safety,
+                cancellation_token=token,
+                job_id=record.job_id,
+            )
+            report = _apply_missing_authentication_detection(
+                report,
+                target=target,
+                active_checks=permit.permit.claims.active_checks,
+                scan_id=scan_id,
+                organization_id=scope[0],
+                authorization_id=record.request.authorization_id,
+                permit_id=permit.permit.claims.permit_id,
+                permit_fingerprint=permit.permit.fingerprint,
+                authentication_context_id=permit.permit.claims.authentication_context_id,
+                missing_authentication_endpoints=(
+                    permit.permit.claims.missing_authentication_endpoints
+                ),
+                authentication_contexts=self.authentication_contexts,
+                secret_provider=self.secret_provider,
+                fetch_policy=fetch_policy,
+                safety=safety,
+                cancellation_token=token,
             )
         except TrustScanRuntimeSafetyError as exc:
             receipt = safety.signed_receipt(termination_reason="safety_blocked")

@@ -173,6 +173,7 @@ class SigningServiceEndToEndTests(unittest.TestCase):
                         "active_checks": [],
                         "authentication_context_id": None,
                         "authorization_comparison_plan_id": None,
+                        "missing_authentication_endpoints": [],
                     }
                 ).encode()
                 connection = http.client.HTTPConnection(stack.host, stack.port, timeout=5)

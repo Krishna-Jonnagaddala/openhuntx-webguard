@@ -91,7 +91,7 @@ class PassiveScanLabIntegrationTests(unittest.TestCase):
         self.assertEqual(len(DEFAULT_PASSIVE_ANALYZERS), 6)
         self.assertEqual(
             result.coverage.completion_percent,
-            80.0,
+            80.49,
         )
         self.assertTrue(
             set(PASSIVE_COOKIE_CHECKS).issubset(

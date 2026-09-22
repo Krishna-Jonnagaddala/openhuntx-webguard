@@ -411,6 +411,17 @@ def _permit_issue_command(args: argparse.Namespace) -> int:
         )
         return EXIT_USAGE
 
+    endpoints = args.missing_auth_endpoint or []
+    markers = args.missing_auth_marker or []
+    missing_authentication_endpoints = [
+        {
+            "endpoint": endpoint,
+            "method": "GET",
+            "owner_marker": markers[index] if index < len(markers) else "",
+        }
+        for index, endpoint in enumerate(endpoints)
+    ]
+
     body = json.dumps(
         {
             "target": args.target,
@@ -436,6 +447,7 @@ def _permit_issue_command(args: argparse.Namespace) -> int:
             "active_checks": active_checks,
             "authentication_context_id": args.authentication_context_id,
             "authorization_comparison_plan_id": args.authorization_comparison_plan_id,
+            "missing_authentication_endpoints": missing_authentication_endpoints,
         }
     ).encode("utf-8")
 
@@ -454,6 +466,11 @@ def _permit_issue_command(args: argparse.Namespace) -> int:
         print(f"Active checks authorized: {', '.join(claims['active_checks'])}")
     else:
         print("Active checks authorized: none (passive-only)")
+    if claims["missing_authentication_endpoints"]:
+        print(
+            "Missing-authentication endpoints: "
+            f"{len(claims['missing_authentication_endpoints'])}"
+        )
     return EXIT_SUCCESS
 
 
@@ -1439,6 +1456,38 @@ def build_parser() -> argparse.ArgumentParser:
             "the default and the fail-closed behaviour for every permit "
             "that does not explicitly request one. Requesting this "
             "requires an organization-owner token."
+        ),
+    )
+    permit_issue.add_argument(
+        "--missing-auth-endpoint",
+        action="append",
+        default=None,
+        help=(
+            "May be repeated, up to 10 times. A URL that should require "
+            "--authentication-context-id to access at all; authorizes "
+            "active.authentication.missing (CWE-306) to test it "
+            "anonymously. Requires --authentication-context-id and "
+            "--active-check active.authentication.missing to also be "
+            "set. Requesting this requires an organization-owner token."
+        ),
+    )
+    permit_issue.add_argument(
+        "--missing-auth-marker",
+        action="append",
+        default=None,
+        help=(
+            "May be repeated. Optional corroborating marker text, "
+            "paired by position with --missing-auth-endpoint (the Nth "
+            "marker corresponds to the Nth endpoint): a string known to "
+            "appear only in that endpoint's genuinely protected content. "
+            "Omit for a given endpoint (pass fewer markers than "
+            "endpoints) to configure no marker for it -- detection still "
+            "works via exact content matching, just without this "
+            "additional corroboration. To set a marker for an endpoint "
+            "other than the first, or to skip one in the middle, issue "
+            "the permit via the HTTP API's JSON submission instead, "
+            "which addresses each endpoint's marker directly rather "
+            "than by position."
         ),
     )
     permit_issue.set_defaults(handler=_permit_issue_command)

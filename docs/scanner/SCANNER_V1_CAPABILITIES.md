@@ -4,6 +4,24 @@
 
 This is the authoritative, audited inventory of what OpenHuntX WebGuard's scanner engine actually does, as of Slice 11 (the Scanner v1 feature freeze). It was compiled by cross-checking the actual registries (`ACTIVE_DETECTOR_REGISTRY`, `KNOWN_TRUSTSCAN_ACTIVE_CHECKS`, `DEFAULT_PASSIVE_ANALYZERS`), the actual detector/analyzer source code, and the actual test suite, not derived from prior documentation or roadmap intent. Every "PROVEN" claim below traces to a named, currently-passing test. Nothing here is marked proven on the strength of documentation alone.
 
+**Slice 12 addendum:** two more active detectors were added after this freeze, at the user's explicit request (sections 13-14 below). They follow the identical registry/permit architecture sections 6-9 describe, but are marked PARTIAL rather than PROVEN for the end-to-end and live-target claims sections 6-9 carry, since that verification has not been done for them yet. Sections 1-12 below describe the state as of Slice 11 and are unchanged by Slice 12 except where a section explicitly says otherwise.
+
+**Slice 13 addendum:** a third post-freeze active detector, XXE (section 15 below), was added the same way. Unlike sections 13-14, it does not use `ACTIVE_DETECTOR_REGISTRY` at all: like SSRF, it needs a `CallbackBroker` wait, so it lives in `CALLBACK_ACTIVE_CHECK_IDS` and its own executor function instead.
+
+**Slice 14 addendum:** a fourth post-freeze active detector, open redirect (section 16 below), was added the same way. Unlike section 15's XXE, it fits `ACTIVE_DETECTOR_REGISTRY`'s generic calling convention exactly, the same as sections 13-14.
+
+**Slice 15 addendum:** a fifth post-freeze active detector, LDAP injection (section 17 below), was added the same way. Unlike CWE-90's predecessors in this addendum, it was never previously named in `docs/CWE_COVERAGE.md`'s own "Planned" list at all.
+
+**Slice 16 addendum:** a sixth post-freeze addition, CSRF (section 18 below), is not an active detector at all: it is a passive heuristic inside `html_analyzer.py`, since true active CSRF confirmation would require completing a real state-changing action, which `ROADMAP.md` excludes as destructive testing. It carries `docs/CWE_COVERAGE.md`'s PARTIAL status, not IMPLEMENTED (active).
+
+**Slice 17 addendum:** a seventh post-freeze addition, missing authentication (section 19 below), the precise CWE-306 child of the CWE-287 ("broken authentication") the user asked for. Unlike sections 13-17, this one IS marked PROVEN for the end-to-end and real-fixture claims, the same standard sections 6-9 carry: it required a signed-permit schema change (`1.3`→`1.4`) rather than staying self-contained in the scanner package, and got the corresponding full verification effort, including a true end-to-end lab test.
+
+**Slice 18 addendum:** the "PARTIAL rather than PROVEN" gap Slice 12's own addendum named above is now half-closed for sections 13-17: each of those five detectors' real-network-validation claim moves from NOT DONE to PROVEN, against a purpose-built local fixture over real sockets. The end-to-end (CLI → API → worker → executor → report) and live/public-target claims sections 6-9 also carry remain NOT DONE for all five; this slice did not attempt either.
+
+**Slice 19 addendum:** the remaining half of that gap is now closed too: sections 13-17's end-to-end claim also moves from NOT DONE to PROVEN, against the identical local fixtures Slice 18 already built. Only the live/public-target claim remains open for sections 13-17: proven only for CWE-639 (section 8) among every detector in this project; section 9's SSRF was genuinely investigated against Juice Shop and found no compatible surface there (a real attempt with a stated result, not an unattempted gap), while sections 13-17 have not been attempted against any live target at all.
+
+**Slice 20 addendum:** that remaining gap is now closed too. Sections 13-17 (and section 19, missing authentication) were investigated against the same live Juice Shop container, each with its own specific finding: five of the six are structural negatives (a real bug the detector's own technique cannot reach, or no compatible surface at all); section 15's XXE is the exception, a real, confirmed, anonymously-exploitable vulnerability of a different, currently out-of-scope variant (in-band file disclosure, not the out-of-band technique this detector tests for). Sections 6 and 7 (XSS, SQLi) already had this done in Slices 1-4; section 8 (IDOR) remains the only detector with a confirmed positive at this live target.
+
 **PROVEN** means a named unit test, integration test, or real-network/E2E test currently passes and exercises exactly that claim. **PARTIAL** means some real capability exists but with a stated, real restriction. **NOT SUPPORTED** means the capability does not exist in code at all, not merely undocumented.
 
 ## 1. Target authorization & scope safety
@@ -151,6 +169,137 @@ See `docs/audit/scanner-v1-security-review.md` for the full finding-schema and f
 | Scheduling | PROVEN | `tests/unit/test_phase2_cross_tenant_schedules.py` and the scheduler test suite |
 | Unexpected detector/executor exception never crashes the worker | PROVEN, generically | `test_job_worker.py::test_unexpected_exception_is_redacted`: proven via a fake executor raising, not via a real detector raising through the full call chain. See Known Limitations. |
 | Redis/message-queue-backed dispatch | NOT SUPPORTED | SQLite-backed leases/polling only |
+
+## 13. Path traversal (`active.pathtraversal.disclosure`, CWE-22, Slice 12, post-freeze)
+
+```
+Path Traversal
+├── GET query          PARTIAL   (unit-tested against a mocked connection only)
+├── GET form           PARTIAL   (same evidence)
+├── POST form          PARTIAL   (Slice 6 mutation engine, same evidence)
+├── JSON body          PARTIAL   (same evidence)
+├── Windows targets     NOT SUPPORTED  (Unix/Linux /etc/passwd only this slice)
+├── Alternate depths    NOT SUPPORTED  (one fixed six-level payload only)
+└── Encoding bypasses   NOT SUPPORTED  (no URL-encoding/null-byte/absolute-path variants attempted)
+```
+
+Confirmation requires an `/etc/passwd` root-entry-line signature present in the diagnostic response and absent from the baseline: never a generic status-code change alone. Authentication support: full, reuses the identical `authentication_material` threading every other detector uses. Evidence sanitization and fingerprint determinism: PROVEN (`test_path_traversal_detector.py`, `test_finding_fingerprint_determinism.py::PathTraversalFingerprintDeterminismTests`). Real-network validation: PROVEN (`test_path_traversal_detector_live.py`, a real temporary directory and a real `/etc/passwd` read; lands on PROBABLE rather than CONFIRMED for this fixture shape since baseline and diagnostic both return 200). True end-to-end test: PROVEN (`test_path_traversal_checks_e2e_lab.py`, real CLI bootstrap through a real worker and executor against the identical local fixture). Live-target investigation: DONE, not confirmed (Juice Shop has a real file-disclosure bug there, but it is a poison-null-byte extension bypass, not `..`-sequence traversal, and this detector's payload structurally cannot reach it). See `docs/audit/active-detection-phase11-path-traversal.md`.
+
+## 14. OS command injection (`active.cmdi.marker`, CWE-78, Slice 12, post-freeze)
+
+```
+OS Command Injection
+├── GET query               PARTIAL   (unit-tested against a mocked connection only)
+├── GET form                PARTIAL   (same evidence)
+├── POST form               PARTIAL   (Slice 6 mutation engine, same evidence)
+├── JSON body                PARTIAL   (same evidence)
+├── Other separators (| && ` $())  NOT SUPPORTED  (";"-plus-"#" POSIX chaining only)
+├── Windows cmd.exe/PowerShell      NOT SUPPORTED
+└── Quote-breaking injection contexts  NOT SUPPORTED
+```
+
+Confirmation requires a fresh, unique marker to appear in the diagnostic response *and* the full raw diagnostic payload to be absent, specifically to rule out a target reflecting the unexecuted payload verbatim (a real false positive found and fixed during this slice, not caught later). Severity is CRITICAL, the highest this project assigns. Authentication support: full. Evidence sanitization and fingerprint determinism: PROVEN (`test_command_injection_detector.py`, `test_finding_fingerprint_determinism.py::CommandInjectionFingerprintDeterminismTests`). Real-network validation: PROVEN (`test_command_injection_detector_live.py`, a real `shell=True` subprocess call genuinely executes the injected command; a separate reflection-only route with no execution at all proves the marker-plus-payload-absence check against a real false-positive shape). True end-to-end test: PROVEN (`test_command_injection_checks_e2e_lab.py`, real CLI bootstrap through a real worker and executor, a real shell genuinely executing the injected marker). Live-target investigation: DONE, definitive negative (an exhaustive source search inside the running Juice Shop container found zero shell-execution code anywhere in the server). See `docs/audit/active-detection-phase12-command-injection.md`.
+
+## 15. XXE (`active.xxe.callback`, CWE-611, Slice 13, post-freeze)
+
+```
+XML External Entity injection (out-of-band/blind only)
+├── POST form endpoint, whole-body XML override   PARTIAL  (unit-tested against a mocked connection and the real in-memory CallbackBroker only)
+├── JSON body endpoint, whole-body XML override    PARTIAL  (same evidence)
+├── GET-only endpoints                              NOT SUPPORTED  (no body to replace; never selected)
+├── In-band file disclosure (reflected entity value) NOT SUPPORTED  (see the module's own docstring for why this was ruled out, not just deferred)
+├── In-band error-signature detection                NOT SUPPORTED  (ruled out: a hardened parser's own safe-rejection error often uses the same vocabulary a vulnerable parser's failure could)
+├── Parameter-entity two-stage exfiltration           NOT SUPPORTED  (would require inducing the target to actually read and transmit its own file, the exact risk this detector is built to avoid)
+└── DNS-only out-of-band channel                      NOT SUPPORTED  (only a completed inbound HTTP request at WebGuard's receiver counts as proof)
+```
+
+Unlike path traversal and command injection, this detector does not fit `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention: like SSRF, it requires a `CallbackBroker` registration and a bounded wait for an out-of-band observation, so it lives in `CALLBACK_ACTIVE_CHECK_IDS` and its own `executor._apply_xxe_callback_detection`, a close mirror of `_apply_ssrf_callback_detection`. Confirmation requires a genuine callback observation correlated to a token embedded in the probe's SYSTEM identifier, exactly SSRF's own confirmation logic; response text is never inspected, so there is no in-band signature for a hardened parser's own rejection message to be misread as. Candidate selection dedupes by (endpoint, method) rather than by parameter, since the crafted document replaces the whole request body regardless of which field discovered the endpoint. Authentication support: full, reuses the identical `authentication_material` threading every other detector uses. Evidence sanitization and fingerprint determinism: PROVEN (`test_xxe_callback_detector.py`, `test_finding_fingerprint_determinism.py::XxeFingerprintDeterminismTests`). Real-network validation: PROVEN (`test_xxe_callback_detector_live.py`, a deliberately-vulnerable `xml.parsers.expat` `ExternalEntityRefHandler` performs a real outbound fetch against the real `CallbackHttpReceiver`; the identical document parsed with no handler assigned, Python's actual secure default, produces no fetch and no finding). True end-to-end test: PROVEN (`test_xxe_callback_e2e_lab.py`, mirroring SSRF's own true end-to-end test over the real `CallbackHttpReceiver`/`CallbackRepository`; requires the permit's `allowed_http_methods` to include `POST`, or discovery silently drops the candidate). Live-target investigation: DONE, and the most significant finding in this project's live-target work so far: a real, anonymously-exploitable, in-band XXE was confirmed at Juice Shop (`file:///etc/passwd` disclosed via `POST /file-upload`), but this detector's out-of-band-only design structurally cannot reach it. See `docs/audit/active-detection-phase13-xxe-callback.md`.
+
+## 16. Open redirect (`active.openredirect.location`, CWE-601, Slice 14, post-freeze)
+
+```
+Open Redirect (Location header only)
+├── GET query                                PARTIAL   (unit-tested against a mocked connection only)
+├── GET form                                 PARTIAL   (same evidence)
+├── POST form                                PARTIAL   (Slice 6 mutation engine, same evidence)
+├── JSON body                                PARTIAL   (same evidence)
+├── HTTP Refresh response header             NOT SUPPORTED  (a second, real, non-JS redirect mechanism; only Location on a 3xx is checked)
+├── HTML meta-refresh tag                    NOT SUPPORTED  (pre-existing html_analyzer.py gap, not this detector's to close)
+├── Client-side JS redirect                  NOT SUPPORTED  (black-box HTTP scanner, no JS execution)
+├── Store-now-redirect-later (post-login/SSO) NOT SUPPORTED  (single request per candidate, no follow-up action; a real, common shape for this weakness, not a rare corner case)
+└── Alternate payload encodings               NOT SUPPORTED  (protocol-relative input, backslash tricks, double-encoding not attempted)
+```
+
+Fits `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention exactly, unlike SSRF/XXE: one request per candidate, no `CallbackBroker`, no wait. Confirmation requires the diagnostic response's status to be one of the five codes browsers actually auto-follow (301/302/303/307/308) with exactly one `Location` header resolving, via `urlsplit(...).hostname`, to this probe's own fresh marker host; response body is never inspected. A drafted classification design was adversarially reviewed by three independent lenses before implementation, finding no false-positive path but three real bugs fixed before any code was written: duplicate-`Location`-header ambiguity, trailing-dot FQDN normalization, and narrowing the accepted status set to the browser-auto-followed five. Candidate reach inherits this codebase's existing discovery-pipeline restrictions (crawl-mode's per-page path filter, the shared state-changing-keyword safety classification) in a way that costs this technique specifically more than the others, since redirect-controlling parameters are classically discovered via a link to a different endpoint or present only in the entry URL's own query string; both are named directly in the detector module's own docstring. This slice also threads a new `allow_redirect_status` keyword-only argument (defaulted False) through `issue_probe` and `issue_templated_request`, so a 3xx response can be read intact instead of becoming a `redirect_blocked` error; every existing caller is unaffected. Authentication support: full. Evidence sanitization and fingerprint determinism: PROVEN (`test_open_redirect_detector.py`, `test_finding_fingerprint_determinism.py::OpenRedirectFingerprintDeterminismTests`). Real-network validation: PROVEN (`test_open_redirect_detector_live.py`, a real unconditional 302 to the client-supplied value reaches CONFIRMED; a fixed-destination redirect and a 200 response that merely mentions the marker host as page text both correctly produce no finding). True end-to-end test: PROVEN (`test_open_redirect_checks_e2e_lab.py`, real CLI bootstrap through a real worker and executor against the identical local fixture). Live-target investigation: DONE, not confirmed (Juice Shop's own "Allowlist Bypass" challenge has a real, present redirect allowlist; this detector tests only for a missing one). See `docs/audit/active-detection-phase14-open-redirect.md`.
+
+## 17. LDAP injection (`active.ldapi.error`, CWE-90, Slice 15, post-freeze)
+
+```
+LDAP Injection (filter-syntax-error induction only)
+├── GET query                          PARTIAL   (unit-tested against a mocked connection only)
+├── GET form                           PARTIAL   (same evidence)
+├── POST form                          PARTIAL   (Slice 6 mutation engine, same evidence)
+├── JSON body                          PARTIAL   (same evidence)
+├── DN-injection variant                NOT SUPPORTED  (different metacharacters, corrupts a distinguished name rather than a search filter, structurally distinct technique)
+├── Boolean-based blind detection        NOT SUPPORTED  (no always-true/always-false comparison attempted)
+├── Time-based detection                 NOT SUPPORTED
+└── Node.js ldapjs targets               PARTIAL, WITH A REAL RISK  (this exact payload can crash the target process via a documented, uncaught exception in that library's own filter parser, not merely error one request; see the module's own docstring)
+```
+
+Fits `ACTIVE_DETECTOR_REGISTRY`'s generic calling convention exactly, structurally near-identical to `active.sqli.error`'s own two-request baseline/diagnostic/signature-matching architecture, reused unchanged apart from the payload (a single closing parenthesis appended to the baseline value, not a bare replacement) and the 13-entry signature list. Before implementation, the signature list and payload were fact-checked and stress-tested by three independent lenses against real client-library source and real production incident reports (not assumed from memory): all originally-drafted signatures checked out accurate, 4 more were added to close real coverage gaps (Python's two major LDAP clients, the Apache Directory API stack, Node.js's ldapjs), and one real design ambiguity was caught and resolved in code before it became a bug (the module explicitly appends the payload to the baseline value, never a bare replacement constant, unlike its SQLi/path-traversal siblings). Confirmation requires a specific, implementation-attributable signature (a function name or fully-qualified exception class name, never a bare word) to newly appear in the diagnostic response, absent from the baseline, mirroring SQLi's own classification discipline exactly. One signature, `"bad search filter"`, is the sole bare, non-attributable entry in the list, kept because no false-positive evidence was found against it but named as the first suspect if one is ever reported. Authentication support: full. Evidence sanitization and fingerprint determinism: PROVEN (`test_ldap_injection_detector.py`, `test_finding_fingerprint_determinism.py::LdapInjectionFingerprintDeterminismTests`). Real-network validation: PROVEN (`test_ldap_injection_detector_live.py`, a real `ldap3.Connection` on the `MOCK_SYNC` strategy: its own client-side filter compiler genuinely raises `LDAPInvalidFilterError` on the diagnostic filter, one of this detector's own 13 signatures, actually exercised rather than only asserted; `ldap3` is a dev-only, unlocked test dependency, not wired into CI, so this one skips there while the other four detectors' live tests run for real). True end-to-end test: PROVEN (`test_ldap_injection_checks_e2e_lab.py`, over the identical `ldap3` fixture; carries the same dev-only-dependency skip caveat). Live-target investigation: DONE, definitive negative (an exhaustive source search inside the running Juice Shop container found zero LDAP-related code anywhere in the server). See `docs/audit/active-detection-phase15-ldap-injection.md`.
+
+## 18. CSRF (`web.html.csrf_token`, CWE-352, Slice 16, post-freeze, passive not active)
+
+```
+CSRF (anti-CSRF token field naming heuristic only)
+├── POST form, recognized token name + real value   PROVEN   (suppresses the finding)
+├── POST form, no recognized token name              PROVEN   (produces a MEDIUM/LOW finding)
+├── POST form, recognized name but empty/placeholder value   PROVEN   (does not suppress -- value-awareness check)
+├── GET form                                          NOT CHECKED  (assumed side-effect-free per ordinary HTTP semantics)
+├── SameSite-cookie-based protection                   NOT VISIBLE TO THIS CHECK  (checked separately: CWE-1275, cookie_analyzer.py)
+├── Origin/Referer header validation                   NOT VISIBLE TO THIS CHECK  (server-side logic, not observable in static HTML)
+├── Custom-header/double-submit-cookie (SPA) pattern    NOT VISIBLE TO THIS CHECK  (token lives in a cookie, attached by JS; never a form field)
+├── <meta>-tag-plus-fetch pattern                       NOT VISIBLE TO THIS CHECK  (token lives outside any <form>, sent by a JS-issued fetch/XHR)
+├── Deliberately renamed token field (WordPress/Drupal's own guidance)   NOT VISIBLE TO THIS CHECK  (a false "absent" reading, not a false positive)
+└── True active confirmation (submit without a valid token, observe)     NOT ATTEMPTED  (unavoidably destructive; excluded by ROADMAP.md, not by choice of technique)
+```
+
+Unlike every other post-freeze addition, this is a passive check inside the existing `html_analyzer.py`, not a new active detector: confirming CSRF the active way this project's other detectors work (a deliberately non-destructive diagnostic payload) is not possible for this specific weakness, since a genuine positive result requires the state-changing action to actually complete. `_BoundedHtmlParser`'s existing form-tracking (`_FormRecord`, already used for the password-transport and cross-origin-action checks) is extended to also track hidden-input names/values; a POST form with none matching one of 9 real, pre-verified anti-CSRF naming conventions (fact-checked by two independent lenses, one using live web search against current framework source/docs, the other stress-testing false positives against the actual parser code) produces a MEDIUM-severity, LOW-confidence finding. The bare word `token` (Apache Struts 2's own default) is deliberately excluded from the recognized-name list: both lenses independently confirmed it collides with unrelated one-time-link fields (`reset_token`, `api_token`) in the dangerous direction. A name match also requires a non-empty, non-template-placeholder value, closing a real gap the review found (a name-only check would silently trust a stale or broken template). Evidence sanitization: PROVEN (12 new unit tests, `tests/unit/test_html_analyzer.py`). Real-network validation and true end-to-end test: not applicable, this is a passive check with no active probe. See `docs/audit/active-detection-phase16-csrf-token-heuristic.md`.
+
+## 19. Missing authentication (`active.authentication.missing`, CWE-306, Slice 17, post-freeze)
+
+```
+Missing authentication for critical function
+├── Operator-supplied endpoint list (permit claim, max 10)      PROVEN
+├── Authenticated baseline + fully anonymous probe               PROVEN
+├── CONFIRMED = exact fingerprint match AND owner_marker match   PROVEN  (bare fingerprint match alone is capped at PROBABLE -- no second identity to serve as a negative control)
+├── Redirect-to-login (3xx) classified from status alone          PROVEN  (never fingerprints a redirect body)
+├── Per-endpoint failure isolation (one bad URL != whole batch)   PROVEN
+├── Crawl-mode findings                                           NOT SUPPORTED (CrawlScanResult has no scan-wide findings field at all; this detector's candidates were never page-specific to begin with, so restricted to single-page scans same as sections 8/15/16)
+├── POST/PUT/DELETE endpoints                                     NOT SUPPORTED (v1 is GET-only, enforced both on the permit claim and independently in the detector)
+└── Credential-guessing / login-bypass confirmation (CWE-287)     NOT ATTEMPTED (destructive testing; excluded by ROADMAP.md, not by choice of technique)
+```
+
+The precise CWE-306 child of the CWE-287 ("broken authentication") the user asked for, the same precision discipline section 8 already applies to CWE-639-not-862. Required a signed-permit schema bump (`1.3`→`1.4`) to add `missing_authentication_endpoints` (a tuple of `MissingAuthenticationEndpoint`, mirroring `permitted_modes`'s enum-tuple shape), enforced bidirectionally and self-containedly in `TrustScanPermitClaims.__post_init__` (the check ID, a non-empty endpoint list, and a set `authentication_context_id` must all be present together, with no live-repository lookup needed, a stricter rule than IDOR's own analogous, issuance-time-only cross-check). Neither a resource-pair architecture like IDOR's nor a `CallbackBroker` wait like SSRF/XXE's fit this detector's shape (one real identity, flat endpoints, permit-scoped candidates), so it gets a fourth dispatch category, `FIXED_ENDPOINT_ACTIVE_CHECK_IDS`, alongside `ACTIVE_DETECTOR_REGISTRY`/`COMPARISON_ACTIVE_CHECK_IDS`/`CALLBACK_ACTIVE_CHECK_IDS`. A two-agent pre-implementation adversarial review found one blocking false-positive risk (fixed by requiring both the fingerprint match and the marker, not either alone, for CONFIRMED) and several should-fix issues (redirect handling, per-endpoint error isolation, the real reason crawl mode is out of scope) before any detector code was written; see `docs/CWE_COVERAGE.md`'s Slice 17 section for the full list. Real-network proven (a purpose-built local HTTPS fixture with a genuinely vulnerable endpoint and a properly-gated 401 endpoint, real sockets, self-signed cert) and full E2E proven (CLI → HTTP API → worker → executor → report, `tests/integration/test_missing_authentication_e2e_lab.py`). Live-target investigation: DONE, no confirmable candidate found (every anonymously-reachable Juice Shop endpoint checked is either intentionally public by design or a different CWE shape entirely; this detector's own contract needs an operator's genuine intent behind a specific URL, which a lab target cannot supply on someone else's behalf). Fingerprint determinism and evidence sanitization: PROVEN (`test_missing_authentication_detector.py`). See `docs/audit/active-detection-phase17-missing-authentication.md`.
+
+## 20. In-band XXE disclosure (`active.xxe.disclosure`, CWE-611, Slice 21, post-freeze)
+
+```
+XML External Entity injection (in-band file disclosure only)
+├── POST form endpoint, whole-body XML override        PARTIAL  (unit-tested against a mocked connection only)
+├── JSON body endpoint, whole-body XML override         PARTIAL  (same evidence)
+├── GET-only endpoints                                   NOT SUPPORTED  (no body to replace; never selected)
+├── Multipart file-upload endpoint, uploaded-file XXE     NOT SUPPORTED  (this scanner's discovery has no FILE/MULTIPART InputLocation at all; no RequestTemplate is ever built for one, see below)
+├── Out-of-band / no-socket-capability parser              NOT SUPPORTED  (that gap is section 15's, not this detector's; the two are complementary, not overlapping)
+├── Windows-target / alternate-protocol-wrapper payloads   NOT ATTEMPTED  (php://filter, expect://, data://, Windows paths; v1 is file:///etc/passwd only)
+└── Parameter-entity-based blind exfiltration              NOT ATTEMPTED  (same exclusion section 15 already states, for the same reason)
+```
+
+The in-band counterpart to section 15, closing the half of that detector's own documented gap a signature-based check can safely close. Joins `ACTIVE_DETECTOR_REGISTRY` directly, unlike section 15: no `CallbackBroker`, no asynchronous wait, just a synchronous baseline (entity-free XML) plus diagnostic (`file:///etc/passwd` via a single external entity) pair, dispatched by the same generic per-page loop as path traversal. Classification mirrors path traversal's own `_classify`/`_PASSWD_SIGNATURES` exactly, as a private, per-module copy; candidate selection is likewise a private, per-module copy of section 15's own dedupe-by-(endpoint, method) logic, not a cross-module import, so this detector's real candidate set is never silently affected by a change made for the out-of-band detector's own reasons. `FindingIdentity.parameter` is always `None`, matching section 15's own reasoning (the whole body is replaced; no single parameter is the subject of the evidence), not path traversal's.
+
+A two-agent pre-implementation adversarial review, one hunting false positives/negatives and one checking the design's structural claims against the actual registry/executor/contracts code, found and fixed three design issues before any code was written (the imprecise "mirrors path traversal" claim about request construction, the unprecedented cross-module import for candidate selection, and the unspecified `FindingIdentity.parameter`), and surfaced the one finding that most changes this detector's own honest scope: the live Juice Shop vulnerability that motivated it is a genuine multipart file upload, a shape this scanner's discovery cannot represent at all, so this detector cannot reconfirm that specific finding, only close the general in-band-vs-out-of-band gap for the candidate class it shares with section 15. See `docs/CWE_COVERAGE.md`'s Slice 21 section for the full review findings.
+
+Authentication support: full, reuses the identical `authentication_material` threading every other detector uses. Evidence sanitization and fingerprint determinism: PROVEN (`test_xxe_disclosure_detector.py`, `test_finding_fingerprint_determinism.py::XxeDisclosureFingerprintDeterminismTests`). Real-network validation and a true end-to-end test: **not yet attempted**, matching this project's own precedent that a detector's initial build slice ships without them (sections 13-15 all did the same; both were added later as their own separate, explicitly-requested slices). Live-target investigation: not attempted, for the reason stated above: it would only reproduce the identical structural negative section 15's own Slice 20 investigation already recorded, with no new information. See `docs/audit/active-detection-phase18-xxe-disclosure.md`.
 
 ## Cross-references
 

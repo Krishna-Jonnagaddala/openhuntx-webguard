@@ -467,6 +467,7 @@ export const permitsApi = {
       active_checks: [],
       authentication_context_id: null,
       authorization_comparison_plan_id: null,
+      missing_authentication_endpoints: [],
     });
   },
 };

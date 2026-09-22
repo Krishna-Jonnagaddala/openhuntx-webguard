@@ -12,6 +12,7 @@ from webguard_scanner import ACTIVE_DETECTOR_REGISTRY, KNOWN_ACTIVE_DETECTOR_IDS
 from webguard_scanner.active_detector_registry import (
     CALLBACK_ACTIVE_CHECK_IDS,
     COMPARISON_ACTIVE_CHECK_IDS,
+    FIXED_ENDPOINT_ACTIVE_CHECK_IDS,
 )
 
 
@@ -28,13 +29,15 @@ class ActiveDetectorRegistryConsistencyTests(unittest.TestCase):
         a separate orchestration path, not the generic per-candidate
         detector loop. This test asserts that split is complete and
         explicit, not an accidental gap: every known active-check ID is
-        either in the generic registry or in COMPARISON_ACTIVE_CHECK_IDS,
-        never neither, never both."""
+        in exactly one of the generic registry, COMPARISON_ACTIVE_CHECK_IDS,
+        CALLBACK_ACTIVE_CHECK_IDS, or FIXED_ENDPOINT_ACTIVE_CHECK_IDS,
+        never neither, never more than one."""
 
         self.assertEqual(
             set(ACTIVE_DETECTOR_REGISTRY)
             | COMPARISON_ACTIVE_CHECK_IDS
-            | CALLBACK_ACTIVE_CHECK_IDS,
+            | CALLBACK_ACTIVE_CHECK_IDS
+            | FIXED_ENDPOINT_ACTIVE_CHECK_IDS,
             KNOWN_ACTIVE_DETECTOR_IDS,
         )
         self.assertEqual(
@@ -46,7 +49,19 @@ class ActiveDetectorRegistryConsistencyTests(unittest.TestCase):
             set(),
         )
         self.assertEqual(
+            set(ACTIVE_DETECTOR_REGISTRY) & FIXED_ENDPOINT_ACTIVE_CHECK_IDS,
+            set(),
+        )
+        self.assertEqual(
             COMPARISON_ACTIVE_CHECK_IDS & CALLBACK_ACTIVE_CHECK_IDS,
+            set(),
+        )
+        self.assertEqual(
+            COMPARISON_ACTIVE_CHECK_IDS & FIXED_ENDPOINT_ACTIVE_CHECK_IDS,
+            set(),
+        )
+        self.assertEqual(
+            CALLBACK_ACTIVE_CHECK_IDS & FIXED_ENDPOINT_ACTIVE_CHECK_IDS,
             set(),
         )
 

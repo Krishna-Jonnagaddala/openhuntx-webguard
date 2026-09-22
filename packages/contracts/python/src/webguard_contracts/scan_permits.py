@@ -15,8 +15,8 @@ from .owned_targets import OwnedTargetContractError, canonicalize_owned_target_u
 from .scan_jobs import ScanJobMode
 
 
-CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.3"
-SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.3",)
+CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.4"
+SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.4",)
 TRUSTSCAN_PERMIT_TYPE = "trustscan_scan_permit"
 TRUSTSCAN_SIGNATURE_ALGORITHM = "Ed25519"
 # P1-7 (docs/audit/WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md): every
@@ -56,11 +56,27 @@ TRUSTSCAN_PROHIBITED_OPERATIONS = (
 # still pre-production (README: "not yet a publicly hosted production
 # service"), so there is no deployed 1.0 permit this would break.
 KNOWN_TRUSTSCAN_ACTIVE_CHECKS = (
+    "active.authentication.missing",
     "active.authorization.idor",
+    "active.cmdi.marker",
+    "active.ldapi.error",
+    "active.openredirect.location",
+    "active.pathtraversal.disclosure",
     "active.sqli.error",
     "active.ssrf.callback",
     "active.xss.reflected",
+    "active.xxe.callback",
+    "active.xxe.disclosure",
 )
+
+# Slice 17: bounded, operator-supplied resource list for
+# active.authentication.missing (CWE-306). Unlike
+# authorization_comparison_plan_id, this list holds no secrets (plain
+# URLs and, optionally, a non-secret corroborating marker string), so it
+# lives directly on the signed permit rather than needing a separately
+# stored, separately revocable plan/repository the way IDOR's two-
+# identity comparison does.
+MAXIMUM_MISSING_AUTHENTICATION_ENDPOINTS = 10
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _KEY_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -305,6 +321,160 @@ def _authorization_comparison_plan_id(value: object) -> str | None:
     return _uuid(value, "authorization_comparison_plan_id")
 
 
+@dataclass(frozen=True, slots=True)
+class MissingAuthenticationEndpoint:
+    """One operator-asserted endpoint that should require the permit's
+    referenced ``authentication_context_id`` to access at all (Slice
+    17, CWE-306). WebGuard never discovers, crawls for, or enumerates
+    these entries: every one is an explicit, already-known URL the
+    operator supplies, the identical discipline
+    ``authorization_comparison.py``'s ``ResourcePairSpec`` already
+    follows for IDOR's own resource scope.
+
+    ``owner_marker`` is optional (default ``""``, meaning "none
+    configured"), for the same reason
+    ``AuthorizationResource.owner_marker`` is: when the operator
+    supplies a string that appears only in this endpoint's genuinely
+    protected content, the detector can treat its presence in an
+    anonymous response as PROBABLE-tier corroboration even when that
+    response is not byte-for-byte identical to the authenticated
+    baseline (for example because the page embeds a per-request CSRF
+    token or timestamp). Detection with no marker configured still
+    works; this field narrows what evidence is possible, it never
+    becomes a requirement.
+
+    v1 supports only GET: an anonymous probe against this endpoint
+    must never be able to change state regardless of whether the
+    target turns out to be vulnerable.
+    """
+
+    endpoint: str
+    method: str = "GET"
+    owner_marker: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.endpoint, str) or not self.endpoint.strip():
+            raise TrustScanPermitValidationError(
+                "trustscan_permit_missing_auth_endpoint_invalid",
+                "A missing_authentication_endpoints entry requires a "
+                "non-empty endpoint.",
+            )
+        if not isinstance(self.method, str):
+            raise TrustScanPermitValidationError(
+                "trustscan_permit_missing_auth_endpoint_invalid",
+                "A missing_authentication_endpoints entry's method must "
+                "be a string.",
+            )
+        object.__setattr__(self, "method", self.method.upper())
+        if self.method != "GET":
+            raise TrustScanPermitValidationError(
+                "trustscan_permit_missing_auth_endpoint_method_invalid",
+                "missing_authentication_endpoints v1 supports only GET.",
+            )
+        if not isinstance(self.owner_marker, str):
+            raise TrustScanPermitValidationError(
+                "trustscan_permit_missing_auth_endpoint_invalid",
+                "A missing_authentication_endpoints entry's owner_marker "
+                "must be a string.",
+            )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "endpoint": self.endpoint,
+            "method": self.method,
+            "owner_marker": self.owner_marker,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "MissingAuthenticationEndpoint":
+        if not isinstance(value, Mapping):
+            raise TrustScanPermitValidationError(
+                "trustscan_permit_missing_auth_endpoint_invalid",
+                "Each missing_authentication_endpoints entry must be a "
+                "JSON object.",
+            )
+        try:
+            return cls(
+                endpoint=value["endpoint"],
+                method=value.get("method", "GET"),
+                owner_marker=value.get("owner_marker", ""),
+            )
+        except (KeyError, TypeError) as exc:
+            raise TrustScanPermitValidationError(
+                "trustscan_permit_missing_auth_endpoint_invalid",
+                "Each missing_authentication_endpoints entry requires "
+                "an endpoint field.",
+            ) from exc
+
+
+def _missing_authentication_endpoints(
+    value: object,
+) -> tuple[MissingAuthenticationEndpoint, ...]:
+    """missing_authentication_endpoints (Slice 17) is the signed,
+    operator-supplied resource list active.authentication.missing
+    tests for CWE-306. Callers always pass already-constructed
+    ``MissingAuthenticationEndpoint`` instances here, the identical
+    "enum, not raw string" discipline ``permitted_modes`` already uses:
+    JSON loaders convert each raw dict via
+    ``MissingAuthenticationEndpoint.from_dict`` before ever
+    constructing the claims/submission dataclass."""
+
+    if not isinstance(value, tuple) or any(
+        not isinstance(item, MissingAuthenticationEndpoint) for item in value
+    ):
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_missing_auth_endpoints_invalid",
+            "missing_authentication_endpoints must be a tuple of "
+            "MissingAuthenticationEndpoint.",
+        )
+    if len(value) > MAXIMUM_MISSING_AUTHENTICATION_ENDPOINTS:
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_missing_auth_endpoints_too_many",
+            f"missing_authentication_endpoints cannot exceed "
+            f"{MAXIMUM_MISSING_AUTHENTICATION_ENDPOINTS} entries.",
+        )
+    return value
+
+
+def _validate_missing_authentication_binding(
+    *,
+    active_checks: tuple[str, ...],
+    authentication_context_id: str | None,
+    missing_authentication_endpoints: tuple[MissingAuthenticationEndpoint, ...],
+) -> None:
+    """Both directions are enforced, self-containedly, from the signed
+    claims alone: referencing the endpoint list without also requesting
+    the check (or vice versa) is rejected, and the check additionally
+    requires a real identity to build an authenticated baseline
+    against. This is a stronger, fully self-contained guarantee than
+    authorization_comparison_plan_id's own cross-check, which can only
+    be enforced against a live plan-repository lookup at issuance time
+    (service.py), since that plan is stored separately from the permit
+    -- missing_authentication_endpoints has no such separate store."""
+
+    check_requested = "active.authentication.missing" in active_checks
+    endpoints_supplied = len(missing_authentication_endpoints) > 0
+    if endpoints_supplied and not check_requested:
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_missing_auth_endpoints_without_check",
+            "missing_authentication_endpoints requires "
+            "'active.authentication.missing' to also be present in "
+            "active_checks.",
+        )
+    if check_requested and not endpoints_supplied:
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_missing_auth_check_without_endpoints",
+            "'active.authentication.missing' in active_checks requires "
+            "at least one missing_authentication_endpoints entry.",
+        )
+    if check_requested and authentication_context_id is None:
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_missing_auth_check_without_context",
+            "'active.authentication.missing' in active_checks requires "
+            "authentication_context_id to also be set.",
+        )
+
+
 def _prohibited_operations(value: object) -> tuple[str, ...]:
     if not isinstance(value, tuple) or value != TRUSTSCAN_PROHIBITED_OPERATIONS:
         raise TrustScanPermitValidationError(
@@ -390,6 +560,7 @@ class TrustScanPermitSubmission:
     active_checks: tuple[str, ...] = ()
     authentication_context_id: str | None = None
     authorization_comparison_plan_id: str | None = None
+    missing_authentication_endpoints: tuple[MissingAuthenticationEndpoint, ...] = ()
 
     def __post_init__(self) -> None:
         try:
@@ -456,6 +627,16 @@ class TrustScanPermitSubmission:
             "authorization_comparison_plan_id",
             _authorization_comparison_plan_id(self.authorization_comparison_plan_id),
         )
+        object.__setattr__(
+            self,
+            "missing_authentication_endpoints",
+            _missing_authentication_endpoints(self.missing_authentication_endpoints),
+        )
+        _validate_missing_authentication_binding(
+            active_checks=self.active_checks,
+            authentication_context_id=self.authentication_context_id,
+            missing_authentication_endpoints=self.missing_authentication_endpoints,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +661,7 @@ class TrustScanPermitClaims:
     active_checks: tuple[str, ...] = ()
     authentication_context_id: str | None = None
     authorization_comparison_plan_id: str | None = None
+    missing_authentication_endpoints: tuple[MissingAuthenticationEndpoint, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "permit_id", _uuid(self.permit_id, "permit_id"))
@@ -555,6 +737,16 @@ class TrustScanPermitClaims:
             "authorization_comparison_plan_id",
             _authorization_comparison_plan_id(self.authorization_comparison_plan_id),
         )
+        object.__setattr__(
+            self,
+            "missing_authentication_endpoints",
+            _missing_authentication_endpoints(self.missing_authentication_endpoints),
+        )
+        _validate_missing_authentication_binding(
+            active_checks=self.active_checks,
+            authentication_context_id=self.authentication_context_id,
+            missing_authentication_endpoints=self.missing_authentication_endpoints,
+        )
 
     @property
     def fingerprint(self) -> str:
@@ -584,6 +776,9 @@ class TrustScanPermitClaims:
             "active_checks": list(self.active_checks),
             "authentication_context_id": self.authentication_context_id,
             "authorization_comparison_plan_id": self.authorization_comparison_plan_id,
+            "missing_authentication_endpoints": [
+                entry.to_dict() for entry in self.missing_authentication_endpoints
+            ],
         }
 
 
@@ -679,21 +874,24 @@ def load_trustscan_permit_submission_json(document: str | bytes) -> TrustScanPer
             "active_checks",
             "authentication_context_id",
             "authorization_comparison_plan_id",
+            "missing_authentication_endpoints",
         },
         context="TrustScan permit submission",
     )
     mode_values = root["permitted_modes"]
     method_values = root["allowed_http_methods"]
     active_check_values = root["active_checks"]
+    endpoint_values = root["missing_authentication_endpoints"]
     if (
         not isinstance(mode_values, list)
         or not isinstance(method_values, list)
         or not isinstance(active_check_values, list)
+        or not isinstance(endpoint_values, list)
     ):
         raise TrustScanPermitLoadError(
             "trustscan_permit_list_required",
-            "permitted_modes, allowed_http_methods, and active_checks must "
-            "be JSON arrays.",
+            "permitted_modes, allowed_http_methods, active_checks, and "
+            "missing_authentication_endpoints must be JSON arrays.",
         )
     try:
         submission = TrustScanPermitSubmission(
@@ -710,6 +908,10 @@ def load_trustscan_permit_submission_json(document: str | bytes) -> TrustScanPer
             active_checks=tuple(active_check_values),
             authentication_context_id=root["authentication_context_id"],
             authorization_comparison_plan_id=root["authorization_comparison_plan_id"],
+            missing_authentication_endpoints=tuple(
+                MissingAuthenticationEndpoint.from_dict(item)
+                for item in endpoint_values
+            ),
         )
     except ValueError as exc:
         if isinstance(exc, TrustScanPermitContractError):
@@ -748,6 +950,7 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
             "active_checks",
             "authentication_context_id",
             "authorization_comparison_plan_id",
+            "missing_authentication_endpoints",
         },
         context="TrustScan permit claims",
     )
@@ -760,9 +963,16 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
     method_values = claims["allowed_http_methods"]
     prohibited_values = claims["prohibited_operations"]
     active_check_values = claims["active_checks"]
+    endpoint_values = claims["missing_authentication_endpoints"]
     if not all(
         isinstance(value, list)
-        for value in (mode_values, method_values, prohibited_values, active_check_values)
+        for value in (
+            mode_values,
+            method_values,
+            prohibited_values,
+            active_check_values,
+            endpoint_values,
+        )
     ):
         raise TrustScanPermitLoadError(
             "trustscan_permit_list_required",
@@ -791,6 +1001,10 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
                 active_checks=tuple(active_check_values),
                 authentication_context_id=claims["authentication_context_id"],
                 authorization_comparison_plan_id=claims["authorization_comparison_plan_id"],
+                missing_authentication_endpoints=tuple(
+                    MissingAuthenticationEndpoint.from_dict(item)
+                    for item in endpoint_values
+                ),
             ),
             signature_algorithm=signature["algorithm"],
             signing_key_id=signature["key_id"],
@@ -823,6 +1037,7 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
 __all__ = [
     "CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION",
     "KNOWN_TRUSTSCAN_ACTIVE_CHECKS",
+    "MAXIMUM_MISSING_AUTHENTICATION_ENDPOINTS",
     "MAXIMUM_TRUSTSCAN_PERMIT_DOCUMENT_BYTES",
     "MAXIMUM_TRUSTSCAN_PERMIT_VALIDITY_DAYS",
     "MAXIMUM_TRUSTSCAN_REQUEST_ATTEMPTS",
@@ -834,6 +1049,7 @@ __all__ = [
     "TRUSTSCAN_PROHIBITED_OPERATIONS",
     "TRUSTSCAN_SIGNATURE_ALGORITHM",
     "TRUSTSCAN_V1_MAXIMUM_CONCURRENCY",
+    "MissingAuthenticationEndpoint",
     "SignedTrustScanPermit",
     "TrustScanPermitClaims",
     "TrustScanPermitContractError",

@@ -216,6 +216,7 @@ def issue_probe(
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
     authentication_material: AuthenticationMaterial | None = None,
+    allow_redirect_status: bool = False,
 ) -> ProbeAttempt:
     """Send exactly one bounded GET probe request.
 
@@ -229,6 +230,14 @@ def issue_probe(
     -- this function never builds an Authorization/Cookie header itself.
     Every existing caller passes nothing here and probes exactly as
     before (unauthenticated).
+
+    ``allow_redirect_status`` (Slice 14: open redirect) is passed straight
+    through to ``fetch_once``, which already supports it (added for the
+    login workflow's own redirect-marker check): a 3xx response is
+    returned intact, with its real status and ``Location`` header, instead
+    of being turned into a ``redirect_blocked`` error. It never causes a
+    second request to the redirect's target. Every existing caller leaves
+    this False and is unaffected.
     """
 
     _require_same_origin(base_target, candidate.url)
@@ -253,6 +262,7 @@ def issue_probe(
             method="GET",
             policy=policy.fetch_policy,
             extra_headers=extra_headers,
+            allow_redirect_status=allow_redirect_status,
         )
     except SafeRequestError as exc:
         if after_request is not None:
