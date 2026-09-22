@@ -2,7 +2,7 @@
 
 ## Status
 
-Partial. A sixth active detector (marker-based OS command injection detection) is implemented, unit-tested (mocked connection, no real network), and registered/permit-gated through the exact same infrastructure the original four active detectors already use. **Not yet real-network validated against a purpose-built fixture, and not yet taken through a true end-to-end CLI → API → worker → executor → report test.** Built in the same pass as `active-detection-phase11-path-traversal.md`; see that document and `docs/CWE_COVERAGE.md`'s Slice 12 note for the "added after the stated Scanner v1 feature freeze" framing, which applies identically here.
+Partial. A sixth active detector (marker-based OS command injection detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the original four active detectors already use, and (Slice 18) real-network validated against a purpose-built local fixture that genuinely shells out. **Not yet taken through a true end-to-end CLI → API → worker → executor → report test.** Built in the same pass as `active-detection-phase11-path-traversal.md`; see that document and `docs/CWE_COVERAGE.md`'s Slice 12 note for the "added after the stated Scanner v1 feature freeze" framing, which applies identically here.
 
 ## What was built
 
@@ -46,7 +46,7 @@ Cross-detector authorization independence has not been re-proven with a dedicate
 
 ## Real-network validation
 
-**Not done this slice.** No purpose-built vulnerable HTTP fixture over real sockets exists for this detector yet.
+Done (Slice 18). `tests/integration/test_command_injection_detector_live.py` runs the unmodified detector against a real `ThreadingHTTPServer` with three routes, each doing something genuinely different with the value: `/vulnerable` calls `subprocess.run(f"echo {value}", shell=True, ...)`, so a real POSIX shell on the machine running the test genuinely splits the diagnostic payload on `;` and comments out the rest with `#` (confirmed by a module-level self-check that runs before the test class, failing loudly at import time if this machine's shell ever behaved differently); `/safe` calls `subprocess.run(["echo", value], shell=False, ...)`, so the identical string arrives at `/bin/echo` as one inert argv element and comes back completely intact; `/reflects-input` executes nothing at all and echoes the raw value into an `Invalid input: <value>` string, proving the detector's marker-plus-payload-absence check for real against the exact reflection shape it exists to rule out (the marker is genuinely present in that response body, and the detector still correctly produces no finding).
 
 ## True end-to-end test
 
@@ -58,7 +58,7 @@ Cross-detector authorization independence has not been re-proven with a dedicate
 
 ## Regression
 
-`tests/unit/test_command_injection_detector.py`: 13/13 pass. `tests/unit/test_finding_fingerprint_determinism.py`: 12/12 pass (10 pre-existing + 2 new, including this detector's own). `tests/unit/test_active_detector_registry.py`: 3/3 pass unchanged. Full `tests/unit` discover run clean, no regressions in any pre-existing detector's own test file.
+`tests/unit/test_command_injection_detector.py`: 13/13 pass. `tests/unit/test_finding_fingerprint_determinism.py`: 12/12 pass (10 pre-existing + 2 new, including this detector's own). `tests/unit/test_active_detector_registry.py`: 3/3 pass unchanged. `tests/integration/test_command_injection_detector_live.py` (Slice 18): 4/4 pass with `WEBGUARD_RUN_INTEGRATION=1`; skips cleanly without it. Full `tests/unit` discover run clean, no regressions in any pre-existing detector's own test file.
 
 ## Implemented / Tested / Proven / Not Proven / Remaining Risks
 
@@ -66,13 +66,13 @@ Cross-detector authorization independence has not been re-proven with a dedicate
 
 **Tested:** classification logic including the reflection-vs-execution distinction found and fixed this slice, marker uniqueness, same-origin/budget/redirect/connection-failure/cancellation/hook safety boundaries, evidence sanitization, fingerprint determinism. All against a fake connection.
 
-**Proven:** the reflection-vs-execution distinction is real and tested, not assumed; the classification logic is architecturally identical in safety plumbing (though not in classification method) to the already real-network-and-end-to-end-verified SQLi detector.
+**Proven:** the reflection-vs-execution distinction is real and tested, not assumed, now against a real shell as well as a mocked one; the classification logic correctly fires against a real, genuinely vulnerable local server that actually executes the injected command, and correctly abstains against both a real properly-fixed route and a real reflection-only route carrying the marker text.
 
-**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server actually running a shell command with the injected value, or correctly abstains against a real near-miss one; that it survives the full CLI/API/worker/executor pipeline; that it correctly cannot be triggered by a permit that only authorizes a different check; that any real-world target is actually detectable by it, particularly since Severity is CRITICAL (the highest this project assigns) for a technique that has only ever been proven against a scripted fake connection.
+**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real near-miss one in the wild; that it survives the full CLI/API/worker/executor pipeline; that it correctly cannot be triggered by a permit that only authorizes a different check; that any real-world target is actually detectable by it.
 
 **Remaining risks:**
 - Detection is limited to the single `;`-plus-`#` POSIX separator; a target vulnerable only through `|`, `&&`, backticks, `$()`, Windows chaining, or requiring a quote-breaking prefix produces a false negative.
-- No real-network or true end-to-end test exists yet, the same gap path traversal has, arguably more important to close here given CRITICAL severity means this finding would be the highest-urgency item in any report it appears in.
+- No true end-to-end test exists yet; the real-network fixture test proves the detector behaves correctly against an actual shell and an actual TCP connection, but not that it survives the actual executor/permit/worker pipeline, still arguably the most important gap to close here given CRITICAL severity means this finding would be the highest-urgency item in any report it appears in.
 - Cross-detector authorization independence for this specific detector is inferred, not independently reconfirmed.
 
-**Next steps:** same as path traversal's own next steps: a purpose-built vulnerable/safe local fixture and a true end-to-end lab test, ideally before this detector is issued against anything but a fully controlled, disposable test target given its CRITICAL severity and the fact that it demonstrates actual code execution, not just data disclosure.
+**Next steps:** a true end-to-end lab test (mirroring `test_sqli_checks_e2e_lab.py`'s shape), ideally before this detector is issued against anything but a fully controlled, disposable test target given its CRITICAL severity and the fact that it demonstrates actual code execution, not just data disclosure.

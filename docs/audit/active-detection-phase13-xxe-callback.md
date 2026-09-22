@@ -2,7 +2,7 @@
 
 ## Status
 
-Partial. A seventh active detector (out-of-band/blind XXE, confirmed via the existing `CallbackBroker`) is implemented, unit-tested (mocked connection plus the real in-memory callback broker, no real network), and registered/permit-gated. Unlike Slice 12's two additions, this one does not fit `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention: it needed the same `CallbackBroker`-dependent orchestration path `active.ssrf.callback` already required, so it lives in `CALLBACK_ACTIVE_CHECK_IDS` and its own executor function. **Not yet real-network validated against a purpose-built fixture, and not yet taken through a true end-to-end CLI → API → worker → executor → report test.** Added after the same Slice 11 feature freeze Slice 12 was added after, at the user's continued request; see `docs/CWE_COVERAGE.md`'s Slice 13 note.
+Partial. A seventh active detector (out-of-band/blind XXE, confirmed via the existing `CallbackBroker`) is implemented, unit-tested (mocked connection plus the real in-memory callback broker, no real network), registered/permit-gated, and (Slice 18) real-network validated against a purpose-built local fixture that genuinely resolves an external entity. Unlike Slice 12's two additions, this one does not fit `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention: it needed the same `CallbackBroker`-dependent orchestration path `active.ssrf.callback` already required, so it lives in `CALLBACK_ACTIVE_CHECK_IDS` and its own executor function. **Not yet taken through a true end-to-end CLI → API → worker → executor → report test.** Added after the same Slice 11 feature freeze Slice 12 was added after, at the user's continued request; see `docs/CWE_COVERAGE.md`'s Slice 13 note.
 
 ## Design decision: why out-of-band only
 
@@ -77,7 +77,7 @@ Stated directly, matching how every prior detector states its own limits:
 
 ## Real-network validation
 
-**Not done this slice.** No purpose-built vulnerable HTTP fixture with a real XML parser over real sockets exists for this detector yet.
+Done (Slice 18). `tests/integration/test_xxe_callback_detector_live.py` runs the unmodified detector against a real `ThreadingHTTPServer` and the real `CallbackHttpReceiver`/`InMemoryCallbackBroker` (the identical classes the SSRF live test already uses). Python's own standard-library XML parsers do not resolve external entities by default, so the fixture's vulnerable route deliberately uses `xml.parsers.expat` directly with an `ExternalEntityRefHandler` assigned that performs a real, blocking `urllib.request.urlopen` on the entity's SYSTEM identifier before returning, mirroring exactly how the existing SSRF live fixture's own vulnerable route works. The safe route parses the identical posted document with no handler assigned at all, which is Python's actual secure-by-default behavior, not a simulated one, so no outbound fetch happens no matter what the document declares.
 
 ## True end-to-end test
 
@@ -91,21 +91,23 @@ Stated directly, matching how every prior detector states its own limits:
 
 `tests/unit/test_xxe_callback_detector.py`: 21/21 pass. `tests/unit/test_finding_fingerprint_determinism.py`: 14/14 pass (12 pre-existing + 2 new, including this detector's own). `tests/unit/test_active_detector_registry.py`: 3/3 pass unchanged. Full `tests/unit` discover run: 1948/1948 pass (up from 1925 before this slice), no regressions in any pre-existing detector's own test file. `tests/contract`: 99/99 pass (63 skipped, PostgreSQL-backed). `ruff check --select S --ignore S101` against `packages/contracts/python/src`, `workers/scanner/src`, `apps/api/src` (the exact scope `scripts/run-security-gates.sh` checks): clean. `scripts/scan-secrets.py`: clean.
 
+**Slice 18 addendum:** `tests/integration/test_xxe_callback_detector_live.py`: 1/1 pass with `WEBGUARD_RUN_INTEGRATION=1`; skips cleanly without it. Re-ran the full `tests/unit` suite (2031/2031 pass, current total, not the 1948 figure above) and the full security-gates script (secret scan, ruff, dependency audit) at the same time as the other four Slice 18 additions; see `docs/CWE_COVERAGE.md`'s own Slice 18 section for the combined run.
+
 ## Implemented / Tested / Proven / Not Proven / Remaining Risks
 
 **Implemented:** out-of-band XXE detector (CWE-611), independently permit-gated (`active.xxe.callback`), registered in `CALLBACK_ACTIVE_CHECK_IDS`, wired into the executor's call sequence, evidence-sanitized.
 
 **Tested:** payload shape (exactly one entity, no `file://`, correct callback URL substitution, correct content-type header, full body replacement not merge), classification logic including a hardened-parser-rejection false-positive control, callback token/scan correlation, evidence sanitization, `FindingIdentity.parameter` always `None`, fingerprint determinism, and the same-origin/budget/cancellation/hook safety-boundary suite every other active detector already requires. All against a fake connection and the real in-memory `CallbackBroker`.
 
-**Proven:** the out-of-band design's core safety claims (structurally cannot expand entities, structurally cannot read a local file) hold by construction of the payload itself, not by policy alone; the classification logic never reads response text, so it is structurally immune to the reflection/hardened-rejection false-positive class this slice specifically investigated.
+**Proven:** the out-of-band design's core safety claims (structurally cannot expand entities, structurally cannot read a local file) hold by construction of the payload itself, not by policy alone; the classification logic never reads response text, so it is structurally immune to the reflection/hardened-rejection false-positive class this slice specifically investigated. As of Slice 18, also proven against a real, genuinely vulnerable local server whose own XML parser actually resolves an external entity and performs a real outbound fetch, and correctly abstains against a real parser using Python's own secure-by-default configuration.
 
-**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server running a real XML parser that actually resolves the external entity and makes a real outbound request; that it correctly abstains against a real hardened parser; that it survives the full CLI/API/worker/executor pipeline; that the executor wiring (`_apply_xxe_callback_detection`) itself is exercised by any test, dedicated or otherwise, at that layer; that any real-world target is actually detectable by it.
+**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real hardened parser in the wild; that it survives the full CLI/API/worker/executor pipeline; that the executor wiring (`_apply_xxe_callback_detection`) itself is exercised by any test, dedicated or otherwise, at that layer; that any real-world target is actually detectable by it.
 
 **Remaining risks:**
 - Detection is limited to one payload shape and to endpoints already discoverable as POST-form/JSON-body candidates; a target reachable only through a genuinely XML-native, undiscovered endpoint produces neither a true positive nor a false positive, it is simply never probed.
 - A target with egress that permits DNS resolution but blocks outbound HTTP produces a false negative (NOT_VULNERABLE), inherited from the CallbackBroker/receiver architecture this shares with SSRF.
-- No real-network or true end-to-end test exists yet, the same gap path traversal and command injection both have.
+- No true end-to-end test exists yet, the same gap path traversal and command injection both have.
 - Cross-detector authorization independence for this specific detector is inferred, not independently reconfirmed.
 - The executor-layer wiring (`_apply_xxe_callback_detection`) is new code with no test of its own; only the detector module underneath it is unit-tested.
 
-**Next steps:** a purpose-built vulnerable/safe local fixture with a real XML parser and a real local callback receiver, then a true end-to-end lab test, the same next step already recorded for path traversal and command injection, and the one that would let a fourth real-world reproduction (after CWE-639's Juice Shop confirmation) be attempted for this technique specifically.
+**Next steps:** a true end-to-end lab test, the same next step already recorded for path traversal and command injection, and the one that would let a fourth real-world reproduction (after CWE-639's Juice Shop confirmation) be attempted for this technique specifically.

@@ -2,7 +2,7 @@
 
 ## Status
 
-Partial. A fifth active detector (conservative, /etc/passwd-content-signature-based path traversal detection) is implemented, unit-tested (mocked connection, no real network), and registered/permit-gated through the exact same infrastructure the original four active detectors already use. **Not yet real-network validated against a purpose-built fixture, and not yet taken through a true end-to-end CLI → API → worker → executor → report test.** This slice is added after `docs/scanner/SCANNER_V1_CAPABILITIES.md`'s own stated "Scanner v1 feature freeze" (Slice 11), at the user's explicit request; see `docs/CWE_COVERAGE.md`'s own Slice 12 note for that framing.
+Partial. A fifth active detector (conservative, /etc/passwd-content-signature-based path traversal detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the original four active detectors already use, and (Slice 18) real-network validated against a purpose-built local fixture over real sockets. **Not yet taken through a true end-to-end CLI → API → worker → executor → report test.** This slice is added after `docs/scanner/SCANNER_V1_CAPABILITIES.md`'s own stated "Scanner v1 feature freeze" (Slice 11), at the user's explicit request; see `docs/CWE_COVERAGE.md`'s own Slice 12 note for that framing.
 
 ## What was built
 
@@ -50,7 +50,9 @@ Cross-detector authorization independence (does a permit authorizing only `activ
 
 ## Real-network validation
 
-**Not done this slice.** No purpose-built vulnerable HTTP fixture over real sockets exists for this detector yet, unlike SQLi's `test_sqli_error_detector_live.py`. All coverage is against a fake connection.
+Done (Slice 18). `tests/integration/test_path_traversal_detector_live.py` runs the unmodified detector against a real `ThreadingHTTPServer`, mirroring SQLi's own `test_sqli_error_detector_live.py`. The fixture serves files from a real temporary directory created in `setUpClass`: the vulnerable route's `os.path.join` plus `open()`, with no sanitization, genuinely walks out of that directory when given the six-level payload and reads the actual `/etc/passwd` file on whatever machine runs the test, confirmed byte-for-byte equal to a direct read in a dedicated test. The safe route canonicalizes with `os.path.realpath` and rejects anything outside the base directory's own resolved path, a real containment check, not a stand-in.
+
+One honest result this surfaced: a successful traversal read and a successful intended read both return HTTP 200 over this fixture, so the detector's own `_classify` lands on PROBABLE rather than CONFIRMED (`baseline_status == diagnostic_status`). This is not a bug; it is what the module's own classification table already predicts for this exact shape, now exercised for real rather than only reasoned about.
 
 ## True end-to-end test
 
@@ -62,7 +64,7 @@ Cross-detector authorization independence (does a permit authorizing only `activ
 
 ## Regression
 
-`tests/unit/test_path_traversal_detector.py`: 13/13 pass. `tests/unit/test_finding_fingerprint_determinism.py`: 12/12 pass (10 pre-existing + 2 new). `tests/unit/test_active_detector_registry.py`: 3/3 pass unchanged against the six-entry registry. Full `tests/unit` discover run clean, no regressions in any pre-existing detector's own test file.
+`tests/unit/test_path_traversal_detector.py`: 13/13 pass. `tests/unit/test_finding_fingerprint_determinism.py`: 12/12 pass (10 pre-existing + 2 new). `tests/unit/test_active_detector_registry.py`: 3/3 pass unchanged against the six-entry registry. `tests/integration/test_path_traversal_detector_live.py` (Slice 18): 5/5 pass with `WEBGUARD_RUN_INTEGRATION=1`; skips cleanly without it. Full `tests/unit` discover run clean, no regressions in any pre-existing detector's own test file.
 
 ## Implemented / Tested / Proven / Not Proven / Remaining Risks
 
@@ -70,13 +72,13 @@ Cross-detector authorization independence (does a permit authorizing only `activ
 
 **Tested:** classification logic (positive/probable/inconclusive, false-positive resistance), same-origin/budget/redirect/connection-failure/cancellation/hook safety boundaries, evidence sanitization, fingerprint determinism. All against a fake connection.
 
-**Proven:** the classification logic itself is correct against every scenario a fake connection can construct, and is architecturally identical (same primitives, same safety plumbing) to the already real-network-and-end-to-end-verified SQLi detector.
+**Proven:** the classification logic itself is correct against every scenario a fake connection can construct, and now also against a real, unmocked local fixture: the vulnerable route genuinely discloses this machine's own `/etc/passwd` and the safe route's canonicalize-then-check-containment fix genuinely blocks it, over a real TCP socket.
 
-**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server, or correctly abstains against a real near-miss one; that it survives the full CLI/API/worker/executor pipeline; that it correctly cannot be triggered by a permit that only authorizes a different check; that any real-world target (lab or otherwise) is actually detectable by it.
+**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real near-miss one in the wild; that it survives the full CLI/API/worker/executor pipeline; that it correctly cannot be triggered by a permit that only authorizes a different check; that any real-world target (lab or otherwise) is actually detectable by it.
 
 **Remaining risks:**
 - Detection is limited to Unix/Linux `/etc/passwd` disclosure via one payload and one depth; a target reachable only through Windows-path traversal, a different depth, or an encoding bypass produces a false negative, not a false positive.
-- No real-network or true end-to-end test exists yet: the mocked-connection unit tests prove the classification logic is correct given a scripted response, not that the detector behaves correctly against an actual TCP connection, actual redirect handling, or the actual executor/permit pipeline.
+- No true end-to-end test exists yet: the real-network fixture test proves the detector behaves correctly against an actual TCP connection and actual filesystem traversal, but not that it survives the actual executor/permit/worker pipeline.
 - Cross-detector authorization independence for this specific detector is inferred from the shared mechanism's existing tests, not independently reconfirmed with this detector as one of the two compared.
 
-**Next steps:** a purpose-built vulnerable/safe local fixture (mirroring `test_sqli_error_detector_live.py`'s shape) and a true end-to-end lab test, before this detector should be considered as verified as the original four.
+**Next steps:** a true end-to-end lab test (mirroring `test_sqli_checks_e2e_lab.py`'s shape), before this detector should be considered as verified as the original four.
