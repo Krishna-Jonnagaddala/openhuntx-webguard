@@ -2,7 +2,7 @@
 
 ## Status
 
-Partial. A sixth active detector (marker-based OS command injection detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the original four active detectors already use, and (Slice 18) real-network validated against a purpose-built local fixture that genuinely shells out. **Not yet taken through a true end-to-end CLI → API → worker → executor → report test.** Built in the same pass as `active-detection-phase11-path-traversal.md`; see that document and `docs/CWE_COVERAGE.md`'s Slice 12 note for the "added after the stated Scanner v1 feature freeze" framing, which applies identically here.
+Complete for this detector's own scope. A sixth active detector (marker-based OS command injection detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the original four active detectors already use, (Slice 18) real-network validated against a purpose-built local fixture that genuinely shells out, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. **Not yet run against any live/public target.** Built in the same pass as `active-detection-phase11-path-traversal.md`; see that document and `docs/CWE_COVERAGE.md`'s Slice 12 note for the "added after the stated Scanner v1 feature freeze" framing, which applies identically here.
 
 ## What was built
 
@@ -50,7 +50,7 @@ Done (Slice 18). `tests/integration/test_command_injection_detector_live.py` run
 
 ## True end-to-end test
 
-**Not done this slice.**
+Done (Slice 19). `tests/integration/test_command_injection_checks_e2e_lab.py` mirrors SQLi's own `test_sqli_checks_e2e_lab.py` exactly: real CLI bootstrap, real permit issuance with `--active-check active.cmdi.marker`, a real HTTP job submission claimed by a real worker, the real `ScanJobExecutor`, against a fixture reusing the identical `subprocess.run(shell=True)` mechanism the Slice 18 real-network test already proved works. The persisted report's finding carries exactly `CWE-78` and a `rule_id` starting with `active.cmdi.marker`.
 
 ## Live-target investigation
 
@@ -60,19 +60,20 @@ Done (Slice 18). `tests/integration/test_command_injection_detector_live.py` run
 
 `tests/unit/test_command_injection_detector.py`: 13/13 pass. `tests/unit/test_finding_fingerprint_determinism.py`: 12/12 pass (10 pre-existing + 2 new, including this detector's own). `tests/unit/test_active_detector_registry.py`: 3/3 pass unchanged. `tests/integration/test_command_injection_detector_live.py` (Slice 18): 4/4 pass with `WEBGUARD_RUN_INTEGRATION=1`; skips cleanly without it. Full `tests/unit` discover run clean, no regressions in any pre-existing detector's own test file.
 
+**Slice 19 addendum:** `tests/integration/test_command_injection_checks_e2e_lab.py`: 1/1 pass with `WEBGUARD_RUN_INTEGRATION=1` (ran twice to rule out flakiness, identical both times); skips cleanly without it. Re-ran the full `tests/unit` suite (2031/2031 pass), the full `tests/integration` suite (312/312 pass, 243 skipped), and the full security-gates script (secret scan, ruff, dependency audit) at the same time as the other four Slice 19 additions; see `docs/CWE_COVERAGE.md`'s own Slice 19 section for the combined run.
+
 ## Implemented / Tested / Proven / Not Proven / Remaining Risks
 
 **Implemented:** OS command injection detector (CWE-78), independently permit-gated (`active.cmdi.marker`), registered, candidate-discovery-integrated, evidence-sanitized.
 
 **Tested:** classification logic including the reflection-vs-execution distinction found and fixed this slice, marker uniqueness, same-origin/budget/redirect/connection-failure/cancellation/hook safety boundaries, evidence sanitization, fingerprint determinism. All against a fake connection.
 
-**Proven:** the reflection-vs-execution distinction is real and tested, not assumed, now against a real shell as well as a mocked one; the classification logic correctly fires against a real, genuinely vulnerable local server that actually executes the injected command, and correctly abstains against both a real properly-fixed route and a real reflection-only route carrying the marker text.
+**Proven:** the reflection-vs-execution distinction is real and tested, not assumed, now against a real shell as well as a mocked one; the classification logic correctly fires against a real, genuinely vulnerable local server that actually executes the injected command, and correctly abstains against both a real properly-fixed route and a real reflection-only route carrying the marker text. As of Slice 19, also proven to survive the full, real CLI → HTTP API → worker → executor → report pipeline unmodified.
 
-**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real near-miss one in the wild; that it survives the full CLI/API/worker/executor pipeline; that it correctly cannot be triggered by a permit that only authorizes a different check; that any real-world target is actually detectable by it.
+**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real near-miss one in the wild; that it correctly cannot be triggered by a permit that only authorizes a different check; that any real-world target is actually detectable by it.
 
 **Remaining risks:**
 - Detection is limited to the single `;`-plus-`#` POSIX separator; a target vulnerable only through `|`, `&&`, backticks, `$()`, Windows chaining, or requiring a quote-breaking prefix produces a false negative.
-- No true end-to-end test exists yet; the real-network fixture test proves the detector behaves correctly against an actual shell and an actual TCP connection, but not that it survives the actual executor/permit/worker pipeline, still arguably the most important gap to close here given CRITICAL severity means this finding would be the highest-urgency item in any report it appears in.
 - Cross-detector authorization independence for this specific detector is inferred, not independently reconfirmed.
 
-**Next steps:** a true end-to-end lab test (mirroring `test_sqli_checks_e2e_lab.py`'s shape), ideally before this detector is issued against anything but a fully controlled, disposable test target given its CRITICAL severity and the fact that it demonstrates actual code execution, not just data disclosure.
+**Next steps:** live/public-target investigation, the same next step now recorded for every detector besides CWE-639 and CWE-306; given this detector's CRITICAL severity and the fact that it demonstrates actual code execution rather than only data disclosure, that investigation should stay confined to a fully controlled, disposable test target if and when it happens.

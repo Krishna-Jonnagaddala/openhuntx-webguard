@@ -2,7 +2,7 @@
 
 ## Status
 
-Partial. A fifth active detector (conservative, /etc/passwd-content-signature-based path traversal detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the original four active detectors already use, and (Slice 18) real-network validated against a purpose-built local fixture over real sockets. **Not yet taken through a true end-to-end CLI → API → worker → executor → report test.** This slice is added after `docs/scanner/SCANNER_V1_CAPABILITIES.md`'s own stated "Scanner v1 feature freeze" (Slice 11), at the user's explicit request; see `docs/CWE_COVERAGE.md`'s own Slice 12 note for that framing.
+Complete for this detector's own scope. A fifth active detector (conservative, /etc/passwd-content-signature-based path traversal detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the original four active detectors already use, (Slice 18) real-network validated against a purpose-built local fixture over real sockets, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. **Not yet run against any live/public target.** This slice is added after `docs/scanner/SCANNER_V1_CAPABILITIES.md`'s own stated "Scanner v1 feature freeze" (Slice 11), at the user's explicit request; see `docs/CWE_COVERAGE.md`'s own Slice 12 note for that framing.
 
 ## What was built
 
@@ -56,7 +56,7 @@ One honest result this surfaced: a successful traversal read and a successful in
 
 ## True end-to-end test
 
-**Not done this slice.** No CLI -> HTTP API -> worker -> executor -> report test exists for this detector yet, unlike SQLi's `test_sqli_checks_e2e_lab.py`.
+Done (Slice 19). `tests/integration/test_path_traversal_checks_e2e_lab.py` mirrors SQLi's own `test_sqli_checks_e2e_lab.py` exactly: real CLI bootstrap, real authorization assignment, real `permit issue --active-check active.pathtraversal.disclosure`, a real HTTP job submission claimed by a real worker, the real, unmodified `ScanJobExecutor`, against the identical real-temp-directory fixture the Slice 18 real-network test already proved works. The persisted report's finding carries exactly `CWE-22` and a `rule_id` starting with `active.pathtraversal.disclosure`.
 
 ## Live-target investigation
 
@@ -66,19 +66,20 @@ One honest result this surfaced: a successful traversal read and a successful in
 
 `tests/unit/test_path_traversal_detector.py`: 13/13 pass. `tests/unit/test_finding_fingerprint_determinism.py`: 12/12 pass (10 pre-existing + 2 new). `tests/unit/test_active_detector_registry.py`: 3/3 pass unchanged against the six-entry registry. `tests/integration/test_path_traversal_detector_live.py` (Slice 18): 5/5 pass with `WEBGUARD_RUN_INTEGRATION=1`; skips cleanly without it. Full `tests/unit` discover run clean, no regressions in any pre-existing detector's own test file.
 
+**Slice 19 addendum:** `tests/integration/test_path_traversal_checks_e2e_lab.py`: 1/1 pass with `WEBGUARD_RUN_INTEGRATION=1`; skips cleanly without it. Re-ran the full `tests/unit` suite (2031/2031 pass), the full `tests/integration` suite (312/312 pass, 243 skipped), and the full security-gates script (secret scan, ruff, dependency audit) at the same time as the other four Slice 19 additions; see `docs/CWE_COVERAGE.md`'s own Slice 19 section for the combined run.
+
 ## Implemented / Tested / Proven / Not Proven / Remaining Risks
 
 **Implemented:** path-traversal detector (CWE-22), independently permit-gated (`active.pathtraversal.disclosure`), registered, candidate-discovery-integrated, evidence-sanitized.
 
 **Tested:** classification logic (positive/probable/inconclusive, false-positive resistance), same-origin/budget/redirect/connection-failure/cancellation/hook safety boundaries, evidence sanitization, fingerprint determinism. All against a fake connection.
 
-**Proven:** the classification logic itself is correct against every scenario a fake connection can construct, and now also against a real, unmocked local fixture: the vulnerable route genuinely discloses this machine's own `/etc/passwd` and the safe route's canonicalize-then-check-containment fix genuinely blocks it, over a real TCP socket.
+**Proven:** the classification logic itself is correct against every scenario a fake connection can construct, and now also against a real, unmocked local fixture: the vulnerable route genuinely discloses this machine's own `/etc/passwd` and the safe route's canonicalize-then-check-containment fix genuinely blocks it, over a real TCP socket. As of Slice 19, also proven to survive the full, real CLI → HTTP API → worker → executor → report pipeline unmodified.
 
-**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real near-miss one in the wild; that it survives the full CLI/API/worker/executor pipeline; that it correctly cannot be triggered by a permit that only authorizes a different check; that any real-world target (lab or otherwise) is actually detectable by it.
+**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real near-miss one in the wild; that it correctly cannot be triggered by a permit that only authorizes a different check; that any real-world target (lab or otherwise) is actually detectable by it.
 
 **Remaining risks:**
 - Detection is limited to Unix/Linux `/etc/passwd` disclosure via one payload and one depth; a target reachable only through Windows-path traversal, a different depth, or an encoding bypass produces a false negative, not a false positive.
-- No true end-to-end test exists yet: the real-network fixture test proves the detector behaves correctly against an actual TCP connection and actual filesystem traversal, but not that it survives the actual executor/permit/worker pipeline.
 - Cross-detector authorization independence for this specific detector is inferred from the shared mechanism's existing tests, not independently reconfirmed with this detector as one of the two compared.
 
-**Next steps:** a true end-to-end lab test (mirroring `test_sqli_checks_e2e_lab.py`'s shape), before this detector should be considered as verified as the original four.
+**Next steps:** live/public-target investigation, the same next step now recorded for every detector besides CWE-639 and CWE-306, if one is prioritized for this specific technique.

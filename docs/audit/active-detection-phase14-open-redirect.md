@@ -2,7 +2,7 @@
 
 ## Status
 
-Partial. An eighth active detector (single-request Location-header confirmation) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated, and (Slice 18) real-network validated against a purpose-built local fixture that genuinely redirects. Unlike XXE, it fits `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention exactly, the same shape SQLi/XSS/path traversal/command injection already use. **Not yet taken through a true end-to-end CLI → API → worker → executor → report test.** Added after the same Slice 11 feature freeze the three prior post-freeze slices were added after, at the user's continued request; see `docs/CWE_COVERAGE.md`'s Slice 14 note.
+Complete for this detector's own scope. An eighth active detector (single-request Location-header confirmation) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated, (Slice 18) real-network validated against a purpose-built local fixture that genuinely redirects, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. Unlike XXE, it fits `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention exactly, the same shape SQLi/XSS/path traversal/command injection already use. **Not yet run against any live/public target.** Added after the same Slice 11 feature freeze the three prior post-freeze slices were added after, at the user's continued request; see `docs/CWE_COVERAGE.md`'s Slice 14 note.
 
 ## Pre-implementation adversarial review
 
@@ -82,7 +82,7 @@ Done (Slice 18). `tests/integration/test_open_redirect_detector_live.py` runs th
 
 ## True end-to-end test
 
-**Not done this slice.**
+Done (Slice 19). `tests/integration/test_open_redirect_checks_e2e_lab.py` mirrors SQLi's own `test_sqli_checks_e2e_lab.py` exactly: real CLI bootstrap, real permit issuance with `--active-check active.openredirect.location`, a real HTTP job submission claimed by a real worker, the real `ScanJobExecutor`, against a fixture reusing the identical unconditional-redirect mechanism the Slice 18 real-network test already proved works. The persisted report's finding carries exactly `CWE-601` and a `rule_id` starting with `active.openredirect.location`, reaching CONFIRMED directly (this detector has no PROBABLE tier).
 
 ## Live-target investigation
 
@@ -94,20 +94,21 @@ Done (Slice 18). `tests/integration/test_open_redirect_detector_live.py` runs th
 
 **Slice 18 addendum:** `tests/integration/test_open_redirect_detector_live.py`: 3/3 pass with `WEBGUARD_RUN_INTEGRATION=1`; skips cleanly without it. Re-ran the full `tests/unit` suite (2031/2031 pass) and the full security-gates script (secret scan, ruff, dependency audit) at the same time as the other four Slice 18 additions; see `docs/CWE_COVERAGE.md`'s own Slice 18 section for the combined run.
 
+**Slice 19 addendum:** `tests/integration/test_open_redirect_checks_e2e_lab.py`: 1/1 pass with `WEBGUARD_RUN_INTEGRATION=1`; skips cleanly without it. Re-ran the full `tests/unit` suite (2031/2031 pass), the full `tests/integration` suite (312/312 pass, 243 skipped), and the full security-gates script (secret scan, ruff, dependency audit) at the same time as the other four Slice 19 additions; see `docs/CWE_COVERAGE.md`'s own Slice 19 section for the combined run.
+
 ## Implemented / Tested / Proven / Not Proven / Remaining Risks
 
 **Implemented:** open redirect detector (CWE-601), independently permit-gated (`active.openredirect.location`), registered in `ACTIVE_DETECTOR_REGISTRY`, evidence-sanitized. One new shared-transport capability (`allow_redirect_status` on `issue_probe`/`issue_templated_request`), additive and backward-compatible.
 
 **Tested:** classification logic including every false-positive scenario the adversarial review specifically constructed (userinfo trick, safe query-string echo, duplicate headers, malformed IPv6, excluded status codes), evidence sanitization, fingerprint determinism, and the same-origin/budget/cancellation/hook safety-boundary suite. All against a fake connection.
 
-**Proven:** the structural hostname-comparison approach is sound against every false-positive scenario three independent, code-grounded adversarial reviews could construct, not merely against the scenarios the detector's own author thought of; the three real bugs those reviews found (duplicate headers, trailing-dot FQDN, status scope) were fixed before implementation, not discovered after shipping.
+**Proven:** the structural hostname-comparison approach is sound against every false-positive scenario three independent, code-grounded adversarial reviews could construct, not merely against the scenarios the detector's own author thought of; the three real bugs those reviews found (duplicate headers, trailing-dot FQDN, status scope) were fixed before implementation, not discovered after shipping. As of Slice 19, also proven to survive the full, real CLI → HTTP API → worker → executor → report pipeline unmodified.
 
-**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real, hardened target in the wild; that it survives the full CLI/API/worker/executor pipeline; that any real-world target is actually detectable by it given the disclosed discovery-reach gaps.
+**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real, hardened target in the wild; that any real-world target is actually detectable by it given the disclosed discovery-reach gaps.
 
 **Remaining risks:**
 - The single-request, no-follow-up-action methodology cannot detect the common post-login/post-SSO redirect pattern, arguably the highest-impact real-world shape of this exact weakness; this is a real, disclosed false-negative class, not a rare corner case.
 - Candidate reach is capped by shared discovery-pipeline restrictions (crawl-mode path filtering, state-changing-keyword classification) that cost this technique specifically more than the others; closing them is a separately-justified, cross-cutting change, not something attempted here.
-- No true end-to-end test exists yet, the same gap path traversal, command injection, and XXE all have.
 - Cross-detector authorization independence for this specific detector is inferred, not independently reconfirmed.
 
-**Next steps:** a true end-to-end lab test, the same next step already recorded for the three prior post-freeze detectors; separately, whether to extend discovery to surface the entry URL's own query string as candidates (which would benefit every GET-based detector, not just this one) is worth its own, dedicated design discussion rather than being folded into this slice.
+**Next steps:** live/public-target investigation, the same next step now recorded for every detector besides CWE-639 and CWE-306; separately, whether to extend discovery to surface the entry URL's own query string as candidates (which would benefit every GET-based detector, not just this one) is worth its own, dedicated design discussion rather than being folded into this slice.
