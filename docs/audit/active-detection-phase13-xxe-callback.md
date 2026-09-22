@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete for this detector's own scope. A seventh active detector (out-of-band/blind XXE, confirmed via the existing `CallbackBroker`) is implemented, unit-tested (mocked connection plus the real in-memory callback broker, no real network), registered/permit-gated, (Slice 18) real-network validated against a purpose-built local fixture that genuinely resolves an external entity, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. Unlike Slice 12's two additions, this one does not fit `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention: it needed the same `CallbackBroker`-dependent orchestration path `active.ssrf.callback` already required, so it lives in `CALLBACK_ACTIVE_CHECK_IDS` and its own executor function. **Not yet run against any live/public target.** Added after the same Slice 11 feature freeze Slice 12 was added after, at the user's continued request; see `docs/CWE_COVERAGE.md`'s Slice 13 note.
+Complete for this detector's own scope. A seventh active detector (out-of-band/blind XXE, confirmed via the existing `CallbackBroker`) is implemented, unit-tested (mocked connection plus the real in-memory callback broker, no real network), registered/permit-gated, (Slice 18) real-network validated against a purpose-built local fixture that genuinely resolves an external entity, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. Unlike Slice 12's two additions, this one does not fit `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention: it needed the same `CallbackBroker`-dependent orchestration path `active.ssrf.callback` already required, so it lives in `CALLBACK_ACTIVE_CHECK_IDS` and its own executor function. **Investigated (Slice 20) against a live Juice Shop container: a real, confirmed, anonymously-exploitable XXE vulnerability exists there, but it is in-band file disclosure via `file://`, a technique this detector deliberately excludes by design, not the out-of-band technique this detector tests for.** Added after the same Slice 11 feature freeze Slice 12 was added after, at the user's continued request; see `docs/CWE_COVERAGE.md`'s Slice 13 note.
 
 ## Design decision: why out-of-band only
 
@@ -87,7 +87,19 @@ One real, non-obvious requirement surfaced while building this: the permit's `al
 
 ## Live-target investigation
 
-**Not attempted this slice.**
+Done (Slice 20), and the most significant finding of that slice. Investigated against the pinned Juice Shop lab container (v20.1.1), source-verified via `docker exec` before drawing any conclusion, not probed blindly. **A real, live, anonymously-exploitable XXE vulnerability was confirmed**, but it is a different variant from the one this detector tests for, and this detector structurally cannot reach it.
+
+`routes/fileUpload.js`'s `handleXmlUpload`, reachable at `POST /file-upload` with no authentication requirement at all (confirmed both by the absence of any `security.isAuthorized()` middleware on that route in `server.js`, and live: the exploit below succeeded with zero `Authorization` header), parses an uploaded `.xml` file's contents with `lib/xml.js`'s `parseXmlString`, which sets `libxml2.ParseOption.XML_PARSE_NOENT | XML_PARSE_DTDLOAD` and explicitly calls `xmlRegisterFsInputProviders()`: the module's own comment states this plainly, "Grants the WASM sandbox host filesystem access so external entities like `file:///etc/passwd` resolve - required for the XXE challenges." Confirmed live: uploading
+
+```xml
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>
+<complaint><message>&xxe;</message></complaint>
+```
+
+as `complaint.xml` to `POST /file-upload` (anonymous, multipart, field name `file`) returned an HTTP 410 whose error message embeds the container's real `/etc/passwd` content verbatim: `root:x:0:0:root:/root:/sbin/nologinnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologinnonroot:x:65532:65532:nonroot:/home/nonroot:/sbin/nologin`. This is genuine, in-band, unauthenticated file disclosure, not a simulation.
+
+This detector cannot confirm it, for two independent, structural reasons, not a tuning gap: first, this detector's own design (see the module docstring's "Why out-of-band only" section) deliberately never inspects response text at all, specifically to stay immune to the hardened-parser-rejection false-positive class; the real vulnerability here manifests entirely in the response body, which this detector by design never reads. Second, `libxml2-wasm`'s filesystem input provider grants access to `file://` URIs specifically; a WASM sandbox has no general network/socket capability, so an `http://` SYSTEM identifier (this detector's own callback URL, the only kind of entity it ever sends) would have no path to resolve even if the response were inspected. The vulnerability is real; the specific technique this detector uses to confirm XXE is a different, and here unreachable, variant of it.
 
 ## Regression
 
@@ -97,6 +109,8 @@ One real, non-obvious requirement surfaced while building this: the permit's `al
 
 **Slice 19 addendum:** `tests/integration/test_xxe_callback_e2e_lab.py`: 1/1 pass with `WEBGUARD_RUN_INTEGRATION=1` (ran three times to rule out flakiness, identical every time); skips cleanly without it. Re-ran the full `tests/unit` suite (2031/2031 pass), the full `tests/integration` suite (312/312 pass, 243 skipped), and the full security-gates script (secret scan, ruff, dependency audit) at the same time as the other four Slice 19 additions; see `docs/CWE_COVERAGE.md`'s own Slice 19 section for the combined run.
 
+**Slice 20 addendum:** live-target investigation against Juice Shop is done; see the "Live-target investigation" section above. No code or test changes this slice, investigation only.
+
 ## Implemented / Tested / Proven / Not Proven / Remaining Risks
 
 **Implemented:** out-of-band XXE detector (CWE-611), independently permit-gated (`active.xxe.callback`), registered in `CALLBACK_ACTIVE_CHECK_IDS`, wired into the executor's call sequence, evidence-sanitized.
@@ -105,11 +119,12 @@ One real, non-obvious requirement surfaced while building this: the permit's `al
 
 **Proven:** the out-of-band design's core safety claims (structurally cannot expand entities, structurally cannot read a local file) hold by construction of the payload itself, not by policy alone; the classification logic never reads response text, so it is structurally immune to the reflection/hardened-rejection false-positive class this slice specifically investigated. As of Slice 18, also proven against a real, genuinely vulnerable local server whose own XML parser actually resolves an external entity and performs a real outbound fetch, and correctly abstains against a real parser using Python's own secure-by-default configuration. As of Slice 19, also proven to survive the full, real CLI → HTTP API → worker → executor → report pipeline unmodified, including the executor-layer wiring (`_apply_xxe_callback_detection`) itself, exercised directly for the first time.
 
-**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real hardened parser in the wild; that any real-world target is actually detectable by it.
+**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real hardened parser in the wild. As of Slice 20, it is now known specifically that this detector's out-of-band-only technique cannot reach the one live, real, in-band XXE vulnerability found at the one live target investigated so far: a real, disclosed detection-technique gap, not an unknown.
 
 **Remaining risks:**
 - Detection is limited to one payload shape and to endpoints already discoverable as POST-form/JSON-body candidates; a target reachable only through a genuinely XML-native, undiscovered endpoint produces neither a true positive nor a false positive, it is simply never probed.
 - A target with egress that permits DNS resolution but blocks outbound HTTP produces a false negative (NOT_VULNERABLE), inherited from the CallbackBroker/receiver architecture this shares with SSRF.
+- Confirmed at a live target (Slice 20): a real XXE implementation confined to `file://`-scheme in-band disclosure, with no outbound network capability at all, is invisible to this detector by construction. This is not a hypothetical edge case; it is the exact shape of the one real XXE this project has found.
 - Cross-detector authorization independence for this specific detector is inferred, not independently reconfirmed.
 
-**Next steps:** live/public-target investigation, the same next step now recorded for every detector besides CWE-639 and CWE-306, and the one that would let a fourth real-world reproduction (after CWE-639's Juice Shop confirmation) be attempted for this technique specifically.
+**Next steps:** an in-band file-disclosure variant of this detector (matching `path_traversal_detector.py`'s own signature-based classification approach, adapted to XML entity responses) would be needed to confirm the specific vulnerability Slice 20 found at Juice Shop; this is new detector scope, not a fix to the existing out-of-band detector, and was not attempted this slice.

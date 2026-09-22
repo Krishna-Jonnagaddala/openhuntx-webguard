@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete for this detector's own scope. A sixth active detector (marker-based OS command injection detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the original four active detectors already use, (Slice 18) real-network validated against a purpose-built local fixture that genuinely shells out, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. **Not yet run against any live/public target.** Built in the same pass as `active-detection-phase11-path-traversal.md`; see that document and `docs/CWE_COVERAGE.md`'s Slice 12 note for the "added after the stated Scanner v1 feature freeze" framing, which applies identically here.
+Complete for this detector's own scope. A sixth active detector (marker-based OS command injection detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the original four active detectors already use, (Slice 18) real-network validated against a purpose-built local fixture that genuinely shells out, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. **Investigated (Slice 20) against a live Juice Shop container: no compatible surface exists at all.** Built in the same pass as `active-detection-phase11-path-traversal.md`; see that document and `docs/CWE_COVERAGE.md`'s Slice 12 note for the "added after the stated Scanner v1 feature freeze" framing, which applies identically here.
 
 ## What was built
 
@@ -38,7 +38,7 @@ Covered by `tests/unit/test_command_injection_detector.py` (mocked connection, n
 
 ## Safety boundaries
 
-Identical to the other GET/POST/JSON detectors', inherited unmodified: same-origin enforcement, GET-only legacy candidates rejected at construction, shared `before_request`/`after_request` hooks, redirect/connection-failure handling as probe errors, cancellation checked before every candidate. Evidence sanitization: the marker itself is never retained in the finding's provenance string (`test_finding_evidence_never_contains_raw_marker_text`). Fingerprint determinism: `test_finding_fingerprint_determinism.py::CommandInjectionFingerprintDeterminismTests` proves the fingerprint ignores the marker entirely (two runs against the same candidate, each with its own fresh random marker, produce the identical fingerprint; a different endpoint produces a different one) -- the one property this whole module exists to check, and the one most specific to this detector's own marker-based design, not just a copy of the SQLi/path-traversal version.
+Identical to the other GET/POST/JSON detectors', inherited unmodified: same-origin enforcement, GET-only legacy candidates rejected at construction, shared `before_request`/`after_request` hooks, redirect/connection-failure handling as probe errors, cancellation checked before every candidate. Evidence sanitization: the marker itself is never retained in the finding's provenance string (`test_finding_evidence_never_contains_raw_marker_text`). Fingerprint determinism: `test_finding_fingerprint_determinism.py::CommandInjectionFingerprintDeterminismTests` proves the fingerprint ignores the marker entirely (two runs against the same candidate, each with its own fresh random marker, produce the identical fingerprint; a different endpoint produces a different one), the one property this whole module exists to check, and the one most specific to this detector's own marker-based design, not just a copy of the SQLi/path-traversal version.
 
 Cross-detector authorization independence has not been re-proven with a dedicated test for this specific detector, same open gap as path traversal's own audit doc records, relying on the shared, already-tested `active_checks` claim-matching mechanism rather than a per-pair retest.
 
@@ -54,7 +54,9 @@ Done (Slice 19). `tests/integration/test_command_injection_checks_e2e_lab.py` mi
 
 ## Live-target investigation
 
-**Not attempted this slice.**
+Done (Slice 20). Investigated against the pinned Juice Shop lab container (v20.1.1) by reading its actual server source inside the running container (`docker exec ... node -e`), not by probing blindly: an exhaustive search of every built server-side `.js` file for `child_process`, `execSync`, `spawn(`, or a bare `exec(` call found exactly one match, inside `lib/codingChallenges.js`, and that match is `RegExp.prototype.exec()` (a regex call, matched only because the search pattern's `exec(` substring also matches `.exec(`), not process execution. No other match exists anywhere in the codebase.
+
+This is a definitive negative, not merely "no vulnerable endpoint found": the underlying mechanism this technique requires (passing user-controlled input to a system shell) does not exist anywhere in this application's server-side code. Juice Shop's own actual code-execution challenges (`b2bOrder.js`'s `node:vm` sandbox, gated behind `notevil`) are a different vulnerability class (VM sandbox escape, categorized "Insecure Deserialization" in Juice Shop's own challenge catalog), not OS command injection via shell metacharacters.
 
 ## Regression
 
@@ -70,10 +72,10 @@ Done (Slice 19). `tests/integration/test_command_injection_checks_e2e_lab.py` mi
 
 **Proven:** the reflection-vs-execution distinction is real and tested, not assumed, now against a real shell as well as a mocked one; the classification logic correctly fires against a real, genuinely vulnerable local server that actually executes the injected command, and correctly abstains against both a real properly-fixed route and a real reflection-only route carrying the marker text. As of Slice 19, also proven to survive the full, real CLI → HTTP API → worker → executor → report pipeline unmodified.
 
-**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real near-miss one in the wild; that it correctly cannot be triggered by a permit that only authorizes a different check; that any real-world target is actually detectable by it.
+**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture; that it correctly cannot be triggered by a permit that only authorizes a different check. As of Slice 20, it is now known that the one live target investigated (Juice Shop) has no shell-execution surface at all, source-confirmed, so no claim about detectability there is possible in either direction.
 
 **Remaining risks:**
 - Detection is limited to the single `;`-plus-`#` POSIX separator; a target vulnerable only through `|`, `&&`, backticks, `$()`, Windows chaining, or requiring a quote-breaking prefix produces a false negative.
 - Cross-detector authorization independence for this specific detector is inferred, not independently reconfirmed.
 
-**Next steps:** live/public-target investigation, the same next step now recorded for every detector besides CWE-639 and CWE-306; given this detector's CRITICAL severity and the fact that it demonstrates actual code execution rather than only data disclosure, that investigation should stay confined to a fully controlled, disposable test target if and when it happens.
+**Next steps:** none specific to live-target investigation; a genuinely shell-backed target would need to be found or built separately to ever confirm this detector's real-world reach, and given its CRITICAL severity and the fact that it demonstrates actual code execution rather than only data disclosure, any such target should stay a fully controlled, disposable one.

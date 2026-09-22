@@ -4,7 +4,7 @@
 
 Complete for v1 scope. A tenth active detector (missing-authentication-for-critical-function detection) is implemented, unit-tested (mocked connection, no real network), contract-tested at the permit-claim layer, registered/permit-gated through a new dedicated dispatch category, and taken through a true end-to-end CLI → HTTP API → worker → executor → report pipeline against a real, purpose-built local HTTPS fixture. Added after the same Slice 11 feature freeze the six prior post-freeze slices were added after, at the user's continued request ("do broken authentication next"). Unlike every other post-freeze slice, this one could not stay self-contained inside the scanner package: it required a signed-permit schema change, so the user was asked directly (via a scoping question, not assumed) whether to do the full build or a narrower alternative, and chose the full build.
 
-**Not yet run against a live/public target.** Every other claim in this doc that a prior post-freeze slice left undone (end-to-end pipeline, real-network fixture validation) is done here.
+**Investigated (Slice 20) against a live Juice Shop container: no genuine, unambiguous candidate for this detector's specific claim exists there.** Every other claim in this doc that a prior post-freeze slice left undone (end-to-end pipeline, real-network fixture validation) is done here.
 
 ## CWE precision: why CWE-306, not CWE-287
 
@@ -119,9 +119,24 @@ Result: exactly one CONFIRMED finding on `/vulnerable`; zero findings on `/secur
 - **Expired permit / revoked authorization / wrong target / wrong organization / tampered `active_checks` claim**: already generically covered by the existing, detector-agnostic `test_active_checks_permit_control.py` suite; `active.authentication.missing` now being a real, known check ID means these protections provably apply to it identically, with no detector-specific code path that could bypass them.
 - **An XSS-only or SQLi-only permit cannot trigger this detector**: not separately re-run through the full pipeline (structurally identical to the passive-permit proof already run: the gate `"active.authentication.missing" not in active_checks` does not special-case any other check), inferred from the shared mechanism rather than independently re-proven, the same posture SSRF's own audit doc took toward IDOR.
 
+## Live-target investigation
+
+Done (Slice 20). Investigated against the pinned Juice Shop lab container (v20.1.1) both by probing live and by reading the actual server route table inside the running container (`docker exec ... node -e`, listing every `app.use`/`app.get`/etc. registration and cross-referencing which ones attach `security.isAuthorized()`). **No genuine, unambiguous CWE-306 candidate was found**: every endpoint reachable with zero authentication is either intentionally public by the application's own design, or exposes a real problem of a different CWE shape.
+
+Checked directly:
+- `GET /api/Users` (the admin user-listing endpoint the "Admin Section" challenge's own page depends on) correctly returns `401 Unauthorized` with no token. Properly gated.
+- `GET /rest/user/authentication-details` and `GET /rest/admin/application-config` both correctly return `401`. Properly gated (the latter's 500 on a broken query string is an unrelated server error, not an auth bypass).
+- `GET /rest/memories` (the public photo-wall feed) succeeds with zero authentication and returns every user's memory records, each embedding that user's full nested `User` object, including password hash and `deluxeToken`. This is real, but it is CWE-200 (sensitive data exposure via a legitimately-public endpoint over-sharing fields it should have filtered out of its response), not CWE-306: the endpoint itself is intentionally public by design (it is literally the "Photo Wall" gallery feature), so there is no operator-defensible claim that it "should require authentication to access at all," only that it should redact certain fields once it responds. This project's own passive `disclosure_analyzer.py`/`html_analyzer.py` checks, not this detector, are the right tool for that shape of finding.
+- `GET /rest/track-order/:id` and `POST /api/Feedbacks` both succeed anonymously by the application's own explicit design (public order tracking and public review submission are ordinary storefront features, not oversights).
+- `POST /file-upload` (the complaint-file-upload route that Slice 20's XXE investigation, see `docs/audit/active-detection-phase13-xxe-callback.md`, already found has no `security.isAuthorized()` middleware at all) is the closest candidate, but its intent is genuinely ambiguous: a public complaint-submission form is a defensible design choice (comparable to a contact form), and Juice Shop's own challenge catalog frames this route's real, intended weakness as the deprecated-XML-upload/XXE angle, never as a missing-authentication one. Using it as a CWE-306 example would be asserting an operator intent this project has no actual basis to assert.
+
+This detector's own contract requires an operator to assert "this specific URL should require my authenticated identity," a judgment call about intent that source-reading and probing alone cannot make on someone else's behalf. No confirmable example exists in this lab target under that standard.
+
 ## Regression
 
 `tests/unit/test_missing_authentication_detector.py`: 12/12 pass. `tests/unit/test_trustscan_permit_contract.py`: 26/26 pass (17 new). `tests/unit/test_finding_fingerprint_determinism.py`: pass, including 2 new tests for this detector. `tests/unit/test_active_detector_registry.py`: pass, extended for the fourth category. Full `tests/unit` discover run: 2031/2031 pass, no regressions in any pre-existing detector's own test file (the ~13-file permit-schema-fixture ripple from the `1.3`→`1.4` bump was mechanical: every raw JSON permit submission fixture across unit and integration tests needed `"missing_authentication_endpoints"` added, the same kind of ripple the CSRF slice's check-count shift caused, now fixed). `tests/integration/test_missing_authentication_e2e_lab.py`: 3/3 pass (`WEBGUARD_RUN_INTEGRATION=1`).
+
+**Slice 20 addendum:** live-target investigation against Juice Shop is done; see the "Live-target investigation" section above. No code or test changes this slice, investigation only.
 
 ## Implemented / Tested / Proven / Not Proven / Remaining Risks
 
@@ -131,12 +146,12 @@ Result: exactly one CONFIRMED finding on `/vulnerable`; zero findings on `/secur
 
 **Proven:** the detector correctly reaches CONFIRMED against a real, genuinely vulnerable HTTP endpoint and correctly abstains against a real, properly-gated one, over real sockets and real TLS, through the complete CLI → HTTP API → worker → executor → report pipeline, not only against a mocked connection.
 
-**Not Proven:** that this detector correctly fires against, or correctly abstains against, any real-world third-party target; that the marker-based CONFIRMED/PROBABLE tiering behaves as intended against a genuinely diverse set of real applications (only the two fixture shapes, exactly-identical and denied, were exercised end-to-end; the dynamic-content/marker-only PROBABLE path is proven only at the unit level); that a live/public target investigation (the way `active.authorization.idor` was confirmed against Juice Shop) would surface anything this detector's synthetic fixture did not.
+**Not Proven:** that this detector correctly fires against, or correctly abstains against, any real-world third-party target; that the marker-based CONFIRMED/PROBABLE tiering behaves as intended against a genuinely diverse set of real applications (only the two fixture shapes, exactly-identical and denied, were exercised end-to-end; the dynamic-content/marker-only PROBABLE path is proven only at the unit level). As of Slice 20, it is now known that the one live target investigated (Juice Shop) presents no genuine, unambiguous example of this detector's specific claim, so no finding there was ever expected once that was established, not a gap in the detector.
 
 **Remaining risks:**
-- No live/public target investigation has been attempted for this detector yet.
 - Detection is capped at PROBABLE, never CONFIRMED, for any endpoint whose operator did not configure an `owner_marker`, an explicit, named ceiling of comparing one identity against no identity at all, not a bug.
 - Single-page scans only; a crawl-mode scan silently never runs this check today (consistent with, not worse than, IDOR/SSRF/XXE's identical existing restriction), pending a `CrawlScanResult` schema change to add a scan-wide findings field.
 - Up to 10 endpoints per permit; an operator with more than 10 critical endpoints to check must issue multiple permits.
+- This detector's own contract needs an operator's genuine intent ("this URL should require auth") to test meaningfully; a lab environment with no such documented intent behind any of its anonymously-reachable endpoints cannot supply a confirmable positive, a structural limit on what live-target investigation alone can establish for this specific CWE, not something a different target would necessarily fix.
 
-**Next steps:** live/public target investigation (a real application with a known, disclosed missing-authentication weakness, the way IDOR was confirmed against Juice Shop); a `CrawlScanResult` scan-wide findings field, if crawl-mode support for this detector is ever prioritized.
+**Next steps:** a `CrawlScanResult` scan-wide findings field, if crawl-mode support for this detector is ever prioritized; separately, a live target with a *documented* missing-authentication weakness (rather than one inferred from source reading) would be needed to move this claim further.

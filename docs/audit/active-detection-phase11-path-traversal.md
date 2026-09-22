@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete for this detector's own scope. A fifth active detector (conservative, /etc/passwd-content-signature-based path traversal detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the original four active detectors already use, (Slice 18) real-network validated against a purpose-built local fixture over real sockets, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. **Not yet run against any live/public target.** This slice is added after `docs/scanner/SCANNER_V1_CAPABILITIES.md`'s own stated "Scanner v1 feature freeze" (Slice 11), at the user's explicit request; see `docs/CWE_COVERAGE.md`'s own Slice 12 note for that framing.
+Complete for this detector's own scope. A fifth active detector (conservative, /etc/passwd-content-signature-based path traversal detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the original four active detectors already use, (Slice 18) real-network validated against a purpose-built local fixture over real sockets, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. **Investigated (Slice 20) against a live Juice Shop container: a real file-disclosure vulnerability exists there, but it uses a different technique (a poison-null-byte extension bypass, not `..` traversal) this detector's own payload cannot reach.** This slice is added after `docs/scanner/SCANNER_V1_CAPABILITIES.md`'s own stated "Scanner v1 feature freeze" (Slice 11), at the user's explicit request; see `docs/CWE_COVERAGE.md`'s own Slice 12 note for that framing.
 
 ## What was built
 
@@ -60,7 +60,11 @@ Done (Slice 19). `tests/integration/test_path_traversal_checks_e2e_lab.py` mirro
 
 ## Live-target investigation
 
-**Not attempted this slice.**
+Done (Slice 20). Investigated against the pinned Juice Shop lab container (v20.1.1), source-verified via `docker exec` rather than assumed: **a real, file-disclosure-shaped vulnerability exists there, but it is a poison-null-byte extension-filter bypass, not `..`-sequence directory traversal, and this detector's specific technique cannot reach it.**
+
+`routes/fileServer.js`'s `servePublicFiles` middleware explicitly rejects any requested filename containing a `/` (`if (!file.includes('/')) { ... } else { res.status(403) ... }`) before ever calling `res.sendFile`, so a `../../../../../../etc/passwd`-style payload is rejected outright, confirmed live: `GET /ftp/../../../../../../etc/passwd` never reaches the filesystem check at all and instead falls through to the SPA's catch-all route, returning `index.html` (byte-identical `ETag`/`Content-Length` to a deliberately-unrelated `../package.json` probe, proving neither ever escaped to a real file). The real vulnerability is different: an allowlist restricts served files to `.md`/`.pdf` extensions, but `security.cutOffPoisonNullByte(file)` strips everything after a literal null byte only *after* that allowlist check already passed, so `package.json.bak%00.md` passes the extension check and then serves `package.json.bak`. Confirmed live: `GET /ftp/package.json.bak%2500.md` returns the real `package.json.bak` content (`200`, genuine JSON body). Every file this bypass can reach is a fixture the application itself planted inside its own `ftp/` directory (`package.json.bak`, `coupons_2013.md.bak`, `eastere.gg`, `suspicious_errors.yml`); none of it is ever an absolute system path like `/etc/passwd`, so even a successful exploit would never satisfy this detector's own passwd-signature-based classification.
+
+Two independent, compounding reasons this detector cannot confirm this real vulnerability: the technique (a null-byte suffix bypass on an extension allowlist, never a directory-escape sequence, and explicitly blocked from ever containing `/`) does not match the payload this detector sends, and the target data (app-internal fixture files) does not match the `root:x:0:0:`-style signature list this detector's classification requires even if a byte sequence did get through. Both were independently confirmed by reading the actual served route source inside the running container, not inferred from behavior alone.
 
 ## Regression
 
@@ -76,10 +80,10 @@ Done (Slice 19). `tests/integration/test_path_traversal_checks_e2e_lab.py` mirro
 
 **Proven:** the classification logic itself is correct against every scenario a fake connection can construct, and now also against a real, unmocked local fixture: the vulnerable route genuinely discloses this machine's own `/etc/passwd` and the safe route's canonicalize-then-check-containment fix genuinely blocks it, over a real TCP socket. As of Slice 19, also proven to survive the full, real CLI → HTTP API → worker → executor → report pipeline unmodified.
 
-**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real near-miss one in the wild; that it correctly cannot be triggered by a permit that only authorizes a different check; that any real-world target (lab or otherwise) is actually detectable by it.
+**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture; that it correctly cannot be triggered by a permit that only authorizes a different check. As of Slice 20, it is now known specifically that the one live target investigated (Juice Shop) does not present a directory-traversal-shaped vulnerability this detector's exact technique can reach, even though a related, differently-shaped file-disclosure vulnerability does exist there.
 
 **Remaining risks:**
 - Detection is limited to Unix/Linux `/etc/passwd` disclosure via one payload and one depth; a target reachable only through Windows-path traversal, a different depth, or an encoding bypass produces a false negative, not a false positive.
 - Cross-detector authorization independence for this specific detector is inferred from the shared mechanism's existing tests, not independently reconfirmed with this detector as one of the two compared.
 
-**Next steps:** live/public-target investigation, the same next step now recorded for every detector besides CWE-639 and CWE-306, if one is prioritized for this specific technique.
+**Next steps:** if broader real-world traversal coverage is prioritized, a poison-null-byte-style extension-filter-bypass payload (as a second, distinct diagnostic technique, not a replacement for the existing one) would reach the Juice Shop vulnerability this slice found but the current payload cannot; this is a genuinely different technique, not a tuning change.

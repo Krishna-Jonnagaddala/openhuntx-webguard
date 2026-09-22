@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete for this detector's own scope, with one disclosed dependency caveat. A ninth active detector (error-based LDAP injection detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the SQLi/path-traversal/command-injection/open-redirect detectors already use, (Slice 18) real-network validated using a real LDAP client library's own filter compiler, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. Both the real-network and true-end-to-end proofs depend on the optional `ldap3` package (dev-only, not wired into this project's CI), so they run for real on any machine with it installed and skip cleanly everywhere else, including this project's own CI. **Not yet run against any live/public target.** Added after the same Slice 11 feature freeze the four prior post-freeze slices were added after, at the user's continued request; see `docs/CWE_COVERAGE.md`'s Slice 15 note. Unlike CWE-601/611/78/22, CWE-90 was never previously named in this project's own "Planned" list: it is new scope added directly, not a promotion from a pre-existing entry.
+Complete for this detector's own scope, with one disclosed dependency caveat. A ninth active detector (error-based LDAP injection detection) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated through the exact same infrastructure the SQLi/path-traversal/command-injection/open-redirect detectors already use, (Slice 18) real-network validated using a real LDAP client library's own filter compiler, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. Both the real-network and true-end-to-end proofs depend on the optional `ldap3` package (dev-only, not wired into this project's CI), so they run for real on any machine with it installed and skip cleanly everywhere else, including this project's own CI. **Investigated (Slice 20) against a live Juice Shop container: no compatible surface exists at all.** Added after the same Slice 11 feature freeze the four prior post-freeze slices were added after, at the user's continued request; see `docs/CWE_COVERAGE.md`'s Slice 15 note. Unlike CWE-601/611/78/22, CWE-90 was never previously named in this project's own "Planned" list: it is new scope added directly, not a promotion from a pre-existing entry.
 
 ## Pre-implementation verification
 
@@ -86,7 +86,9 @@ Done (Slice 19), with the same `ldap3` dependency caveat as the real-network val
 
 ## Live-target investigation
 
-**Not attempted this slice.**
+Done (Slice 20). Investigated against the pinned Juice Shop lab container (v20.1.1) by reading its actual server source inside the running container (`docker exec ... node -e`): an exhaustive search of every built server-side `.js` file for `ldap` or `ldapjs` (case-insensitive) found zero matches anywhere in the codebase.
+
+This is a definitive negative: Juice Shop has no LDAP directory integration of any kind, so there is no compatible surface for this technique to exist against, let alone be reached by this detector's specific diagnostic. Juice Shop's own challenge catalog (fetched live from `/api/Challenges`) confirms this indirectly: no category or challenge name references LDAP anywhere among its 113 entries.
 
 ## Regression
 
@@ -96,6 +98,8 @@ Done (Slice 19), with the same `ldap3` dependency caveat as the real-network val
 
 **Slice 19 addendum:** `tests/integration/test_ldap_injection_checks_e2e_lab.py`: 1/1 pass with `WEBGUARD_RUN_INTEGRATION=1` and `ldap3` installed; skips cleanly with either missing. Re-ran the full `tests/unit` suite (2031/2031 pass), the full `tests/integration` suite (312/312 pass, 243 skipped), and the full security-gates script (secret scan, ruff, dependency audit) at the same time as the other four Slice 19 additions; see `docs/CWE_COVERAGE.md`'s own Slice 19 section for the combined run.
 
+**Slice 20 addendum:** live-target investigation against Juice Shop is done; see the "Live-target investigation" section above. No code or test changes this slice, investigation only.
+
 ## Implemented / Tested / Proven / Not Proven / Remaining Risks
 
 **Implemented:** error-based LDAP injection detector (CWE-90), independently permit-gated (`active.ldapi.error`), registered in `ACTIVE_DETECTOR_REGISTRY`, candidate-discovery-integrated, evidence-sanitized.
@@ -104,7 +108,7 @@ Done (Slice 19), with the same `ldap3` dependency caveat as the real-network val
 
 **Proven:** the payload's structural reliability (an injected, unmatched closing parenthesis can only ever increase a filter's paren imbalance, never be absorbed by any surrounding template shape) was independently verified by hand-worked arithmetic across simple, wildcard-wrapped, and compound filter shapes and corroborated by real production incident reports, not merely asserted by analogy to SQLi; all 13 signatures are real, currently-accurate strings/class names from named, real libraries and servers, fact-checked against source and real bug reports before this detector was written, not assumed. As of Slice 18, one of those 13 signatures (`ldap3.core.exceptions.ldapinvalidfiltererror`) is also proven by actually triggering it: a real `ldap3` client genuinely raises it on the detector's own diagnostic filter, not merely cited as existing in the wild. As of Slice 19, also proven to survive the full, real CLI → HTTP API → worker → executor → report pipeline unmodified, on any machine with `ldap3` installed.
 
-**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable directory-backed HTTP server beyond this project's own `ldap3`-backed fixture, or correctly abstains against a real, properly-escaping target in the wild; that any real-world target is actually detectable by it; that the other 12 signatures behave as documented against their own real libraries (only the `ldap3` one has been actually triggered so far).
+**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable directory-backed HTTP server beyond this project's own `ldap3`-backed fixture, or correctly abstains against a real, properly-escaping target in the wild; that the other 12 signatures behave as documented against their own real libraries (only the `ldap3` one has been actually triggered so far). As of Slice 20, it is now known that the one live target investigated (Juice Shop) has no LDAP surface at all, source-confirmed, so no claim about detectability there is possible in either direction.
 
 **Remaining risks:**
 - On an ldapjs-backed Node.js target, this detector's own diagnostic payload can crash the target process, a materially different and larger risk than any other active detector in this project carries. An operator should be aware of this before authorizing this specific check against a target that might be running that library. Still not exercised under test; the Slice 18/19 fixtures use `ldap3`, not ldapjs, and do not attempt to reproduce the crash.
@@ -112,4 +116,4 @@ Done (Slice 19), with the same `ldap3` dependency caveat as the real-network val
 - Both the real-network validation and the true end-to-end test depend on the optional `ldap3` package, installed dev-only and not wired into this project's CI; unlike the other four Slice 18/19 additions, neither currently runs for real anywhere but a machine with `ldap3` installed by hand.
 - Cross-detector authorization independence for this specific detector is inferred, not independently reconfirmed.
 
-**Next steps:** live/public-target investigation, the same next step now recorded for every detector besides CWE-639 and CWE-306; separately, a decision on whether to add `ldap3` to this project's locked CI dependencies so both of this detector's Slice 18/19 additions run in CI like the other four do, and whether a simulated ldapjs-shaped crash-on-malformed-filter behavior is worth building to exercise the crash risk under test rather than only reasoning about it.
+**Next steps:** none specific to live-target investigation; an actual LDAP-directory-backed target would need to be found or built separately to ever confirm this detector's real-world reach. Separately, a decision on whether to add `ldap3` to this project's locked CI dependencies so both of this detector's Slice 18/19 additions run in CI like the other four do, and whether a simulated ldapjs-shaped crash-on-malformed-filter behavior is worth building to exercise the crash risk under test rather than only reasoning about it.

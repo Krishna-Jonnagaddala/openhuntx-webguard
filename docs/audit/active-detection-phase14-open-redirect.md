@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete for this detector's own scope. An eighth active detector (single-request Location-header confirmation) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated, (Slice 18) real-network validated against a purpose-built local fixture that genuinely redirects, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. Unlike XXE, it fits `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention exactly, the same shape SQLi/XSS/path traversal/command injection already use. **Not yet run against any live/public target.** Added after the same Slice 11 feature freeze the three prior post-freeze slices were added after, at the user's continued request; see `docs/CWE_COVERAGE.md`'s Slice 14 note.
+Complete for this detector's own scope. An eighth active detector (single-request Location-header confirmation) is implemented, unit-tested (mocked connection, no real network), registered/permit-gated, (Slice 18) real-network validated against a purpose-built local fixture that genuinely redirects, and (Slice 19) taken through a true end-to-end CLI → API → worker → executor → report test. Unlike XXE, it fits `ACTIVE_DETECTOR_REGISTRY`'s generic synchronous calling convention exactly, the same shape SQLi/XSS/path traversal/command injection already use. **Investigated (Slice 20) against a live Juice Shop container: a real, correctly-gated redirect allowlist exists there, and this detector's own fixed-marker technique cannot exploit the specific bypass its own challenge is named for.** Added after the same Slice 11 feature freeze the three prior post-freeze slices were added after, at the user's continued request; see `docs/CWE_COVERAGE.md`'s Slice 14 note.
 
 ## Pre-implementation adversarial review
 
@@ -86,7 +86,9 @@ Done (Slice 19). `tests/integration/test_open_redirect_checks_e2e_lab.py` mirror
 
 ## Live-target investigation
 
-**Not attempted this slice.**
+Done (Slice 20). Investigated against the pinned Juice Shop lab container (v20.1.1), by direct probing rather than assumption. Juice Shop's own challenge catalog (fetched live from `/api/Challenges`) names exactly this weakness twice: "Outdated Allowlist" and "Allowlist Bypass," under the "Unvalidated Redirects" category, confirming a real redirect-allowlist-bypass surface genuinely exists at `GET /redirect?to=`.
+
+Confirmed live that the allowlist is real, not decorative: `GET /redirect?to=https://<a made-up, unregistered host>/` returns `406 Not Acceptable` (rejected), while `GET /redirect?to=https://github.com/juice-shop/juice-shop` (a genuinely allowlisted destination) returns a real `302 Found` with that exact `Location`. This detector's own diagnostic is a single, fixed-shape probe: submit `https://<fresh-random-marker>.invalid/` and check for a 3xx with a `Location` resolving to that exact marker host. Since the marker host can never be a member of, or contain, one of the allowlist's own real domain strings, this probe structurally cannot exercise whichever bypass technique the challenge's own name implies exists (a substring/prefix check flaw in the allowlist logic itself, not simply "no allowlist"). This detector tests for the *absence* of an allowlist; Juice Shop has a real, present, just imperfect one, a category this detector's own design was never built to probe.
 
 ## Regression
 
@@ -96,6 +98,8 @@ Done (Slice 19). `tests/integration/test_open_redirect_checks_e2e_lab.py` mirror
 
 **Slice 19 addendum:** `tests/integration/test_open_redirect_checks_e2e_lab.py`: 1/1 pass with `WEBGUARD_RUN_INTEGRATION=1`; skips cleanly without it. Re-ran the full `tests/unit` suite (2031/2031 pass), the full `tests/integration` suite (312/312 pass, 243 skipped), and the full security-gates script (secret scan, ruff, dependency audit) at the same time as the other four Slice 19 additions; see `docs/CWE_COVERAGE.md`'s own Slice 19 section for the combined run.
 
+**Slice 20 addendum:** live-target investigation against Juice Shop is done; see the "Live-target investigation" section above. No code or test changes this slice, investigation only.
+
 ## Implemented / Tested / Proven / Not Proven / Remaining Risks
 
 **Implemented:** open redirect detector (CWE-601), independently permit-gated (`active.openredirect.location`), registered in `ACTIVE_DETECTOR_REGISTRY`, evidence-sanitized. One new shared-transport capability (`allow_redirect_status` on `issue_probe`/`issue_templated_request`), additive and backward-compatible.
@@ -104,11 +108,12 @@ Done (Slice 19). `tests/integration/test_open_redirect_checks_e2e_lab.py` mirror
 
 **Proven:** the structural hostname-comparison approach is sound against every false-positive scenario three independent, code-grounded adversarial reviews could construct, not merely against the scenarios the detector's own author thought of; the three real bugs those reviews found (duplicate headers, trailing-dot FQDN, status scope) were fixed before implementation, not discovered after shipping. As of Slice 19, also proven to survive the full, real CLI → HTTP API → worker → executor → report pipeline unmodified.
 
-**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture, or correctly abstains against a real, hardened target in the wild; that any real-world target is actually detectable by it given the disclosed discovery-reach gaps.
+**Not Proven:** that this detector correctly fires against a real, genuinely vulnerable HTTP server beyond this project's own fixture; that any real-world target is actually detectable by it given the disclosed discovery-reach gaps. As of Slice 20, it is now known that the one live target investigated (Juice Shop) has a real redirect allowlist, correctly rejecting this detector's own probe, so no finding there was ever expected once the allowlist's existence was confirmed.
 
 **Remaining risks:**
 - The single-request, no-follow-up-action methodology cannot detect the common post-login/post-SSO redirect pattern, arguably the highest-impact real-world shape of this exact weakness; this is a real, disclosed false-negative class, not a rare corner case.
 - Candidate reach is capped by shared discovery-pipeline restrictions (crawl-mode path filtering, state-changing-keyword classification) that cost this technique specifically more than the others; closing them is a separately-justified, cross-cutting change, not something attempted here.
 - Cross-detector authorization independence for this specific detector is inferred, not independently reconfirmed.
+- Confirmed at a live target (Slice 20): this detector tests only for a missing allowlist, never for a bypassable one. A real, present allowlist with a known bypass technique (Juice Shop's own "Allowlist Bypass" challenge) is invisible to it by design.
 
-**Next steps:** live/public-target investigation, the same next step now recorded for every detector besides CWE-639 and CWE-306; separately, whether to extend discovery to surface the entry URL's own query string as candidates (which would benefit every GET-based detector, not just this one) is worth its own, dedicated design discussion rather than being folded into this slice.
+**Next steps:** an allowlist-bypass-aware diagnostic (submitting a candidate value shaped to satisfy a common allowlist-check flaw, such as a substring or prefix match, rather than a bare unregistered marker host) would be needed to confirm Juice Shop's specific vulnerability; this is new detector scope, not a fix to the existing one, and was not attempted this slice. Separately, whether to extend discovery to surface the entry URL's own query string as candidates (which would benefit every GET-based detector, not just this one) is worth its own, dedicated design discussion.
