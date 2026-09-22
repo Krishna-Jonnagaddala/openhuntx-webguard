@@ -137,6 +137,14 @@ class ProductionServiceConfig:
     # docs/production/TRUSTSCAN_SIGNING_SERVICE.md.
     signing_service_url: str | None = None
     signing_service_bearer_token: str | None = None
+    # First-release module gate: defaults to "webguard" so a
+    # deployment that never sets WEBGUARD_ENABLED_MODULES fails closed
+    # toward the MORE restrictive state, the same direction every other
+    # optional field above fails toward (no field here silently widens
+    # to a weaker or broader configuration when unset). A future
+    # release that ships SOC/Compliance flips this with one environment
+    # variable, no code change.
+    enabled_modules: str = "webguard"
 
     def __post_init__(self) -> None:
         if self.environment != "production":
@@ -304,6 +312,24 @@ class ProductionServiceConfig:
                 "production_config_invalid",
                 f"database_pool_maximum must be from database_pool_minimum to {MAXIMUM_DATABASE_POOL_MAXIMUM}.",
             )
+        modules = {token.strip() for token in self.enabled_modules.split(",") if token.strip()}
+        if not modules.issubset({"webguard", "soc", "compliance"}):
+            raise ProductionConfigError(
+                "production_config_invalid",
+                'enabled_modules must be a comma-separated subset of "webguard", "soc", "compliance".',
+            )
+        if "webguard" not in modules:
+            raise ProductionConfigError(
+                "production_config_invalid",
+                "enabled_modules must include \"webguard\": it is the platform's foundational "
+                "module and cannot be disabled.",
+            )
+
+    @property
+    def enabled_module_set(self) -> frozenset[str]:
+        """Parsed, already-validated by ``__post_init__``."""
+
+        return frozenset(token.strip() for token in self.enabled_modules.split(",") if token.strip())
 
     @property
     def cursor_signing_key_bytes(self) -> bytes:
@@ -353,6 +379,7 @@ class ProductionServiceConfig:
             secret_provider=os.environ.get("WEBGUARD_SECRET_PROVIDER") or None,
             signing_service_url=os.environ.get("WEBGUARD_SIGNING_SERVICE_URL") or None,
             signing_service_bearer_token=os.environ.get("WEBGUARD_SIGNING_SERVICE_BEARER_TOKEN") or None,
+            enabled_modules=os.environ.get("WEBGUARD_ENABLED_MODULES", "webguard"),
         )
 
 

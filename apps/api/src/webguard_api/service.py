@@ -11,6 +11,7 @@ from uuid import uuid4
 from webguard_contracts import (
     AuditOutcome,
     OrganizationRole,
+    PlatformModule,
     PrincipalType,
     ScanJobLoadError,
     ScanJobMode,
@@ -162,6 +163,7 @@ class WebGuardJobService:
         module_entitlements=None,
         compliance_catalog=None,
         assertion_collections=None,
+        enabled_modules: frozenset[PlatformModule] | None = None,
     ) -> None:
         self.store = store
         self.authorizations = authorizations
@@ -312,6 +314,55 @@ class WebGuardJobService:
         self.assertion_collections = (
             assertion_collections if assertion_collections is not None else InMemoryAssertionCollectionRepository()
         )
+        # None means "every module offered by this deployment": every
+        # pre-existing call site (local/lab/dev) is unaffected, matching
+        # every other optional constructor parameter above. Production
+        # wiring (production_startup.py) passes a real, restricted set
+        # derived from WEBGUARD_ENABLED_MODULES; WEBGUARD itself is
+        # always in it regardless of what that variable says, since it
+        # is the platform's foundational module (set_module_entitlement
+        # already rejects trying to manage it for the identical reason).
+        self.enabled_modules = enabled_modules
+
+    def _module_is_available(self, module: PlatformModule) -> bool:
+        """Whether this deployment offers ``module`` at all, independent
+        of any organization's own entitlement state.
+        ``enabled_modules=None`` (every non-production call site) means
+        every module is offered."""
+
+        return self.enabled_modules is None or module in self.enabled_modules
+
+    def _require_module_available(
+        self,
+        module: PlatformModule,
+        *,
+        context: AuthContext,
+        request_id: str,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+    ) -> None:
+        """Deployment-wide release gate, independent of and prior to
+        both RBAC and per-organization module entitlement: a module
+        this deployment does not offer at all is not a "not entitled"
+        or "not permitted" condition for this caller, it is "this route
+        does not exist here," the same 404 regardless of what the
+        caller's own role or organization would otherwise allow. Audits
+        a denial exactly like ``_require`` does for an RBAC failure, so
+        every rejected attempt is reconstructable from the audit trail
+        the same way."""
+
+        if not self._module_is_available(module):
+            self._audit(
+                context, request_id=request_id, action=action, resource_type=resource_type,
+                resource_id=resource_id, outcome=AuditOutcome.DENIED,
+                detail_code="module_not_available_in_this_deployment",
+            )
+            raise ApiServiceError(
+                "module_not_available_in_this_deployment",
+                f"The {module.value} module is not available in this deployment.",
+                status=404,
+            )
 
     def _send_mail_best_effort(self, *, to: str, subject: str, body: str, category: str) -> None:
         """A delivery failure never fails the caller's own operation --
@@ -3230,6 +3281,12 @@ class WebGuardJobService:
                     "status": entitlement.status.value,
                     "updated_at": entitlement.updated_at.isoformat(),
                     "enabled_at": entitlement.enabled_at.isoformat() if entitlement.enabled_at else None,
+                    # Deployment-wide, not per-organization: false means
+                    # no one, not even this organization's own owner,
+                    # can turn this module on right now, distinct from
+                    # "status" above (which an owner genuinely controls
+                    # when this is true).
+                    "available": self._module_is_available(entitlement.module),
                 }
                 for entitlement in entitlements
             ]
@@ -3279,6 +3336,14 @@ class WebGuardJobService:
             raise ApiServiceError(
                 "module_entitlement_unknown", f"{module_id!r} is not a known module.", status=400
             )
+        # An owner cannot enable a module this deployment does not
+        # offer at all, regardless of their own role: the deployment-
+        # wide release gate outranks the per-organization toggle it
+        # would otherwise control.
+        self._require_module_available(
+            PlatformModule(module_id), context=context, request_id=request_id,
+            action="module_entitlements.manage", resource_type="module_entitlement", resource_id=module_id,
+        )
         if not isinstance(body, dict) or body.get("status") not in ("enabled", "disabled"):
             self._audit(
                 context, request_id=request_id, action="module_entitlements.manage",
@@ -3289,7 +3354,7 @@ class WebGuardJobService:
                 "module_entitlement_body_invalid", "status must be 'enabled' or 'disabled'.", status=400
             )
         from .module_entitlements import ModuleEntitlementError
-        from webguard_contracts import ModuleEntitlementStatus, PlatformModule
+        from webguard_contracts import ModuleEntitlementStatus
 
         try:
             entitlement = self.module_entitlements.set_entitlement(
@@ -3325,6 +3390,11 @@ class WebGuardJobService:
         reference data, the same as the Compliance framework catalog:
         every organization sees the identical list."""
 
+        self._require_module_available(
+            PlatformModule.SOC, context=context, request_id=request_id,
+            action="soc.connectors.list", resource_type="organization",
+            resource_id=context.organization_id,
+        )
         self._require(
             context, ApiPermission.SOC_CONNECTOR_READ, request_id=request_id,
             action="soc.connectors.list", resource_type="organization",
@@ -3365,6 +3435,11 @@ class WebGuardJobService:
         source, no legally-reviewed control content loaded yet. That is
         reported honestly (control_count=0), never hidden or padded."""
 
+        self._require_module_available(
+            PlatformModule.COMPLIANCE, context=context, request_id=request_id,
+            action="compliance.frameworks.list", resource_type="organization",
+            resource_id=context.organization_id,
+        )
         self._require(
             context, ApiPermission.COMPLIANCE_CATALOG_READ, request_id=request_id,
             action="compliance.frameworks.list", resource_type="organization",
@@ -3387,6 +3462,11 @@ class WebGuardJobService:
         own result. Global reference data, same as the framework
         catalog and the SOC connector manifests."""
 
+        self._require_module_available(
+            PlatformModule.COMPLIANCE, context=context, request_id=request_id,
+            action="compliance.assertions.list", resource_type="organization",
+            resource_id=context.organization_id,
+        )
         self._require(
             context, ApiPermission.COMPLIANCE_ASSERTION_READ, request_id=request_id,
             action="compliance.assertions.list", resource_type="organization",
@@ -3439,6 +3519,10 @@ class WebGuardJobService:
         a row here, never a fabricated record (assertion_collections.py's
         own module docstring)."""
 
+        self._require_module_available(
+            PlatformModule.COMPLIANCE, context=context, request_id=request_id,
+            action="compliance.assertion_collections.list", resource_type="assertion", resource_id=assertion_id,
+        )
         self._require(
             context, ApiPermission.COMPLIANCE_ASSERTION_READ, request_id=request_id,
             action="compliance.assertion_collections.list", resource_type="assertion", resource_id=assertion_id,
@@ -3465,6 +3549,11 @@ class WebGuardJobService:
         Nothing here talks to a live Microsoft tenant: no SOC connector
         in this codebase has a live HTTP client yet."""
 
+        self._require_module_available(
+            PlatformModule.COMPLIANCE, context=context, request_id=request_id,
+            action="compliance.assertion_collections.create", resource_type="assertion",
+            resource_id=assertion_id,
+        )
         self._require(
             context, ApiPermission.COMPLIANCE_ASSERTION_COLLECT, request_id=request_id,
             action="compliance.assertion_collections.create", resource_type="assertion", resource_id=assertion_id,
@@ -3482,7 +3571,7 @@ class WebGuardJobService:
         # as an explicit "disabled" status -- never treated as implicitly
         # enabled.
         from .module_entitlements import ModuleEntitlementError
-        from webguard_contracts import ModuleEntitlementStatus, PlatformModule
+        from webguard_contracts import ModuleEntitlementStatus
 
         try:
             entitlement = self.module_entitlements.get_entitlement(
