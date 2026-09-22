@@ -67,7 +67,7 @@ Cross-detector authorization independence has not been re-proven with a dedicate
 
 ## Regression
 
-`tests/unit/test_xxe_disclosure_detector.py`: 25/25 pass. `tests/unit/test_finding_fingerprint_determinism.py`: 22/22 pass (20 pre-existing + 2 new, including this detector's own). `tests/unit/test_active_detector_registry.py`: 3/3 pass unchanged. Full `tests/unit` discover run: 2055/2055 pass (up from 2031 before this slice), no regressions in any pre-existing detector's own test file.
+`tests/unit/test_xxe_disclosure_detector.py`: 22/22 pass (recounted directly from `grep -c "def test_"` and confirmed by `unittest`'s own collection output, correcting an earlier "25/25" miscount). `tests/unit/test_finding_fingerprint_determinism.py`: 22/22 pass (20 pre-existing + 2 new, including this detector's own). `tests/unit/test_active_detector_registry.py`: 3/3 pass unchanged. Full `tests/unit` discover run: 2055/2055 pass (up from 2031 before this slice), no regressions in any pre-existing detector's own test file.
 
 ## Implemented / Tested / Proven / Not Proven / Remaining Risks
 
