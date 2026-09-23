@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import os
 import stat
+import urllib.request
 from dataclasses import dataclass, replace as dataclasses_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.error import URLError
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from webguard_contracts import (
     OwnedTargetContractError,
+    ScanError,
     ScanJobMode,
     ScanJobRecord,
     ScanStatus,
@@ -47,6 +50,7 @@ from webguard_scanner import (
     ResourceSource,
     RequestTemplate,
     RetryPolicy,
+    SsrfDetectionOutcome,
     ValidatedTarget,
     ValidationMode,
     ValidationPolicy,
@@ -823,6 +827,57 @@ class _ScanScopedCallbackBroker:
             raise CallbackBrokerError(exc.code, exc.message) from exc
 
 
+def _ssrf_callback_pipeline_confirmed_healthy(
+    broker: _ScanScopedCallbackBroker,
+    *,
+    scan_id: str,
+    policy,
+    cancellation_check: Callable[[], bool],
+) -> bool:
+    """Positive control for a NOT_VULNERABLE SSRF result: the detector
+    cannot otherwise tell "the target genuinely never called back"
+    from "it called back but `_record_observation_with_bounded_retry`
+    (callback_server.py) failed to persist it": both look identical
+    from the read side, `(None, False, False)`
+    (docs/PROJECT_EXECUTION_LEDGER.md's P1-12-R1). This registers a
+    synthetic token, calls it directly (WebGuard's own infrastructure
+    request to its own callback service, never routed through the
+    target-safety hooks a real probe uses, since the target
+    same-origin rule would otherwise reject it), then waits on it
+    exactly as a real candidate would. If this canary is never
+    recorded either, the persistence write path, not the target, is
+    why nothing came back, and the NOT_VULNERABLE verdicts reached
+    during this run cannot be trusted."""
+
+    try:
+        canary = broker.register(
+            scan_id=scan_id, candidate_fingerprint="webguard-positive-control"
+        )
+    except CallbackBrokerError:
+        return False
+
+    # The broker (never external input) constructs this URL, but
+    # urlopen's own scheme handling covers file:// and other unintended
+    # schemes too, so this is checked explicitly rather than trusted
+    # implicitly: a broker bug that ever produced a non-HTTP(S) URL
+    # here should fail this canary, not open it.
+    if urlsplit(canary.url).scheme not in ("http", "https"):
+        return False
+
+    try:
+        urllib.request.urlopen(canary.url, timeout=2)  # noqa: S310 - scheme checked immediately above
+    except (URLError, OSError):
+        pass
+
+    try:
+        observation, _within_primary_window, _cancelled = broker.wait_for_observation(
+            canary, policy=policy, cancellation_check=cancellation_check
+        )
+    except CallbackBrokerError:
+        return False
+    return observation is not None
+
+
 def _apply_ssrf_callback_detection(
     report: WebGuardReport,
     *,
@@ -949,10 +1004,54 @@ def _apply_ssrf_callback_detection(
     except ActiveDetectionError:
         return report
 
-    if not result.findings:
+    errors = report.errors
+    unverified = sum(
+        1
+        for record in result.records
+        if record.outcome in (SsrfDetectionOutcome.INCONCLUSIVE, SsrfDetectionOutcome.ERROR)
+    )
+    if unverified:
+        errors = errors + (
+            ScanError(
+                code="ssrf_callback_unverified",
+                stage="active_ssrf_callback",
+                message=(
+                    f"{unverified} of {len(result.records)} SSRF callback candidates "
+                    "could not be verified."
+                ),
+            ),
+        )
+
+    not_vulnerable_count = sum(
+        1 for record in result.records if record.outcome is SsrfDetectionOutcome.NOT_VULNERABLE
+    )
+    if not_vulnerable_count and not cancellation_check():
+        healthy = _ssrf_callback_pipeline_confirmed_healthy(
+            broker,
+            scan_id=scan_id,
+            policy=callback_repository.policy,
+            cancellation_check=cancellation_check,
+        )
+        if not healthy:
+            errors = errors + (
+                ScanError(
+                    code="ssrf_callback_pipeline_unverified",
+                    stage="active_ssrf_callback",
+                    message=(
+                        f"{not_vulnerable_count} not_vulnerable SSRF callback result(s) "
+                        "could not be confirmed: the callback persistence path failed "
+                        "its own positive control."
+                    ),
+                ),
+            )
+
+    if errors == report.errors and not result.findings:
         return report
     return dataclasses_replace(
-        report, findings=report.findings + tuple(result.findings)
+        report,
+        status=ScanStatus.COMPLETED_WITH_ERRORS if errors else report.status,
+        errors=errors,
+        findings=report.findings + tuple(result.findings),
     )
 
 
