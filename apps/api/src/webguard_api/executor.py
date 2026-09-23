@@ -856,8 +856,16 @@ def _ssrf_callback_pipeline_confirmed_healthy(
     except CallbackBrokerError:
         return False
 
+    # The broker (never external input) constructs this URL, but
+    # urlopen's own scheme handling covers file:// and other unintended
+    # schemes too, so this is checked explicitly rather than trusted
+    # implicitly: a broker bug that ever produced a non-HTTP(S) URL
+    # here should fail this canary, not open it.
+    if urlsplit(canary.url).scheme not in ("http", "https"):
+        return False
+
     try:
-        urllib.request.urlopen(canary.url, timeout=2)
+        urllib.request.urlopen(canary.url, timeout=2)  # noqa: S310 - scheme checked immediately above
     except (URLError, OSError):
         pass
 

@@ -27,10 +27,10 @@ def _cancellation_check() -> bool:
     return False
 
 
-def _canary_token() -> CallbackToken:
+def _canary_token(url: str = "https://callback.example/c/canary-token") -> CallbackToken:
     return CallbackToken(
         value="canary-token",
-        url="https://callback.example/c/canary-token",
+        url=url,
         scan_id="scan-1",
         candidate_fingerprint="webguard-positive-control",
         expires_at=datetime.now(timezone.utc) + timedelta(seconds=300),
@@ -38,10 +38,11 @@ def _canary_token() -> CallbackToken:
 
 
 class _FakeBroker:
-    def __init__(self, *, observation, register_error=None, wait_error=None) -> None:
+    def __init__(self, *, observation, register_error=None, wait_error=None, token=None) -> None:
         self._observation = observation
         self._register_error = register_error
         self._wait_error = wait_error
+        self._token = token or _canary_token()
         self.registered_with: dict | None = None
         self.waited_on = None
 
@@ -49,7 +50,7 @@ class _FakeBroker:
         self.registered_with = {"scan_id": scan_id, "candidate_fingerprint": candidate_fingerprint}
         if self._register_error is not None:
             raise self._register_error
-        return _canary_token()
+        return self._token
 
     def wait_for_observation(self, token, *, policy, cancellation_check=None):
         self.waited_on = token
@@ -93,6 +94,21 @@ class SsrfCallbackPipelineHealthTests(unittest.TestCase):
                 broker, scan_id="scan-1", policy=_POLICY, cancellation_check=_cancellation_check
             )
         self.assertFalse(healthy)
+
+    def test_unhealthy_and_never_opened_when_the_broker_returns_a_non_http_url(self) -> None:
+        """The broker (never external input) is what builds this URL,
+        but urlopen's own scheme handling covers file:// and other
+        unintended schemes too, so this is a defense-in-depth check
+        against a hypothetical broker bug, not a real attacker-facing
+        path. A bad scheme must fail the canary without ever calling
+        urlopen at all."""
+        broker = _FakeBroker(observation=object(), token=_canary_token(url="file:///etc/passwd"))
+        with patch("webguard_api.executor.urllib.request.urlopen") as mock_urlopen:
+            healthy = _ssrf_callback_pipeline_confirmed_healthy(
+                broker, scan_id="scan-1", policy=_POLICY, cancellation_check=_cancellation_check
+            )
+        self.assertFalse(healthy)
+        mock_urlopen.assert_not_called()
 
     def test_the_canary_probe_itself_failing_to_connect_does_not_short_circuit(self) -> None:
         """The canary's own outbound GET is best-effort: what actually
