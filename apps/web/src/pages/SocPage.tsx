@@ -66,10 +66,14 @@ function ConnectorCard({ connector }: { connector: SocConnector }) {
 }
 
 export function SocPage() {
-  const { data, isLoading, error } = useSocConnectors();
-  const { data: entitlements } = useModuleEntitlements();
+  const { data: entitlements, isLoading: entitlementsLoading } = useModuleEntitlements();
   const { session } = useAuth();
   const socEntitlement = entitlements?.entitlements.find((entitlement) => entitlement.module === "soc");
+  // Never fetch the connector catalog until we know whether this
+  // deployment offers SOC at all: available=false must never reach
+  // the server, since the route itself now rejects it there too.
+  const available = entitlements ? (socEntitlement?.available ?? true) : false;
+  const { data, isLoading, error } = useSocConnectors(available);
 
   return (
     <div>
@@ -77,7 +81,14 @@ export function SocPage() {
         title="SOC"
         description="Connector contracts for the Microsoft security products this module is built against."
       />
-      {socEntitlement && socEntitlement.status === "disabled" ? (
+      {!entitlementsLoading && !available ? (
+        <div className="mb-4">
+          <InDevelopmentNotice>
+            SOC is not part of this release. It is a separate module still in development; this deployment only
+            offers WebGuard today.
+          </InDevelopmentNotice>
+        </div>
+      ) : socEntitlement && socEntitlement.status === "disabled" ? (
         <div className="mb-4">
           <InDevelopmentNotice>
             {session?.role === "owner" ? (
@@ -101,7 +112,7 @@ export function SocPage() {
           </InDevelopmentNotice>
         </div>
       )}
-      {isLoading ? <LoadingState label="Loading connectors…" /> : null}
+      {available && isLoading ? <LoadingState label="Loading connectors…" /> : null}
       {error ? <ErrorState message={error instanceof ApiError ? error.message : "Unable to load connectors."} /> : null}
       {data ? (
         <div className="grid gap-4 lg:grid-cols-2">

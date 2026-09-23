@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Sequence
 from uuid import uuid4
 
-from webguard_contracts import OrganizationRole, PrincipalType
+from webguard_contracts import OrganizationRole, PlatformModule, PrincipalType
 
 from . import __version__
 from .artifact_store import LocalArtifactStore
@@ -52,7 +52,7 @@ from .identity import (
     IdentityStore,
     IdentityStoreError,
 )
-from .production_config import ProductionConfigError, ProductionServiceConfig
+from .production_config import ProductionConfigError, ProductionServiceConfig, parse_enabled_modules
 from .production_startup import ProductionComponents, build_production_components
 from .callback_server import CallbackHttpReceiver
 from .postgres_callback_service import PostgresCallbackRegistrationRepository
@@ -155,6 +155,22 @@ def _stores(config: ServiceConfig) -> tuple[ScanJobStore, IdentityStore]:
     return jobs, identity
 
 
+def _enabled_modules_from_environment() -> frozenset[PlatformModule] | None:
+    """Local/lab/test counterpart of ``ProductionServiceConfig.enabled_modules``:
+    reads the identical ``WEBGUARD_ENABLED_MODULES`` variable so an
+    operator (or a manual verification pass) can exercise the same
+    release-mode restriction here without needing full production
+    configuration (a real KMS key, S3 bucket, Postmark token, ...).
+    Unset means every module is offered, unlike production's own
+    default: this environment's existing behavior stays exactly as
+    it was for every caller that never sets this variable."""
+
+    raw = os.environ.get("WEBGUARD_ENABLED_MODULES")
+    if raw is None:
+        return None
+    return frozenset(PlatformModule(value) for value in parse_enabled_modules(raw))
+
+
 def _components(config: ServiceConfig):
     store, identity = _stores(config)
     authorizations = AuthorizationRepository(config.authorization_directory)
@@ -210,6 +226,7 @@ def _components(config: ServiceConfig):
         scan_repository=scan_repository,
         finding_repository=finding_repository,
         coverage_repository=coverage_repository,
+        enabled_modules=_enabled_modules_from_environment(),
     )
     worker = ScanJobWorker(
         store=store,

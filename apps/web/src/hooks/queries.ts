@@ -294,16 +294,16 @@ export function useSetModuleEntitlement() {
   });
 }
 
-export function useSocConnectors() {
-  return useQuery({ queryKey: ["soc-connectors"], queryFn: socApi.connectors });
+export function useSocConnectors(enabled: boolean = true) {
+  return useQuery({ queryKey: ["soc-connectors"], queryFn: socApi.connectors, enabled });
 }
 
-export function useComplianceFrameworks() {
-  return useQuery({ queryKey: ["compliance-frameworks"], queryFn: complianceApi.frameworks });
+export function useComplianceFrameworks(enabled: boolean = true) {
+  return useQuery({ queryKey: ["compliance-frameworks"], queryFn: complianceApi.frameworks, enabled });
 }
 
-export function useComplianceAssertions() {
-  return useQuery({ queryKey: ["compliance-assertions"], queryFn: complianceApi.assertions });
+export function useComplianceAssertions(enabled: boolean = true) {
+  return useQuery({ queryKey: ["compliance-assertions"], queryFn: complianceApi.assertions, enabled });
 }
 
 export function useAssertionCollections(assertionId: string | undefined) {
