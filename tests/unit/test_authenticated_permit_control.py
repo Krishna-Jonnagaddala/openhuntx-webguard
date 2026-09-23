@@ -336,5 +336,105 @@ class AuthenticatedPermitControlTests(unittest.TestCase):
         )
 
 
+class _ReferenceOnlyAuthenticationContexts:
+    """Minimal double for a production-shaped repository: no
+    ``get_secret`` at all (forcing ``register_authentication_context``'s
+    ``secret_reference_id`` branch, the same test service
+    ``PostgresAuthenticationContextRepository`` takes in production),
+    and a ``create`` matching that branch's exact call shape."""
+
+    def __init__(self) -> None:
+        self.created_with_reference: str | None = None
+
+    def create(self, *, organization_id, target, authorization_id, identity_label, method, secret_reference_id, expires_at, now):
+        from webguard_api.authentication_contexts import AuthenticationContextRecord
+        from uuid import uuid4
+
+        self.created_with_reference = secret_reference_id
+        return AuthenticationContextRecord(
+            authentication_context_id=str(uuid4()),
+            organization_id=organization_id,
+            target=target,
+            authorization_id=authorization_id,
+            identity_label=identity_label,
+            method=method,
+            created_at=now,
+            expires_at=expires_at,
+        )
+
+
+class SecretReferenceTenantScopingTests(unittest.TestCase):
+    """M22/P1-13: secret_reference_id must be scoped to the caller's
+    own organization, matching the identical tenant-prefixed
+    convention object storage already enforces for report/artifact
+    keys, so org A cannot name org B's own Secrets Manager entry and
+    have it silently accepted."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        auth_dir = root / "authorizations"
+        write_authorization(auth_dir)
+        store = ScanJobStore(root / "jobs.sqlite3")
+        identity, self.owner, _ = create_identity_fixture(store.path)
+        self.contexts = _ReferenceOnlyAuthenticationContexts()
+        self.service = WebGuardJobService(
+            store=store,
+            authorizations=AuthorizationRepository(auth_dir),
+            identity=identity,
+            clock=lambda: NOW,
+            authentication_contexts=self.contexts,
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _register(self, secret_reference_id: str):
+        body = {
+            "target": TARGET,
+            "authorization_id": AUTH_ID,
+            "identity_label": "user-a",
+            "method": "bearer_token",
+            "expires_at": (NOW + timedelta(days=1))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            "secret_reference_id": secret_reference_id,
+        }
+        return self.service.register_authentication_context(
+            self.owner, body, request_id=REQUEST_ID
+        )
+
+    def test_own_organization_prefixed_reference_is_accepted(self) -> None:
+        reference = f"organizations/{self.owner.organization_id}/bearer-secret"
+        self._register(reference)
+        self.assertEqual(self.contexts.created_with_reference, reference)
+
+    def test_unprefixed_reference_is_rejected(self) -> None:
+        with self.assertRaises(ApiServiceError) as caught:
+            self._register("bearer-secret")
+        self.assertEqual(
+            caught.exception.code, "authentication_context_secret_reference_not_tenant_scoped"
+        )
+        self.assertIsNone(self.contexts.created_with_reference)
+
+    def test_a_different_organizations_prefix_is_rejected(self) -> None:
+        with self.assertRaises(ApiServiceError) as caught:
+            self._register("organizations/99999999-9999-4999-8999-999999999999/bearer-secret")
+        self.assertEqual(
+            caught.exception.code, "authentication_context_secret_reference_not_tenant_scoped"
+        )
+        self.assertIsNone(self.contexts.created_with_reference)
+
+    def test_own_organization_id_as_a_bare_substring_not_a_real_prefix_is_rejected(self) -> None:
+        # Guards against a naive "organization_id in reference" check:
+        # this must require the exact "organizations/<id>/" prefix, not
+        # merely contain the ID somewhere in the string.
+        with self.assertRaises(ApiServiceError) as caught:
+            self._register(f"other-team-note-mentions-{self.owner.organization_id}-somewhere")
+        self.assertEqual(
+            caught.exception.code, "authentication_context_secret_reference_not_tenant_scoped"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

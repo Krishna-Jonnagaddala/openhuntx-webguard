@@ -1001,6 +1001,30 @@ class WebGuardJobService:
                     "with the configured secret provider out-of-band and supply its reference.",
                     status=400,
                 )
+            # M22/P1-13: secret_reference_id is otherwise a free-form,
+            # client-supplied string with no server-side ownership
+            # check at all: nothing stops org A from naming org B's
+            # own Secrets Manager entry and having org A's next scan
+            # resolve org B's real bearer token/cookies, since the
+            # shared secret provider has no per-tenant scoping of its
+            # own (secret_provider.py's own module docstring: it is a
+            # thin resolver, not an authorization boundary). This
+            # mirrors the identical tenant-scoped-prefix convention
+            # object storage already enforces for report/artifact keys
+            # (executor.py's "organizations/<organization_id>/jobs/..."
+            # shape): a reference not prefixed with this organization's
+            # own ID can only be a typo or a cross-tenant reference,
+            # never a legitimate one, so it is rejected here, at
+            # creation time, before it is ever persisted or resolved.
+            required_prefix = f"organizations/{context.organization_id}/"
+            if not secret_reference_id.startswith(required_prefix):
+                raise ApiServiceError(
+                    "authentication_context_secret_reference_not_tenant_scoped",
+                    f"secret_reference_id must start with {required_prefix!r}: register the "
+                    "secret with the configured secret provider under a name scoped to this "
+                    "organization, matching how report/artifact storage is already scoped.",
+                    status=400,
+                )
             for raw_field in ("bearer_token", "cookies", "basic_username", "basic_password"):
                 if raw_field in body:
                     raise ApiServiceError(
