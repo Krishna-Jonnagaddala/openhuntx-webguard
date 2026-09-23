@@ -8,6 +8,40 @@
 
 `scripts/run-postgres-migrations.py` is **forward-only**. There is no down-migration file, no "undo" command, and no code path that reverses an already-applied `.sql` file. This is a deliberate design choice (the script's own docstring: "Safe against accidental destructive migration... editing history after the fact fails closed"), not an oversight, but it means **a schema migration cannot itself be rolled back**. Every case below follows from that one fact.
 
+## Decision: which recovery path, and what it costs
+
+**Restore-from-backup is the response to exactly one situation below (Case 3), never the default response to a bad deployment.** Read this section before any of the three cases: it is the decision a real incident actually needs first, and getting it wrong in either direction has a real cost, either discarding data that a code-only fix would have preserved, or wasting the incident window attempting a code rollback that Case 3 already rules out.
+
+| Path | When it applies | Data loss | Owner acceptance needed |
+|---|---|---|---|
+| **Application rollback** (Case 1) | No schema migration in the bad deploy | None | No |
+| **Forward-compatible, no restore** (Case 2) | Migration applied, but the old code tolerates the new schema | None | No |
+| **Restore-from-backup** (Case 3, unsafe path) | Migration applied, old code cannot tolerate the new schema | Every write between the migration and the restore | **Yes**, always: this is a deliberate trade of data for speed |
+| **Forward-fixing migration** (Case 3, alternative) | Same as above, but the loss window contains data that cannot be discarded | None | No data loss, but needs a reviewed migration + code deploy before the incident resolves, not during it |
+
+The only branch point that needs a human is inside Case 3: restore now and lose the window, or write a new migration that adapts the schema without discarding the incompatible rows. Cases 1 and 2 need no owner decision because they lose nothing either way.
+
+### Recovery point objective (RPO) for the restore path
+
+In real production, this is **not** "since the last daily backup." RDS automated backups ship the transaction log continuously once enabled (`docs/production/BACKUP_RESTORE.md`'s own PITR section), so a real restore targets the exact point-in-time immediately before the bad migration's own commit, not the nearest daily snapshot boundary. The actual data-loss window is therefore **the time between the bad migration committing and the moment an operator starts the restore**, which is a function of how fast the outage is noticed and a restore is authorized, not a function of backup frequency. This is why "minimum monitoring" (below) is not a separate, optional concern from rollback: without it, the RPO-relevant clock (detection time) has no upper bound at all.
+
+### Expected downtime: what was actually measured, and what wasn't
+
+The backup/restore *mechanics* were timed for real this session, against the same real, disposable Postgres 16.10 instance this document's rehearsal already uses: `scripts/backup-postgres.py` against a 33-table, 983-row database completed in 0.16s; applying all 17 tracked migrations to a fresh database took 0.19s; the tenant-isolation bootstrap chain took 0.27s; `scripts/restore-postgres.py --truncate-first` took 0.27s. Total mechanical time: **under one second**, for this database's current size.
+
+**That number does not extrapolate to a production-scale restore, and is not claimed to.** `scripts/backup-postgres.py`/`restore-postgres.py` are psycopg-driven, row-oriented scripts, not `pg_dump`/`pg_restore` or RDS's own native snapshot-restore machinery; their cost scales with row count in a way this rehearsal's ~1,000 rows cannot demonstrate against a real multi-million-row production table. `docs/production/BACKUP_RESTORE.md`'s own RTO section already says this precisely: RTO "is not knowable precisely without actually testing it against real data volume." This session's measurement proves the mechanics are fast at this scale and confirms nothing about production scale.
+
+**The mechanical time is very unlikely to be the dominant cost of a real incident's downtime.** The larger, unmeasured components are: (1) detection time, how long before anyone notices the bad deploy, which "Minimum monitoring status" below shows has no current answer at all; (2) decision time, getting explicit owner sign-off for a data-loss trade-off is not instantaneous and should not be rushed to be; (3) write-quiescing (next section); (4) validation time after restore, confirming the restored data is actually correct before resuming traffic. A downtime estimate that only cites the backup/restore step's wall-clock time, as this document's own earlier version implicitly did by only ever describing the mechanics, would understate real incident downtime by omitting all four of these.
+
+### Write-quiescing requirements
+
+Two separate reasons traffic must stop before a restore begins, not just one:
+
+1. **Writes landing in the database being discarded.** Every write accepted after the decision to restore but before the restore actually starts is lost anyway (it's in the database Case 3 is about to throw away), so accepting it at all just wastes user-facing work and support burden for something guaranteed to disappear.
+2. **Writes landing in the restore target before it's validated.** The freshly-restored database must not accept application traffic until an operator has confirmed the restore actually matches the backup manifest (row counts, a spot-check of known records) exactly as this rehearsal's own step 8 already does. Resuming traffic into an unvalidated restore risks compounding a data-integrity incident with a second one.
+
+Concretely: take the API out of load-balancer rotation (fail its own `/ready` check deliberately, or a maintenance-mode flag if one exists) before starting the restore, and do not restore it to rotation until both the row-count validation above and a smoke-test login/scan pass against the restored database.
+
 ## Case 1: bad application code, no schema migration
 
 The common case. Redeploy the previous known-good application version (previous container image / previous git SHA's build). No database action of any kind.
@@ -50,6 +84,17 @@ Rehearsed for real below. This is the unsafe case: rolling back code alone break
 - **A migration has already been running long enough that "everything since the migration" is not an acceptable loss.** Case 3's restore-from-backup discards it unconditionally; if that window contains anything the business cannot lose, the correct move is a **forward-fixing migration** (a new, reviewed `.sql` file that adapts the schema without touching the incompatible rows, e.g. making a NOT NULL column nullable again, or backfilling it from existing data) plus a **forward-fixing code deploy**, not a rollback. This is slower and requires a real review, which is the point: it trades speed for not discarding data.
 - **The signing key active at deploy time was retired or disabled between the bad deploy and the rollback.** `SigningKeyRegistry.set_status` can mark a key `disabled` (verification fails outright, `trustscan_signing_key_disabled`), which is irreversible by rolling back application code: if an operator disabled a key in direct response to a suspected compromise, rolling the application back does not un-disable it, and should not: that specific action requires the same explicit, reviewed key-management decision either way, not an accidental side effect of an unrelated rollback.
 - **The restore target is the same database the bad migration ran against, in place, without first ensuring its schema matches the backup's own pre-migration state.** Not rehearsed as a working path here (see step 7 above); treat it as unsafe until proven otherwise, and use a fresh restore target instead.
+
+## Minimum monitoring status (2026-09-24 investigation)
+
+This section exists because the RPO discussion above depends entirely on detection time, and detection time depends on monitoring that does not exist yet. Investigated directly this session, code and infrastructure both, not asserted from memory of what was previously reported:
+
+- **Health/readiness endpoints exist; nothing polls them.** `/healthz` and `/ready` (`http_api.py`) work correctly, including a real `SELECT 1` readiness check, and equivalent listeners exist for the worker, scheduler, callback-service, and signing-service processes. But there is no load balancer, no external uptime check, no systemd/cron/k8s probe, nothing configured anywhere in this repository that actually calls them on a schedule. `infra/nginx/api-sidecar.conf`'s own comment about "LB/monitoring polls" describes a poller that does not exist yet.
+- **Structured logs go to stdout; nothing reads them.** `configure_structured_logging` emits real, well-formed JSON events, including exactly the ones that would matter here (`job_failed`, `sign_request_failed`, `callback_observation_persistence_exhausted`, `database_outage_detected`). No log shipping, aggregation, or SIEM export is configured. `docs/production/INFRASTRUCTURE_REQUIREMENTS.md` already lists this as "Needed," not done.
+- **No alerting exists in any form.** No PagerDuty, Opsgenie, Slack webhook, SNS topic, CloudWatch alarm, or Alertmanager rule exists in this repository's code or Terraform. The only outbound notification this system sends is transactional customer email (Postmark), tested only against a fake transport. No operator has ever been paged by anything this system does.
+- **Failed jobs, schedules, and signing operations are visible only by looking.** A failed scan, a failed schedule materialization, and a failed signing operation each leave a real, correct trail (a database row, a structured log line, in the scan/dashboard case a tenant-facing count), but every one of them requires an operator to actively open a page or query a log; none of them reaches anyone on its own.
+
+**Correction to a claim made earlier in this engagement:** describing this state as "minimum actionable monitoring" was inaccurate. What exists is *instrumentation ready to be monitored* (probe endpoints, structured events worth alerting on), not monitoring itself. The distinction matters specifically for this document: it means there is currently no bound at all on how long a bad deployment could run undetected, which is the single biggest unmeasured variable in the RPO discussion above. This is not fixable from this repository alone: it needs a real place to run a poller and a real destination for an alert, both of which are downstream of the same "real infrastructure" dependency as M18 and M23, not a code change available today.
 
 ## What this document does not cover
 
