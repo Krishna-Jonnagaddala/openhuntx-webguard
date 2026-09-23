@@ -80,7 +80,7 @@ export function ScanDetailPage() {
         </Card>
         <Card className="p-4">
           <h2 className="mb-2 text-sm font-semibold text-[var(--color-text-primary)]">Report</h2>
-          {scan.status === "completed" ? (
+          {scan.status === "completed" || scan.status === "completed_with_errors" ? (
             <RequestReportPanel scanId={scan.scan_id} />
           ) : (
             <p className="text-sm text-[var(--color-text-secondary)]">A report can be requested once this scan completes.</p>

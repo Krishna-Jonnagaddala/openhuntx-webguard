@@ -270,7 +270,13 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         return server, stop, worker_thread, server_thread
 
-    def _run_job_and_get_findings(self, active_checks: list[str], *, completion_timeout_seconds: float = 25) -> list[dict]:
+    def _run_job_and_get_findings(
+        self,
+        active_checks: list[str],
+        *,
+        completion_timeout_seconds: float = 25,
+        expected_state: str = "completed",
+    ) -> list[dict]:
         config, components, auth_dir = self._build_components()
         organization, owner, token, now = self._bootstrap_org(components)
 
@@ -382,7 +388,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
                         break
                     time.sleep(RESULT_POLL_INTERVAL_SECONDS)
                 self.assertIsNotNone(result_payload, "job did not complete in time")
-                self.assertEqual(result_payload["state"], "completed", result_payload)
+                self.assertEqual(result_payload["state"], expected_state, result_payload)
 
                 connection = http.client.HTTPConnection(host, port, timeout=5)
                 connection.request("GET", "/v1/findings", headers={"Authorization": f"Bearer {token.token}"})
@@ -481,7 +487,21 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         so the detector must not confirm anything it never actually
         saw. This is the residual, honest limitation P1-12 accepts by
         design -- see the P1-12 remediation report's LONG-OUTAGE
-        BEHAVIOR / FALSE-NEGATIVE RESIDUAL sections."""
+        BEHAVIOR / FALSE-NEGATIVE RESIDUAL sections.
+
+        What changed: previously this scan still reported
+        state=completed, since every candidate's own read correctly
+        returned "no observation", indistinguishable from a genuine
+        negative. `executor.py`'s `_ssrf_callback_pipeline_confirmed_healthy`
+        now runs a positive-control canary through the same, real,
+        outage-affected write path whenever any candidate came back
+        not_vulnerable; here the canary's own observation can't persist
+        either (this fixture fails every
+        `resolve_and_record_callback_observation` call, not just the
+        real candidates'), so the scan now honestly reports
+        completed_with_errors with an `ssrf_callback_pipeline_unverified`
+        error, instead of silently claiming the three not_vulnerable
+        results were verified."""
         import psycopg
 
         real_execute = psycopg.Connection.execute
@@ -510,13 +530,18 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         # 1.0s minimum_delay_seconds (the inter-probe throttle, applied
         # once per candidate after the probe request succeeds) + 3.0s
         # maximum_wait_seconds + 2.0s grace_seconds = 6.0s, times 3
-        # candidates = 18.0s hard floor, plus register/probe/page-fetch
-        # network overhead. Empirically (instrumented job-claim/execute
-        # timestamps against the real Postgres container this test
-        # requires) the whole pipeline (claim, passive scan, all three
-        # candidates, terminal-state write) consistently completes in
-        # ~20s. 60s leaves roughly 3x headroom over that traced/measured
-        # figure, which is generous margin, not a marginal budget.
+        # candidates = 18.0s hard floor, plus one more register/wait
+        # cycle for the positive-control canary this scenario now also
+        # triggers (all three candidates come back not_vulnerable under
+        # this permanent fault, so `_ssrf_callback_pipeline_confirmed_healthy`
+        # runs once), plus register/probe/page-fetch network overhead.
+        # Empirically (instrumented job-claim/execute timestamps against
+        # the real Postgres container this test requires) the whole
+        # pipeline (claim, passive scan, all three candidates, the
+        # canary, terminal-state write) consistently completes well
+        # under 30s. 60s leaves roughly 2x headroom over that
+        # traced/measured figure, which is generous margin, not a
+        # marginal budget.
         #
         # A first pass at reproducing this test's reported CI failure
         # found runs finishing anywhere from ~21s to ~60s with no code
@@ -546,7 +571,11 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         # traced cost once the test stops self-throttling.
         run_started_at = _utc_now()
         with patch.object(psycopg.Connection, "execute", always_faulty_execute):
-            findings = self._run_job_and_get_findings(["active.ssrf.callback"], completion_timeout_seconds=60)
+            findings = self._run_job_and_get_findings(
+                ["active.ssrf.callback"],
+                completion_timeout_seconds=60,
+                expected_state="completed_with_errors",
+            )
 
         ssrf_findings = [f for f in findings if f["check_id"].startswith("active.ssrf.callback")]
         confirmed_or_probable = [

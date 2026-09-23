@@ -572,6 +572,10 @@ Production SSRF evidence preserved from this remediation's E2E proofs:
 - Brief persistence failure (one forced connection error, resolves on retry) → observation recovered, original `observed_at` retained → **CONFIRMED CWE-918**.
 - Sustained persistence failure (every attempt fails for the whole run) → no fabricated observation, zero observation rows → **NOT_VULNERABLE residual confirmed** (P1-12-R1, above).
 
+#### 2026-09-24 addendum: the silent half of this residual is closed; the durability half is not
+
+Everything above this addendum remains true exactly as measured on the date it was written: under a sustained outage, the observation genuinely was, and still is, never durably persisted, and PostgreSQL genuinely remains the sole durable store (no secondary queue/WAL was added). What changed is what the scan record says when this happens. `executor.py`'s `_ssrf_callback_pipeline_confirmed_healthy` now runs a positive-control canary, registered and probed through the identical write path a real candidate uses, whenever a scan has a NOT_VULNERABLE SSRF result; when that canary is also never recorded (the same sustained-outage condition this section proves), the scan now reports `ScanStatus.COMPLETED_WITH_ERRORS` with an `ssrf_callback_pipeline_unverified` error rather than the plain `completed` this section's own trace showed it reporting before. `test_no_fabricated_confirmation_when_persistence_never_recovers` was extended, against the same real, permanently-faulty PostgreSQL fixture used above, to assert exactly that: findings and observation-row counts are unchanged (still zero), only `result_payload["state"]` and the presence of the new error differ. The classification above, "indistinguishable at the API level from an actually-safe target," no longer holds in its strongest form: the API level now distinguishes them, by refusing to call the unverified case complete. It is not, and is not claimed to be, a fix for the underlying data loss.
+
 ## CURRENT P1 ACCOUNTING
 
 - BASELINE P1 AT AUDIT: 9 (P1-1 through P1-9: immutable historical count, never altered)
