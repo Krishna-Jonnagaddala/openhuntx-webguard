@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import {
   Card,
   ErrorState,
@@ -8,6 +9,7 @@ import {
 import { useModuleEntitlements, useSocConnectors } from "../hooks/queries";
 import { ApiError } from "../lib/api";
 import type { SocConnector } from "../lib/api";
+import { useAuth } from "../lib/auth";
 
 const LIVE_STATE_LABEL: Record<SocConnector["live_validation_state"], string> = {
   not_started: "Not started",
@@ -66,6 +68,7 @@ function ConnectorCard({ connector }: { connector: SocConnector }) {
 export function SocPage() {
   const { data, isLoading, error } = useSocConnectors();
   const { data: entitlements } = useModuleEntitlements();
+  const { session } = useAuth();
   const socEntitlement = entitlements?.entitlements.find((entitlement) => entitlement.module === "soc");
 
   return (
@@ -77,8 +80,17 @@ export function SocPage() {
       {socEntitlement && socEntitlement.status === "disabled" ? (
         <div className="mb-4">
           <InDevelopmentNotice>
-            SOC is not enabled for {"your organization"} yet. You can still review every connector's reviewed
-            contract below; contact an organization owner to request access once a live connection is available.
+            {session?.role === "owner" ? (
+              <>
+                SOC is not enabled for your organization yet. You can still review every connector's reviewed
+                contract below; <Link to="/app/settings" className="underline">enable it from Settings</Link>.
+              </>
+            ) : (
+              <>
+                SOC is not enabled for your organization yet. You can still review every connector's reviewed
+                contract below; contact an organization owner to request access once a live connection is available.
+              </>
+            )}
           </InDevelopmentNotice>
         </div>
       ) : (
