@@ -24,6 +24,18 @@ own provider-neutral pattern exactly:
   ``boto3.client("secretsmanager")`` satisfies this protocol
   structurally without this package ever depending on it.
 
+M22/P1-13: this provider has no per-tenant scoping of its own --
+``resolve`` takes whatever ``secret_reference_id`` it is given and asks
+the shared client for exactly that ID, for every organization alike.
+The tenant boundary is enforced one layer up, at the point
+``secret_reference_id`` is first accepted from a client
+(``service.py``'s ``register_authentication_context``), which requires
+it to start with ``f"organizations/{organization_id}/"`` before it is
+ever persisted: an operator provisioning a real AWS Secrets Manager
+entry for a given organization's authenticated-scanning credentials
+must name it under that exact prefix, or no organization will ever be
+able to register a context referencing it.
+
 Fail-closed by construction, not by convention: if production is
 running (``PostgresAuthenticationContextRepository`` is active, which
 has no ``get_secret``) and no real ``SecretProvider`` was configured,

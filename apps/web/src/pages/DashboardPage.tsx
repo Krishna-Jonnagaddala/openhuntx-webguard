@@ -1,16 +1,7 @@
 import { Link } from "react-router-dom";
-import { Card, ErrorState, LoadingState, PageHeader, SeverityBadge, StatusBadge } from "../components/ui/primitives";
+import { Card, ErrorState, LoadingState, PageHeader, SeverityBadge, StatCard, StatusBadge } from "../components/ui/primitives";
 import { useDashboardSummary } from "../hooks/queries";
 import { ApiError } from "../lib/api";
-
-function StatCard({ label, value }: { label: string; value: number | string }) {
-  return (
-    <Card className="p-4">
-      <p className="text-xs font-medium uppercase tracking-wide text-[var(--color-text-tertiary)]">{label}</p>
-      <p className="mt-1 text-2xl font-semibold text-[var(--color-text-primary)]">{value}</p>
-    </Card>
-  );
-}
 
 const SEVERITY_ORDER = ["critical", "high", "medium", "low", "informational"];
 

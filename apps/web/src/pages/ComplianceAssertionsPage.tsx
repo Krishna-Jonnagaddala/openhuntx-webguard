@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   Button,
   Card,
@@ -21,6 +21,7 @@ import {
 } from "../hooks/queries";
 import { ApiError } from "../lib/api";
 import type { AssertionCollection, AssertionOutcome, TechnicalAssertion } from "../lib/api";
+import { useAuth } from "../lib/auth";
 
 const OUTCOME_LABEL: Record<AssertionOutcome, { label: string; className: string }> = {
   satisfied: { label: "Satisfied", className: "text-[var(--color-success)] bg-[var(--color-success-bg)]" },
@@ -199,6 +200,7 @@ function AssertionDetail({
   canCollect: boolean;
 }) {
   const { data, isLoading, error } = useAssertionCollections(assertion.assertion_id);
+  const { session } = useAuth();
   const [dialogOpen, setDialogOpen] = useState(false);
 
   return (
@@ -225,8 +227,17 @@ function AssertionDetail({
       {assertion.evaluatable && !canCollect ? (
         <div className="mt-4">
           <InDevelopmentNotice>
-            Compliance is not enabled for your organization, so running a new collection is disabled. Any history
-            below is still visible.
+            {session?.role === "owner" ? (
+              <>
+                Compliance is not enabled for your organization yet. <Link to="/app/settings" className="underline">Enable it from Settings</Link> to run a
+                new collection. Any history below is still visible.
+              </>
+            ) : (
+              <>
+                Compliance is not enabled for your organization, so running a new collection is disabled. Any history
+                below is still visible.
+              </>
+            )}
           </InDevelopmentNotice>
         </div>
       ) : null}
@@ -273,13 +284,16 @@ function AssertionDetail({
 }
 
 export function ComplianceAssertionsPage() {
-  const { data, isLoading, error } = useComplianceAssertions();
-  const { data: entitlements } = useModuleEntitlements();
+  const { data: entitlements, isLoading: entitlementsLoading } = useModuleEntitlements();
+  const complianceEntitlement = entitlements?.entitlements.find((entitlement) => entitlement.module === "compliance");
+  // Never fetch the assertion catalog until we know whether this
+  // deployment offers Compliance at all: available=false must never
+  // reach the server, since the route itself now rejects it there too.
+  const available = entitlements ? (complianceEntitlement?.available ?? true) : false;
+  const { data, isLoading, error } = useComplianceAssertions(available);
   const [searchParams, setSearchParams] = useSearchParams();
   const selectedId = searchParams.get("assertion");
-  const canCollect = entitlements?.entitlements.some(
-    (entitlement) => entitlement.module === "compliance" && (entitlement.status === "enabled" || entitlement.status === "trial"),
-  );
+  const canCollect = complianceEntitlement?.status === "enabled" || complianceEntitlement?.status === "trial";
 
   const selected = data?.assertions.find((assertion) => assertion.assertion_id === selectedId) ?? data?.assertions[0];
 
@@ -289,7 +303,15 @@ export function ComplianceAssertionsPage() {
         title="Technical assertions"
         description="What this platform knows how to check, and your organization's own collection history against each one."
       />
-      {isLoading ? <LoadingState label="Loading assertions…" /> : null}
+      {!entitlementsLoading && !available ? (
+        <div className="mb-4">
+          <InDevelopmentNotice>
+            Compliance is not part of this release. It is a separate module still in development; this deployment
+            only offers WebGuard today.
+          </InDevelopmentNotice>
+        </div>
+      ) : null}
+      {available && isLoading ? <LoadingState label="Loading assertions…" /> : null}
       {error ? <ErrorState message={error instanceof ApiError ? error.message : "Unable to load assertions."} /> : null}
       {data ? (
         <div className="grid gap-5 lg:grid-cols-[18rem_1fr]">

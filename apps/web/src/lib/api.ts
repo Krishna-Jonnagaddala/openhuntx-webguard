@@ -592,6 +592,11 @@ export interface ModuleEntitlement {
   status: ModuleEntitlementStatus;
   updated_at: string;
   enabled_at: string | null;
+  // Deployment-wide, not per-organization: false means no one, not
+  // even this organization's own owner, can turn this module on right
+  // now. Distinct from `status`, which an owner genuinely controls
+  // when this is true.
+  available: boolean;
 }
 
 export const moduleEntitlementsApi = {
