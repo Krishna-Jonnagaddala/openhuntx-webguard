@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from .authorizations import AuthorizationRepository, AuthorizationRepositoryError
-from .identity import IdentityStore
+from .identity import IdentityStore, IdentityStoreError
 from .permits import TrustScanPermitError, TrustScanSigner, validate_permit_use
 from .store import JobStoreError, ScanJobStore
 
@@ -48,6 +48,8 @@ class ScanScheduleCoordinator:
         self.poll_seconds = float(poll_seconds)
         self.batch_size = batch_size
         self.clock = clock
+        self.last_loop_error_type: str | None = None
+        self.last_loop_error_at: datetime | None = None
         if not 0.1 <= self.poll_seconds <= 60.0:
             raise ValueError("poll_seconds must be from 0.1 to 60 seconds.")
         if isinstance(self.batch_size, bool) or not isinstance(self.batch_size, int):
@@ -71,10 +73,15 @@ class ScanScheduleCoordinator:
         schedules = self.store.list_due_schedules(now=now, limit=self.batch_size)
         enqueued = blocked = raced = 0
         for schedule in schedules:
-            if not self.identity.authorization_is_assigned(
-                schedule.organization_id,
-                schedule.authorization_id,
-            ):
+            try:
+                assigned = self.identity.authorization_is_assigned(
+                    schedule.organization_id,
+                    schedule.authorization_id,
+                )
+            except IdentityStoreError as exc:
+                blocked += int(self._block(schedule, code=exc.code, now=now))
+                continue
+            if not assigned:
                 blocked += int(
                     self._block(
                         schedule,
@@ -169,7 +176,18 @@ class ScanScheduleCoordinator:
 
     def run_forever(self, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
-            self.run_once()
+            try:
+                self.run_once()
+            except Exception as exc:  # noqa: BLE001 - see worker.py's identical run_forever guard
+                # Without this, an exception this loop's own run_once()
+                # does not already convert into a blocked-schedule outcome
+                # (a store failure other than the ones already caught
+                # above, for instance) would end this thread permanently
+                # and silently: serve mode runs it as an unsupervised
+                # daemon thread, and /healthz does not check whether it
+                # is still alive.
+                self.last_loop_error_type = type(exc).__name__
+                self.last_loop_error_at = self.clock()
             stop_event.wait(self.poll_seconds)
 
 

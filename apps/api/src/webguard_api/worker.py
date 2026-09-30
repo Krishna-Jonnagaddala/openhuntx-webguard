@@ -71,6 +71,8 @@ class ScanJobWorker:
         self.clock = clock
         self.monotonic = monotonic
         self.last_recovery_summary = LeaseRecoverySummary()
+        self.last_loop_error_type: str | None = None
+        self.last_loop_error_at: datetime | None = None
         self._validate_configuration()
 
     def _validate_configuration(self) -> None:
@@ -244,7 +246,23 @@ class ScanJobWorker:
 
     def run_forever(self, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
-            processed = self.run_once()
+            try:
+                processed = self.run_once()
+            except Exception as exc:  # noqa: BLE001 - see last_loop_error_type below
+                # run_once()'s own except Exception (above) only covers
+                # the scanner-execution section; a handful of store/
+                # identity calls around it (claim, lease recovery, the
+                # cancellation-check helper) are not wrapped, so a
+                # transient error there (e.g. a real database lock) would
+                # otherwise propagate out of this loop and end this
+                # thread permanently and silently -- serve mode has no
+                # supervisor to restart it, and /healthz does not check
+                # whether it is still running. Continuing after the
+                # normal poll interval, rather than a tight retry loop,
+                # matters if the underlying condition is not transient.
+                self.last_loop_error_type = type(exc).__name__
+                self.last_loop_error_at = self.clock()
+                processed = False
             if not processed:
                 stop_event.wait(self.poll_seconds)
 
