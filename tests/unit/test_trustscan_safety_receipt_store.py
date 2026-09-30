@@ -66,7 +66,7 @@ class TrustScanSafetyReceiptStoreTests(unittest.TestCase):
         )
         self.assertIs(completed.state, ScanJobState.COMPLETED)
         self.assertEqual(
-            self.store.get_job_safety_receipt(running.job_id),
+            self.store.get_job_safety_receipt_scoped(running.job_id, ORG_ID),
             (
                 f"jobs/{running.job_id}/trustscan-safety-receipt.json",
                 "b" * 64,
@@ -88,7 +88,7 @@ class TrustScanSafetyReceiptStoreTests(unittest.TestCase):
             "trustscan_safety_receipt_metadata_invalid",
         )
         self.assertIs(self.store.get(running.job_id).state, ScanJobState.RUNNING)
-        self.assertIsNone(self.store.get_job_safety_receipt(running.job_id))
+        self.assertIsNone(self.store.get_job_safety_receipt_scoped(running.job_id, ORG_ID))
 
     def test_unsafe_receipt_reference_rolls_back_terminal_transition(self) -> None:
         running = self.running_job()
@@ -106,7 +106,7 @@ class TrustScanSafetyReceiptStoreTests(unittest.TestCase):
             "trustscan_safety_receipt_reference_invalid",
         )
         self.assertIs(self.store.get(running.job_id).state, ScanJobState.RUNNING)
-        self.assertIsNone(self.store.get_job_safety_receipt(running.job_id))
+        self.assertIsNone(self.store.get_job_safety_receipt_scoped(running.job_id, ORG_ID))
 
 
 if __name__ == "__main__":

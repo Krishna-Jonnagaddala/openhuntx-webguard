@@ -1,6 +1,6 @@
-# WebGuard Stability & Security Audit — Checkpoint 1
+# WebGuard Stability & Security Audit: Checkpoint 1
 
-## Phase 2 — Authentication, Authorization & Tenant Isolation
+## Phase 2: Authentication, Authorization & Tenant Isolation
 
 Date: 2026-08-08
 
@@ -36,9 +36,9 @@ service tests.
 
 ## Findings
 
-### P2-001 — Cross-tenant idempotency collision
+### P2-001: Cross-tenant idempotency collision
 
-Status: CLOSED — NOT A VULNERABILITY
+Status: CLOSED (NOT A VULNERABILITY)
 
 An initial direct-store test suggested that identical client-provided
 idempotency keys could collide globally.
@@ -56,11 +56,11 @@ job.
 
 No production change was required.
 
-## P2-002 — Authentication attempts bypass rate limiting
+## P2-002: Authentication attempts bypass rate limiting
 
 Severity: Medium
 
-Status: CONFIRMED — REMEDIATED
+Status: CONFIRMED (REMEDIATED)
 
 ### Initial condition
 
@@ -252,18 +252,18 @@ Complete unit suite:
 
 Repository verification gate:
 
-- supply-chain pin verification — PASS
-- security-governance verification — PASS
-- Python compilation — PASS
-- unit tests — PASS
-- integration opt-in enforcement — PASS
+- supply-chain pin verification: PASS
+- security-governance verification: PASS
+- Python compilation: PASS
+- unit tests: PASS
+- integration opt-in enforcement: PASS
 
 Security gates:
 
-- repository secret scan — PASS
+- repository secret scan: PASS
 - 203 repository files checked before this audit record was added
-- Ruff security/static analysis — PASS
-- dependency advisory audit — PASS
+- Ruff security/static analysis: PASS
+- dependency advisory audit: PASS
 - 6 exact locked packages checked
 
 Authorised OWASP Juice Shop integration suite:
@@ -279,11 +279,11 @@ The Juice Shop integration target was the local explicitly authorised lab:
 
 Confirmed findings:
 
-- P2-002 — Medium — Remediated
+- P2-002: Medium, Remediated
 
 Closed false alarms:
 
-- P2-001 — Not a vulnerability
+- P2-001: Not a vulnerability
 
 Unresolved Critical findings:
 

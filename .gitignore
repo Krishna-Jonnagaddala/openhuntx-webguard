@@ -58,3 +58,21 @@ var/webguard-api/
 
 # Local WebGuard runtime state
 /var/
+
+# Terraform state and local overrides -- never committed, may contain
+# resource attribute values that should not enter Git history even
+# when they are not, in this configuration's case, credentials.
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/*.tfvars
+infra/terraform/*.tfvars.json
+
+# Assistant working state and unrelated scratch content -- never
+# staged, never scanned, never part of this project's own tree
+# (Slice 13 requirement 18: the secret-scan gate's file enumeration
+# must exclude these by repository policy, not by ad-hoc script
+# workarounds; this is that policy).
+/.claude/
+/Breach/
+infra/terraform/crash.log

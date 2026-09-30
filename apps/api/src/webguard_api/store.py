@@ -120,6 +120,32 @@ def _persisted_integer(value: object) -> int:
     return value
 
 
+def _no_earlier_than(candidate: datetime, floor: datetime) -> datetime:
+    """Never returns a value earlier than `floor`.
+
+    A caller's `now` (worker.py's `self.clock()`, read once at the top
+    of `run_once()`) is captured before this store even attempts to
+    acquire the SQLite write lock for the transaction that will read
+    and update a job row. Because SQLite serializes writers, that
+    attempt can block until a concurrent transaction (e.g. a job
+    submission that reads its own, later `now` for `submitted_at`)
+    commits first. Once unblocked, the row this call selects or
+    updates can carry a `submitted_at` later than the `now` this call
+    started with, even though nothing about either clock reading was
+    itself wrong. `ScanJobRecord.__post_init__` enforces that
+    `updated_at`/`started_at` can never precede a job's own
+    `submitted_at`; flooring the value written for those columns to
+    the row's own `submitted_at` keeps that true by construction
+    rather than by assuming a `now` read before a lock wait is still
+    fresh once the wait ends. This only ever raises the value used,
+    never lowers it: it does not fabricate an earlier event as
+    having happened later for any other purpose (permit validity
+    windows, lease-expiry filtering, and similar checks all keep using
+    the caller's real `now` untouched)."""
+
+    return candidate if candidate >= floor else floor
+
+
 class ScanJobStore:
     """A small transactional queue using one SQLite database file."""
 
@@ -957,13 +983,29 @@ class ScanJobStore:
     def get_scan_permit_scoped(
         self, permit_id: str, organization_id: str
     ) -> PersistedTrustScanPermit:
-        record = self.get_scan_permit(permit_id)
-        if record.permit.claims.organization_id != organization_id:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        mirrors ``PostgresJobRepository.get_scan_permit_scoped``'s own
+        atomic-scoping fix -- see that method's docstring."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM scan_permits WHERE permit_id = ? AND organization_id = ?",
+                (permit_id, organization_id),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "trustscan_permit_read_failed",
+                "Unable to read the TrustScan permit.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
             raise JobStoreError(
                 "trustscan_permit_not_found",
                 "TrustScan permit was not found.",
             )
-        return record
+        return self._permit_from_row(row)
 
     def revoke_scan_permit_scoped(
         self,
@@ -1020,6 +1062,11 @@ class ScanJobStore:
             connection.close()
 
     def get_job_permit_binding(self, job_id: str) -> tuple[str, str] | None:
+        """Unscoped -- retained for internal/system callers that already
+        hold an independently-verified ``job_id`` (see
+        ``get_job_permit_binding_scoped`` for the customer/service-facing
+        equivalent, which is what ``service.py`` must use)."""
+
         connection = self._connect()
         try:
             row = connection.execute(
@@ -1037,12 +1084,54 @@ class ScanJobStore:
             return None
         return row["permit_id"], row["permit_sha256"]
 
-    def get_job_safety_receipt(self, job_id: str) -> tuple[str, str] | None:
+    def get_job_permit_binding_scoped(
+        self, job_id: str, organization_id: str
+    ) -> tuple[str, str] | None:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        mirrors ``PostgresJobRepository.get_job_permit_binding_scoped``
+        exactly -- ``job_permits`` has no ``organization_id`` of its own,
+        so tenant scope is proven by joining to ``job_scopes`` (the
+        authoritative job/organization relation in this backend) inside
+        one query."""
+
         connection = self._connect()
         try:
             row = connection.execute(
-                "SELECT receipt_ref, receipt_sha256 FROM job_safety_receipts WHERE job_id = ?",
-                (job_id,),
+                """
+                SELECT binding.permit_id, binding.permit_sha256
+                FROM job_permits AS binding
+                JOIN job_scopes AS scope ON scope.job_id = binding.job_id
+                WHERE binding.job_id = ? AND scope.organization_id = ?
+                """,
+                (job_id, organization_id),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "trustscan_job_binding_read_failed",
+                "Unable to read TrustScan job permit binding.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return row["permit_id"], row["permit_sha256"]
+
+    def get_job_safety_receipt_scoped(
+        self, job_id: str, organization_id: str
+    ) -> tuple[str, str] | None:
+        """P1-C1: mirrors ``get_job_permit_binding_scoped``'s
+        join-to-``job_scopes`` rationale exactly."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT receipt.receipt_ref, receipt.receipt_sha256
+                FROM job_safety_receipts AS receipt
+                JOIN job_scopes AS scope ON scope.job_id = receipt.job_id
+                WHERE receipt.job_id = ? AND scope.organization_id = ?
+                """,
+                (job_id, organization_id),
             ).fetchone()
         except sqlite3.Error as exc:
             raise JobStoreError("job_store_read_failed", "Unable to read TrustScan safety-receipt metadata.") from exc
@@ -1053,11 +1142,45 @@ class ScanJobStore:
         return row["receipt_ref"], row["receipt_sha256"]
 
     def get_schedule_permit_binding(self, schedule_id: str) -> tuple[str, str] | None:
+        """Unscoped -- retained for internal/system callers; see
+        ``get_schedule_permit_binding_scoped`` for the customer/
+        service-facing equivalent."""
+
         connection = self._connect()
         try:
             row = connection.execute(
                 "SELECT permit_id, permit_sha256 FROM schedule_permits WHERE schedule_id = ?",
                 (schedule_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "trustscan_schedule_binding_read_failed",
+                "Unable to read TrustScan schedule permit binding.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return row["permit_id"], row["permit_sha256"]
+
+    def get_schedule_permit_binding_scoped(
+        self, schedule_id: str, organization_id: str
+    ) -> tuple[str, str] | None:
+        """P1-C1: ``schedule_permits`` has no ``organization_id`` of its
+        own -- tenant scope is proven by joining to ``scan_schedules``
+        (which carries ``organization_id`` directly in this backend,
+        unlike jobs) inside one query."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT binding.permit_id, binding.permit_sha256
+                FROM schedule_permits AS binding
+                JOIN scan_schedules AS schedules ON schedules.schedule_id = binding.schedule_id
+                WHERE binding.schedule_id = ? AND schedules.organization_id = ?
+                """,
+                (schedule_id, organization_id),
             ).fetchone()
         except sqlite3.Error as exc:
             raise JobStoreError(
@@ -1456,11 +1579,35 @@ class ScanJobStore:
         return row["organization_id"], row["submitted_by"]
 
     def get_scoped(self, job_id: str, organization_id: str) -> ScanJobRecord:
-        record = self.get(job_id)
-        scope = self.get_scope(job_id)
-        if scope is None or scope[0] != organization_id:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        atomically scoped by ``organization_id`` via the same
+        ``scan_jobs``/``job_scopes`` join ``list_jobs_scoped_page``
+        already uses, not two separate unscoped fetches plus a
+        Python-level compare -- this is the primary tenant-facing job
+        lookup (``service.py`` calls it directly with a caller-supplied
+        ``job_id``, and every ``_scoped`` mutation below it, e.g.
+        ``request_cancellation_scoped``, relies on it failing closed)."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT jobs.* FROM scan_jobs AS jobs
+                JOIN job_scopes AS scope ON scope.job_id = jobs.job_id
+                WHERE jobs.job_id = ? AND scope.organization_id = ?
+                """,
+                (job_id, organization_id),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise JobStoreError(
+                "job_store_read_failed",
+                "Unable to read scan-job metadata.",
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
             raise JobStoreError("job_not_found", "Scan job was not found.")
-        return record
+        return self._record_from_row(row)
 
     def list_jobs_scoped_page(
         self,
@@ -1650,17 +1797,26 @@ class ScanJobStore:
         ).fetchone()
 
     def claim_next(self, *, now: datetime) -> ScanJobRecord | None:
-        timestamp = _timestamp(now)
+        select_timestamp = _timestamp(now)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = self._select_claimable_row(
                 connection,
-                timestamp=timestamp,
+                timestamp=select_timestamp,
             )
             if row is None:
                 connection.execute("COMMIT")
                 return None
+            # See _no_earlier_than's own docstring: `now` was read
+            # before this call could even try to acquire SQLite's
+            # write lock, so the row this select just found can belong
+            # to a submission that raced ahead of it and committed a
+            # later submitted_at first.
+            row_submitted_at = _parse_timestamp(row["submitted_at"])
+            claim_timestamp = _timestamp(
+                now if row_submitted_at is None else _no_earlier_than(now, row_submitted_at)
+            )
             revision = _persisted_integer(
                 row["revision"]
             ) + 1
@@ -1672,8 +1828,8 @@ class ScanJobStore:
                 """,
                 (
                     ScanJobState.RUNNING.value,
-                    timestamp,
-                    timestamp,
+                    claim_timestamp,
+                    claim_timestamp,
                     revision,
                     row["job_id"],
                     ScanJobState.QUEUED.value,
@@ -1720,20 +1876,30 @@ class ScanJobStore:
 
         effective_worker_id = self._worker_id(worker_id)
         duration = self._lease_seconds(lease_seconds)
-        timestamp = _timestamp(now)
-        expires_at = now + timedelta(seconds=duration)
-        expires_text = _timestamp(expires_at)
+        select_timestamp = _timestamp(now)
         lease_token = str(uuid4())
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = self._select_claimable_row(
                 connection,
-                timestamp=timestamp,
+                timestamp=select_timestamp,
             )
             if row is None:
                 connection.execute("COMMIT")
                 return None
+            # See _no_earlier_than's own docstring: `now` was read
+            # before this call could even try to acquire SQLite's
+            # write lock, so the row this select just found can belong
+            # to a submission that raced ahead of it and committed a
+            # later submitted_at first. The lease itself is derived
+            # from the same floored moment, so a job's lease always
+            # runs lease_seconds from when it could actually have
+            # started, not from a stale pre-lock-wait reading.
+            row_submitted_at = _parse_timestamp(row["submitted_at"])
+            claim_now = now if row_submitted_at is None else _no_earlier_than(now, row_submitted_at)
+            claim_timestamp = _timestamp(claim_now)
+            expires_text = _timestamp(claim_now + timedelta(seconds=duration))
             revision = _persisted_integer(
                 row["revision"]
             ) + 1
@@ -1747,13 +1913,13 @@ class ScanJobStore:
                 """,
                 (
                     ScanJobState.RUNNING.value,
-                    timestamp,
-                    timestamp,
+                    claim_timestamp,
+                    claim_timestamp,
                     revision,
                     effective_worker_id,
                     lease_token,
                     expires_text,
-                    timestamp,
+                    claim_timestamp,
                     row["job_id"],
                     ScanJobState.QUEUED.value,
                     row["revision"],
@@ -1801,8 +1967,6 @@ class ScanJobStore:
 
         effective_worker_id = self._worker_id(worker_id)
         duration = self._lease_seconds(lease_seconds)
-        timestamp = _timestamp(now)
-        expires_text = _timestamp(now + timedelta(seconds=duration))
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -1818,6 +1982,15 @@ class ScanJobStore:
                 lease_token=lease_token,
                 now=now,
             )
+            # See _no_earlier_than's own docstring. This row is already
+            # RUNNING, so its existing updated_at is already >=
+            # submitted_at; flooring here defends the same invariant
+            # against the same class of stale-`now` race, not a defect
+            # specific to renewal.
+            row_submitted_at = _parse_timestamp(row["submitted_at"])
+            renew_now = now if row_submitted_at is None else _no_earlier_than(now, row_submitted_at)
+            timestamp = _timestamp(renew_now)
+            expires_text = _timestamp(renew_now + timedelta(seconds=duration))
             revision = _persisted_integer(row["revision"]) + 1
             updated = connection.execute(
                 """
@@ -1895,8 +2068,21 @@ class ScanJobStore:
             ).fetchall()
             for row in rows:
                 revision = _persisted_integer(row["revision"]) + 1
+                # See _no_earlier_than's own docstring. `timestamp`
+                # above is the true `now` used to find expired leases
+                # (a genuine elapsed-time filter, left untouched); the
+                # value actually WRITTEN to this row's own timestamp
+                # columns is floored to its own submitted_at instead,
+                # per row, since a batch recovery sweep can touch jobs
+                # submitted at different times.
+                row_submitted_at = _parse_timestamp(row["submitted_at"])
+                row_timestamp = (
+                    timestamp
+                    if row_submitted_at is None
+                    else _timestamp(_no_earlier_than(now, row_submitted_at))
+                )
                 common = (
-                    timestamp,
+                    row_timestamp,
                     revision,
                     row["job_id"],
                     ScanJobState.RUNNING.value,
@@ -1913,7 +2099,7 @@ class ScanJobStore:
                         WHERE job_id = ? AND state = ? AND revision = ?
                             AND lease_token = ?
                         """,
-                        (ScanJobState.CANCELLED.value, timestamp, *common),
+                        (ScanJobState.CANCELLED.value, row_timestamp, *common),
                     )
                     cancelled += result.rowcount
                 elif _persisted_integer(row["attempt_count"]) >= limit:
@@ -1929,8 +2115,8 @@ class ScanJobStore:
                         """,
                         (
                             ScanJobState.FAILED.value,
-                            timestamp,
-                            timestamp,
+                            row_timestamp,
+                            row_timestamp,
                             revision,
                             "worker_lease_attempts_exhausted",
                             "The scan job exceeded the permitted worker recovery attempts.",
@@ -1953,7 +2139,7 @@ class ScanJobStore:
                         """,
                         (
                             ScanJobState.QUEUED.value,
-                            timestamp,
+                            row_timestamp,
                             revision,
                             row["job_id"],
                             ScanJobState.RUNNING.value,
@@ -2292,7 +2478,6 @@ class ScanJobStore:
         effective_worker_id = (
             None if worker_id is None else self._worker_id(worker_id)
         )
-        timestamp = _timestamp(now)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -2308,6 +2493,19 @@ class ScanJobStore:
                     "job_state_transition_invalid",
                     "Only running jobs can enter a terminal worker state.",
                 )
+            # See _no_earlier_than's own docstring. ScanJobRecord also
+            # requires completed_at not precede the job's start
+            # boundary (started_at if set, else submitted_at); floor
+            # against whichever of the two is later so both that check
+            # and the updated_at/submitted_at one hold regardless of
+            # whether this row's own `now` reading raced a concurrent
+            # write. This row is already RUNNING, so its own
+            # started_at/updated_at are already consistent with that
+            # boundary; this defends the same invariant class against
+            # the same stale-`now` race, not a defect specific to
+            # terminal writes.
+            terminal_floor = record.started_at or record.request.submitted_at
+            timestamp = _timestamp(_no_earlier_than(now, terminal_floor))
             if row["lease_token"] is not None:
                 if effective_worker_id is None or lease_token is None:
                     raise JobStoreError(
@@ -2554,6 +2752,7 @@ class ScanJobStore:
         limit: int,
         after: tuple[str, str] | None = None,
         state: ScanScheduleState | None = None,
+        target: str | None = None,
     ) -> tuple[tuple[ScanScheduleRecord, ...], bool]:
         """List one stable descending organization schedule page."""
 
@@ -2572,6 +2771,9 @@ class ScanJobStore:
                 )
             clauses.append("state = ?")
             parameters.append(state.value)
+        if target is not None:
+            clauses.append("target = ?")
+            parameters.append(target)
         if after is not None:
             if (
                 not isinstance(after, tuple)

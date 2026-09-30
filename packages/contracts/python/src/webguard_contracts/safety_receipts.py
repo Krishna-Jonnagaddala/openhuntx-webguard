@@ -14,6 +14,10 @@ from typing import Any
 CURRENT_TRUSTSCAN_SAFETY_RECEIPT_SCHEMA_VERSION = "1.0"
 TRUSTSCAN_SAFETY_RECEIPT_TYPE = "trustscan_safety_receipt"
 TRUSTSCAN_SAFETY_RECEIPT_SIGNATURE_ALGORITHM = "Ed25519"
+# P1-7 (docs/audit/WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md): see the
+# identical constant and comment in scan_permits.py -- same reasoning
+# applies to safety receipts.
+SUPPORTED_TRUSTSCAN_SAFETY_RECEIPT_SIGNATURE_ALGORITHMS = ("Ed25519", "ECDSA_SHA_256")
 TRUSTSCAN_SAFETY_RECEIPT_MAXIMUM_BYTES = 128 * 1024
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
@@ -295,7 +299,11 @@ class TrustScanSafetyReceiptClaims:
 
 @dataclass(frozen=True, slots=True)
 class SignedTrustScanSafetyReceipt:
-    """Ed25519-signed runtime safety receipt."""
+    """One signed runtime safety receipt. ``signature_algorithm``
+    self-reports which of
+    ``SUPPORTED_TRUSTSCAN_SAFETY_RECEIPT_SIGNATURE_ALGORITHMS``
+    produced ``signature`` -- see the identical note on
+    ``SignedTrustScanPermit`` in ``scan_permits.py``."""
 
     claims: TrustScanSafetyReceiptClaims
     signing_key_id: str
@@ -313,9 +321,9 @@ class SignedTrustScanSafetyReceipt:
             raise TrustScanSafetyReceiptError(
                 "trustscan_safety_receipt_type_invalid", "Safety receipt type or schema is invalid."
             )
-        if self.signature_algorithm != TRUSTSCAN_SAFETY_RECEIPT_SIGNATURE_ALGORITHM:
+        if self.signature_algorithm not in SUPPORTED_TRUSTSCAN_SAFETY_RECEIPT_SIGNATURE_ALGORITHMS:
             raise TrustScanSafetyReceiptError(
-                "trustscan_safety_receipt_signature_algorithm_invalid", "Signature algorithm must be Ed25519."
+                "trustscan_safety_receipt_signature_algorithm_invalid", "Signature algorithm is not supported."
             )
         if not isinstance(self.signing_key_id, str) or _KEY_ID.fullmatch(self.signing_key_id) is None:
             raise TrustScanSafetyReceiptError(

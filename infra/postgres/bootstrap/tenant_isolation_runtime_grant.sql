@@ -1,0 +1,34 @@
+-- P1-2 (docs/audit/WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md): the runtime
+-- half of Phase C's role scaffolding. tenant_isolation_roles.sql
+-- creates api_tenant_data/worker_tenant_data/scheduler_tenant_data as
+-- NOLOGIN roles on purpose -- nothing can authenticate as one
+-- directly. This file is what makes them reachable at all: it grants
+-- role MEMBERSHIP (never a login credential) to "webguard", the role
+-- every WebGuard process actually connects as today --
+-- infra/terraform/postgres.tf's own `username = "webguard"` on the
+-- production RDS instance, and the identical literal name in
+-- .github/workflows/ci.yml's WEBGUARD_DATABASE_URL and
+-- WEBGUARD_POSTGRES_TEST_DSN.
+--
+-- Membership alone changes nothing about what "webguard" can already
+-- do. PostgreSQL only narrows a session's privileges the moment
+-- application code actually runs SET ROLE (or SET LOCAL ROLE) to
+-- switch into one of these roles for a specific connection or
+-- transaction -- see postgres_pool.py's role_scoped_connection(),
+-- which is the one place that happens. Applying this file to a real
+-- deployment adds an option ("webguard" may now voluntarily drop into
+-- a narrower, tenant-scoped identity for a specific query); it
+-- revokes nothing "webguard" already has.
+--
+-- Run this only after tenant_isolation_roles.sql -- the three
+-- api_tenant_data/worker_tenant_data/scheduler_tenant_data roles must
+-- already exist.
+--
+-- Safe to run more than once: GRANT <role> TO <role> is naturally
+-- idempotent in PostgreSQL. Re-running this file against a "webguard"
+-- that already holds all three memberships is a silent no-op, never
+-- an error -- unlike tenant_isolation_roles.sql's CREATE ROLE, this
+-- needs no explicit IF NOT FOUND guard to get that property.
+GRANT api_tenant_data TO webguard;
+GRANT worker_tenant_data TO webguard;
+GRANT scheduler_tenant_data TO webguard;

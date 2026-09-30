@@ -1,0 +1,570 @@
+"""Provider-neutral signing abstraction for TrustScan permits and safety
+receipts (Slice 12, requirements 2-3).
+
+Scope discipline: this module intentionally exposes only what TrustScan
+signing actually needs -- ``sign(message)``, public verification
+material, a key identifier, and algorithm metadata. It is not a general
+encryption API (no encrypt/decrypt, no key-wrapping, no arbitrary KMS
+operation surface) because TrustScan has never needed one and adding
+one "for later" is exactly the kind of speculative surface this
+project's own conventions (see ``docs/audit/trustscan-permit-schema-
+policy.md``) reject.
+
+Two concrete ``SigningProvider`` implementations exist:
+
+- ``LocalDevelopmentSigner`` -- an in-process Ed25519 key, identical
+  cryptography to every prior slice. This remains a fully supported
+  local/dev/test backend; it is not being removed or deprecated by the
+  existence of a KMS-backed option, mirroring this slice's own explicit
+  instruction not to remove SQLite just because PostgreSQL exists.
+- ``KmsSigningProvider`` -- signs through an injected, duck-typed
+  ``KmsClientProtocol`` (matching the shape of ``boto3``'s KMS client:
+  ``sign(...)`` / ``get_public_key(...)``) rather than importing
+  ``boto3`` directly. This keeps the project's minimal, hash-locked
+  dependency footprint intact (``requirements-ci.lock`` pins exactly
+  four packages today, none of them an AWS SDK) -- any real
+  ``boto3.client("kms")`` satisfies this protocol structurally, so
+  production code can inject one without this package ever depending
+  on it, and tests can inject a fake with zero network access.
+
+The AWS KMS Ed25519 gap, corrected 2026-09 (read, do not skip): when
+``KmsSigningProvider`` was built, AWS KMS's asymmetric ``KeySpec``
+values were RSA_2048/3072/4096 and ECC_NIST_P256/P384/P521/SECG_P256K1
+only, with no Ed25519/EdDSA option. That is no longer true: AWS
+added ``ECC_NIST_EDWARDS25519`` (Ed25519) as a KMS asymmetric signing
+key spec, generally available since 2025-11-07, with the
+``ED25519_SHA_512`` signing algorithm (``MessageType:RAW``, the same
+raw-message EdDSA convention every provider in this file already
+uses) or ``ED25519_PH_SHA_512`` (prehashed, ``MessageType:DIGEST``).
+See AWS's current KMS developer guide's key-spec reference for the
+authoritative, current list.
+
+This class has not been changed to use it: ``KmsSigningProvider``
+still targets ``ECDSA_SHA_256`` exactly as before, and no
+``ECC_NIST_EDWARDS25519``-backed provider exists in this codebase.
+Nothing here has been live-tested against AWS KMS at all, with either
+key spec: this correction is sourced from AWS's own published
+documentation, not from a validated integration. What the corrected
+fact does change is the reasoning that once justified building
+``CloudHsmSigningProvider`` specifically: at the time, CloudHSM was
+the only HSM-backed path that could keep the Ed25519 algorithm without
+a permit-schema migration. A native KMS-Ed25519 provider would now
+close that same gap without CloudHSM's cluster cost and PKCS#11
+indirection. Whether to actually build one, migrate to it, or keep
+the CloudHSM path already built is a real, unmade engineering
+decision: see ``docs/production/TRUSTSCAN_PRODUCTION_SIGNING.md``'s
+own 2026-09 correction note for the full reassessment. This module
+still does not make that decision: switching TrustScan's production
+signing key custody, by any path, remains a separate, explicit,
+reviewed change this docstring only describes, never performs.
+
+Slice 18 implements ``docs/production/TRUSTSCAN_PRODUCTION_SIGNING.md``'s
+recommended v1 path (Option A: AWS CloudHSM-backed Ed25519) via two new
+pieces:
+
+- ``CloudHsmSigningProvider`` -- preserves the Ed25519 algorithm and
+  the existing permit/receipt signature format entirely (no schema
+  change, no dual-algorithm verification period). Signs through an
+  injected, duck-typed PKCS#11 key handle
+  (``Pkcs11Ed25519KeyProtocol``) rather than importing a PKCS#11
+  binding (e.g. ``python-pkcs11``) directly -- the identical pattern
+  ``KmsSigningProvider`` already established for ``boto3``. This class
+  never runs inside the main WebGuard API/worker process; see
+  ``signing_service.py``'s module docstring for why.
+- ``SigningServiceClient`` -- what the main WebGuard API/worker
+  actually inject as their ``SigningProvider`` in the CloudHSM-backed
+  production path. It never touches CloudHSM (or any HSM) directly; it
+  calls a separate, narrow-interface internal HTTP service
+  (``signing_service.py``) that is the only process with real key
+  access. See ``docs/production/TRUSTSCAN_SIGNING_SERVICE.md`` for the
+  full architecture and why this indirection exists (not every
+  WebGuard API/worker process should hold unrestricted HSM
+  credentials).
+
+``SigningKeyRegistry`` is the lifecycle layer (requirement 3): one
+active provider used for new signatures, plus a set of
+``VerificationKey`` records (including the active key's own public
+half) used to verify by key ID. A key's ``status`` is one of
+``"active"`` (used for new signing and accepted for verification),
+``"retired"`` (no longer used for new signing, but still accepted for
+verification so permits/receipts issued before a rotation continue to
+verify until they naturally expire), or ``"disabled"`` (rejected for
+verification unconditionally -- the emergency-revocation case, e.g. a
+suspected key compromise, where even an unexpired signature must no
+longer be trusted). Verification is always looked up by the key ID
+carried in the signed object itself (``signing_key_id`` /
+``verifying_key_id``), never assumed to be the currently active key --
+this is what makes rotation possible at all.
+
+No raw private key material is ever placed in this module's own
+state beyond what each provider already holds in memory for its own
+signing operation (an Ed25519 private key object for
+``LocalDevelopmentSigner``, or nothing at all for
+``KmsSigningProvider``, whose private key material never leaves AWS
+KMS by design). Nothing here writes to a database, log, report,
+checkpoint, or environment dump -- callers are responsible for keeping
+it that way, as they already are for the pre-Slice-12 signing key.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+from dataclasses import dataclass
+from typing import Literal, Protocol, runtime_checkable
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+
+KeyStatus = Literal["active", "retired", "disabled"]
+
+
+class SigningProviderError(RuntimeError):
+    """Controlled signing-provider configuration or operation failure."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@runtime_checkable
+class SigningProvider(Protocol):
+    """The narrow contract TrustScan signing needs from any key
+    custody backend. Deliberately excludes decrypt/encrypt/key-wrap --
+    TrustScan only ever signs and verifies."""
+
+    key_id: str
+    algorithm: str
+
+    def sign(self, message: bytes) -> bytes:
+        """Return a raw signature over ``message``."""
+
+    def public_key_material(self) -> bytes:
+        """Return the raw, algorithm-specific public verification
+        material (not secret) for this provider's key."""
+
+
+class LocalDevelopmentSigner:
+    """Ed25519 signing backed by an in-process private key. The
+    supported local/unit/lab backend -- unchanged cryptography from
+    every prior slice, not deprecated by ``KmsSigningProvider``
+    existing."""
+
+    algorithm = "Ed25519"
+
+    def __init__(self, private_key_bytes: bytes) -> None:
+        if not isinstance(private_key_bytes, bytes) or len(private_key_bytes) != 32:
+            raise SigningProviderError(
+                "trustscan_signing_key_invalid",
+                "TrustScan Ed25519 private key must contain exactly 32 bytes.",
+            )
+        try:
+            self._private_key = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
+        except ValueError as exc:
+            raise SigningProviderError(
+                "trustscan_signing_key_invalid",
+                "TrustScan Ed25519 private key is invalid.",
+            ) from exc
+        self._public_bytes = self._private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        self.key_id = f"sha256:{hashlib.sha256(self._public_bytes).hexdigest()}"
+
+    def sign(self, message: bytes) -> bytes:
+        return self._private_key.sign(message)
+
+    def public_key_material(self) -> bytes:
+        return self._public_bytes
+
+
+@runtime_checkable
+class KmsClientProtocol(Protocol):
+    """Structural shape of the subset of ``boto3``'s KMS client this
+    module calls -- satisfied by a real ``boto3.client("kms")`` without
+    this package importing ``boto3``, and by a plain fake in tests."""
+
+    def sign(
+        self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str
+    ) -> dict:
+        ...
+
+    def get_public_key(self, *, KeyId: str) -> dict:
+        ...
+
+
+class KmsSigningProvider:
+    """Signs through an injected AWS KMS-shaped client. Targets
+    ``ECDSA_SHA_256``, unchanged since this class was built; AWS KMS
+    has separately since added an Ed25519 key spec
+    (``ECC_NIST_EDWARDS25519``, GA 2025-11-07) that this class does not
+    use. Never claims Ed25519 compatibility. Not wired as TrustScan's
+    active signer; see module docstring's 2026-09 correction note."""
+
+    algorithm = "ECDSA_SHA_256"
+
+    def __init__(self, client: KmsClientProtocol, *, key_id: str) -> None:
+        """``key_id`` here is AWS's own key identifier (an ARN, key ID,
+        or alias) -- used only for the ``KeyId=`` parameter on the
+        underlying KMS calls. ``self.key_id`` (the attribute other
+        code reads, e.g. to write into a signed permit's
+        ``signing_key_id``) is instead derived as ``sha256:<hex>`` of
+        this key's own public material, matching
+        ``LocalDevelopmentSigner``'s scheme exactly. This is required,
+        not cosmetic: ``TrustScanPermitClaims.signing_key_id`` is
+        contract-validated against ``^sha256:[0-9a-f]{64}$`` (a
+        constraint that predates this slice's signing abstraction) --
+        surfacing AWS's own ARN there would fail that validation on
+        every KMS-signed permit. The AWS key identifier is preserved
+        as ``self.provider_key_id`` for anything that genuinely needs
+        it (KMS console lookups, IaC cross-references)."""
+
+        self._client = client
+        self.provider_key_id = key_id
+        self.key_id = f"sha256:{hashlib.sha256(self._fetch_public_key_material(client, key_id)).hexdigest()}"
+
+    @staticmethod
+    def _fetch_public_key_material(client: KmsClientProtocol, key_id: str) -> bytes:
+        try:
+            response = client.get_public_key(KeyId=key_id)
+        except Exception as exc:  # noqa: BLE001 - normalized below
+            raise SigningProviderError(
+                "kms_public_key_request_failed",
+                "The KMS get-public-key request failed.",
+            ) from exc
+        public_key = response.get("PublicKey")
+        if not isinstance(public_key, (bytes, bytearray)):
+            raise SigningProviderError(
+                "kms_public_key_response_invalid",
+                "The KMS get-public-key response did not contain usable key material.",
+            )
+        return bytes(public_key)
+
+    def sign(self, message: bytes) -> bytes:
+        try:
+            response = self._client.sign(
+                KeyId=self.provider_key_id,
+                Message=message,
+                MessageType="RAW",
+                SigningAlgorithm=self.algorithm,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalized below
+            raise SigningProviderError(
+                "kms_signing_request_failed",
+                "The KMS signing request failed.",
+            ) from exc
+        signature = response.get("Signature")
+        if not isinstance(signature, (bytes, bytearray)):
+            raise SigningProviderError(
+                "kms_signing_response_invalid",
+                "The KMS signing response did not contain a usable signature.",
+            )
+        return bytes(signature)
+
+    def public_key_material(self) -> bytes:
+        return self._fetch_public_key_material(self._client, self.provider_key_id)
+
+
+@runtime_checkable
+class Pkcs11Ed25519KeyProtocol(Protocol):
+    """Structural shape of the one PKCS#11 capability
+    ``CloudHsmSigningProvider`` needs from an already-logged-in-and-
+    resolved Ed25519 key handle -- deliberately not a general PKCS#11
+    session wrapper (no ``encrypt``/``decrypt``/key-generation/object-
+    management surface). A real implementation (e.g. a thin adapter
+    over ``python-pkcs11``'s ``PrivateKey``/``PublicKey`` pair) is
+    constructed only inside ``signing_service.py``'s production
+    startup path -- this module never imports a PKCS#11 binding."""
+
+    def sign(self, message: bytes) -> bytes:
+        """Return a raw Ed25519 signature over ``message``, computed
+        inside the HSM -- the private key material never leaves it."""
+
+    def public_key_material(self) -> bytes:
+        """Return the raw 32-byte Ed25519 public key."""
+
+
+class CloudHsmSigningProvider:
+    """Signs through an injected, duck-typed PKCS#11 Ed25519 key
+    handle. AWS CloudHSM supports Ed25519 natively via PKCS#11, so this
+    preserves TrustScan's existing signature format entirely: same
+    algorithm, same claims, same verification code path as
+    ``LocalDevelopmentSigner``, zero permit-schema change
+    (``docs/production/TRUSTSCAN_PRODUCTION_SIGNING.md``'s Option A).
+    AWS KMS has since also added a native Ed25519 key spec (see the
+    module docstring's 2026-09 correction note), so CloudHSM is no
+    longer the only managed path that keeps this algorithm: that
+    document's Option A recommendation is flagged there for
+    re-evaluation, not changed here. The private key never leaves the
+    HSM; this class only ever calls ``sign()``/reads public material
+    through the injected handle, never anything encryption/decryption-
+    shaped."""
+
+    algorithm = "Ed25519"
+
+    def __init__(self, key_handle: Pkcs11Ed25519KeyProtocol) -> None:
+        self._key_handle = key_handle
+        public_bytes = key_handle.public_key_material()
+        if not isinstance(public_bytes, (bytes, bytearray)) or len(public_bytes) != 32:
+            raise SigningProviderError(
+                "cloudhsm_public_key_invalid",
+                "CloudHSM-reported Ed25519 public key material must be exactly 32 bytes.",
+            )
+        self._public_bytes = bytes(public_bytes)
+        self.key_id = f"sha256:{hashlib.sha256(self._public_bytes).hexdigest()}"
+
+    def sign(self, message: bytes) -> bytes:
+        try:
+            signature = self._key_handle.sign(message)
+        except Exception as exc:  # noqa: BLE001 - normalized below
+            raise SigningProviderError(
+                "cloudhsm_signing_request_failed",
+                "The CloudHSM signing request failed.",
+            ) from exc
+        if not isinstance(signature, (bytes, bytearray)) or len(signature) != 64:
+            raise SigningProviderError(
+                "cloudhsm_signing_response_invalid",
+                "The CloudHSM signing response did not contain a usable Ed25519 signature.",
+            )
+        return bytes(signature)
+
+    def public_key_material(self) -> bytes:
+        return self._public_bytes
+
+
+@runtime_checkable
+class SigningServiceClientProtocol(Protocol):
+    """Structural shape of the narrow HTTP transport
+    ``SigningServiceClient`` needs -- satisfied by
+    ``signing_service.py``'s real ``SigningServiceHttpClient`` (stdlib
+    ``http.client`` only) or a fake in tests."""
+
+    def sign(self, message: bytes) -> dict:
+        """POST to the signing service's sign endpoint; returns
+        ``{"key_id": str, "signature": bytes}``."""
+
+    def get_active_key_id(self) -> str: ...
+
+    def get_public_key(self, key_id: str) -> dict:
+        """Returns ``{"key_id": str, "algorithm": str, "public_key": bytes, "status": str}``."""
+
+
+class SigningServiceClient:
+    """What the main WebGuard API/worker actually inject as their
+    ``SigningProvider`` in the CloudHSM-backed production path -- this
+    class never touches CloudHSM, PKCS#11, or any HSM binding at all.
+    It calls the dedicated TrustScan Signing Service
+    (``signing_service.py``) over its narrow, three-operation HTTP
+    interface (``sign`` / ``get_public_key`` / ``get_active_key_id`` --
+    never a general encrypt/decrypt surface), exactly the boundary
+    ``docs/production/TRUSTSCAN_SIGNING_SERVICE.md`` documents: no
+    WebGuard API or worker process needs, or gets, direct HSM
+    credentials.
+
+    ``key_id`` here is already the ``sha256:<hex>``-derived,
+    contract-valid identifier the signing service itself computed
+    (mirroring ``KmsSigningProvider``'s and ``CloudHsmSigningProvider``'s
+    own derivation) -- this client does not recompute it."""
+
+    algorithm = "Ed25519"
+
+    def __init__(self, client: SigningServiceClientProtocol) -> None:
+        self._client = client
+        self.key_id = client.get_active_key_id()
+
+    def sign(self, message: bytes) -> bytes:
+        response = self._client.sign(message)
+        signature = response.get("signature")
+        if not isinstance(signature, (bytes, bytearray)):
+            raise SigningProviderError(
+                "signing_service_response_invalid",
+                "The signing service response did not contain a usable signature.",
+            )
+        return bytes(signature)
+
+    def public_key_material(self) -> bytes:
+        response = self._client.get_public_key(self.key_id)
+        public_key = response.get("public_key")
+        if not isinstance(public_key, (bytes, bytearray)):
+            raise SigningProviderError(
+                "signing_service_response_invalid",
+                "The signing service response did not contain usable public key material.",
+            )
+        return bytes(public_key)
+
+
+def _verify_ed25519(public_key_material: bytes, message: bytes, signature: bytes) -> bool:
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key_material).verify(
+            signature, message
+        )
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+def _verify_ecdsa_sha256(
+    public_key_material: bytes, message: bytes, signature: bytes
+) -> bool:
+    try:
+        public_key = serialization.load_der_public_key(public_key_material)
+        public_key.verify(signature, message, ec.ECDSA(hashes.SHA256()))
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+_VERIFIERS = {
+    "Ed25519": _verify_ed25519,
+    "ECDSA_SHA_256": _verify_ecdsa_sha256,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationKey:
+    """Public-only verification record for one signing key. Never
+    holds private key material -- safe to log, persist as
+    configuration, or hand to an operator, unlike the signer it
+    describes."""
+
+    key_id: str
+    algorithm: str
+    public_key_material: bytes
+    status: KeyStatus = "active"
+
+    def verify(self, message: bytes, signature: bytes) -> bool:
+        verifier = _VERIFIERS.get(self.algorithm)
+        if verifier is None:
+            return False
+        return verifier(self.public_key_material, message, signature)
+
+
+class SigningKeyRegistry:
+    """Signing-key lifecycle (requirement 3): one active provider used
+    for new signatures, plus every key (active, retired, or disabled)
+    known for verification. Verification always resolves by the key ID
+    carried in the signed object -- never assumed to be the current
+    active key -- which is what makes rotation possible: a permit
+    signed under a now-retired key keeps verifying until it naturally
+    expires, while a disabled key is rejected unconditionally even if
+    otherwise still within its old validity window."""
+
+    def __init__(self, active: SigningProvider) -> None:
+        self._active = active
+        self._verification_keys: dict[str, VerificationKey] = {
+            active.key_id: VerificationKey(
+                key_id=active.key_id,
+                algorithm=active.algorithm,
+                public_key_material=active.public_key_material(),
+                status="active",
+            )
+        }
+
+    @property
+    def active(self) -> SigningProvider:
+        return self._active
+
+    def verification_key(self, key_id: str) -> VerificationKey | None:
+        """Read-only lookup by key ID -- ``None`` if unknown. Used by
+        ``signing_service.py``'s ``GET /v1/public-key/{id}`` endpoint;
+        deliberately the only way that endpoint can ever observe a
+        key's status/public material, never the private one."""
+
+        return self._verification_keys.get(key_id)
+
+    def add_verification_key(self, key: VerificationKey) -> None:
+        """Registers an additional key as verifiable -- typically a
+        just-retired former active key, kept around only so permits it
+        already signed keep verifying until they expire."""
+
+        self._verification_keys[key.key_id] = key
+
+    def ensure_active_key_signable(self) -> None:
+        """Raises if the active provider's own key has been marked
+        disabled via ``set_status`` -- disabling a key must stop it
+        from signing immediately, not just stop it from verifying.
+        ``self._active`` is fixed at construction and never mutated by
+        ``set_status`` (see this class's own docstring: a retired key
+        cannot become active by accident), so an operator who disables
+        the currently-active key mid-rotation or in response to a
+        suspected compromise needs this checked before every sign, not
+        just before every verify. The active key's own ID is always
+        present in ``_verification_keys`` (inserted at construction,
+        never removed), so this lookup cannot miss."""
+
+        if self._verification_keys[self._active.key_id].status == "disabled":
+            raise SigningProviderError(
+                "trustscan_signing_key_disabled",
+                "This signing key has been disabled and can no longer be used to sign.",
+            )
+
+    def set_status(self, key_id: str, status: KeyStatus) -> None:
+        existing = self._verification_keys.get(key_id)
+        if existing is None:
+            raise SigningProviderError(
+                "trustscan_signing_key_unknown",
+                "No signing key is registered under the requested key ID.",
+            )
+        self._verification_keys[key_id] = VerificationKey(
+            key_id=existing.key_id,
+            algorithm=existing.algorithm,
+            public_key_material=existing.public_key_material,
+            status=status,
+        )
+
+    def verify_by_key_id(self, key_id: str, message: bytes, signature: bytes) -> None:
+        key = self._verification_keys.get(key_id)
+        if key is None:
+            raise SigningProviderError(
+                "trustscan_signing_key_unknown",
+                "No signing key is registered under the requested key ID.",
+            )
+        if key.status == "disabled":
+            raise SigningProviderError(
+                "trustscan_signing_key_disabled",
+                "This signing key has been disabled and can no longer be trusted.",
+            )
+        if not key.verify(message, signature):
+            raise SigningProviderError(
+                "trustscan_signature_invalid",
+                "Signature verification failed.",
+            )
+
+    def verification_key_documents(self) -> list[dict[str, str]]:
+        return [
+            {
+                "type": "trustscan_verification_key",
+                "algorithm": key.algorithm,
+                "key_id": key.key_id,
+                "status": key.status,
+                "encoding": "base64url-raw",
+                "public_key": _b64url_encode(key.public_key_material),
+            }
+            for key in self._verification_keys.values()
+        ]
+
+
+def _b64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+__all__ = [
+    "CloudHsmSigningProvider",
+    "KeyStatus",
+    "KmsClientProtocol",
+    "KmsSigningProvider",
+    "LocalDevelopmentSigner",
+    "Pkcs11Ed25519KeyProtocol",
+    "SigningKeyRegistry",
+    "SigningProvider",
+    "SigningProviderError",
+    "SigningServiceClient",
+    "SigningServiceClientProtocol",
+    "VerificationKey",
+]

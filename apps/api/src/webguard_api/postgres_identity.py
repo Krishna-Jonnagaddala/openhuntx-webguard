@@ -1,0 +1,1010 @@
+"""PostgreSQL-backed identity, RBAC, and audit repository (Slice 12
+requirement 4/9). Satisfies the same ``IdentityRepository`` protocol
+as the existing SQLite ``IdentityStore`` -- same method names, same
+signatures, same error codes on the same failure conditions -- so
+contract tests can run unmodified against either backend, and so
+callers never need a backend-specific branch.
+
+Password/token-secret hashing reuses ``identity.py``'s own
+``_hash_secret``/``_verify_secret``/``_token_parts`` helpers rather
+than reimplementing scrypt parameters a second time -- there must be
+exactly one reviewed implementation of that logic in this codebase,
+not two that could quietly drift apart.
+"""
+
+from __future__ import annotations
+
+import secrets
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+from webguard_contracts import (
+    ApiTokenMetadata,
+    AuditOutcome,
+    Organization,
+    OrganizationRole,
+    OrganizationStatus,
+    Principal,
+    PrincipalType,
+    SecurityAuditEvent,
+)
+
+from .db_errors import DatabaseIntegrityError
+from .identity import (
+    DEFAULT_TOKEN_VALIDITY_DAYS,
+    IDENTITY_TOKEN_PREFIX,
+    MAXIMUM_TOKEN_VALIDITY_DAYS,
+    IdentityStoreError,
+    IdentityTokenPurpose,
+    IdentityTokenRecord,
+    IssuedApiToken,
+    IssuedIdentityToken,
+    _hash_secret,
+    _parse_prefixed_secret,
+    _token_parts,
+    _verify_secret,
+)
+from .postgres_pool import API_TENANT_DATA_ROLE, WebGuardPostgresPool, set_tenant_context
+
+
+class PostgresIdentityRepository:
+    """Production identity store. Every method mirrors
+    ``IdentityStore``'s behavior and error codes; the only intended
+    difference is durability across a restart and safety under
+    concurrent writers across multiple hosts (SQLite's single-file
+    design supports neither).
+
+    P1-2 Phase H: every ordinary method that carries its own
+    organization_id, resolves one, or generates a fresh one before its
+    own write, runs under api_tenant_data via tenant_connection. A
+    cluster of methods carries no organization_id in their own
+    signature at all: get_principal, set_principal_email_verified,
+    touch_last_login, set_password_hash, invalidate_identity_tokens,
+    list_tokens_for_principal, and revoke_token_owned. Each of these
+    runs under api_tenant_data via role_scoped_connection instead,
+    the same role-only, no-tenant-context treatment
+    PostgresAuthenticationContextRepository's get_metadata and revoke
+    use, and for the same reason: there is no organization_id at that
+    call site to set the GUC to. get_password_hash and
+    consume_identity_token are the two exceptions already documented
+    below as a genuine, unclosed Phase H gap and are not touched here.
+    revoke_token and assign_authorization have no live caller anywhere
+    in the API serve process (cli.py's operator subcommands are their
+    only callers), so both stay on the unrestricted connection."""
+
+    def __init__(self, pool: WebGuardPostgresPool, *, module_entitlements=None) -> None:
+        self._pool = pool
+        # Platform expansion (docs/adr/0033): optional and defaulted so
+        # every pre-existing constructor call site is unaffected.
+        # Production wiring passes a real
+        # PostgresModuleEntitlementRepository; when absent (most
+        # existing tests), create_organization simply does not grant
+        # default entitlements, matching how coverage_repository's own
+        # None default on ScanJobExecutor works.
+        self._module_entitlements = module_entitlements
+
+    def create_organization(
+        self, name: str, *, now: datetime, organization_id: str | None = None
+    ) -> Organization:
+        value = Organization(
+            organization_id=str(uuid4()) if organization_id is None else organization_id,
+            name=name,
+            status=OrganizationStatus.ACTIVE,
+            created_at=now,
+        )
+        try:
+            with self._pool.tenant_connection(value.organization_id, role=API_TENANT_DATA_ROLE) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO organizations (organization_id, name, name_key, status, created_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        value.organization_id,
+                        value.name,
+                        value.name.casefold(),
+                        value.status.value,
+                        value.created_at,
+                    ),
+                )
+        except DatabaseIntegrityError as exc:
+            raise IdentityStoreError(
+                "organization_conflict",
+                "An organization with that identifier or name already exists.",
+            ) from exc
+        if self._module_entitlements is not None:
+            self._module_entitlements.grant_default_entitlements(value.organization_id, now=now)
+        return value
+
+    def get_organization(self, organization_id: str) -> Organization:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            row = connection.execute(
+                """
+                SELECT organization_id, name, status, created_at
+                FROM organizations WHERE organization_id = %s
+                """,
+                (organization_id,),
+            ).fetchone()
+        if row is None:
+            raise IdentityStoreError("organization_not_found", "Organization was not found.")
+        return Organization(
+            organization_id=str(row[0]),
+            name=row[1],
+            status=OrganizationStatus(row[2]),
+            created_at=row[3].astimezone(timezone.utc),
+        )
+
+    _PRINCIPAL_COLUMNS = (
+        "principal_id, organization_id, display_name, principal_type, role, active, created_at, "
+        "email, email_verified_at, last_login_at"
+    )
+
+    def create_principal(
+        self,
+        organization_id: str,
+        display_name: str,
+        *,
+        principal_type: PrincipalType,
+        role: OrganizationRole,
+        now: datetime,
+        principal_id: str | None = None,
+        email: str | None = None,
+    ) -> Principal:
+        organization = self.get_organization(organization_id)
+        if organization.status is not OrganizationStatus.ACTIVE:
+            raise IdentityStoreError("organization_disabled", "Organization is disabled.")
+        value = Principal(
+            principal_id=str(uuid4()) if principal_id is None else principal_id,
+            organization_id=organization.organization_id,
+            display_name=display_name,
+            principal_type=principal_type,
+            role=role,
+            active=True,
+            created_at=now,
+            email=email,
+        )
+        try:
+            with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+                with connection.transaction():
+                    connection.execute(
+                        """
+                        INSERT INTO principals
+                            (principal_id, organization_id, display_name, principal_type, role, active, created_at, email)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            value.principal_id,
+                            value.organization_id,
+                            value.display_name,
+                            value.principal_type.value,
+                            value.role.value,
+                            True,
+                            value.created_at,
+                            value.email,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO memberships
+                            (membership_id, organization_id, principal_id, role, assigned_by, assigned_at)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            str(uuid4()),
+                            value.organization_id,
+                            value.principal_id,
+                            value.role.value,
+                            value.principal_id,
+                            value.created_at,
+                        ),
+                    )
+        except DatabaseIntegrityError as exc:
+            if value.email is not None:
+                raise IdentityStoreError(
+                    "principal_email_conflict",
+                    "An account with that email address already exists.",
+                ) from exc
+            raise IdentityStoreError(
+                "principal_conflict", "Principal already exists."
+            ) from exc
+        return value
+
+    def get_principal(self, principal_id: str) -> Principal:
+        """P1-2 Phase H follow-up (2026-09-18): this method ran under
+        role_scoped_connection with no tenant context at all: the
+        identical gap set_password_hash had, found while proving that
+        fix against a real forced-RLS database (this method is on the
+        critical path of literally every flow tested there: it is
+        create_token's own way of discovering a principal's
+        organization, and BrowserSessionAuthenticator.authenticate's
+        way of resolving a session's principal). Unlike
+        set_password_hash, this method's callers cannot all be given a
+        trusted organization_id to pass in (create_token's only input
+        is principal_id; discovering the organization IS what calling
+        this is for), so widening its signature would be circular for
+        them. Fixed the same way get_principal_by_email already is:
+        resolve organization_id first, under api_tenant_data with no
+        tenant context (via webguard_control.resolve_principal_organization,
+        the identical minimal SECURITY DEFINER shape resolve_job_organization
+        already established), then set_tenant_context on the same
+        connection, then read the full row as an ordinary, now-tenant-
+        scoped query. No signature change; every existing caller
+        (create_token, assign_authorization, get_principal_scoped,
+        BrowserSessionAuthenticator, and every service.py call site)
+        needed zero changes."""
+
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+            organization_row = connection.execute(
+                "SELECT webguard_control.resolve_principal_organization(%s)",
+                (principal_id,),
+            ).fetchone()
+            if organization_row is None or organization_row[0] is None:
+                raise IdentityStoreError("principal_not_found", "Principal was not found.")
+            set_tenant_context(connection, organization_row[0])
+            row = connection.execute(
+                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals WHERE principal_id = %s",  # noqa: S608
+                (principal_id,),
+            ).fetchone()
+        if row is None:
+            raise IdentityStoreError("principal_not_found", "Principal was not found.")
+        return self._principal_from_row(row)
+
+    def get_principal_by_email(self, email: str) -> Principal | None:
+        """P1-2 Phase H: mirrors authenticate_token's shape. No
+        organization is known from an email address alone, so the
+        resolve step runs under api_tenant_data via
+        webguard_control.resolve_principal_by_email, then the full
+        principal row (every field this method's own callers need,
+        including ones the resolver deliberately omits: principal_type,
+        created_at, email, email_verified_at, last_login_at) is read
+        as an ordinary, now-tenant-scoped query once organization_id
+        is known."""
+
+        normalized_email = email.strip().casefold()
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+            row = connection.execute(
+                "SELECT * FROM webguard_control.resolve_principal_by_email(%s)",
+                (normalized_email,),
+            ).fetchone()
+            if row is None:
+                return None
+            principal_id, organization_id = row[0], row[5]
+            set_tenant_context(connection, organization_id)
+            principal_row = connection.execute(
+                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals "  # noqa: S608
+                "WHERE principal_id = %s AND organization_id = %s",
+                (str(principal_id), organization_id),
+            ).fetchone()
+        return None if principal_row is None else self._principal_from_row(principal_row)
+
+    @staticmethod
+    def _principal_from_row(row: tuple) -> Principal:
+        return Principal(
+            principal_id=str(row[0]),
+            organization_id=str(row[1]),
+            display_name=row[2],
+            principal_type=PrincipalType(row[3]),
+            role=OrganizationRole(row[4]),
+            active=bool(row[5]),
+            created_at=row[6].astimezone(timezone.utc),
+            email=row[7],
+            email_verified_at=row[8].astimezone(timezone.utc) if row[8] else None,
+            last_login_at=row[9].astimezone(timezone.utc) if row[9] else None,
+        )
+
+    def get_principal_scoped(self, principal_id: str, *, organization_id: str) -> Principal:
+        principal = self.get_principal(principal_id)
+        if principal.organization_id != organization_id:
+            raise IdentityStoreError("principal_not_found", "Principal was not found.")
+        return principal
+
+    def list_principals(self, organization_id: str) -> tuple[Principal, ...]:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            rows = connection.execute(
+                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals WHERE organization_id = %s ORDER BY created_at",  # noqa: S608
+                (organization_id,),
+            ).fetchall()
+        return tuple(self._principal_from_row(row) for row in rows)
+
+    def update_principal_role(
+        self, principal_id: str, *, organization_id: str, role: OrganizationRole, now: datetime
+    ) -> Principal:
+        """P1-C1 (docs/audit/WEBGUARD_P1_REMEDIATION_TRACKING_2026-08.md):
+        ``get_principal_scoped`` already fails closed before this method
+        ever reaches the mutation, and ``organization_id`` is never
+        updated anywhere on ``principals`` (immutable post-creation, like
+        ``scan_jobs.organization_id``), so there was never a TOCTOU
+        window in practice -- but the ``UPDATE`` predicate itself now
+        also carries ``organization_id`` directly, so this mutation is
+        atomically self-scoped and does not rely on a separate
+        preceding call or on that invariant holding forever."""
+
+        principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            connection.execute(
+                "UPDATE principals SET role = %s WHERE principal_id = %s AND organization_id = %s",
+                (role.value, principal_id, organization_id),
+            )
+        return Principal(
+            principal_id=principal.principal_id,
+            organization_id=principal.organization_id,
+            display_name=principal.display_name,
+            principal_type=principal.principal_type,
+            role=role,
+            active=principal.active,
+            created_at=principal.created_at,
+            email=principal.email,
+            email_verified_at=principal.email_verified_at,
+            last_login_at=principal.last_login_at,
+        )
+
+    def set_principal_active(
+        self, principal_id: str, *, organization_id: str, active: bool, now: datetime
+    ) -> Principal:
+        """P1-C1: mirrors ``update_principal_role``'s atomic-mutation
+        fix -- see that method's docstring."""
+
+        principal = self.get_principal_scoped(principal_id, organization_id=organization_id)
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            connection.execute(
+                "UPDATE principals SET active = %s WHERE principal_id = %s AND organization_id = %s",
+                (active, principal_id, organization_id),
+            )
+        return Principal(
+            principal_id=principal.principal_id,
+            organization_id=principal.organization_id,
+            display_name=principal.display_name,
+            principal_type=principal.principal_type,
+            role=principal.role,
+            active=active,
+            created_at=principal.created_at,
+            email=principal.email,
+            email_verified_at=principal.email_verified_at,
+            last_login_at=principal.last_login_at,
+        )
+
+    def set_principal_email_verified(self, principal_id: str, organization_id: str, *, now: datetime) -> Principal:
+        # P1-2 Phase H follow-up (2026-09-18): same tenant-context gap
+        # as set_password_hash, same fix shape. Every real caller
+        # (service.py's confirm_email_verification and accept_invitation)
+        # already has organization_id from the IdentityTokenRecord
+        # consume_identity_token just returned.
+        principal = self.get_principal(principal_id)
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            connection.execute(
+                "UPDATE principals SET email_verified_at = %s WHERE principal_id = %s",
+                (now, principal_id),
+            )
+        return Principal(
+            principal_id=principal.principal_id,
+            organization_id=principal.organization_id,
+            display_name=principal.display_name,
+            principal_type=principal.principal_type,
+            role=principal.role,
+            active=principal.active,
+            created_at=principal.created_at,
+            email=principal.email,
+            email_verified_at=now,
+            last_login_at=principal.last_login_at,
+        )
+
+    def touch_last_login(self, principal_id: str, organization_id: str, *, now: datetime) -> None:
+        # P1-2 Phase H follow-up (2026-09-18): same gap, same fix.
+        # login()'s only two callers already have the just-resolved
+        # Principal's own organization_id in scope.
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            connection.execute(
+                "UPDATE principals SET last_login_at = %s WHERE principal_id = %s",
+                (now, principal_id),
+            )
+
+    def set_password_hash(
+        self, principal_id: str, organization_id: str, *, algorithm: str, password_hash: str, now: datetime
+    ) -> None:
+        # P1-2 Phase H gap closed 2026-09-18: this method ran under
+        # role_scoped_connection (API_TENANT_DATA_ROLE) with no tenant
+        # context set at all, converted correctly to a restricted role
+        # in an earlier Phase H slice but never given the organization_id
+        # its own RLS policy needs. password_credentials' INSERT/UPDATE
+        # policies (tenant_isolation_rls_policies.sql) are both predicated
+        # on EXISTS(... principals ... organization_id = webguard_current_tenant()),
+        # since the table carries no organization_id column of its own.
+        # Every real caller already has a server-resolved organization_id
+        # in scope before it ever calls this method (service.py's
+        # register_account has the just-created Organization; login's
+        # rehash path and change_password have it on the Principal/
+        # AuthContext they already authenticated; confirm_password_reset
+        # and accept_invitation have it on the IdentityTokenRecord
+        # consume_identity_token just returned); none of the five call
+        # sites needed to look anything up newly to supply this.
+        #
+        # Two statements, one transaction (this method's own connection
+        # checkout is the transaction boundary, unchanged): INSERT ...
+        # ON CONFLICT DO NOTHING first, then a conditional UPDATE only
+        # if the insert did not apply. Not a single ON CONFLICT DO
+        # UPDATE: that shape's DO UPDATE SET clause would have to
+        # reference EXCLUDED.password_hash, and PostgreSQL requires
+        # SELECT privilege on any target-table column a DO UPDATE
+        # clause references this way, which would force api_tenant_data
+        # to hold direct SELECT on the password hash column just to
+        # write it. This shape's UPDATE assigns caller-supplied
+        # parameters directly, never EXCLUDED or the row's own existing
+        # values, so it only ever needs SELECT on principal_id (the
+        # WHERE-clause column); see tenant_isolation_acl.sql's own
+        # comment on this grant for the full empirical trace.
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO password_credentials (principal_id, algorithm, password_hash, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (principal_id) DO NOTHING
+                """,
+                (principal_id, algorithm, password_hash, now, now),
+            )
+            if cursor.rowcount == 0:
+                connection.execute(
+                    """
+                    UPDATE password_credentials
+                    SET algorithm = %s, password_hash = %s, updated_at = %s
+                    WHERE principal_id = %s
+                    """,
+                    (algorithm, password_hash, now, principal_id),
+                )
+
+    def get_password_hash(self, principal_id: str) -> str | None:
+        """P1-2 Phase H gap closed: webguard_control.resolve_password_hash
+        is a new principal_id-keyed SECURITY DEFINER function (none of
+        Phase F's original 13 were keyed by a bare principal_id:
+        login() already has a resolved Principal from
+        get_principal_by_email, but that function deliberately never
+        returns password_hash, and change_password() only ever holds
+        an already-authenticated context.principal_id, never an
+        email). Returns only password_hash, matching this method's own
+        return shape exactly. Both real callers (service.py's login()
+        and change_password()) run inside the API serve process, which
+        is exactly api_tenant_data's own domain, and neither needs
+        organization_id for this specific lookup, since principal_id is
+        already a global unique key."""
+
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+            row = connection.execute(
+                "SELECT webguard_control.resolve_password_hash(%s)",
+                (principal_id,),
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def create_identity_token(
+        self,
+        principal_id: str,
+        organization_id: str,
+        *,
+        purpose: IdentityTokenPurpose,
+        ttl: timedelta,
+        now: datetime,
+    ) -> IssuedIdentityToken:
+        token_id = str(uuid4())
+        secret = secrets.token_urlsafe(32)
+        raw = f"{IDENTITY_TOKEN_PREFIX}_{token_id}_{secret}"
+        expires_at = now + ttl
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            connection.execute(
+                """
+                INSERT INTO identity_tokens
+                    (token_id, principal_id, organization_id, purpose, secret_hash, created_at, expires_at, used_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NULL)
+                """,
+                (token_id, principal_id, organization_id, purpose.value, _hash_secret(secret), now, expires_at),
+            )
+        record = IdentityTokenRecord(
+            token_id=token_id,
+            principal_id=principal_id,
+            organization_id=organization_id,
+            purpose=purpose,
+            created_at=now,
+            expires_at=expires_at,
+        )
+        return IssuedIdentityToken(record=record, token=raw)
+
+    def consume_identity_token(
+        self, token: object, *, purpose: IdentityTokenPurpose, now: datetime
+    ) -> IdentityTokenRecord:
+        """P1-2 Phase H gap closed: webguard_control.resolve_identity_token's
+        RETURNS TABLE now includes created_at, appended after the
+        original 7 columns (see the SQL file's own comment on why
+        this needed DROP FUNCTION/CREATE FUNCTION, not CREATE OR
+        REPLACE): the one column this method's own IdentityTokenRecord
+        contract needed that the function did not yet return. Now
+        follows the same pattern authenticate_token/get_principal_by_email
+        already use: resolve via the function under api_tenant_data,
+        then (once organization_id is known) set_tenant_context on the
+        same connection before the post-resolution UPDATE, so that
+        UPDATE runs correctly scoped once a future phase force-enables
+        identity_tokens' own tenant-predicated RLS policy. secret_hash/
+        purpose/used_at/expires_at verification, and their exact error
+        codes and ordering, are completely unchanged. Only the
+        connection/privilege plumbing underneath moved."""
+
+        token_id, secret = _parse_prefixed_secret(
+            token, prefix=IDENTITY_TOKEN_PREFIX, error_code="identity_token_invalid"
+        )
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+            row = connection.execute(
+                "SELECT * FROM webguard_control.resolve_identity_token(%s)",
+                (token_id,),
+            ).fetchone()
+            if row is None or not _verify_secret(secret, row[4]):
+                raise IdentityStoreError("identity_token_invalid", "Token is invalid.")
+            if row[3] != purpose.value:
+                raise IdentityStoreError("identity_token_invalid", "Token is invalid.")
+            if row[6] is not None:
+                raise IdentityStoreError("identity_token_used", "Token has already been used.")
+            expires_at = row[5].astimezone(timezone.utc)
+            if now.astimezone(timezone.utc) >= expires_at:
+                raise IdentityStoreError("identity_token_expired", "Token has expired.")
+            organization_id = row[2]
+            set_tenant_context(connection, organization_id)
+            connection.execute(
+                "UPDATE identity_tokens SET used_at = %s WHERE token_id = %s",
+                (now, token_id),
+            )
+        return IdentityTokenRecord(
+            token_id=str(row[0]),
+            principal_id=str(row[1]),
+            organization_id=str(organization_id),
+            purpose=IdentityTokenPurpose(row[3]),
+            created_at=row[7].astimezone(timezone.utc),
+            expires_at=expires_at,
+            used_at=now,
+        )
+
+    def invalidate_identity_tokens(
+        self, principal_id: str, organization_id: str, *, purpose: IdentityTokenPurpose, now: datetime
+    ) -> None:
+        """Mark every still-usable token of this purpose for this
+        principal as used, without needing its secret -- used when a new
+        token supersedes an older, still-pending one (e.g. requesting a
+        second password reset invalidates the first). principal_id,
+        purpose, and used_at are exactly the columns tenant_isolation_acl.sql
+        grants api_tenant_data SELECT on for identity_tokens (proven
+        necessary for this statement's own WHERE clause).
+
+        P1-2 Phase H follow-up (2026-09-18): this ran under
+        role_scoped_connection with no tenant context, the same gap
+        set_password_hash had. identity_tokens' own UPDATE policy is
+        predicated on organization_id = webguard_current_tenant()
+        directly (the table carries the column itself, unlike
+        password_credentials), so it needed the same tenant_connection
+        fix once forced RLS was actually exercised end to end. Both real
+        callers (service.py's request_password_reset and
+        request_email_verification) already have organization_id on the
+        Principal they just resolved."""
+
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            connection.execute(
+                """
+                UPDATE identity_tokens SET used_at = %s
+                WHERE principal_id = %s AND purpose = %s AND used_at IS NULL
+                """,
+                (now, principal_id, purpose.value),
+            )
+
+    def list_tokens_for_principal(self, principal_id: str, organization_id: str) -> tuple[ApiTokenMetadata, ...]:
+        # P1-2 Phase H follow-up (2026-09-18): same gap, same fix.
+        # service.py's list_api_keys already has context.organization_id
+        # (self-service, authenticated).
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            rows = connection.execute(
+                """
+                SELECT token_id, organization_id, principal_id, label,
+                       created_at, expires_at, revoked_at, last_used_at
+                FROM api_tokens WHERE principal_id = %s ORDER BY created_at DESC
+                """,
+                (principal_id,),
+            ).fetchall()
+        return tuple(
+            ApiTokenMetadata(
+                token_id=str(row[0]),
+                organization_id=str(row[1]),
+                principal_id=str(row[2]),
+                label=row[3],
+                created_at=row[4].astimezone(timezone.utc),
+                expires_at=row[5].astimezone(timezone.utc),
+                revoked_at=row[6].astimezone(timezone.utc) if row[6] else None,
+                last_used_at=row[7].astimezone(timezone.utc) if row[7] else None,
+            )
+            for row in rows
+        )
+
+    def revoke_token_owned(
+        self, token_id: str, organization_id: str, *, principal_id: str, now: datetime
+    ) -> ApiTokenMetadata:
+        # P1-2 Phase H follow-up (2026-09-18): same gap, same fix.
+        # service.py's revoke_api_key already has context.organization_id.
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            row = connection.execute(
+                """
+                SELECT token_id, organization_id, principal_id, label,
+                       created_at, expires_at, revoked_at, last_used_at
+                FROM api_tokens WHERE token_id = %s
+                """,
+                (token_id,),
+            ).fetchone()
+            if row is None or str(row[2]) != principal_id:
+                raise IdentityStoreError("api_token_not_found", "API token was not found.")
+            revoked_at = row[6]
+            if revoked_at is None:
+                connection.execute(
+                    "UPDATE api_tokens SET revoked_at = %s WHERE token_id = %s", (now, token_id)
+                )
+                revoked_at = now
+            else:
+                revoked_at = revoked_at.astimezone(timezone.utc)
+        return ApiTokenMetadata(
+            token_id=str(row[0]),
+            organization_id=str(row[1]),
+            principal_id=str(row[2]),
+            label=row[3],
+            created_at=row[4].astimezone(timezone.utc),
+            expires_at=row[5].astimezone(timezone.utc),
+            revoked_at=revoked_at,
+            last_used_at=row[7].astimezone(timezone.utc) if row[7] else None,
+        )
+
+    def create_token(
+        self,
+        principal_id: str,
+        *,
+        label: str,
+        now: datetime,
+        validity_days: int = DEFAULT_TOKEN_VALIDITY_DAYS,
+        token_id: str | None = None,
+    ) -> IssuedApiToken:
+        if (
+            isinstance(validity_days, bool)
+            or not isinstance(validity_days, int)
+            or not 1 <= validity_days <= MAXIMUM_TOKEN_VALIDITY_DAYS
+        ):
+            raise IdentityStoreError(
+                "token_validity_invalid",
+                f"Token validity must be from 1 to {MAXIMUM_TOKEN_VALIDITY_DAYS} days.",
+            )
+        principal = self.get_principal(principal_id)
+        if not principal.active:
+            raise IdentityStoreError("principal_disabled", "Principal is disabled.")
+        organization = self.get_organization(principal.organization_id)
+        if organization.status is not OrganizationStatus.ACTIVE:
+            raise IdentityStoreError("organization_disabled", "Organization is disabled.")
+        effective_id = str(uuid4()) if token_id is None else token_id
+        secret = secrets.token_urlsafe(32)
+        raw = f"wgt_{effective_id}_{secret}"
+        metadata = ApiTokenMetadata(
+            token_id=effective_id,
+            organization_id=principal.organization_id,
+            principal_id=principal.principal_id,
+            label=label,
+            created_at=now,
+            expires_at=now + timedelta(days=validity_days),
+        )
+        try:
+            with self._pool.tenant_connection(
+                metadata.organization_id, role=API_TENANT_DATA_ROLE
+            ) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO api_tokens
+                        (token_id, organization_id, principal_id, label, secret_hash, created_at, expires_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        metadata.token_id,
+                        metadata.organization_id,
+                        metadata.principal_id,
+                        metadata.label,
+                        _hash_secret(secret),
+                        metadata.created_at,
+                        metadata.expires_at,
+                    ),
+                )
+        except DatabaseIntegrityError as exc:
+            raise IdentityStoreError(
+                "api_token_conflict", "API token already exists."
+            ) from exc
+        return IssuedApiToken(metadata=metadata, token=raw)
+
+    def authenticate_token(
+        self, token: object, *, now: datetime
+    ) -> tuple[ApiTokenMetadata, Principal, Organization]:
+        """P1-2 Phase H: the token-id/secret pair alone can't carry a
+        tenant context yet, so this pre-auth step runs under
+        ``api_tenant_data`` (see ``postgres_pool.py``'s
+        ``role_scoped_connection``) and resolves through
+        ``webguard_control.resolve_api_token`` -- the ``SECURITY
+        DEFINER`` function that already replicates this method's exact
+        revoked/expired/principal/organization logic (see
+        ``infra/postgres/bootstrap/tenant_isolation_control_functions.sql``'s
+        own comment on it) without needing a tenant context that
+        doesn't exist yet. The moment ``organization_id`` comes back
+        resolved and validated, the rest of this method -- the full
+        principal/organization reads and the ``last_used_at`` write --
+        runs as an ordinary, now-tenant-scoped query on the same
+        connection, via ``set_tenant_context``, exactly the pattern
+        ``resolve_identity_token``'s own SQL comment describes for
+        this whole class of method."""
+
+        token_id, secret = _token_parts(token)
+        with self._pool.role_scoped_connection(API_TENANT_DATA_ROLE) as connection:
+            row = connection.execute(
+                "SELECT * FROM webguard_control.resolve_api_token(%s)",
+                (token_id,),
+            ).fetchone()
+            if row is None or not _verify_secret(secret, row[1]):
+                raise IdentityStoreError("api_token_invalid", "API token is invalid.")
+            (
+                _resolved_token_id,
+                _secret_hash,
+                token_revoked_at,
+                token_expires_at,
+                principal_id,
+                _principal_display_name,
+                _principal_role,
+                principal_active,
+                organization_id,
+                _organization_name,
+                organization_status,
+            ) = row
+            if token_revoked_at is not None:
+                raise IdentityStoreError("api_token_revoked", "API token has been revoked.")
+            if now.astimezone(timezone.utc) >= token_expires_at.astimezone(timezone.utc):
+                raise IdentityStoreError("api_token_expired", "API token has expired.")
+            if principal_id is None or organization_id is None:
+                raise IdentityStoreError("api_token_invalid", "API token is invalid.")
+            if not principal_active:
+                raise IdentityStoreError("principal_disabled", "Principal is disabled.")
+            if organization_status != OrganizationStatus.ACTIVE.value:
+                raise IdentityStoreError("organization_disabled", "Organization is disabled.")
+
+            set_tenant_context(connection, organization_id)
+            token_row = connection.execute(
+                "SELECT label, created_at FROM api_tokens WHERE token_id = %s AND organization_id = %s",
+                (token_id, organization_id),
+            ).fetchone()
+            principal_row = connection.execute(
+                f"SELECT {self._PRINCIPAL_COLUMNS} FROM principals "  # noqa: S608
+                "WHERE principal_id = %s AND organization_id = %s",
+                (str(principal_id), organization_id),
+            ).fetchone()
+            organization_row = connection.execute(
+                """
+                SELECT organization_id, name, status, created_at
+                FROM organizations WHERE organization_id = %s
+                """,
+                (organization_id,),
+            ).fetchone()
+            if token_row is None or principal_row is None or organization_row is None:
+                raise IdentityStoreError("api_token_invalid", "API token is invalid.")
+            principal = self._principal_from_row(principal_row)
+            organization = Organization(
+                organization_id=str(organization_row[0]),
+                name=organization_row[1],
+                status=OrganizationStatus(organization_row[2]),
+                created_at=organization_row[3].astimezone(timezone.utc),
+            )
+            connection.execute(
+                "UPDATE api_tokens SET last_used_at = %s WHERE token_id = %s AND organization_id = %s",
+                (now, token_id, organization_id),
+            )
+        updated = ApiTokenMetadata(
+            token_id=str(token_id),
+            organization_id=str(organization_id),
+            principal_id=str(principal_id),
+            label=token_row[0],
+            created_at=token_row[1].astimezone(timezone.utc),
+            expires_at=token_expires_at.astimezone(timezone.utc),
+            revoked_at=token_revoked_at.astimezone(timezone.utc) if token_revoked_at else None,
+            last_used_at=now,
+        )
+        return updated, principal, organization
+
+    def revoke_token(self, token_id: str, *, now: datetime) -> ApiTokenMetadata:
+        """P1-2 Phase H: unlike revoke_token_owned, this method has no
+        caller anywhere in service.py, only cli.py's operator
+        `token revoke` subcommand. The API serve process never reaches
+        it, so it stays on the unrestricted connection rather than
+        being narrowed to api_tenant_data."""
+
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT token_id, organization_id, principal_id, label,
+                       created_at, expires_at, revoked_at, last_used_at
+                FROM api_tokens WHERE token_id = %s
+                """,
+                (token_id,),
+            ).fetchone()
+            if row is None:
+                raise IdentityStoreError("api_token_not_found", "API token was not found.")
+            revoked_at = row[6]
+            if revoked_at is None:
+                connection.execute(
+                    "UPDATE api_tokens SET revoked_at = %s WHERE token_id = %s",
+                    (now, token_id),
+                )
+                revoked_at = now
+            else:
+                revoked_at = revoked_at.astimezone(timezone.utc)
+        return ApiTokenMetadata(
+            token_id=str(row[0]),
+            organization_id=str(row[1]),
+            principal_id=str(row[2]),
+            label=row[3],
+            created_at=row[4].astimezone(timezone.utc),
+            expires_at=row[5].astimezone(timezone.utc),
+            revoked_at=revoked_at,
+            last_used_at=row[7].astimezone(timezone.utc) if row[7] else None,
+        )
+
+    def assign_authorization(
+        self,
+        organization_id: str,
+        authorization_id: str,
+        *,
+        assigned_by: str,
+        now: datetime,
+    ) -> None:
+        """P1-2 Phase H: tenant_isolation_acl.sql's own header records
+        why organization_authorizations has no INSERT grant for
+        api_tenant_data: this method's only caller anywhere in this
+        codebase is cli.py's `authorization assign` operator
+        subcommand, never the API serve process. It stays on the
+        unrestricted connection rather than being narrowed to a role
+        that could not actually run its INSERT."""
+
+        principal = self.get_principal(assigned_by)
+        if principal.organization_id != organization_id:
+            raise IdentityStoreError(
+                "cross_tenant_assignment_rejected",
+                "The assigning principal does not belong to the organization.",
+            )
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO organization_authorizations
+                    (organization_id, authorization_id, assigned_by, assigned_at)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (organization_id, authorization_id) DO NOTHING
+                """,
+                (organization_id, authorization_id, assigned_by, now),
+            )
+
+    def authorization_is_assigned(self, organization_id: str, authorization_id: str) -> bool:
+        """P1-2 Phase H: called from both service.py (the API serve
+        process) and scheduler.py's own run_once loop. api_tenant_data
+        and scheduler_tenant_data carry the identical SELECT grant on
+        organization_authorizations, so this runs under
+        api_tenant_data and works the same way regardless of which
+        process calls it, the same shared-SELECT reasoning
+        PostgresScanRepository's get_scan_scoped documents for its own
+        worker/API split."""
+
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM organization_authorizations
+                WHERE organization_id = %s AND authorization_id = %s
+                """,
+                (organization_id, authorization_id),
+            ).fetchone()
+            return row is not None
+
+    def list_assigned_authorization_ids(self, organization_id: str) -> tuple[str, ...]:
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            rows = connection.execute(
+                "SELECT authorization_id FROM organization_authorizations WHERE organization_id = %s",
+                (organization_id,),
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def record_audit_event(self, event: SecurityAuditEvent) -> None:
+        if not isinstance(event, SecurityAuditEvent):
+            raise IdentityStoreError("audit_event_invalid", "event must be a SecurityAuditEvent.")
+        try:
+            with self._pool.tenant_connection(event.organization_id, role=API_TENANT_DATA_ROLE) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO security_audit_events
+                        (event_id, request_id, organization_id, principal_id, token_id,
+                         action, resource_type, resource_id, outcome, occurred_at, detail_code)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        event.event_id,
+                        event.request_id,
+                        event.organization_id,
+                        event.principal_id,
+                        event.token_id,
+                        event.action,
+                        event.resource_type,
+                        event.resource_id,
+                        event.outcome.value,
+                        event.occurred_at,
+                        event.detail_code,
+                    ),
+                )
+        except DatabaseIntegrityError as exc:
+            raise IdentityStoreError(
+                "audit_event_conflict", "Audit event already exists."
+            ) from exc
+
+    def list_audit_events_page(
+        self,
+        organization_id: str,
+        *,
+        limit: int,
+        after: tuple[str, str] | None = None,
+        outcome: AuditOutcome | None = None,
+    ) -> tuple[tuple[SecurityAuditEvent, ...], bool]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise IdentityStoreError(
+                "audit_limit_invalid", "Audit limit must be from 1 to 100."
+            )
+        clauses = ["organization_id = %s"]
+        parameters: list[object] = [organization_id]
+        if outcome is not None:
+            if not isinstance(outcome, AuditOutcome):
+                raise IdentityStoreError(
+                    "audit_outcome_invalid", "Audit outcome filter is invalid."
+                )
+            clauses.append("outcome = %s")
+            parameters.append(outcome.value)
+        if after is not None:
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 2
+                or not all(isinstance(value, str) and value for value in after)
+            ):
+                raise IdentityStoreError(
+                    "audit_cursor_invalid", "Audit cursor position is invalid."
+                )
+            clauses.append("(occurred_at < %s OR (occurred_at = %s AND event_id < %s))")
+            parameters.extend((after[0], after[0], after[1]))
+        parameters.append(limit + 1)
+        with self._pool.tenant_connection(organization_id, role=API_TENANT_DATA_ROLE) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT event_id, request_id, organization_id, principal_id, token_id,
+                       action, resource_type, resource_id, outcome, occurred_at, detail_code
+                FROM security_audit_events
+                WHERE {' AND '.join(clauses)}
+                ORDER BY occurred_at DESC, event_id DESC
+                LIMIT %s
+                """,  # noqa: S608
+                tuple(parameters),
+            ).fetchall()
+        has_more = len(rows) > limit
+        events = tuple(self._audit_event_from_row(row) for row in rows[:limit])
+        return events, has_more
+
+    @staticmethod
+    def _audit_event_from_row(row: tuple) -> SecurityAuditEvent:
+        return SecurityAuditEvent(
+            event_id=str(row[0]),
+            request_id=row[1],
+            organization_id=str(row[2]),
+            principal_id=str(row[3]),
+            token_id=str(row[4]),
+            action=row[5],
+            resource_type=row[6],
+            resource_id=row[7],
+            outcome=AuditOutcome(row[8]),
+            occurred_at=row[9].astimezone(timezone.utc),
+            detail_code=row[10],
+        )
+
+    def list_audit_events(
+        self, organization_id: str, *, limit: int = 100
+    ) -> tuple[SecurityAuditEvent, ...]:
+        events, _ = self.list_audit_events_page(organization_id, limit=min(limit, 100))
+        return events
+
+
+__all__ = ["PostgresIdentityRepository"]

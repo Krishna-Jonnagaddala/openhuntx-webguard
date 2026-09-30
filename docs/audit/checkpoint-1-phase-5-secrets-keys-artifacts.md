@@ -1,4 +1,4 @@
-# Audit Checkpoint 1 — Phase 5: Secrets, Keys & Artifact Security
+# Audit Checkpoint 1, Phase 5: Secrets, Keys & Artifact Security
 
 ## Status
 
@@ -11,16 +11,16 @@ controls.
 
 Ten product findings were confirmed during this phase:
 
-- **P5-001 — Medium — Long-lived service signing secrets were directly coupled to the SQLite database.**
-- **P5-002 — Low — Default external service-secret paths could collide between databases in the same directory.**
-- **P5-003 — Medium — The immediate service-secret directory trust boundary was insufficiently validated.**
-- **P5-004 — Low — Service-secret pathname identity was not bound across validation and open.**
-- **P5-005 — Medium — Checkpoint HMAC key pathname identity could change between validation and read.**
-- **P5-006 — Low — Checkpoint document pathname identity could change between validation and read.**
-- **P5-007 — Low — Checkpoint no-overwrite writes were not atomically no-clobber.**
-- **P5-008 — Medium — Checkpoint HMAC key directory trust and ownership were insufficiently enforced.**
-- **P5-009 — Low — Repository secret scanning did not inspect reachable Git history.**
-- **P5-010 — Medium — Service-secret parent directories owned by unrelated UIDs were trusted.**
+- **P5-001 (Medium): Long-lived service signing secrets were directly coupled to the SQLite database.**
+- **P5-002 (Low): Default external service-secret paths could collide between databases in the same directory.**
+- **P5-003 (Medium): The immediate service-secret directory trust boundary was insufficiently validated.**
+- **P5-004 (Low): Service-secret pathname identity was not bound across validation and open.**
+- **P5-005 (Medium): Checkpoint HMAC key pathname identity could change between validation and read.**
+- **P5-006 (Low): Checkpoint document pathname identity could change between validation and read.**
+- **P5-007 (Low): Checkpoint no-overwrite writes were not atomically no-clobber.**
+- **P5-008 (Medium): Checkpoint HMAC key directory trust and ownership were insufficiently enforced.**
+- **P5-009 (Low): Repository secret scanning did not inspect reachable Git history.**
+- **P5-010 (Medium): Service-secret parent directories owned by unrelated UIDs were trusted.**
 
 All confirmed findings were remediated and regression-tested before Phase 5
 technical closure.
@@ -66,7 +66,7 @@ history probes, shallow-clone probes, and authorised Juice Shop integration.
 
 ---
 
-## Phase 5A — Long-Lived Service Signing Secrets
+## Phase 5A: Long-Lived Service Signing Secrets
 
 ### Finding P5-001
 
@@ -123,7 +123,7 @@ P5-001 is recorded as:
 
 ---
 
-## Phase 5B — External Service-Secret Filesystem Boundary
+## Phase 5B: External Service-Secret Filesystem Boundary
 
 ### Finding P5-002
 
@@ -252,7 +252,7 @@ P5-002, P5-003, P5-004 and P5-010 are recorded as:
 
 ---
 
-## Phase 5C — Crawl Checkpoint Filesystem Security
+## Phase 5C: Crawl Checkpoint Filesystem Security
 
 ### Finding P5-005
 
@@ -396,7 +396,7 @@ P5-005 through P5-008 are recorded as:
 
 ---
 
-## Phase 5D — API Token Non-Disclosure
+## Phase 5D: API Token Non-Disclosure
 
 The API bearer-token lifecycle was reviewed separately from long-lived
 service signing secrets.
@@ -421,7 +421,7 @@ No additional Phase 5 finding was assigned.
 
 ---
 
-## Phase 5E — Repository and Generated-Artifact Secret Scanning
+## Phase 5E: Repository and Generated-Artifact Secret Scanning
 
 ### Finding P5-009
 
@@ -602,16 +602,16 @@ No unresolved confirmed Phase 5 vulnerability remains.
 
 Final finding status:
 
-P5-001 — Medium — REMEDIATED / VERIFIED
-P5-002 — Low — REMEDIATED / VERIFIED
-P5-003 — Medium — REMEDIATED / VERIFIED
-P5-004 — Low — REMEDIATED / VERIFIED
-P5-005 — Medium — REMEDIATED / VERIFIED
-P5-006 — Low — REMEDIATED / VERIFIED
-P5-007 — Low — REMEDIATED / VERIFIED
-P5-008 — Medium — REMEDIATED / VERIFIED
-P5-009 — Low — REMEDIATED / VERIFIED
-P5-010 — Medium — REMEDIATED / VERIFIED
+P5-001 (Medium): REMEDIATED / VERIFIED
+P5-002 (Low): REMEDIATED / VERIFIED
+P5-003 (Medium): REMEDIATED / VERIFIED
+P5-004 (Low): REMEDIATED / VERIFIED
+P5-005 (Medium): REMEDIATED / VERIFIED
+P5-006 (Low): REMEDIATED / VERIFIED
+P5-007 (Low): REMEDIATED / VERIFIED
+P5-008 (Medium): REMEDIATED / VERIFIED
+P5-009 (Low): REMEDIATED / VERIFIED
+P5-010 (Medium): REMEDIATED / VERIFIED
 
 Phase 5 remediation and cross-version CI verification are complete.
 

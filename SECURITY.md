@@ -104,12 +104,12 @@ See `docs/DATA_CLASSIFICATION.md` for the repository's detailed handling model.
 
 The security model is documented in:
 
-- `docs/ARCHITECTURE.md` — current system architecture and trust boundaries;
-- `docs/AUTHORIZATION_MODEL.md` — authorisation layers and fail-closed execution flow;
-- `docs/DATA_CLASSIFICATION.md` — data sensitivity and handling rules;
-- `docs/THREAT_MODEL.md` — threat actors, attack paths, mitigations, and residual risks;
-- `docs/PRODUCT_CHARTER.md` — product principles and scope; and
-- `docs/adr/` — milestone and security architecture decisions.
+- `docs/ARCHITECTURE.md`: current system architecture and trust boundaries;
+- `docs/AUTHORIZATION_MODEL.md`: authorisation layers and fail-closed execution flow;
+- `docs/DATA_CLASSIFICATION.md`: data sensitivity and handling rules;
+- `docs/THREAT_MODEL.md`: threat actors, attack paths, mitigations, and residual risks;
+- `docs/PRODUCT_CHARTER.md`: product principles and scope; and
+- `docs/adr/`: milestone and security architecture decisions.
 
 ## Production-readiness limitation
 

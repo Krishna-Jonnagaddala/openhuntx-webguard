@@ -42,6 +42,9 @@ def submission(**changes) -> bytes:
         "maximum_request_attempts": 15,
         "maximum_requests_per_second": 1.0,
         "maximum_concurrency": 1,
+        "active_checks": [],
+        "authentication_context_id": None,
+        "authorization_comparison_plan_id": None,
     }
     values.update(changes)
     return json.dumps(values).encode("utf-8")
@@ -67,11 +70,22 @@ class TrustScanPermitContractTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "trustscan_permit_modes_non_canonical")
 
     def test_submission_rejects_unsafe_http_method(self) -> None:
+        # POST is a permit-issuable method as of Slice 6 (request-template
+        # and mutation-engine work) -- see TRUSTSCAN_ALLOWED_HTTP_METHODS
+        # and docs/audit/active-detection-phase6-request-mutation.md. DELETE
+        # remains outside the vocabulary entirely, so it still exercises
+        # this rejection path.
         with self.assertRaises(TrustScanPermitLoadError) as caught:
             load_trustscan_permit_submission_json(
-                submission(allowed_http_methods=["GET", "POST"])
+                submission(allowed_http_methods=["DELETE", "GET"])
             )
         self.assertEqual(caught.exception.code, "trustscan_permit_methods_invalid")
+
+    def test_submission_accepts_post_as_an_issuable_method(self) -> None:
+        value = load_trustscan_permit_submission_json(
+            submission(allowed_http_methods=["GET", "HEAD", "POST"])
+        )
+        self.assertEqual(value.allowed_http_methods, ("GET", "HEAD", "POST"))
 
     def test_submission_rejects_validity_over_90_days(self) -> None:
         with self.assertRaises(TrustScanPermitLoadError) as caught:

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-08-07
-- **Checkpoint:** Stability & Security Audit — Checkpoint 1
+- **Checkpoint:** Stability & Security Audit, Checkpoint 1
 - **Findings:** C1-002, C1-005, C1-009
 
 ## Context

@@ -8,6 +8,7 @@ from pathlib import Path
 from webguard_api import (
     JobExecutionError,
     JobExecutionOutcome,
+    JobStoreError,
     ScanJobStore,
     ScanJobWorker,
 )
@@ -121,14 +122,18 @@ class ScanJobWorkerTests(unittest.TestCase):
         """Phase 6 C-7: run_once()'s own except Exception only wraps the
         scanner-execution section; recover_expired_leases and
         claim_next_leased, called before it on every pass, are not
-        wrapped at all. Before this test's fix, an exception from either
-        one -- a real database lock, for instance, which after the
-        Phase 6 C-6 fix now raises a controlled JobStoreError rather than
-        a raw sqlite3 error, but was never caught here either way --
-        propagated out of run_forever and ended the worker thread
+        wrapped at all. A real database lock (Phase 6 C-6 hardened this
+        to raise a controlled JobStoreError rather than a raw sqlite3
+        error) propagated out of run_forever and ended the worker thread
         permanently and silently: serve mode has no supervisor to
         restart it, and /healthz never checks whether it is still
-        running. This proves the thread now survives and keeps polling."""
+        running. run_forever()'s own boundary now catches JobStoreError
+        specifically (alongside the unrelated, Postgres-specific
+        DatabaseError a separate track's P1-10 fix already covers) --
+        not a blanket Exception, matching that same track's own
+        reasoning that a genuinely unexpected bug should stay visible.
+        This proves the thread survives and keeps polling on exactly
+        the exception type it is now supposed to."""
         import threading
         from unittest.mock import patch
 
@@ -154,7 +159,10 @@ class ScanJobWorkerTests(unittest.TestCase):
         def flaky_recover(*args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
-                raise RuntimeError("simulated transient database failure")
+                raise JobStoreError(
+                    "job_store_lock_contended",
+                    "Simulated transient database lock contention.",
+                )
             return real_recover(*args, **kwargs)
 
         stop_event = threading.Event()
@@ -175,7 +183,7 @@ class ScanJobWorkerTests(unittest.TestCase):
             call_count["n"], 3,
             "the loop must keep polling on later iterations, not die after the first failure",
         )
-        self.assertEqual(worker.last_loop_error_type, "RuntimeError")
+        self.assertEqual(worker.last_loop_error_type, "JobStoreError")
         self.assertIsNotNone(worker.last_loop_error_at)
         stored = self.store.get(record.job_id)
         self.assertIs(stored.state, ScanJobState.COMPLETED)

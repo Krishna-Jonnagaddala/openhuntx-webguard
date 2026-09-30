@@ -8,6 +8,7 @@ from pathlib import Path
 from webguard_api import (
     AuthorizationRepository,
     IdentityStore,
+    JobStoreError,
     ScanJobStore,
     ScanScheduleCoordinator,
 )
@@ -243,7 +244,10 @@ class SchedulerTests(unittest.TestCase):
         exception boundary of its own at all, so any exception from
         run_once() (e.g. list_due_schedules, unwrapped, or the deliberate
         except JobStoreError: raise around enqueue_due_schedule) ended
-        this thread permanently and silently in serve mode."""
+        this thread permanently and silently in serve mode. _run_forever
+        now catches JobStoreError specifically (alongside the unrelated,
+        Postgres-specific DatabaseError a separate track's P1-11 fix
+        already covers), not a blanket Exception."""
         import threading
         from unittest.mock import patch
 
@@ -256,7 +260,10 @@ class SchedulerTests(unittest.TestCase):
         def flaky_list_due(*args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
-                raise RuntimeError("simulated transient database failure")
+                raise JobStoreError(
+                    "job_store_lock_contended",
+                    "Simulated transient database lock contention.",
+                )
             return real_list_due(*args, **kwargs)
 
         stop_event = threading.Event()
@@ -276,7 +283,7 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertGreaterEqual(call_count["n"], 2)
-        self.assertEqual(coordinator.last_loop_error_type, "RuntimeError")
+        self.assertEqual(coordinator.last_loop_error_type, "JobStoreError")
         self.assertIsNotNone(coordinator.last_loop_error_at)
 
 

@@ -32,6 +32,8 @@ from .analyzer_registry import (
     registered_checks,
     validate_analyzer_registry,
 )
+from .authentication import AuthenticationMaterial
+from .authorization_resource_discovery import ResourceDiscoverySink
 from .crawler import (
     CrawlCancellationToken,
     CrawlPageOutcome,
@@ -370,6 +372,8 @@ def run_passive_crawl_scan(
     checkpoint_callback: CheckpointCallback | None = None,
     before_request: BeforeRequestHook | None = None,
     after_request: AfterRequestHook | None = None,
+    authentication_material: AuthenticationMaterial | None = None,
+    resource_discovery: ResourceDiscoverySink | None = None,
 ) -> CrawlScanResult:
     """Crawl, analyse, checkpoint, or safely resume same-origin pages.
 
@@ -378,6 +382,17 @@ def run_passive_crawl_scan(
     persisted. A resumed crawl reuses the original scan ID, start time, policy,
     visited-page set, pending breadth-first queue, elapsed time, and consumed
     request-attempt budget.
+
+    ``authentication_material`` (Slice 9), when supplied, is threaded
+    straight through to ``crawler.crawl_same_origin`` -- the single
+    shared authentication-application mechanism, unchanged from Slice 7.
+    ``resource_discovery`` (Slice 9), when supplied, is visited with
+    every fetched page's response alongside the existing passive
+    analyzers -- this is the "reusable resource-discovery stage" that
+    turns authenticated pages into `AuthorizationResource` candidates
+    for the IDOR/BOLA engine. Neither parameter changes this function's
+    return value's shape; `CrawlScanResult`'s schema is unaffected by
+    either.
     """
 
     registry = validate_analyzer_registry(analyzers)
@@ -443,6 +458,8 @@ def run_passive_crawl_scan(
                 planned_checks,
             ),
         )
+        if resource_discovery is not None:
+            resource_discovery.visit_page(page_target, response)
 
     def checkpoint_state(state: CrawlResumeState) -> None:
         if checkpoint_callback is None:
@@ -504,6 +521,7 @@ def run_passive_crawl_scan(
         on_checkpoint=checkpoint_state,
         before_request=before_request,
         after_request=after_request,
+        authentication_material=authentication_material,
     )
 
     # Avoid reconstructing a pending queue from a count. The checkpoint callback

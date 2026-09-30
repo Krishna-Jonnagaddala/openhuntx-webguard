@@ -273,6 +273,18 @@ class Phase2AuthenticationAndRbacTests(unittest.TestCase):
             ApiPermission.SCHEDULE_READ,
             ApiPermission.SCHEDULE_UPDATE,
             ApiPermission.PERMIT_READ,
+            ApiPermission.FINDING_READ,
+            ApiPermission.FINDING_UPDATE,
+            ApiPermission.REPORT_CREATE,
+            ApiPermission.REPORT_READ,
+            ApiPermission.ASSET_READ,
+            ApiPermission.ASSET_MANAGE,
+            ApiPermission.TEAM_READ,
+            ApiPermission.MODULE_ENTITLEMENTS_READ,
+            ApiPermission.SOC_CONNECTOR_READ,
+            ApiPermission.COMPLIANCE_CATALOG_READ,
+            ApiPermission.COMPLIANCE_ASSERTION_READ,
+            ApiPermission.COMPLIANCE_ASSERTION_COLLECT,
         }
 
         for permission in ApiPermission:
@@ -287,6 +299,14 @@ class Phase2AuthenticationAndRbacTests(unittest.TestCase):
             ApiPermission.JOB_READ,
             ApiPermission.SCHEDULE_READ,
             ApiPermission.PERMIT_READ,
+            ApiPermission.FINDING_READ,
+            ApiPermission.REPORT_READ,
+            ApiPermission.ASSET_READ,
+            ApiPermission.TEAM_READ,
+            ApiPermission.MODULE_ENTITLEMENTS_READ,
+            ApiPermission.SOC_CONNECTOR_READ,
+            ApiPermission.COMPLIANCE_CATALOG_READ,
+            ApiPermission.COMPLIANCE_ASSERTION_READ,
         }
 
         for permission in ApiPermission:
@@ -312,11 +332,31 @@ class Phase2AuthenticationAndRbacTests(unittest.TestCase):
             token_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
         )
 
+        _OWNER_ONLY_PERMISSIONS = {
+            # Deliberately reserved to the organization owner -- see
+            # test_only_owner_may_issue_active_capability_permits and
+            # the authentication-context RBAC tests (Slice 7).
+            ApiPermission.PERMIT_ISSUE_ACTIVE,
+            ApiPermission.AUTHENTICATION_CONTEXT_REGISTER,
+            ApiPermission.AUTHENTICATION_CONTEXT_READ,
+            ApiPermission.AUTHENTICATION_CONTEXT_REVOKE,
+            ApiPermission.AUTHORIZATION_COMPARISON_REGISTER,
+            ApiPermission.AUTHORIZATION_COMPARISON_READ,
+            ApiPermission.AUTHORIZATION_COMPARISON_REVOKE,
+            # Turning SOC/Compliance on or off is an owner-only billing
+            # decision, not something an administrator can do. See
+            # PlatformExpansionApiTests.test_viewer_and_administrator_cannot_manage_module_entitlements.
+            ApiPermission.MODULE_ENTITLEMENTS_MANAGE,
+        }
         for permission in ApiPermission:
+            if permission in _OWNER_ONLY_PERMISSIONS:
+                continue
             self.assertTrue(
                 administrator.permits(permission),
                 permission.value,
             )
+        for permission in _OWNER_ONLY_PERMISSIONS:
+            self.assertFalse(administrator.permits(permission), permission.value)
 
     def test_analyst_cannot_invoke_privileged_service_operations(
         self,

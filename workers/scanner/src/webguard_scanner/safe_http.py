@@ -28,6 +28,7 @@ class FetchPolicy:
     maximum_header_bytes: int = 65_536
     maximum_header_count: int = 100
     allowed_methods: FrozenSet[str] = frozenset({"GET", "HEAD"})
+    maximum_request_body_bytes: int = 65_536
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +59,19 @@ class SafeHttpResponse:
     connected_address: str
     elapsed_milliseconds: int
     tls: TlsConnectionInfo | None = None
+
+
+_FORBIDDEN_REQUEST_HEADERS = frozenset(
+    {
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "forwarded",
+        "x-forwarded-host",
+        "x-forwarded-for",
+    }
+)
 
 
 class SafeRequestError(RuntimeError):
@@ -358,6 +372,12 @@ def _validate_policy(policy: FetchPolicy) -> None:
             "The response header-count limit must be greater than zero.",
         )
 
+    if policy.maximum_request_body_bytes < 0:
+        raise SafeRequestError(
+            "request_body_limit_invalid",
+            "The request-body limit cannot be negative.",
+        )
+
 
 def _canonical_addresses(
     addresses: Iterable[str],
@@ -605,6 +625,11 @@ def _perform_request(
     method: str,
     path: str,
     policy: FetchPolicy,
+    *,
+    body: bytes = b"",
+    content_type: str = "",
+    extra_headers: Tuple[Tuple[str, str], ...] = (),
+    allow_redirect_status: bool = False,
 ) -> SafeHttpResponse:
     connection = _make_connection(
         target,
@@ -668,19 +693,45 @@ def _perform_request(
             "Accept-Encoding",
             "identity",
         )
+        if body:
+            connection.putheader(
+                "Content-Type",
+                content_type or "application/octet-stream",
+            )
+            connection.putheader("Content-Length", str(len(body)))
+        # extra_headers is validated against _FORBIDDEN_REQUEST_HEADERS by
+        # fetch_once before this function is ever called -- re-checked
+        # here too as defense in depth, since this is the layer that
+        # actually writes bytes onto the wire.
+        for name, value in extra_headers:
+            if name.lower() in _FORBIDDEN_REQUEST_HEADERS:
+                raise SafeRequestError(
+                    "forbidden_request_header",
+                    f"Header {name!r} cannot be set through extra_headers.",
+                )
+            connection.putheader(name, value)
         connection.putheader(
             "Connection",
             "close",
         )
-        connection.endheaders()
+        # Calling endheaders() with zero arguments when there is no body
+        # is deliberately preserved byte-for-byte from before request
+        # bodies existed -- every existing fake connection in the test
+        # suite implements endheaders(self) with no parameters, and this
+        # keeps every GET/HEAD-only code path (the only paths those fakes
+        # exercise) calling it exactly as before.
+        if body:
+            connection.endheaders(body)
+        else:
+            connection.endheaders()
         # fetch_once's caller invokes its before_request/after_request
         # safety hooks (rate limiting, permit-attempt budget, circuit
         # breaker) exactly once per fetch_once call, regardless of how
-        # many resolved addresses it tries below. Once the full GET/HEAD
-        # request (no body, per FetchPolicy.allowed_methods) has actually
-        # gone out over the wire, any further failure is a failure of
-        # *this* accounted attempt, not grounds to silently send a second
-        # real request to another address under the same accounting.
+        # many resolved addresses it tries below. Once the full request
+        # has actually gone out over the wire, any further failure is a
+        # failure of *this* accounted attempt, not grounds to silently
+        # send a second real request to another address under the same
+        # accounting.
         request_sent = True
         tls = (
             _tls_connection_info(connection, target)
@@ -721,6 +772,7 @@ def _perform_request(
         if (
             300 <= response.status < 400
             and response.status != 304
+            and not allow_redirect_status
         ):
             raise SafeRequestError(
                 "redirect_blocked",
@@ -771,7 +823,17 @@ def _perform_request(
         raise
     finally:
         completed.set()
-        connection.close()
+        try:
+            connection.close()
+        except (
+            OSError,
+            ssl.SSLError,
+            http.client.HTTPException,
+        ):
+            # A cleanup-time failure must never replace the try block's
+            # outcome (a returned response or an already-raised error).
+            # The socket is being discarded either way.
+            pass
 
 @dataclass(frozen=True)
 class _ConnectionFailure:
@@ -887,8 +949,34 @@ def fetch_once(
     target: ValidatedTarget,
     method: str = "GET",
     policy: FetchPolicy = FetchPolicy(),
+    *,
+    body: bytes = b"",
+    content_type: str = "",
+    extra_headers: Tuple[Tuple[str, str], ...] = (),
+    allow_redirect_status: bool = False,
 ) -> SafeHttpResponse:
-    """Make one bounded request to an already validated target."""
+    """Make one bounded request to an already validated target.
+
+    ``body``/``content_type`` are optional and empty by default -- every
+    pre-existing GET/HEAD-only caller is unaffected. When ``body`` is
+    supplied it is checked against ``policy.maximum_request_body_bytes``
+    before any connection is attempted (fail closed on an oversized
+    request body, mirroring the existing response-body limit).
+
+    ``extra_headers`` (Slice 7: authentication support) is checked
+    against ``_FORBIDDEN_REQUEST_HEADERS`` before any connection is
+    attempted -- this is not a general header-injection mechanism, only
+    the path ``authentication.apply_authentication`` uses to attach
+    ``Authorization``/``Cookie``. Every other caller passes nothing here
+    and is unaffected.
+
+    ``allow_redirect_status`` (Slice 7: login workflow) lets a 3xx
+    response through instead of raising ``redirect_blocked`` -- this
+    never causes a second request to be issued to the redirect's target;
+    it only lets the caller read the ``Location`` header value as a
+    string (e.g. to check a login-success redirect marker). Every other
+    caller leaves this False and is unaffected.
+    """
 
     _validate_policy(policy)
 
@@ -899,6 +987,19 @@ def fetch_once(
             "method_not_allowed",
             f"HTTP method {normalised_method!r} is prohibited.",
         )
+
+    if body and len(body) > policy.maximum_request_body_bytes:
+        raise SafeRequestError(
+            "request_body_too_large",
+            "The request body exceeds the configured limit.",
+        )
+
+    for name, _ in extra_headers:
+        if name.lower() in _FORBIDDEN_REQUEST_HEADERS:
+            raise SafeRequestError(
+                "forbidden_request_header",
+                f"Header {name!r} cannot be set through extra_headers.",
+            )
 
     path = _request_path(target)
     addresses = _canonical_addresses(
@@ -915,6 +1016,10 @@ def fetch_once(
                 normalised_method,
                 path,
                 policy,
+                body=body,
+                content_type=content_type,
+                extra_headers=extra_headers,
+                allow_redirect_status=allow_redirect_status,
             )
         except SafeRequestError:
             raise

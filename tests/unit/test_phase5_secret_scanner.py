@@ -182,6 +182,34 @@ class Phase5SecretScannerTests(unittest.TestCase):
                 )
             )
 
+    def test_repository_files_excludes_claude_and_breach_by_policy(self) -> None:
+        """Slice 13 requirement 18 regression test: the real secret-scan
+        gate previously crashed enumerating this canonical repository
+        because `Breach/Checker/breach-checker/` is an untracked nested
+        git repository, and `git ls-files --others` reports a nested
+        repo as a single opaque directory path rather than descending
+        into it -- `repository_files()`'s `is_file()` check then raised.
+        The fix is `.gitignore` policy (`/Breach/`, `/.claude/`), not a
+        script-side workaround, so this test calls the real
+        `repository_files()` against the real, canonical repository --
+        the same function the actual gate runs -- and asserts both that
+        it succeeds and that nothing under either excluded path is
+        returned."""
+
+        files = scanner.repository_files()
+
+        self.assertTrue(files, "expected the real repository to enumerate at least one file")
+        for path in files:
+            relative = path.relative_to(REPOSITORY_ROOT).as_posix()
+            self.assertFalse(
+                relative.startswith("Breach/") or relative == "Breach",
+                f"Breach/ must be excluded from the secret-scan enumeration, found: {relative}",
+            )
+            self.assertFalse(
+                relative.startswith(".claude/") or relative == ".claude",
+                f".claude/ must be excluded from the secret-scan enumeration, found: {relative}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

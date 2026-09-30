@@ -1,6 +1,22 @@
 """OpenHuntX WebGuard authenticated local control-plane API."""
 
 from .auth import ApiPermission, ApiTokenAuthenticator, AuthContext, AuthenticationError
+from .authentication_contexts import (
+    AuthenticationContextError,
+    AuthenticationContextRecord,
+    AuthenticationContextRepository,
+    AuthenticationContextStatus,
+    AuthenticationMethod,
+)
+from .authorization_comparison import (
+    MAXIMUM_COMPARISONS_PER_PLAN,
+    MAXIMUM_RESOURCE_PAIRS_PER_PLAN,
+    AuthorizationComparisonError,
+    AuthorizationComparisonPlanRecord,
+    AuthorizationComparisonPlanRepository,
+    AuthorizationComparisonPlanStatus,
+    ResourcePairSpec,
+)
 from .authorizations import (
     MAXIMUM_AUTHORIZATION_FILES,
     AuthorizationRepository,
@@ -77,6 +93,18 @@ __all__ = [
     "ApiTransportError",
     "AuthContext",
     "AuthenticationError",
+    "AuthenticationContextError",
+    "AuthenticationContextRecord",
+    "AuthenticationContextRepository",
+    "AuthenticationContextStatus",
+    "AuthenticationMethod",
+    "MAXIMUM_COMPARISONS_PER_PLAN",
+    "MAXIMUM_RESOURCE_PAIRS_PER_PLAN",
+    "AuthorizationComparisonError",
+    "AuthorizationComparisonPlanRecord",
+    "AuthorizationComparisonPlanRepository",
+    "AuthorizationComparisonPlanStatus",
+    "ResourcePairSpec",
     "AuthorizationRepository",
     "AuthorizationRepositoryError",
     "DATABASE_SCHEMA_VERSION",

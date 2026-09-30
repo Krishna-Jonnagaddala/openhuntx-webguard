@@ -1,0 +1,73 @@
+name: openhuntx-webguard-postgres
+
+# Slice 12 requirement 8: an isolated, authenticated, disposable,
+# resource-bounded PostgreSQL service for local development and CI
+# integration testing -- deliberately separate from
+# `compose.lab.yml`'s Juice Shop target (that is a scan *target* for
+# the scanner to exercise; this is WebGuard's own infrastructure
+# dependency, and mixing the two networks/lifecycles would blur a
+# boundary this project otherwise keeps sharp everywhere else).
+#
+# Not for production: this is a disposable dev/CI container with a
+# dev-only default credential (overridable via
+# WEBGUARD_POSTGRES_PASSWORD), an ephemeral, wipeable volume, and no
+# TLS -- appropriate for a loopback-bound, single-host integration
+# service, never for a real deployment. Production PostgreSQL is AWS
+# RDS per docs/production/PROVIDER_EVALUATION.md, provisioned (if at
+# all) through infra/terraform, not this file.
+
+services:
+  postgres:
+    image: postgres:16.10-alpine@sha256:029660641a0cfc575b14f336ba448fb8a75fd595d42e1fa316b9fb4378742297
+    hostname: webguard-postgres
+    restart: "no"
+
+    environment:
+      POSTGRES_DB: webguard
+      POSTGRES_USER: webguard
+      POSTGRES_PASSWORD: ${WEBGUARD_POSTGRES_PASSWORD:-webguard_dev_only_not_for_production}
+
+    ports:
+      # Loopback-only -- never exposed beyond the local host, matching
+      # every other locally-run WebGuard service (the API server, the
+      # callback receiver, the Juice Shop lab target).
+      - "127.0.0.1:5433:5432"
+
+    networks:
+      - webguard-postgres
+
+    tmpfs:
+      # Ephemeral by design (requirement 8: "disposable") -- data does
+      # not survive a container recreation. This is a dev/integration
+      # service, not a place anything needs to durably persist; a real
+      # deployment's durability comes from RDS's own backup/PITR story
+      # (docs/production/BACKUP_RESTORE.md), not this container.
+      - /var/lib/postgresql/data
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webguard -d webguard"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+networks:
+  webguard-postgres:
+    name: openhuntx-webguard-postgres
+    driver: bridge

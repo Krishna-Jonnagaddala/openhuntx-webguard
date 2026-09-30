@@ -15,17 +15,30 @@ from .owned_targets import OwnedTargetContractError, canonicalize_owned_target_u
 from .scan_jobs import ScanJobMode
 
 
-CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.0"
-SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.0",)
+CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION = "1.3"
+SUPPORTED_TRUSTSCAN_PERMIT_SCHEMA_VERSIONS = ("1.3",)
 TRUSTSCAN_PERMIT_TYPE = "trustscan_scan_permit"
 TRUSTSCAN_SIGNATURE_ALGORITHM = "Ed25519"
+# P1-7 (docs/audit/WEBGUARD_FULL_SYSTEM_AUDIT_2026-08.md): every
+# provider actually wired as TrustScan's active signer today
+# (LocalDevelopmentSigner, CloudHsmSigningProvider/SigningServiceClient)
+# is Ed25519. KmsSigningProvider (ECDSA_SHA_256) is a real, tested
+# provider class -- see webguard_api.signing's own module docstring on
+# why it is never wired as active -- but nothing in this contract
+# should reject it outright if a future caller does wire it: the
+# signature is verified against whichever algorithm the signing key
+# was actually registered under (webguard_api.signing.SigningKeyRegistry),
+# never against this self-reported field, so accepting a second,
+# honestly-labeled algorithm here does not change what a permit's
+# signature must cryptographically satisfy to verify.
+SUPPORTED_TRUSTSCAN_SIGNATURE_ALGORITHMS = ("Ed25519", "ECDSA_SHA_256")
 MAXIMUM_TRUSTSCAN_PERMIT_DOCUMENT_BYTES = 128 * 1024
 MAXIMUM_TRUSTSCAN_PERMIT_VALIDITY_DAYS = 90
 MINIMUM_TRUSTSCAN_REQUESTS_PER_SECOND = 0.2
 MAXIMUM_TRUSTSCAN_REQUESTS_PER_SECOND = 2.0
 MAXIMUM_TRUSTSCAN_REQUEST_ATTEMPTS = 150
 TRUSTSCAN_V1_MAXIMUM_CONCURRENCY = 1
-TRUSTSCAN_ALLOWED_HTTP_METHODS = ("GET", "HEAD")
+TRUSTSCAN_ALLOWED_HTTP_METHODS = ("GET", "HEAD", "POST")
 TRUSTSCAN_PROHIBITED_OPERATIONS = (
     "autonomous_exploitation",
     "credential_attacks",
@@ -34,6 +47,19 @@ TRUSTSCAN_PROHIBITED_OPERATIONS = (
     "malware",
     "persistence",
     "social_engineering",
+)
+
+# The catalog of active (non-passive) detectors a permit may explicitly
+# authorize. A permit's active_checks claim must be a subset of this tuple.
+# Empty active_checks (the default) means passive-only -- fail closed.
+# Schema 1.1 replaces 1.0 outright rather than supporting both: WebGuard is
+# still pre-production (README: "not yet a publicly hosted production
+# service"), so there is no deployed 1.0 permit this would break.
+KNOWN_TRUSTSCAN_ACTIVE_CHECKS = (
+    "active.authorization.idor",
+    "active.sqli.error",
+    "active.ssrf.callback",
+    "active.xss.reflected",
 )
 
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
@@ -224,6 +250,61 @@ def _http_methods(value: object) -> tuple[str, ...]:
     return canonical
 
 
+def _active_checks(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_active_checks_invalid",
+            "active_checks must be a tuple.",
+        )
+    if any(not isinstance(item, str) for item in value):
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_active_checks_invalid",
+            "active_checks must contain detector identifier strings.",
+        )
+    canonical = tuple(sorted(set(value)))
+    if canonical != tuple(sorted(value)) or len(canonical) != len(value):
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_active_checks_non_canonical",
+            "active_checks must be sorted and unique.",
+        )
+    if any(item not in KNOWN_TRUSTSCAN_ACTIVE_CHECKS for item in canonical):
+        raise TrustScanPermitValidationError(
+            "trustscan_permit_active_checks_unknown",
+            "active_checks contains an unrecognized detector identifier.",
+        )
+    return canonical
+
+
+def _authentication_context_id(value: object) -> str | None:
+    """authentication_context_id is the signed binding that authorizes a
+    scan to apply a specific, separately-stored authentication context
+    (Slice 7) -- never the secret material itself, only its ID. None
+    (the default, and the only value every pre-Slice-7 permit can carry)
+    means this permit authorizes no authenticated scanning at all."""
+
+    if value is None:
+        return None
+    return _uuid(value, "authentication_context_id")
+
+
+def _authorization_comparison_plan_id(value: object) -> str | None:
+    """authorization_comparison_plan_id is the signed binding that
+    authorizes a scan to run the authorization-comparison (IDOR/BOLA)
+    detector under a specific, separately-stored comparison plan (Slice
+    8) -- never the two identities' secret material, only a reference to
+    the plan that names which two already-registered authentication
+    contexts may be compared. Deliberately a separate claim from
+    authentication_context_id, not a reinterpretation of it: a single-
+    identity authenticated scan and a two-identity comparison scan are
+    different capabilities, independently authorized. None (the default,
+    and the only value every pre-Slice-8 permit can carry) means this
+    permit authorizes no authorization-comparison scanning at all."""
+
+    if value is None:
+        return None
+    return _uuid(value, "authorization_comparison_plan_id")
+
+
 def _prohibited_operations(value: object) -> tuple[str, ...]:
     if not isinstance(value, tuple) or value != TRUSTSCAN_PROHIBITED_OPERATIONS:
         raise TrustScanPermitValidationError(
@@ -306,6 +387,9 @@ class TrustScanPermitSubmission:
     maximum_request_attempts: int
     maximum_requests_per_second: float
     maximum_concurrency: int = TRUSTSCAN_V1_MAXIMUM_CONCURRENCY
+    active_checks: tuple[str, ...] = ()
+    authentication_context_id: str | None = None
+    authorization_comparison_plan_id: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -361,6 +445,17 @@ class TrustScanPermitSubmission:
                 "TrustScan permit v1 requires maximum_concurrency to be 1.",
             )
         object.__setattr__(self, "maximum_concurrency", concurrency)
+        object.__setattr__(self, "active_checks", _active_checks(self.active_checks))
+        object.__setattr__(
+            self,
+            "authentication_context_id",
+            _authentication_context_id(self.authentication_context_id),
+        )
+        object.__setattr__(
+            self,
+            "authorization_comparison_plan_id",
+            _authorization_comparison_plan_id(self.authorization_comparison_plan_id),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,6 +477,9 @@ class TrustScanPermitClaims:
     maximum_requests_per_second: float
     maximum_concurrency: int = TRUSTSCAN_V1_MAXIMUM_CONCURRENCY
     prohibited_operations: tuple[str, ...] = TRUSTSCAN_PROHIBITED_OPERATIONS
+    active_checks: tuple[str, ...] = ()
+    authentication_context_id: str | None = None
+    authorization_comparison_plan_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "permit_id", _uuid(self.permit_id, "permit_id"))
@@ -446,6 +544,17 @@ class TrustScanPermitClaims:
             "prohibited_operations",
             _prohibited_operations(self.prohibited_operations),
         )
+        object.__setattr__(self, "active_checks", _active_checks(self.active_checks))
+        object.__setattr__(
+            self,
+            "authentication_context_id",
+            _authentication_context_id(self.authentication_context_id),
+        )
+        object.__setattr__(
+            self,
+            "authorization_comparison_plan_id",
+            _authorization_comparison_plan_id(self.authorization_comparison_plan_id),
+        )
 
     @property
     def fingerprint(self) -> str:
@@ -472,12 +581,22 @@ class TrustScanPermitClaims:
             "maximum_requests_per_second": self.maximum_requests_per_second,
             "maximum_concurrency": self.maximum_concurrency,
             "prohibited_operations": list(self.prohibited_operations),
+            "active_checks": list(self.active_checks),
+            "authentication_context_id": self.authentication_context_id,
+            "authorization_comparison_plan_id": self.authorization_comparison_plan_id,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class SignedTrustScanPermit:
-    """One Ed25519-signed TrustScan permit document."""
+    """One signed TrustScan permit document. ``signature_algorithm``
+    self-reports which of ``SUPPORTED_TRUSTSCAN_SIGNATURE_ALGORITHMS``
+    produced ``signature`` -- every provider actually wired as
+    TrustScan's active signer today produces Ed25519, but this field
+    exists so that self-report stays true if that ever changes; the
+    signature is verified against the signing key's own registered
+    algorithm (webguard_api.signing.SigningKeyRegistry), never against
+    this field."""
 
     claims: TrustScanPermitClaims
     signing_key_id: str
@@ -502,10 +621,10 @@ class SignedTrustScanPermit:
                 "trustscan_permit_schema_unsupported",
                 "TrustScan permit schema_version is unsupported.",
             )
-        if self.signature_algorithm != TRUSTSCAN_SIGNATURE_ALGORITHM:
+        if self.signature_algorithm not in SUPPORTED_TRUSTSCAN_SIGNATURE_ALGORITHMS:
             raise TrustScanPermitValidationError(
                 "trustscan_permit_signature_algorithm_invalid",
-                "TrustScan permit signature algorithm must be Ed25519.",
+                "TrustScan permit signature algorithm is not supported.",
             )
         if not isinstance(self.signing_key_id, str) or not _KEY_ID.fullmatch(self.signing_key_id):
             raise TrustScanPermitValidationError(
@@ -557,15 +676,24 @@ def load_trustscan_permit_submission_json(document: str | bytes) -> TrustScanPer
             "maximum_request_attempts",
             "maximum_requests_per_second",
             "maximum_concurrency",
+            "active_checks",
+            "authentication_context_id",
+            "authorization_comparison_plan_id",
         },
         context="TrustScan permit submission",
     )
     mode_values = root["permitted_modes"]
     method_values = root["allowed_http_methods"]
-    if not isinstance(mode_values, list) or not isinstance(method_values, list):
+    active_check_values = root["active_checks"]
+    if (
+        not isinstance(mode_values, list)
+        or not isinstance(method_values, list)
+        or not isinstance(active_check_values, list)
+    ):
         raise TrustScanPermitLoadError(
             "trustscan_permit_list_required",
-            "permitted_modes and allowed_http_methods must be JSON arrays.",
+            "permitted_modes, allowed_http_methods, and active_checks must "
+            "be JSON arrays.",
         )
     try:
         submission = TrustScanPermitSubmission(
@@ -579,6 +707,9 @@ def load_trustscan_permit_submission_json(document: str | bytes) -> TrustScanPer
             maximum_request_attempts=root["maximum_request_attempts"],
             maximum_requests_per_second=root["maximum_requests_per_second"],
             maximum_concurrency=root["maximum_concurrency"],
+            active_checks=tuple(active_check_values),
+            authentication_context_id=root["authentication_context_id"],
+            authorization_comparison_plan_id=root["authorization_comparison_plan_id"],
         )
     except ValueError as exc:
         if isinstance(exc, TrustScanPermitContractError):
@@ -614,6 +745,9 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
             "maximum_requests_per_second",
             "maximum_concurrency",
             "prohibited_operations",
+            "active_checks",
+            "authentication_context_id",
+            "authorization_comparison_plan_id",
         },
         context="TrustScan permit claims",
     )
@@ -625,7 +759,11 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
     mode_values = claims["permitted_modes"]
     method_values = claims["allowed_http_methods"]
     prohibited_values = claims["prohibited_operations"]
-    if not all(isinstance(value, list) for value in (mode_values, method_values, prohibited_values)):
+    active_check_values = claims["active_checks"]
+    if not all(
+        isinstance(value, list)
+        for value in (mode_values, method_values, prohibited_values, active_check_values)
+    ):
         raise TrustScanPermitLoadError(
             "trustscan_permit_list_required",
             "Permit list fields must be JSON arrays.",
@@ -650,6 +788,9 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
                 maximum_requests_per_second=claims["maximum_requests_per_second"],
                 maximum_concurrency=claims["maximum_concurrency"],
                 prohibited_operations=tuple(prohibited_values),
+                active_checks=tuple(active_check_values),
+                authentication_context_id=claims["authentication_context_id"],
+                authorization_comparison_plan_id=claims["authorization_comparison_plan_id"],
             ),
             signature_algorithm=signature["algorithm"],
             signing_key_id=signature["key_id"],
@@ -681,6 +822,7 @@ def load_signed_trustscan_permit_json(document: str | bytes) -> SignedTrustScanP
 
 __all__ = [
     "CURRENT_TRUSTSCAN_PERMIT_SCHEMA_VERSION",
+    "KNOWN_TRUSTSCAN_ACTIVE_CHECKS",
     "MAXIMUM_TRUSTSCAN_PERMIT_DOCUMENT_BYTES",
     "MAXIMUM_TRUSTSCAN_PERMIT_VALIDITY_DAYS",
     "MAXIMUM_TRUSTSCAN_REQUEST_ATTEMPTS",

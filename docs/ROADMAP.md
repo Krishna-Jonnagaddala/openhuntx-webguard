@@ -1,10 +1,18 @@
 # OpenHuntX WebGuard Roadmap
 
+> **This document is historical, marked so 2026-09-15.** It describes WebGuard as it existed before Milestone 1.32: no PostgreSQL, no tenant isolation, no web frontend, no organizations/RBAC, no OpenHuntX SOC or Compliance. All of that has since been built. Several items this roadmap lists as "planned" have since shipped, including: production asset registration and ownership verification (`target_verification.py`, both well-known-file and DNS TXT methods), a hosted web/API control plane (19-page frontend, `apps/web/`; PostgreSQL-backed `apps/api/`), KMS/HSM-backed TrustScan signing key custody (`signing.py`: KMS and CloudHSM providers, though neither is wired as the active signer yet), and coverage truth maps (Coverage Truth Map v1, `coverage_records`). For current, actively-maintained scope and status, use `docs/PLATFORM_SCOPE.md` (scope contract), `docs/PROJECT_EXECUTION_LEDGER.md` (requirement-level status), `docs/PRODUCT_VISION_TRACEABILITY.md` (WebGuard's ten-pillar vision status), and `docs/IMPLEMENTATION_STATUS.md` (layer-level rollup). The rest of this file is preserved unedited below as a historical record of the project's own early planning, not as a claim about current state.
+
 ## Status language
 
 This roadmap separates implemented capability from planned work. Planned items are not current product claims and may change as security, legal, customer, and engineering requirements evolve.
 
-## Implemented foundation — through Milestone 1.32
+## Platform scope
+
+OpenHuntX WebGuard's end goal is a product with one shared scanner/security engine consumed by three interfaces: a web application (primary customer interface), an API (control plane), a CLI (developer/DevSecOps interface), and eventually a private-network scanning agent. **The scanner is the engine; WebGuard is the platform.** No interface may implement its own scanning or authorization logic: all of them call the same `ScanJobExecutor`, the same TrustScan permit model, the same active-detector registry.
+
+Today, only two of those interfaces exist: the `webguard-api` CLI and its local, loopback-only HTTP API (`apps/api/`). There is no web application, no hosted/multi-instance deployment, no PostgreSQL/Redis, and no enterprise agent. This is a real gap against the platform vision, not a hidden one. See `docs/audit/production-gap-matrix.md` for the full inventory and "Control-plane and runner separation" below for what a hosted control plane requires. Per the project's own stated priority, closing this gap comes *after* the current detection-engine work (candidate discovery, additional detector classes, finding/evidence stabilization), not before it: building a web frontend or a PostgreSQL migration on top of an unstable scanner contract would mean redoing that work later.
+
+## Implemented foundation, through Milestone 1.32
 
 The current local engineering foundation includes:
 
@@ -97,6 +105,22 @@ Planned areas may include:
 - carefully permissioned active checks.
 
 Active exploitation, denial-of-service testing, password attacks, persistence, destructive testing, or unverified third-party testing are not part of the current initial release scope.
+
+### Detection architecture and CWE coverage
+
+Today's passive analyzers (`cors_analyzer`, `header_analyzer`, `cookie_analyzer`, `html_analyzer`, `disclosure_analyzer`, `tls_analyzer`) already attach CWE identifiers to findings; see `docs/CWE_COVERAGE.md` for the current implemented/planned registry. Growing this into a standardised detection framework is planned, not yet built:
+
+- a common `SecurityCheck` interface (check ID, CWE/OWASP mapping, severity, confidence, detection mode, prerequisites) so new checks are additive rather than bespoke;
+- a finding model that separates severity from confidence, and separates "indicator detected" from "exploitability confirmed";
+- an evidence model (request, response, reproduction data, evidence hash) sufficient to reproduce a finding independently of the original scan run;
+- check and scanner-engine versioning, so historical findings remain reproducible against the check version that produced them;
+- finding lifecycle and deduplication (open/confirmed/false-positive/accepted-risk/resolved), so one underlying weakness does not produce duplicate findings across pages;
+- OWASP and CVSS classification layered on top of CWE, with CVSS only assigned when evidence supports it; and
+- SARIF, JSON, and CSV export alongside the existing report formats.
+
+Every new active check must still cross the TrustScan permit boundary described above; this section extends detection breadth, not the authorization model.
+
+CWE coverage claims must always be honest and specific: WebGuard tracks web-relevant, externally observable CWE classes with transparent per-CWE status (implemented / partial / planned / not applicable), not a claim of covering the full CWE catalog. See `docs/CWE_COVERAGE.md`.
 
 ### Reporting and interoperability
 
