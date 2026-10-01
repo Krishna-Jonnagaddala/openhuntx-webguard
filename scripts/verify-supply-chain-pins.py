@@ -181,9 +181,10 @@ if re.search(r"uses:\s+actions/(?:checkout|setup-python)@v", workflow):
     fail("a moving GitHub Action major-version tag remains in CI")
 # Slice 18 added terraform, frontend, and frontend-e2e to the original
 # four jobs (unit-tests, security-gates, authorised-lab-integration,
-# postgresql-integration) -- a deliberately reviewed count, bumped as
-# part of this change rather than left silently unenforced.
-if workflow.count(f"runs-on: {EXPECTED_RUNNER}") != 7:
+# postgresql-integration). The CLI release pass added cli-packaging on
+# top of that -- a deliberately reviewed count, bumped as part of this
+# change rather than left silently unenforced.
+if workflow.count(f"runs-on: {EXPECTED_RUNNER}") != 8:
     fail("CI runner count or reviewed Ubuntu runner pin changed")
 if "runs-on: ubuntu-latest" in workflow:
     fail("CI still uses the moving ubuntu-latest runner label")
