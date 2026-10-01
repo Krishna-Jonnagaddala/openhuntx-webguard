@@ -71,6 +71,7 @@ from .owned_target import (
     OWNED_DEFAULT_CRAWL_REQUEST_ATTEMPTS,
     OwnedTargetPreflight,
     OwnedTargetPreflightError,
+    validate_owned_target_authorization_static,
     validate_owned_target_preflight,
 )
 from .passive_scan import ENGINE_VERSION, run_passive_header_scan
@@ -88,6 +89,7 @@ from .scope_validator import (
     TargetValidationError,
     ValidationMode,
     ValidationPolicy,
+    canonicalize_target_url,
     validate_target_url,
 )
 
@@ -1236,6 +1238,41 @@ def _scan_command(args: argparse.Namespace) -> int:
                 exit_code=EXIT_OUTPUT_FAILED,
             )
         _check_output_path(audit_path, overwrite=args.overwrite)
+
+    if authorization is not None:
+        # Reject a malformed, expired, confirmation-mismatched, or
+        # out-of-scope authorization using only the canonicalised URL
+        # string, before validate_target_url's DNS resolution below ever
+        # runs. This is an additional, earlier gate, not a replacement for
+        # the full re-check validate_owned_target_preflight still performs
+        # against the actual resolved target further down -- destination
+        # validation (DNS resolution, private/reserved-address rejection)
+        # still runs in full and still gates every connection exactly as
+        # before.
+        try:
+            early_canonical_target = canonicalize_target_url(
+                args.target,
+                validation_policy,
+            )
+        except TargetValidationError as exc:
+            raise CliControlledError(
+                getattr(exc, "code", "target_validation_failed"),
+                str(exc),
+                exit_code=EXIT_PREFLIGHT_FAILED,
+            ) from exc
+        try:
+            validate_owned_target_authorization_static(
+                authorization,
+                early_canonical_target,
+                confirmation=args.confirm_authorization,
+                now=_utc_now(),
+            )
+        except OwnedTargetPreflightError as exc:
+            raise CliControlledError(
+                exc.code,
+                exc.message,
+                exit_code=EXIT_PREFLIGHT_FAILED,
+            ) from exc
 
     try:
         target = validate_target_url(
