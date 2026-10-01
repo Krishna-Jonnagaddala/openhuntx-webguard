@@ -108,7 +108,7 @@ jobs:
           /tmp/webguard-clean-venv/bin/pip install \
             --no-index \
             --find-links dist \
-            openhuntx-webguard-scanner
+            openhuntx-webguard
 
       - name: Exercise the installed CLI outside the repository checkout
         run: |

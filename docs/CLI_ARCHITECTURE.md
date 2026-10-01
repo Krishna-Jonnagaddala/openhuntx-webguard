@@ -58,20 +58,20 @@ The monorepo already had three independent Python packages before this release:
 | Package | Depends on | Ships in the CLI wheel? |
 |---|---|---|
 | `openhuntx-webguard-contracts` (`packages/contracts/python`) | nothing | yes |
-| `openhuntx-webguard-scanner` (`workers/scanner`) | contracts only | yes — this *is* the CLI |
+| `openhuntx-webguard` (`workers/scanner`) | contracts only | yes, this *is* the CLI |
 | `openhuntx-webguard-api` (`apps/api`) | contracts, scanner, PostgreSQL, KMS/HSM signing, Argon2, DNS | no |
 
-`workers/scanner` already had zero import-time dependency on `apps/api` and already declared its own `webguard` console-script entry point (`workers/scanner/pyproject.toml`). Building and distributing `workers/scanner` on its own — rather than writing a new CLI from scratch, or trying to strip the API package down — was the smallest change that produces a correct, complete, standalone tool: `pip wheel workers/scanner` naturally excludes every line of `apps/api` and `apps/web`, with no manual file-exclusion list to maintain or get wrong.
+`workers/scanner` already had zero import-time dependency on `apps/api` and already declared its own `webguard` console-script entry point (`workers/scanner/pyproject.toml`). Building and distributing `workers/scanner` on its own, rather than writing a new CLI from scratch or trying to strip the API package down, was the smallest change that produces a correct, complete, standalone tool: `pip wheel workers/scanner` naturally excludes every line of `apps/api` and `apps/web`, with no manual file-exclusion list to maintain or get wrong. The package itself is named `openhuntx-webguard` (renamed from the original `openhuntx-webguard-scanner` once it became a standalone product rather than one component among several); the `webguard` command name hasn't changed.
 
 This also means the two products can't accidentally share a trust boundary. The CLI's authorization model (self-attested, fingerprinted, no central identity) and the archived SaaS layer's model (centrally issued accounts, cryptographic TrustScan permits) are different designs for different problems, and neither package can reach into the other's code to blur that line.
 
 ## What changed in this release
 
-Everything below was added to `workers/scanner/src/webguard_scanner/cli.py`; nothing in the scan/authorization/report engine itself needed to change to become a CLI product — it already was one.
+Everything below was added to `workers/scanner/src/webguard_scanner/cli.py`; nothing in the scan/authorization/report engine itself needed to change to become a CLI product, it already was one.
 
-- `webguard init` — scaffolds `authorizations/`, `scan-results/`, `reports/` with `0700` permissions.
-- `webguard doctor` — environment diagnostics (Python version, package versions, write access, free disk space) with **no network calls**; target reachability is intentionally left to each scan's own preflight, not duplicated here.
-- `webguard results list` / `webguard results clean` — list or prune stored scan-result files in a directory, including graceful handling of unreadable/corrupt files and a dry-run-by-default delete.
+- `webguard init`: scaffolds `authorizations/`, `scan-results/`, `reports/` with `0700` permissions.
+- `webguard doctor`: environment diagnostics (Python version, package versions, write access, free disk space) with **no network calls**; target reachability is intentionally left to each scan's own preflight, not duplicated here.
+- `webguard results list` / `webguard results clean`: list or prune stored scan-result files in a directory, including graceful handling of unreadable/corrupt files and a dry-run-by-default delete.
 - A fail-closed catch-all in `main()`: unhandled exceptions now exit `6` with the exception type and message instead of a raw traceback or (if ever introduced by a future bug) silently reporting success; `Ctrl-C` now exits `130` with a clean message instead of a stack trace.
 
 See the root [README](../README.md) for the full command reference and [`docs/CASE_STUDY.md`](CASE_STUDY.md) for the reasoning behind the broader pivot from a hosted platform to a CLI tool.

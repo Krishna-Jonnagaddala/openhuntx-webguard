@@ -1726,7 +1726,7 @@ def _doctor_command(args: argparse.Namespace) -> int:
     ))
 
     for distribution_name in (
-        "openhuntx-webguard-scanner",
+        "openhuntx-webguard",
         "openhuntx-webguard-contracts",
     ):
         try:

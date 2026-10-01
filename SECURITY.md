@@ -2,9 +2,9 @@
 
 ## Product status
 
-WebGuard is a local, terminal-only CLI tool under active pre-1.0 development. It is not a hosted service — there is no server, account, or network call besides the HTTP(S) request it sends to the target you name.
+WebGuard is a local, terminal-only CLI tool under active pre-1.0 development. It is not a hosted service: there is no server, account, or network call besides the HTTP(S) request it sends to the target you name.
 
-An archived, no-longer-maintained multi-tenant SaaS layer exists in this repository's history (`apps/api`, `apps/web`) — see [`docs/LEGACY_PLATFORM.md`](docs/LEGACY_PLATFORM.md). This policy describes the active CLI product, not that archived layer.
+An archived, no-longer-maintained multi-tenant SaaS layer exists in this repository's history (`apps/api`, `apps/web`). See [`docs/LEGACY_PLATFORM.md`](docs/LEGACY_PLATFORM.md). This policy describes the active CLI product, not that archived layer.
 
 ## Supported versions
 
@@ -36,7 +36,7 @@ Do not include real target credentials, API keys, or any third party's data. Red
 
 ## Scope of authorized testing
 
-WebGuard must only be used against targets the operator owns or is explicitly authorized to assess. A reachable hostname or working HTTP endpoint does not by itself establish permission to test it. The CLI's authorization document (`webguard authorization create`) is self-attested, fingerprinted, local record-keeping — it records what the operator asserted, not independently-verified legal permission.
+WebGuard must only be used against targets the operator owns or is explicitly authorized to assess. A reachable hostname or working HTTP endpoint does not by itself establish permission to test it. The CLI's authorization document (`webguard authorization create`) is self-attested, fingerprinted, local record-keeping: it records what the operator asserted, not independently-verified legal permission.
 
 Do not use testing WebGuard itself as a reason to send traffic to an unrelated third-party target. Use an isolated lab target (`--lab`) or a system you have explicit permission to test.
 
@@ -63,6 +63,6 @@ If you believe a secret or sensitive scan artifact was accidentally committed, t
 
 ## Security design documentation
 
-- [`docs/CLI_ARCHITECTURE.md`](docs/CLI_ARCHITECTURE.md) — current CLI architecture and package boundaries.
-- [`README.md`](README.md) — authorization model, security decisions and trade-offs, exit codes.
-- [`docs/LEGACY_PLATFORM.md`](docs/LEGACY_PLATFORM.md) — pointers into the archived SaaS platform's own (no-longer-current) threat model and architecture docs, for historical reference only.
+- [`docs/CLI_ARCHITECTURE.md`](docs/CLI_ARCHITECTURE.md): current CLI architecture and package boundaries.
+- [`README.md`](README.md): authorization model, security decisions and trade-offs, exit codes.
+- [`docs/LEGACY_PLATFORM.md`](docs/LEGACY_PLATFORM.md): pointers into the archived SaaS platform's own (no-longer-current) threat model and architecture docs, for historical reference only.
