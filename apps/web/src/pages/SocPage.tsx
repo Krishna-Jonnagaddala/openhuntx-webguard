@@ -69,10 +69,17 @@ export function SocPage() {
   const { data: entitlements, isLoading: entitlementsLoading } = useModuleEntitlements();
   const { session } = useAuth();
   const socEntitlement = entitlements?.entitlements.find((entitlement) => entitlement.module === "soc");
+  // Deployment-wide availability (is SOC offered at all) is read from
+  // deployment_availability, which is present for every module
+  // regardless of whether this organization has an entitlement row --
+  // unlike socEntitlement itself, which is legitimately absent for an
+  // organization with zero rows (see the backend's own
+  // list_module_entitlements docstring). Missing or still-loading data
+  // must not imply availability, so this defaults to false, never true.
   // Never fetch the connector catalog until we know whether this
   // deployment offers SOC at all: available=false must never reach
   // the server, since the route itself now rejects it there too.
-  const available = entitlements ? (socEntitlement?.available ?? true) : false;
+  const available = entitlements?.deployment_availability.soc ?? false;
   const { data, isLoading, error } = useSocConnectors(available);
 
   return (

@@ -763,7 +763,13 @@ class CustomerPlatformApiTests(unittest.TestCase):
     def test_module_entitlements_route_returns_an_empty_list_for_this_fixture_organization(self) -> None:
         status, _, payload = self.json_request("GET", "/v1/module-entitlements")
         self.assertEqual(status, 200, payload)
-        self.assertEqual(payload, {"entitlements": []})
+        self.assertEqual(
+            payload,
+            {
+                "entitlements": [],
+                "deployment_availability": {"webguard": True, "soc": True, "compliance": True},
+            },
+        )
 
     def test_soc_connectors_route_returns_the_three_real_manifests(self) -> None:
         status, _, payload = self.json_request("GET", "/v1/soc/connectors")
@@ -883,6 +889,139 @@ class CustomerPlatformApiTests(unittest.TestCase):
         self.assertEqual(status, 200, history)
         self.assertEqual(len(history["collections"]), 1)
         self.assertEqual(history["collections"][0]["collection_id"], created["collection_id"])
+
+
+class WebGuardOnlyReleaseGateOverRealHttpTests(unittest.TestCase):
+    """WebGuardOnlyReleaseGateTests (test_platform_expansion_api.py) proves
+    the deployment-wide gate at the service layer; nothing previously
+    drove it through the real HTTP transport this product's one real
+    client (the browser) actually uses. Same harness as
+    CustomerPlatformApiTests, but the service is constructed with
+    enabled_modules restricted to WebGuard only, matching the real
+    WEBGUARD_ENABLED_MODULES production configuration."""
+
+    def setUp(self) -> None:
+        from webguard_api.module_entitlements import InMemoryModuleEntitlementRepository
+        from webguard_contracts import ModuleEntitlementStatus, PlatformModule
+
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        auth_dir = root / "authorizations"
+        write_authorization(auth_dir)
+        store = ScanJobStore(root / "jobs.sqlite3")
+        identity, self.owner_context, self.owner_token = create_identity_fixture(store.path)
+        _, self.viewer_context, self.viewer_token = create_identity_fixture(
+            store.path, role=OrganizationRole.VIEWER, principal_id=VIEWER_ID, token_id=VIEWER_TOKEN_ID,
+        )
+        self.entitlements = InMemoryModuleEntitlementRepository()
+        # Entitled ENABLED on purpose: every assertion below has to show
+        # the deployment gate rejects it anyway, not merely that
+        # entitlement was never granted (test_platform_expansion_api.py's
+        # WebGuardOnlyReleaseGateTests docstring, identical reasoning).
+        self.entitlements.grant_default_entitlements(self.owner_context.organization_id, now=NOW)
+        self.entitlements.set_entitlement(
+            self.owner_context.organization_id, PlatformModule.SOC,
+            status=ModuleEntitlementStatus.ENABLED, now=NOW, changed_by=self.owner_context.principal_id,
+        )
+        self.entitlements.set_entitlement(
+            self.owner_context.organization_id, PlatformModule.COMPLIANCE,
+            status=ModuleEntitlementStatus.ENABLED, now=NOW, changed_by=self.owner_context.principal_id,
+        )
+        self.service = WebGuardJobService(
+            store=store,
+            authorizations=AuthorizationRepository(auth_dir),
+            identity=identity,
+            clock=lambda: NOW,
+            module_entitlements=self.entitlements,
+            enabled_modules=frozenset({PlatformModule.WEBGUARD}),
+        )
+        self.server = create_server(
+            "127.0.0.1", 0, self.service,
+            authenticator=ApiTokenAuthenticator(identity),
+            rate_limiter=FixedWindowRateLimiter(requests=200, window_seconds=60),
+            maximum_request_bytes=4096,
+            clock=lambda: NOW,
+            epoch_clock=lambda: 1000.0,
+        )
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.host, self.port = self.server.server_address[:2]
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.temporary.cleanup()
+
+    def request(self, method, path, body=None, headers=None, *, token="owner"):
+        effective = dict(headers or {})
+        if body is not None and "Content-Type" not in effective:
+            effective["Content-Type"] = "application/json"
+        if token == "owner":
+            effective.setdefault("Authorization", f"Bearer {self.owner_token}")
+        elif token == "viewer":
+            effective.setdefault("Authorization", f"Bearer {self.viewer_token}")
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=3)
+        connection.request(method, path, body=body, headers=effective)
+        response = connection.getresponse()
+        payload = response.read()
+        status = response.status
+        connection.close()
+        return status, payload
+
+    def json_request(self, method, path, body=None, headers=None, *, token="owner"):
+        raw = None if body is None else json.dumps(body).encode()
+        status, payload = self.request(method, path, raw, headers, token=token)
+        return status, json.loads(payload) if payload else None
+
+    def test_soc_connectors_route_404s_over_real_http_despite_org_entitlement(self) -> None:
+        status, payload = self.json_request("GET", "/v1/soc/connectors")
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload["error"]["code"], "module_not_available_in_this_deployment")
+
+    def test_compliance_frameworks_route_404s_over_real_http_despite_org_entitlement(self) -> None:
+        status, payload = self.json_request("GET", "/v1/compliance/frameworks")
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload["error"]["code"], "module_not_available_in_this_deployment")
+
+    def test_compliance_assertions_route_404s_over_real_http_despite_org_entitlement(self) -> None:
+        status, payload = self.json_request("GET", "/v1/compliance/assertions")
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload["error"]["code"], "module_not_available_in_this_deployment")
+
+    def test_owner_cannot_enable_soc_over_real_http_when_the_deployment_does_not_offer_it(self) -> None:
+        # The deployment gate outranks the owner's own toggle, checked
+        # with a valid CSRF-equivalent bearer token (real auth), not
+        # merely blocked earlier by a permission check: an owner who
+        # genuinely has MODULE_ENTITLEMENTS_MANAGE still gets the
+        # identical 404 a non-existent route would give.
+        status, payload = self.json_request(
+            "PATCH", "/v1/module-entitlements/soc", {"status": "enabled"}
+        )
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload["error"]["code"], "module_not_available_in_this_deployment")
+
+    def test_non_owner_also_gets_the_deployment_404_not_a_permission_error(self) -> None:
+        # A low-privilege caller must see the identical "this route does
+        # not exist here" outcome, not a different error that would let
+        # them distinguish "module gated" from "I lack permission".
+        status, payload = self.json_request("GET", "/v1/soc/connectors", token="viewer")
+        self.assertEqual(status, 404, payload)
+        self.assertEqual(payload["error"]["code"], "module_not_available_in_this_deployment")
+
+    def test_module_entitlements_route_reports_deployment_availability_over_real_http(self) -> None:
+        status, payload = self.json_request("GET", "/v1/module-entitlements")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(
+            payload["deployment_availability"],
+            {"webguard": True, "soc": False, "compliance": False},
+        )
+        # The org's own entitlement status is still reported honestly
+        # (ENABLED, set in setUp): the deployment gate and the org's
+        # entitlement are deliberately separate facts over the wire too.
+        status_by_module = {row["module"]: row["status"] for row in payload["entitlements"]}
+        self.assertEqual(status_by_module["soc"], "enabled")
+        self.assertEqual(status_by_module["compliance"], "enabled")
 
 
 if __name__ == "__main__":

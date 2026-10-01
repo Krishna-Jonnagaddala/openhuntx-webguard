@@ -531,6 +531,11 @@ class WebGuardOnlyReleaseGateTests(unittest.TestCase):
         status_by_module = {row["module"]: row["status"] for row in payload["entitlements"]}
         self.assertEqual(status_by_module["soc"], "enabled")
         self.assertEqual(status_by_module["compliance"], "enabled")
+        # The row-independent view must agree with the per-row one above.
+        self.assertEqual(
+            payload["deployment_availability"],
+            {"webguard": True, "soc": False, "compliance": False},
+        )
 
     def test_default_construction_offers_every_module(self) -> None:
         # The fixture used by every other test class in this file never
@@ -549,6 +554,43 @@ class WebGuardOnlyReleaseGateTests(unittest.TestCase):
         self.assertEqual(
             available_by_module,
             {"webguard": True, "soc": True, "compliance": True},
+        )
+        self.assertEqual(
+            payload["deployment_availability"],
+            {"webguard": True, "soc": True, "compliance": True},
+        )
+
+    def test_deployment_availability_is_reported_even_with_zero_entitlement_rows(self) -> None:
+        # Release-checklist "Newly found" item: an organization with no
+        # entitlement rows at all (legitimate -- see
+        # list_module_entitlements's own docstring) has no row for a
+        # frontend to read a per-module "available" off of. This is
+        # exactly the case that caused SocPage.tsx/ComplianceAssertionsPage.tsx/
+        # ComplianceOverviewPage.tsx to default `available` to `true`
+        # via `?? true`, silently claiming a deployment-restricted
+        # module was available. deployment_availability must report the
+        # real, restricted answer regardless of whether this
+        # organization has any entitlement rows. A genuinely separate
+        # organization (its own store) is used rather than self.owner's,
+        # since setUp already granted that one entitlement rows.
+        legacy_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(legacy_temporary.cleanup)
+        legacy_root = Path(legacy_temporary.name)
+        legacy_store = ScanJobStore(legacy_root / "jobs.sqlite3")
+        legacy_identity, legacy_owner, _ = create_identity_fixture(legacy_store.path)
+        legacy_service = WebGuardJobService(
+            store=legacy_store,
+            authorizations=AuthorizationRepository(legacy_root / "authorizations"),
+            identity=legacy_identity,
+            clock=lambda: NOW,
+            module_entitlements=InMemoryModuleEntitlementRepository(),
+            enabled_modules=frozenset({PlatformModule.WEBGUARD}),
+        )
+        payload = legacy_service.list_module_entitlements(legacy_owner, request_id=_rid())
+        self.assertEqual(payload["entitlements"], [])
+        self.assertEqual(
+            payload["deployment_availability"],
+            {"webguard": True, "soc": False, "compliance": False},
         )
 
 

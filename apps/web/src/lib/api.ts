@@ -599,8 +599,20 @@ export interface ModuleEntitlement {
   available: boolean;
 }
 
+export interface ModuleEntitlementsResponse {
+  entitlements: ModuleEntitlement[];
+  // Independent of `entitlements` above: present for every module this
+  // platform defines, regardless of whether this organization has a
+  // row for it (a legitimate state -- see the backend's own
+  // list_module_entitlements docstring). Use this, not a `.find()`
+  // over `entitlements` with a fallback, to answer "does this
+  // deployment offer module X at all" -- a missing row must never be
+  // read as "available".
+  deployment_availability: Record<PlatformModuleId, boolean>;
+}
+
 export const moduleEntitlementsApi = {
-  list: () => api.get<{ entitlements: ModuleEntitlement[] }>("/v1/module-entitlements"),
+  list: () => api.get<ModuleEntitlementsResponse>("/v1/module-entitlements"),
   set: (module: PlatformModuleId, status: ModuleEntitlementStatus) =>
     api.patch<ModuleEntitlement>(`/v1/module-entitlements/${module}`, { status }),
 };

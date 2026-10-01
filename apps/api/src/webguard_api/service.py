@@ -3309,11 +3309,27 @@ class WebGuardJobService:
                     # no one, not even this organization's own owner,
                     # can turn this module on right now, distinct from
                     # "status" above (which an owner genuinely controls
-                    # when this is true).
+                    # when this is true). Kept here for callers already
+                    # reading it off a row, but see deployment_availability
+                    # below for the version that does not depend on a row
+                    # existing at all.
                     "available": self._module_is_available(entitlement.module),
                 }
                 for entitlement in entitlements
-            ]
+            ],
+            # Release-checklist "Newly found" item: an organization with
+            # zero entitlement rows (legitimate -- see this method's own
+            # docstring) has no row to read a per-module "available" off
+            # of at all, so a frontend fallback like `?? true` silently
+            # defaulted to "available" for exactly the deployment-
+            # restricted case this flag exists to prevent. This is a
+            # second, independent view of the identical deployment-wide
+            # flag above, for every module this platform defines,
+            # regardless of whether this organization has a row for it.
+            "deployment_availability": {
+                module.value: self._module_is_available(module)
+                for module in PlatformModule
+            },
         }
 
     def set_module_entitlement(

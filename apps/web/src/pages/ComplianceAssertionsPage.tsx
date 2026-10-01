@@ -286,10 +286,16 @@ function AssertionDetail({
 export function ComplianceAssertionsPage() {
   const { data: entitlements, isLoading: entitlementsLoading } = useModuleEntitlements();
   const complianceEntitlement = entitlements?.entitlements.find((entitlement) => entitlement.module === "compliance");
+  // Deployment-wide availability is read from deployment_availability,
+  // present for every module regardless of whether this organization
+  // has an entitlement row -- unlike complianceEntitlement itself,
+  // which is legitimately absent for an organization with zero rows.
+  // Missing or still-loading data must not imply availability, so this
+  // defaults to false, never true.
   // Never fetch the assertion catalog until we know whether this
   // deployment offers Compliance at all: available=false must never
   // reach the server, since the route itself now rejects it there too.
-  const available = entitlements ? (complianceEntitlement?.available ?? true) : false;
+  const available = entitlements?.deployment_availability.compliance ?? false;
   const { data, isLoading, error } = useComplianceAssertions(available);
   const [searchParams, setSearchParams] = useSearchParams();
   const selectedId = searchParams.get("assertion");
