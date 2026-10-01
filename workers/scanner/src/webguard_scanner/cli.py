@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import math
 import os
+import platform
+import shutil
 import signal
 import stat
 import sys
@@ -95,6 +98,8 @@ EXIT_USAGE = 2
 EXIT_PREFLIGHT_FAILED = 3
 EXIT_REPORT_INVALID = 4
 EXIT_OUTPUT_FAILED = 5
+EXIT_UNEXPECTED_ERROR = 6
+EXIT_DOCTOR_CHECK_FAILED = 7
 
 DEFAULT_OUTPUT_DIRECTORY = Path("scan-results")
 DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -1663,6 +1668,202 @@ def _report_comparison_validate_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _init_command(args: argparse.Namespace) -> int:
+    home = args.directory.expanduser()
+
+    created: list[Path] = []
+    for subdirectory in ("authorizations", "scan-results", "reports"):
+        target = home / subdirectory
+        existed = target.exists()
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            os.chmod(target, 0o700)
+        except OSError as exc:
+            raise CliControlledError(
+                "init_directory_create_failed",
+                f"Unable to create {target}.",
+                exit_code=EXIT_OUTPUT_FAILED,
+            ) from exc
+        if not existed:
+            created.append(target)
+
+    print(f"WebGuard workspace: {home.resolve()}")
+    if created:
+        print("Created:")
+        for path in created:
+            print(f"  - {path}")
+    else:
+        print("All workspace directories already existed.")
+
+    print()
+    print("Next steps:")
+    print(
+        "  webguard authorization create ... "
+        f"--output {home / 'authorizations' / 'example.json'}"
+    )
+    print(
+        "  webguard scan <url> --authorization <authorization-file> "
+        f"--output {home / 'scan-results' / 'example.json'}"
+    )
+    print(
+        f"  webguard report render {home / 'scan-results' / 'example.json'} "
+        f"--output {home / 'reports' / 'example.html'} "
+        '--organization "Example, Inc."'
+    )
+
+    return EXIT_SUCCESS
+
+
+def _doctor_command(args: argparse.Namespace) -> int:
+    checks: list[tuple[str, bool, str]] = []
+
+    python_ok = sys.version_info >= (3, 11)
+    checks.append((
+        "Python version",
+        python_ok,
+        f"{platform.python_version()}"
+        + ("" if python_ok else " (webguard requires Python >= 3.11)"),
+    ))
+
+    for distribution_name in (
+        "openhuntx-webguard-scanner",
+        "openhuntx-webguard-contracts",
+    ):
+        try:
+            version = importlib.metadata.version(distribution_name)
+            checks.append((distribution_name, True, version))
+        except importlib.metadata.PackageNotFoundError:
+            checks.append((
+                distribution_name,
+                False,
+                "not installed via package metadata (editable/dev checkout?)",
+            ))
+
+    directory = args.directory.expanduser()
+
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / f".webguard-doctor-{uuid4().hex}"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        checks.append(("Write access", True, str(directory.resolve())))
+    except OSError as exc:
+        checks.append(("Write access", False, f"{directory}: {exc}"))
+
+    try:
+        usage = shutil.disk_usage(directory)
+        free_megabytes = usage.free / (1024 * 1024)
+        checks.append((
+            "Free disk space",
+            free_megabytes >= 50,
+            f"{free_megabytes:.0f} MiB free at {directory.resolve()}",
+        ))
+    except OSError as exc:
+        checks.append(("Free disk space", False, str(exc)))
+
+    all_ok = all(ok for _, ok, _ in checks)
+
+    for name, ok, detail in checks:
+        print(f"[{'OK' if ok else 'FAIL'}] {name}: {detail}")
+
+    print()
+    print(
+        "Note: target reachability is not checked here. Each `webguard scan` "
+        "run verifies its own authorized target during preflight."
+    )
+
+    return EXIT_SUCCESS if all_ok else EXIT_DOCTOR_CHECK_FAILED
+
+
+def _iter_result_files(directory: Path) -> list[Path]:
+    if not directory.exists():
+        return []
+    return sorted(
+        (path for path in directory.glob("*.json") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def _results_list_command(args: argparse.Namespace) -> int:
+    directory = args.directory.expanduser()
+    files = _iter_result_files(directory)
+
+    if not files:
+        print(f"No stored results found in {directory}.")
+        return EXIT_SUCCESS
+
+    rows: list[dict[str, object]] = []
+    for path in files:
+        try:
+            result = load_webguard_report_file(path)
+        except ScanReportLoadError as exc:
+            rows.append({
+                "path": str(path),
+                "readable": False,
+                "error": exc.message,
+            })
+            continue
+        rows.append({
+            "path": str(path),
+            "readable": True,
+            "scan_id": result.scan_id,
+            "status": result.status.value,
+            "target": result.target,
+            "findings": len(result.findings),
+        })
+
+    if args.json_output:
+        print(json.dumps(rows, indent=2))
+        return EXIT_SUCCESS
+
+    for row in rows:
+        if not row["readable"]:
+            print(f"- [UNREADABLE] {row['path']}: {row['error']}")
+            continue
+        print(
+            f"- {row['path']} | {row['status']} | {row['target']} | "
+            f"{row['findings']} finding(s) | scan {row['scan_id']}"
+        )
+
+    return EXIT_SUCCESS
+
+
+def _results_clean_command(args: argparse.Namespace) -> int:
+    directory = args.directory.expanduser()
+    files = _iter_result_files(directory)
+
+    if not files:
+        print(f"No stored results found in {directory}.")
+        return EXIT_SUCCESS
+
+    if args.older_than_days is not None:
+        cutoff = _utc_now().timestamp() - (args.older_than_days * 86400)
+        files = [path for path in files if path.stat().st_mtime < cutoff]
+
+    if not files:
+        print("No results matched the cleanup criteria.")
+        return EXIT_SUCCESS
+
+    if not args.yes:
+        print(f"Would delete {len(files)} file(s) from {directory}:")
+        for path in files:
+            print(f"  - {path}")
+        print("Re-run with --yes to actually delete these files.")
+        return EXIT_SUCCESS
+
+    deleted = 0
+    for path in files:
+        try:
+            path.unlink()
+            deleted += 1
+        except OSError as exc:
+            print(f"webguard: could not delete {path}: {exc}", file=sys.stderr)
+
+    print(f"Deleted {deleted} of {len(files)} file(s) from {directory}.")
+    return EXIT_SUCCESS
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the public WebGuard argument parser."""
 
@@ -1959,6 +2160,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan.set_defaults(handler=_scan_command)
 
+    init = commands.add_parser(
+        "init",
+        help="Create a local workspace (authorizations/, scan-results/, reports/).",
+    )
+    init.add_argument(
+        "--directory",
+        type=Path,
+        default=Path("."),
+        help="Workspace root (default: current directory).",
+    )
+    init.set_defaults(handler=_init_command)
+
+    doctor = commands.add_parser(
+        "doctor",
+        help="Check the local environment WebGuard needs to run.",
+    )
+    doctor.add_argument(
+        "--directory",
+        type=Path,
+        default=Path("."),
+        help=(
+            "Directory to check for write access and free space "
+            "(default: current directory)."
+        ),
+    )
+    doctor.set_defaults(handler=_doctor_command)
+
     authorization = commands.add_parser(
         "authorization",
         help="Create, validate, or inspect owned-target authorizations.",
@@ -2222,6 +2450,57 @@ def build_parser() -> argparse.ArgumentParser:
         handler=_report_comparison_validate_command
     )
 
+    results = commands.add_parser(
+        "results",
+        help="List or clean up locally stored scan result files.",
+    )
+    results_commands = results.add_subparsers(
+        dest="results_command",
+        required=True,
+    )
+
+    results_list = results_commands.add_parser(
+        "list",
+        help="List stored scan result files.",
+    )
+    results_list.add_argument(
+        "--directory",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIRECTORY,
+        help="Directory to scan for result files (default: scan-results).",
+    )
+    results_list.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Print machine-readable JSON instead of a human summary.",
+    )
+    results_list.set_defaults(handler=_results_list_command)
+
+    results_clean = results_commands.add_parser(
+        "clean",
+        help="Delete stored scan result files.",
+    )
+    results_clean.add_argument(
+        "--directory",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIRECTORY,
+        help="Directory to clean (default: scan-results).",
+    )
+    results_clean.add_argument(
+        "--older-than-days",
+        type=float,
+        default=None,
+        metavar="DAYS",
+        help="Only delete files older than this many days.",
+    )
+    results_clean.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually delete files. Without this flag, only a dry run is printed.",
+    )
+    results_clean.set_defaults(handler=_results_clean_command)
+
     return parser
 
 
@@ -2239,14 +2518,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return exc.exit_code
+    except KeyboardInterrupt:
+        print("webguard: cancelled.", file=sys.stderr)
+        return 130
+    except Exception as exc:  # noqa: BLE001 - last-resort fail-closed boundary
+        print(
+            f"webguard: [unexpected_error] {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return EXIT_UNEXPECTED_ERROR
 
 
 __all__ = [
+    "EXIT_DOCTOR_CHECK_FAILED",
     "EXIT_OUTPUT_FAILED",
     "EXIT_PREFLIGHT_FAILED",
     "EXIT_REPORT_INVALID",
     "EXIT_SCAN_FAILED",
     "EXIT_SUCCESS",
+    "EXIT_UNEXPECTED_ERROR",
     "EXIT_USAGE",
     "build_parser",
     "main",
