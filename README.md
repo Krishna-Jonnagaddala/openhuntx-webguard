@@ -205,7 +205,7 @@ The active product is exactly what's in `packages/contracts/` and `workers/scann
 
 This is pre-release engineering work, not a public release:
 
-- **No license chosen yet.** Nothing in this repository is currently licensed for reuse by anyone other than the copyright holder. This needs an explicit decision (MIT/Apache-2.0/other) before any public use is invited; it is intentionally not silently defaulted here.
+- **No license chosen yet.** Nothing in this repository is currently licensed for reuse by anyone other than the copyright holder. This needs an explicit decision before any public use is invited; it is intentionally not silently defaulted here. See [`docs/LICENSE_OPTIONS.md`](docs/LICENSE_OPTIONS.md) for a comparison and a recommendation (MIT), neither of which has been applied.
 - **Not published to PyPI.** `openhuntx-webguard` is the proposed distribution name (the `pyproject.toml` in `workers/scanner` already uses it); `webguard` and `webguard-cli` were also unclaimed as of this release if a different name is preferred. Re-check availability immediately before actually publishing, since names can be claimed at any time.
 - **No GitHub release has been cut.** Install today by building from source as shown above.
 

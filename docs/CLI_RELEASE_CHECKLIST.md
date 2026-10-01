@@ -40,10 +40,10 @@ A single, finite list. When everything here is checked, v1 is ready to publish, 
 
 ## Owner decisions (blocking publish, not engineering)
 
-- [ ] **License.** Nothing in this repository is currently licensed for reuse. Pick one (MIT/Apache-2.0/other) before any public "go ahead and use this" claim.
+- [ ] **License.** Nothing in this repository is currently licensed for reuse. Pick one before any public "go ahead and use this" claim; see [`docs/LICENSE_OPTIONS.md`](LICENSE_OPTIONS.md) for a comparison and a recommendation (MIT), not yet applied.
 - [ ] **PyPI package name.** `openhuntx-webguard` is the proposed name (already in `workers/scanner/pyproject.toml`); confirm it or pick a different one, then re-check availability right before publishing.
-- [ ] **PyPI publishing credentials/trusted publisher.** No publish workflow exists yet; setting one up (ideally via PyPI's trusted-publisher OIDC flow rather than a long-lived API token) is a deliberate, separate step from everything in this checklist.
-- [ ] **First GitHub release / tag.** Not cut. Once the above are decided, tag `v0.1.0` (or whatever version is chosen) and attach the built wheels.
+- [ ] **PyPI publishing credentials/trusted publisher.** `.github/workflows/publish.yml` exists, is manual-dispatch-only, and uses PyPI's trusted-publisher OIDC flow (no API token stored in this repo), but it cannot succeed until that trusted publisher is actually configured on PyPI's side, pointing at this repository and the `pypi-publish` environment. Registering the project name on PyPI and setting that up is a deliberate, separate step from everything else in this checklist.
+- [ ] **First GitHub release / tag.** Not cut. Once the above are decided, tag `v0.1.0` (or whatever version is chosen), review and publish [`docs/RELEASE_NOTES_DRAFT.md`](RELEASE_NOTES_DRAFT.md) as the release notes, and attach the built wheels.
 
 ## Explicitly out of scope for v1 (not blockers, just not promised)
 

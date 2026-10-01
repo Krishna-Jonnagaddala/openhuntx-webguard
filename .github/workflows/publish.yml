@@ -1,0 +1,52 @@
+name: Publish to PyPI
+
+# Manual-only. This does not run on push, pull_request, or release events,
+# so creating a release or pushing a tag cannot trigger a publish by
+# accident; a human has to open the Actions tab and click "Run workflow."
+# It also cannot succeed yet: PyPI trusted publishing (OIDC) must be
+# configured on the PyPI project side first, pointing at this repository,
+# workflow file, and environment name. Until that's done, the "Publish"
+# step below fails at the identity-token exchange with no stored secret
+# ever involved. See docs/CLI_RELEASE_CHECKLIST.md for what's still open.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "publish" to confirm. Anything else aborts.'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    if: github.event.inputs.confirm == 'publish'
+    name: Build and publish openhuntx-webguard-contracts and openhuntx-webguard
+    runs-on: ubuntu-24.04
+    environment: pypi-publish
+
+    permissions:
+      id-token: write  # required for PyPI trusted publishing (OIDC); no API token is stored in this repo
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13.14"
+          pip-version: "26.2.1"
+
+      - name: Build the contracts and scanner wheels
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python -m pip wheel packages/contracts/python -w dist --no-deps
+          python -m pip wheel workers/scanner -w dist --no-deps
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1, v1.14.2
+        with:
+          packages-dir: dist/

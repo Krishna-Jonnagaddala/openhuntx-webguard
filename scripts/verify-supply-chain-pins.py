@@ -31,6 +31,7 @@ SETUP_PYTHON_SHA = "ece7cb06caefa5fff74198d8649806c4678c61a1"
 SETUP_NODE_SHA = "820762786026740c76f36085b0efc47a31fe5020"  # v7.0.0
 UPLOAD_ARTIFACT_SHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"  # v7.0.1
 SETUP_TERRAFORM_SHA = "dfe3c3f87815947d99a8997f908cb6525fc44e9e"  # v4.0.1
+PYPI_PUBLISH_SHA = "dc37677b2e1c63e2034f94d8a5b11f265b73ba33"  # release/v1, v1.14.2
 TRIVY_VERSION = "0.74.0"
 TRIVY_LINUX_AMD64_SHA256 = (
     "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
@@ -219,6 +220,28 @@ for action in uses_lines:
     action_ref = action.split("#", 1)[0].strip()
     if action_ref not in reviewed_actions:
         fail(f"CI uses an unreviewed GitHub Action: {action_ref}")
+
+# publish.yml is manual-dispatch-only and cannot succeed without PyPI
+# trusted-publisher setup that does not exist yet, but its one
+# third-party action still goes through the same reviewed-SHA discipline
+# as everything in ci.yml.
+publish_workflow = read(".github/workflows/publish.yml")
+publish_uses_lines = [
+    line.strip().split("uses:", 1)[1].strip()
+    for line in publish_workflow.splitlines()
+    if line.strip().startswith("uses:")
+]
+publish_reviewed_actions = reviewed_actions | {
+    f"pypa/gh-action-pypi-publish@{PYPI_PUBLISH_SHA}",
+}
+for action in publish_uses_lines:
+    action_ref = action.split("#", 1)[0].strip()
+    if action_ref not in publish_reviewed_actions:
+        fail(f"publish.yml uses an unreviewed GitHub Action: {action_ref}")
+if "on.push" in publish_workflow or re.search(r"^\s*push:\s*$", publish_workflow, re.MULTILINE):
+    fail("publish.yml must stay manual-dispatch-only, not trigger on push")
+if re.search(r"^\s*release:\s*$", publish_workflow, re.MULTILINE):
+    fail("publish.yml must stay manual-dispatch-only, not trigger on release events")
 
 if "  terraform:" not in workflow:
     fail("CI terraform validation/IaC scan job is missing")
