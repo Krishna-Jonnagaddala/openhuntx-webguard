@@ -92,9 +92,16 @@ class _FakeSecretsManagerClient:
         self._secrets = secrets
 
     def get_secret_value(self, *, SecretId: str) -> dict:
-        if SecretId not in self._secrets:
+        # The organization ID prefixed onto SecretId by service.py's
+        # tenant-scoping check (M22) isn't known at fixture-construction
+        # time (the organization doesn't exist yet), so this fake
+        # matches on the trailing path segment the test actually
+        # provisioned, not the full tenant-scoped SecretId a real AWS
+        # Secrets Manager entry would need registered verbatim.
+        key = SecretId.rsplit("/", 1)[-1]
+        if key not in self._secrets:
             raise KeyError(f"no such secret: {SecretId}")
-        return {"SecretString": self._secrets[SecretId]}
+        return {"SecretString": self._secrets[key]}
 
 
 class _AuthenticatedXssFixtureHandler(_ReflectedXssFixtureHandler):
@@ -321,7 +328,7 @@ class ProductionRuntimeCompletionEndToEndTests(unittest.TestCase):
                         "identity_label": "prod-e2e-bearer-identity",
                         "method": "bearer_token",
                         "expires_at": (now + timedelta(days=1)).isoformat(timespec="microseconds").replace("+00:00", "Z"),
-                        "secret_reference_id": "prod-e2e-bearer-secret",
+                        "secret_reference_id": f"organizations/{organization.organization_id}/prod-e2e-bearer-secret",
                     }
                 ).encode()
                 connection = http.client.HTTPConnection(host, port, timeout=5)
@@ -454,7 +461,10 @@ class ProductionRuntimeCompletionEndToEndTests(unittest.TestCase):
             host, port = server.server_address[:2]
             try:
                 context_ids = {}
-                for label, secret_ref in (("user-a", "prod-e2e-user-a-secret"), ("user-b", "prod-e2e-user-b-secret")):
+                for label, secret_ref in (
+                    ("user-a", f"organizations/{organization.organization_id}/prod-e2e-user-a-secret"),
+                    ("user-b", f"organizations/{organization.organization_id}/prod-e2e-user-b-secret"),
+                ):
                     body = json.dumps(
                         {
                             "target": target, "authorization_id": authorization_id, "identity_label": label,

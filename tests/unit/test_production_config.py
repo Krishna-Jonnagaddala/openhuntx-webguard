@@ -189,6 +189,60 @@ class ProductionServiceConfigTests(unittest.TestCase):
             os.environ.clear()
             os.environ.update(original)
 
+    def test_enabled_modules_defaults_to_webguard_only(self) -> None:
+        config = ProductionServiceConfig(**VALID_KWARGS)
+        self.assertEqual(config.enabled_module_set, frozenset({"webguard"}))
+
+    def test_enabled_modules_can_be_widened_explicitly(self) -> None:
+        config = ProductionServiceConfig(**{**VALID_KWARGS, "enabled_modules": "webguard,soc,compliance"})
+        self.assertEqual(config.enabled_module_set, frozenset({"webguard", "soc", "compliance"}))
+
+    def test_enabled_modules_without_webguard_is_rejected(self) -> None:
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "enabled_modules": "soc,compliance"})
+        self.assertEqual(caught.exception.code, "production_config_invalid")
+
+    def test_enabled_modules_with_an_unknown_token_is_rejected(self) -> None:
+        with self.assertRaises(ProductionConfigError) as caught:
+            ProductionServiceConfig(**{**VALID_KWARGS, "enabled_modules": "webguard,marketing"})
+        self.assertEqual(caught.exception.code, "production_config_invalid")
+
+    def test_from_environment_defaults_enabled_modules_to_webguard_when_unset(self) -> None:
+        import os
+
+        original = dict(os.environ)
+        try:
+            os.environ.clear()
+            os.environ.update(
+                {
+                    "WEBGUARD_ENVIRONMENT": "production",
+                    "WEBGUARD_SERVICE_IDENTITY": "webguard-api-1",
+                    "WEBGUARD_DATABASE_BACKEND": "postgresql",
+                    "WEBGUARD_DATABASE_URL": "postgresql://user:pass@db.internal:5432/webguard",
+                    "WEBGUARD_SIGNING_PROVIDER": "kms",
+                    "WEBGUARD_KMS_KEY_ID": "arn:aws:kms:eu-west-2:111111111111:key/abc-123",
+                    "WEBGUARD_CALLBACK_SERVICE_HOSTNAME": "callback.openhuntx.example",
+                    "WEBGUARD_MIGRATION_MODE": "pre_applied",
+                    "WEBGUARD_AUTHORIZATION_DIRECTORY": "/var/webguard/authorizations",
+                    "WEBGUARD_ARTIFACT_DIRECTORY": "/var/webguard/artifacts",
+                    "WEBGUARD_CURSOR_SIGNING_SECRET": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+                    "WEBGUARD_MAIL_PROVIDER": "postmark",
+                    "WEBGUARD_POSTMARK_SERVER_TOKEN": "postmark-server-token-placeholder",
+                    "WEBGUARD_MAIL_FROM_ADDRESS": "alerts@webguard.example",
+                    "WEBGUARD_WEB_APP_BASE_URL": "https://app.webguard.example",
+                    "WEBGUARD_OBJECT_STORAGE_PROVIDER": "s3",
+                    "WEBGUARD_OBJECT_STORAGE_BUCKET": "webguard-production-artifacts",
+                    "WEBGUARD_OBJECT_STORAGE_REGION": "eu-west-2",
+                    "WEBGUARD_OBJECT_STORAGE_KMS_KEY_ID": "arn:aws:kms:eu-west-2:111111111111:key/def-456",
+                    # WEBGUARD_ENABLED_MODULES deliberately not set.
+                }
+            )
+            config = ProductionServiceConfig.from_environment()
+            self.assertEqual(config.enabled_module_set, frozenset({"webguard"}))
+        finally:
+            os.environ.clear()
+            os.environ.update(original)
+
 
 if __name__ == "__main__":
     unittest.main()

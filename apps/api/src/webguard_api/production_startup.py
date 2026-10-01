@@ -65,6 +65,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from webguard_contracts import PlatformModule
+
 from .artifact_store import ObjectStorageArtifactStore, S3ClientProtocol
 from .auth import ApiTokenAuthenticator, BrowserSessionAuthenticator
 from .auth_rate_limit import PostgresAuthRateLimiter
@@ -283,6 +285,7 @@ def build_production_components(
         module_entitlements=module_entitlements,
         compliance_catalog=PostgresComplianceCatalogRepository(pool),
         assertion_collections=PostgresAssertionCollectionRepository(pool),
+        enabled_modules=frozenset(PlatformModule(m) for m in config.enabled_module_set),
     )
     executor = ScanJobExecutor(
         authorizations=authorizations,

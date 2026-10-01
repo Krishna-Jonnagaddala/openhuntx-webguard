@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
-import { Card, ErrorState, LoadingState, PageHeader, StatusBadge } from "../components/ui/primitives";
-import { useComplianceFrameworks } from "../hooks/queries";
+import { Card, ErrorState, InDevelopmentNotice, LoadingState, PageHeader, StatusBadge } from "../components/ui/primitives";
+import { useComplianceFrameworks, useModuleEntitlements } from "../hooks/queries";
 import { ApiError } from "../lib/api";
 
 const STATUS_LABEL: Record<string, string> = {
@@ -12,7 +12,18 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 export function ComplianceOverviewPage() {
-  const { data, isLoading, error } = useComplianceFrameworks();
+  const { data: entitlements, isLoading: entitlementsLoading } = useModuleEntitlements();
+  // Deployment-wide availability is read from deployment_availability,
+  // present for every module regardless of whether this organization
+  // has an entitlement row -- unlike complianceEntitlement itself,
+  // which is legitimately absent for an organization with zero rows.
+  // Missing or still-loading data must not imply availability, so this
+  // defaults to false, never true.
+  // Never fetch the framework catalog until we know whether this
+  // deployment offers Compliance at all: available=false must never
+  // reach the server, since the route itself now rejects it there too.
+  const available = entitlements?.deployment_availability.compliance ?? false;
+  const { data, isLoading, error } = useComplianceFrameworks(available);
 
   return (
     <div>
@@ -20,7 +31,15 @@ export function ComplianceOverviewPage() {
         title="Frameworks"
         description="Frameworks your organization can track, and how many controls this platform has loaded under each one."
       />
-      {isLoading ? <LoadingState label="Loading frameworks…" /> : null}
+      {!entitlementsLoading && !available ? (
+        <div className="mb-4">
+          <InDevelopmentNotice>
+            Compliance is not part of this release. It is a separate module still in development; this deployment
+            only offers WebGuard today.
+          </InDevelopmentNotice>
+        </div>
+      ) : null}
+      {available && isLoading ? <LoadingState label="Loading frameworks…" /> : null}
       {error ? <ErrorState message={error instanceof ApiError ? error.message : "Unable to load frameworks."} /> : null}
       {data ? (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -50,15 +69,17 @@ export function ComplianceOverviewPage() {
           ))}
         </div>
       ) : null}
-      <div className="mt-8 flex items-center gap-3 border-t border-[var(--color-border)] pt-6">
-        <StatusBadge status="pending" />
-        <p className="text-sm text-[var(--color-text-secondary)]">
-          Looking for something you can actually run today?{" "}
-          <Link to="/app/compliance/assertions" className="text-[var(--color-accent)] hover:underline">
-            See the technical assertion catalog →
-          </Link>
-        </p>
-      </div>
+      {available ? (
+        <div className="mt-8 flex items-center gap-3 border-t border-[var(--color-border)] pt-6">
+          <StatusBadge status="pending" />
+          <p className="text-sm text-[var(--color-text-secondary)]">
+            Looking for something you can actually run today?{" "}
+            <Link to="/app/compliance/assertions" className="text-[var(--color-accent)] hover:underline">
+              See the technical assertion catalog →
+            </Link>
+          </p>
+        </div>
+      ) : null}
     </div>
   );
 }

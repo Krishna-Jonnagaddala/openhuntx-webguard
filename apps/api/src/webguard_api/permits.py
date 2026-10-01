@@ -156,6 +156,12 @@ class TrustScanSigner:
                 else "TrustScan permit signature verification failed."
             )
             raise TrustScanPermitError(code, message) from exc
+        self._require_declared_algorithm_matches_key(
+            permit.signing_key_id,
+            permit.signature_algorithm,
+            error_code="trustscan_permit_signature_algorithm_mismatch",
+            message="TrustScan permit's declared signature algorithm does not match its signing key's registered algorithm.",
+        )
 
     def sign_safety_receipt(
         self, claims: TrustScanSafetyReceiptClaims
@@ -188,6 +194,36 @@ class TrustScanSigner:
                 else "TrustScan safety receipt signature verification failed."
             )
             raise TrustScanPermitError(code, message) from exc
+        self._require_declared_algorithm_matches_key(
+            receipt.signing_key_id,
+            receipt.signature_algorithm,
+            error_code="trustscan_safety_receipt_signature_algorithm_mismatch",
+            message="TrustScan safety receipt's declared signature algorithm does not match its signing key's registered algorithm.",
+        )
+
+    def _require_declared_algorithm_matches_key(
+        self, key_id: str, declared_algorithm: str, *, error_code: str, message: str
+    ) -> None:
+        """A permit's/receipt's ``signature_algorithm`` field is
+        self-reported by whoever produced the JSON (attacker-
+        controlled on anything loaded from external input); the actual
+        cryptographic check just above this call always verifies
+        against the key's own *registered* algorithm
+        (``VerificationKey.algorithm``), never this field, so a
+        mismatch here can never let a signature verify under the
+        wrong algorithm. What it CAN do, if left unchecked, is carry a
+        self-report that lies about which algorithm was actually used:
+        caught here, after a genuine cryptographic pass, so this
+        never masks a real signature failure with a less specific
+        error. Resolving by ``key_id`` cannot miss: this is only
+        reached after ``verify_by_key_id`` already resolved that exact
+        key successfully."""
+
+        key = self._registry.verification_key(key_id)
+        if key is None:
+            raise AssertionError("verify_by_key_id just resolved this same key_id")  # unreachable
+        if key.algorithm != declared_algorithm:
+            raise TrustScanPermitError(error_code, message)
 
     def verification_key_document(self) -> dict[str, str]:
         for document in self._registry.verification_key_documents():

@@ -293,6 +293,7 @@ export function Dialog({
 export function IconButton({
   label,
   children,
+  className,
   ...props
 }: { label: string; children: ReactNode } & React.ButtonHTMLAttributes<HTMLButtonElement>) {
   return (
@@ -300,7 +301,7 @@ export function IconButton({
       type="button"
       aria-label={label}
       title={label}
-      className="rounded-md p-2 text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] disabled:opacity-50"
+      className={`rounded-md p-2 text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] disabled:opacity-50 ${className ?? ""}`}
       {...props}
     >
       {children}

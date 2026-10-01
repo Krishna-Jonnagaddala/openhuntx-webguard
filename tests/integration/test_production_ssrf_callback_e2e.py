@@ -270,7 +270,13 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         return server, stop, worker_thread, server_thread
 
-    def _run_job_and_get_findings(self, active_checks: list[str], *, completion_timeout_seconds: float = 25) -> list[dict]:
+    def _run_job_and_get_findings(
+        self,
+        active_checks: list[str],
+        *,
+        completion_timeout_seconds: float = 25,
+        expected_state: str = "completed",
+    ) -> list[dict]:
         config, components, auth_dir = self._build_components()
         organization, owner, token, now = self._bootstrap_org(components)
 
@@ -382,7 +388,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
                         break
                     time.sleep(RESULT_POLL_INTERVAL_SECONDS)
                 self.assertIsNotNone(result_payload, "job did not complete in time")
-                self.assertEqual(result_payload["state"], "completed", result_payload)
+                self.assertEqual(result_payload["state"], expected_state, result_payload)
 
                 connection = http.client.HTTPConnection(host, port, timeout=5)
                 connection.request("GET", "/v1/findings", headers={"Authorization": f"Bearer {token.token}"})
@@ -390,7 +396,39 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
                 findings_payload = json.loads(response.read())
                 connection.close()
                 self.assertEqual(response.status, 200, findings_payload)
-                return findings_payload["findings"]
+
+                # The scan record, not the job record, carries the
+                # per-check error detail (executor.py's ScanError tuple,
+                # e.g. ssrf_callback_pipeline_unverified): generate and
+                # download the real report through the same HTTP path
+                # M7/Slice 17 already prove, so a caller that needs the
+                # exact error code (not just the overall job state) can
+                # assert on it from real, persisted, checksum-verified
+                # bytes rather than reconstructing it from job state.
+                scan_id = result_payload["scan_id"]
+                report_body = json.dumps({"scan_id": scan_id}).encode()
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "POST", "/v1/reports", body=report_body,
+                    headers={"Authorization": f"Bearer {token.token}", "Content-Type": "application/json", "Content-Length": str(len(report_body))},
+                )
+                response = connection.getresponse()
+                report_created = json.loads(response.read())
+                connection.close()
+                self.assertEqual(response.status, 201, report_created)
+                report_id = report_created["report_id"]
+
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "GET", f"/v1/reports/{report_id}/download", headers={"Authorization": f"Bearer {token.token}"}
+                )
+                response = connection.getresponse()
+                report_bytes = response.read()
+                connection.close()
+                self.assertEqual(response.status, 200)
+                report_errors = json.loads(report_bytes)["errors"]
+
+                return findings_payload["findings"], report_errors
             finally:
                 stop.set()
                 server.shutdown()
@@ -407,7 +445,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         polling-based, cross-process callback correlation actually
         confirms a real out-of-band request."""
 
-        findings = self._run_job_and_get_findings(["active.ssrf.callback"])
+        findings, _report_errors = self._run_job_and_get_findings(["active.ssrf.callback"])
         ssrf_findings = [f for f in findings if f["check_id"].startswith("active.ssrf.callback")]
         self.assertTrue(
             ssrf_findings,
@@ -425,7 +463,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         against the identical vulnerable fixture, even in production
         wiring."""
 
-        findings = self._run_job_and_get_findings([])
+        findings, _report_errors = self._run_job_and_get_findings([])
         self.assertFalse(any(f["check_id"].startswith("active.ssrf.callback") for f in findings), findings)
 
     def test_ssrf_confirmed_despite_a_transient_persistence_failure_within_retry_budget(self) -> None:
@@ -464,7 +502,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
             return real_execute(self_conn, query, params, **kwargs)
 
         with patch.object(psycopg.Connection, "execute", faulty_execute):
-            findings = self._run_job_and_get_findings(["active.ssrf.callback"])
+            findings, _report_errors = self._run_job_and_get_findings(["active.ssrf.callback"])
 
         self.assertTrue(state["failed_once"], "the fault injection must actually have fired at least once")
         ssrf_findings = [f for f in findings if f["check_id"].startswith("active.ssrf.callback")]
@@ -481,7 +519,21 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         so the detector must not confirm anything it never actually
         saw. This is the residual, honest limitation P1-12 accepts by
         design -- see the P1-12 remediation report's LONG-OUTAGE
-        BEHAVIOR / FALSE-NEGATIVE RESIDUAL sections."""
+        BEHAVIOR / FALSE-NEGATIVE RESIDUAL sections.
+
+        What changed: previously this scan still reported
+        state=completed, since every candidate's own read correctly
+        returned "no observation", indistinguishable from a genuine
+        negative. `executor.py`'s `_ssrf_callback_pipeline_confirmed_healthy`
+        now runs a positive-control canary through the same, real,
+        outage-affected write path whenever any candidate came back
+        not_vulnerable; here the canary's own observation can't persist
+        either (this fixture fails every
+        `resolve_and_record_callback_observation` call, not just the
+        real candidates'), so the scan now honestly reports
+        completed_with_errors with an `ssrf_callback_pipeline_unverified`
+        error, instead of silently claiming the three not_vulnerable
+        results were verified."""
         import psycopg
 
         real_execute = psycopg.Connection.execute
@@ -510,13 +562,18 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         # 1.0s minimum_delay_seconds (the inter-probe throttle, applied
         # once per candidate after the probe request succeeds) + 3.0s
         # maximum_wait_seconds + 2.0s grace_seconds = 6.0s, times 3
-        # candidates = 18.0s hard floor, plus register/probe/page-fetch
-        # network overhead. Empirically (instrumented job-claim/execute
-        # timestamps against the real Postgres container this test
-        # requires) the whole pipeline (claim, passive scan, all three
-        # candidates, terminal-state write) consistently completes in
-        # ~20s. 60s leaves roughly 3x headroom over that traced/measured
-        # figure, which is generous margin, not a marginal budget.
+        # candidates = 18.0s hard floor, plus one more register/wait
+        # cycle for the positive-control canary this scenario now also
+        # triggers (all three candidates come back not_vulnerable under
+        # this permanent fault, so `_ssrf_callback_pipeline_confirmed_healthy`
+        # runs once), plus register/probe/page-fetch network overhead.
+        # Empirically (instrumented job-claim/execute timestamps against
+        # the real Postgres container this test requires) the whole
+        # pipeline (claim, passive scan, all three candidates, the
+        # canary, terminal-state write) consistently completes well
+        # under 30s. 60s leaves roughly 2x headroom over that
+        # traced/measured figure, which is generous margin, not a
+        # marginal budget.
         #
         # A first pass at reproducing this test's reported CI failure
         # found runs finishing anywhere from ~21s to ~60s with no code
@@ -546,7 +603,11 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         # traced cost once the test stops self-throttling.
         run_started_at = _utc_now()
         with patch.object(psycopg.Connection, "execute", always_faulty_execute):
-            findings = self._run_job_and_get_findings(["active.ssrf.callback"], completion_timeout_seconds=60)
+            findings, report_errors = self._run_job_and_get_findings(
+                ["active.ssrf.callback"],
+                completion_timeout_seconds=60,
+                expected_state="completed_with_errors",
+            )
 
         ssrf_findings = [f for f in findings if f["check_id"].startswith("active.ssrf.callback")]
         confirmed_or_probable = [
@@ -557,6 +618,21 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
             confirmed_or_probable, [],
             "must never fabricate a CWE-918 finding for an observation that was never durably persisted",
         )
+
+        # The overall job state (completed_with_errors, asserted via
+        # expected_state above) is necessary but not sufficient: it
+        # would also be true of an unrelated error. The specific code
+        # this fix exists to produce, and the message a user would
+        # actually see explaining what happened, must both be present.
+        unverified_errors = [
+            error for error in report_errors if error["code"] == "ssrf_callback_pipeline_unverified"
+        ]
+        self.assertEqual(
+            len(unverified_errors), 1,
+            f"expected exactly one ssrf_callback_pipeline_unverified error, got: {report_errors}",
+        )
+        self.assertIn("could not be confirmed", unverified_errors[0]["message"])
+        self.assertIn("positive control", unverified_errors[0]["message"])
 
         from webguard_api.postgres_pool import WebGuardPostgresPool
 

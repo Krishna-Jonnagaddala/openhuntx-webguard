@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from uuid import uuid4
 
-from webguard_api import AuthorizationRepository, ScanJobStore, WebGuardJobService
+from webguard_api import ApiServiceError, AuthorizationRepository, ScanJobStore, WebGuardJobService
 from webguard_api.module_entitlements import InMemoryModuleEntitlementRepository
 from webguard_contracts import ModuleEntitlementStatus, OrganizationRole, PlatformModule
 
@@ -57,7 +57,13 @@ class PlatformExpansionApiTests(unittest.TestCase):
 
     def test_module_entitlements_empty_for_an_organization_with_no_rows(self) -> None:
         payload = self.service.list_module_entitlements(self.owner, request_id=_rid())
-        self.assertEqual(payload, {"entitlements": []})
+        self.assertEqual(
+            payload,
+            {
+                "entitlements": [],
+                "deployment_availability": {"webguard": True, "soc": True, "compliance": True},
+            },
+        )
 
     def test_module_entitlements_reflects_granted_defaults(self) -> None:
         self.entitlements.grant_default_entitlements(self.owner.organization_id, now=NOW)
@@ -426,6 +432,171 @@ class PlatformExpansionApiTests(unittest.TestCase):
         self.assertEqual(
             by_module,
             {"webguard": "enabled", "soc": "disabled", "compliance": "disabled"},
+        )
+
+
+class WebGuardOnlyReleaseGateTests(unittest.TestCase):
+    """The first WebGuard-only release needs SOC/Compliance unreachable
+    for every customer, enforced by the deployment itself, not by an
+    organization's own entitlement toggle. These prove the deployment-
+    wide ``enabled_modules`` gate outranks a per-organization
+    entitlement that says otherwise, for every read route, the one
+    write route, and the entitlement toggle itself."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        root = Path(self.temporary.name)
+        auth_dir = root / "authorizations"
+        write_authorization(auth_dir)
+        self.store = ScanJobStore(root / "jobs.sqlite3")
+        self.auth_dir = auth_dir
+        self.identity, self.owner, _ = create_identity_fixture(self.store.path)
+        self.entitlements = InMemoryModuleEntitlementRepository()
+        # SOC/Compliance are entitled ENABLED for this organization on
+        # purpose: every assertion below has to show the deployment
+        # gate rejects it anyway, not merely that entitlement was never
+        # granted in the first place.
+        self.entitlements.grant_default_entitlements(self.owner.organization_id, now=NOW)
+        self.entitlements.set_entitlement(
+            self.owner.organization_id, PlatformModule.SOC,
+            status=ModuleEntitlementStatus.ENABLED, now=NOW, changed_by=self.owner.principal_id,
+        )
+        self.entitlements.set_entitlement(
+            self.owner.organization_id, PlatformModule.COMPLIANCE,
+            status=ModuleEntitlementStatus.ENABLED, now=NOW, changed_by=self.owner.principal_id,
+        )
+        self.service = WebGuardJobService(
+            store=self.store,
+            authorizations=AuthorizationRepository(auth_dir),
+            identity=self.identity,
+            clock=lambda: NOW,
+            module_entitlements=self.entitlements,
+            enabled_modules=frozenset({PlatformModule.WEBGUARD}),
+        )
+
+    def _assert_module_not_available(self, callable_, *args, **kwargs) -> None:
+        with self.assertRaises(ApiServiceError) as caught:
+            callable_(*args, **kwargs)
+        self.assertEqual(caught.exception.code, "module_not_available_in_this_deployment")
+        self.assertEqual(caught.exception.status, 404)
+
+    def test_soc_connectors_route_is_unavailable_despite_org_entitlement(self) -> None:
+        self._assert_module_not_available(
+            self.service.list_soc_connectors, self.owner, request_id=_rid()
+        )
+
+    def test_compliance_frameworks_route_is_unavailable_despite_org_entitlement(self) -> None:
+        self._assert_module_not_available(
+            self.service.list_compliance_frameworks, self.owner, request_id=_rid()
+        )
+
+    def test_compliance_assertions_route_is_unavailable_despite_org_entitlement(self) -> None:
+        self._assert_module_not_available(
+            self.service.list_compliance_assertions, self.owner, request_id=_rid()
+        )
+
+    def test_assertion_collections_route_is_unavailable_despite_org_entitlement(self) -> None:
+        self._assert_module_not_available(
+            self.service.list_assertion_collections,
+            self.owner, "entra_conditional_access_policy_mode", request_id=_rid(),
+        )
+
+    def test_collect_assertion_is_unavailable_despite_org_entitlement(self) -> None:
+        self._assert_module_not_available(
+            self.service.collect_assertion,
+            self.owner, "entra_conditional_access_policy_mode", {"evidence_source": "fixture"},
+            request_id=_rid(),
+        )
+
+    def test_owner_cannot_enable_soc_when_the_deployment_does_not_offer_it(self) -> None:
+        # The deployment gate outranks the owner's own toggle: even
+        # MODULE_ENTITLEMENTS_MANAGE cannot turn on a module this
+        # release does not ship.
+        self._assert_module_not_available(
+            self.service.set_module_entitlement,
+            self.owner, "soc", {"status": "enabled"}, request_id=_rid(),
+        )
+
+    def test_owner_cannot_enable_compliance_when_the_deployment_does_not_offer_it(self) -> None:
+        self._assert_module_not_available(
+            self.service.set_module_entitlement,
+            self.owner, "compliance", {"status": "enabled"}, request_id=_rid(),
+        )
+
+    def test_list_module_entitlements_reports_available_false_for_undeployed_modules(self) -> None:
+        payload = self.service.list_module_entitlements(self.owner, request_id=_rid())
+        available_by_module = {row["module"]: row["available"] for row in payload["entitlements"]}
+        self.assertEqual(
+            available_by_module,
+            {"webguard": True, "soc": False, "compliance": False},
+        )
+        # The org's own status is still reported honestly (ENABLED, set
+        # in setUp) -- "available" and "status" are deliberately
+        # separate facts, not collapsed into one.
+        status_by_module = {row["module"]: row["status"] for row in payload["entitlements"]}
+        self.assertEqual(status_by_module["soc"], "enabled")
+        self.assertEqual(status_by_module["compliance"], "enabled")
+        # The row-independent view must agree with the per-row one above.
+        self.assertEqual(
+            payload["deployment_availability"],
+            {"webguard": True, "soc": False, "compliance": False},
+        )
+
+    def test_default_construction_offers_every_module(self) -> None:
+        # The fixture used by every other test class in this file never
+        # passes enabled_modules, so every non-production call site
+        # (local/unit/lab) is completely unaffected by this gate's
+        # existence.
+        unrestricted = WebGuardJobService(
+            store=self.store,
+            authorizations=AuthorizationRepository(self.auth_dir),
+            identity=self.identity,
+            module_entitlements=self.entitlements,
+        )
+        self.assertIsNone(unrestricted.enabled_modules)
+        payload = unrestricted.list_module_entitlements(self.owner, request_id=_rid())
+        available_by_module = {row["module"]: row["available"] for row in payload["entitlements"]}
+        self.assertEqual(
+            available_by_module,
+            {"webguard": True, "soc": True, "compliance": True},
+        )
+        self.assertEqual(
+            payload["deployment_availability"],
+            {"webguard": True, "soc": True, "compliance": True},
+        )
+
+    def test_deployment_availability_is_reported_even_with_zero_entitlement_rows(self) -> None:
+        # Release-checklist "Newly found" item: an organization with no
+        # entitlement rows at all (legitimate -- see
+        # list_module_entitlements's own docstring) has no row for a
+        # frontend to read a per-module "available" off of. This is
+        # exactly the case that caused SocPage.tsx/ComplianceAssertionsPage.tsx/
+        # ComplianceOverviewPage.tsx to default `available` to `true`
+        # via `?? true`, silently claiming a deployment-restricted
+        # module was available. deployment_availability must report the
+        # real, restricted answer regardless of whether this
+        # organization has any entitlement rows. A genuinely separate
+        # organization (its own store) is used rather than self.owner's,
+        # since setUp already granted that one entitlement rows.
+        legacy_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(legacy_temporary.cleanup)
+        legacy_root = Path(legacy_temporary.name)
+        legacy_store = ScanJobStore(legacy_root / "jobs.sqlite3")
+        legacy_identity, legacy_owner, _ = create_identity_fixture(legacy_store.path)
+        legacy_service = WebGuardJobService(
+            store=legacy_store,
+            authorizations=AuthorizationRepository(legacy_root / "authorizations"),
+            identity=legacy_identity,
+            clock=lambda: NOW,
+            module_entitlements=InMemoryModuleEntitlementRepository(),
+            enabled_modules=frozenset({PlatformModule.WEBGUARD}),
+        )
+        payload = legacy_service.list_module_entitlements(legacy_owner, request_id=_rid())
+        self.assertEqual(payload["entitlements"], [])
+        self.assertEqual(
+            payload["deployment_availability"],
+            {"webguard": True, "soc": False, "compliance": False},
         )
 
 

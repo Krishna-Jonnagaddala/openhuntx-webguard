@@ -155,6 +155,42 @@ class PermitSignatureAlgorithmSelfReportTests(unittest.TestCase):
             signer.verify(tampered)
         self.assertEqual(caught.exception.code, "trustscan_permit_signature_invalid")
 
+    def test_permit_declaring_a_different_supported_algorithm_than_its_key_is_rejected(self) -> None:
+        # The crypto check above always verifies against the key's own
+        # registered algorithm, never this field, so a lying
+        # self-report cannot make a signature verify under the wrong
+        # algorithm. It can still carry a false claim about what
+        # actually happened, which this catches: an Ed25519-signed
+        # permit relabeled as ECDSA_SHA_256 (both individually
+        # supported values, so the contract-level whitelist alone
+        # would accept it) must still be rejected once it reaches
+        # TrustScanSigner.verify, which resolves the real algorithm by
+        # key_id and compares.
+        from dataclasses import replace
+
+        from webguard_api import TrustScanPermitError
+
+        signer = TrustScanSigner(bytes(range(32)))
+        permit = signer.sign(_permit_claims())
+        self.assertEqual(permit.signature_algorithm, "Ed25519")
+        relabeled = replace(permit, signature_algorithm="ECDSA_SHA_256")
+        with self.assertRaises(TrustScanPermitError) as caught:
+            signer.verify(relabeled)
+        self.assertEqual(caught.exception.code, "trustscan_permit_signature_algorithm_mismatch")
+
+    def test_kms_backed_permit_declaring_ed25519_instead_of_its_real_algorithm_is_rejected(self) -> None:
+        from dataclasses import replace
+
+        from webguard_api import TrustScanPermitError
+
+        signer = self._kms_signer()
+        permit = signer.sign(_permit_claims())
+        self.assertEqual(permit.signature_algorithm, "ECDSA_SHA_256")
+        relabeled = replace(permit, signature_algorithm="Ed25519")
+        with self.assertRaises(TrustScanPermitError) as caught:
+            signer.verify(relabeled)
+        self.assertEqual(caught.exception.code, "trustscan_permit_signature_algorithm_mismatch")
+
     def test_unsupported_permit_signature_algorithm_is_still_rejected(self) -> None:
         signer = TrustScanSigner(bytes(range(32)))
         permit = signer.sign(_permit_claims())
@@ -197,6 +233,19 @@ class SafetyReceiptSignatureAlgorithmSelfReportTests(unittest.TestCase):
         with self.assertRaises(TrustScanPermitError) as caught:
             signer.verify_safety_receipt(tampered)
         self.assertEqual(caught.exception.code, "trustscan_safety_receipt_signature_invalid")
+
+    def test_receipt_declaring_a_different_supported_algorithm_than_its_key_is_rejected(self) -> None:
+        from dataclasses import replace
+
+        from webguard_api import TrustScanPermitError
+
+        signer = TrustScanSigner(bytes(range(32)))
+        receipt = signer.sign_safety_receipt(_receipt_claims())
+        self.assertEqual(receipt.signature_algorithm, "Ed25519")
+        relabeled = replace(receipt, signature_algorithm="ECDSA_SHA_256")
+        with self.assertRaises(TrustScanPermitError) as caught:
+            signer.verify_safety_receipt(relabeled)
+        self.assertEqual(caught.exception.code, "trustscan_safety_receipt_signature_algorithm_mismatch")
 
     def test_unsupported_receipt_signature_algorithm_is_still_rejected(self) -> None:
         signer = TrustScanSigner(bytes(range(32)))

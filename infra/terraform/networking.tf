@@ -1,8 +1,33 @@
 # Minimal networking foundation -- only what an RDS subnet group and a
 # private database actually require. This is not a general-purpose VPC
-# design; it deliberately has no public subnets, no NAT gateway, and no
-# internet gateway, since nothing provisioned in this configuration
-# needs outbound internet access.
+# design; by default it has no public subnets, no NAT gateway, and no
+# internet gateway, since nothing in a real deployment of this
+# configuration needs outbound internet access (the application layer
+# that reaches RDS is separate compute with its own networking, not
+# provisioned here).
+#
+# var.create_staging_bastion_networking is the one deliberate opt-in
+# exception, default false so it changes nothing about a production
+# apply. docs/production/STAGING_ENVIRONMENT_PROVISIONING.md's own
+# bastion (a temporary EC2 instance reached via AWS Systems Manager
+# Session Manager, used only to run bootstrap SQL and the test suite
+# against a real RDS instance during P1-2 validation) cannot actually
+# reach anything without this: SSM Session Manager needs to reach
+# AWS's own SSM service endpoints, and the bastion also needs to
+# install OS packages (git, python3, psycopg2's build dependencies)
+# and read the RDS master credential from Secrets Manager, none of
+# which a security-group egress rule alone makes reachable if the
+# subnet itself has no route to the internet at all. A security
+# group's default "allow all egress" rule permits the traffic to
+# leave the instance; it does not give the SUBNET a path anywhere,
+# and those are two separate layers, the second one being what a
+# no-NAT/no-IGW private subnet is missing. This block gives the
+# bastion exactly that path, one NAT Gateway in one AZ (not
+# highly-available: a deliberate corner-cut for a disposable,
+# few-hours validation environment, not a production posture), and
+# nothing else: no change to the RDS security group, no public IP on
+# RDS itself, no route from the private subnets to anywhere except
+# through this NAT.
 
 resource "aws_vpc" "webguard" {
   cidr_block           = var.vpc_cidr_block
@@ -31,6 +56,122 @@ resource "aws_subnet" "private" {
     Environment = var.environment_name
     ManagedBy   = "terraform"
   }
+}
+
+resource "aws_internet_gateway" "webguard" {
+  count  = var.create_staging_bastion_networking ? 1 : 0
+  vpc_id = aws_vpc.webguard.id
+
+  tags = {
+    Name        = "webguard-${var.environment_name}-igw"
+    Environment = var.environment_name
+    ManagedBy   = "terraform"
+    Purpose     = "staging-bastion-egress"
+  }
+}
+
+resource "aws_subnet" "public_nat" {
+  count             = var.create_staging_bastion_networking ? 1 : 0
+  vpc_id            = aws_vpc.webguard.id
+  cidr_block        = var.public_subnet_cidr_block
+  availability_zone = var.availability_zones[0]
+
+  # Only the NAT Gateway's own ENI lives here; the bastion stays in
+  # the private subnet with no public IP of its own (postgres.tf's
+  # RDS instance and the bastion are both unreachable from the
+  # internet directly; only this one subnet, holding only the NAT
+  # Gateway, is public).
+  map_public_ip_on_launch = false
+
+  tags = {
+    Name        = "webguard-${var.environment_name}-public-nat"
+    Environment = var.environment_name
+    ManagedBy   = "terraform"
+    Purpose     = "staging-bastion-egress"
+  }
+}
+
+resource "aws_eip" "nat" {
+  count  = var.create_staging_bastion_networking ? 1 : 0
+  domain = "vpc"
+
+  tags = {
+    Name        = "webguard-${var.environment_name}-nat"
+    Environment = var.environment_name
+    ManagedBy   = "terraform"
+    Purpose     = "staging-bastion-egress"
+  }
+}
+
+# Single NAT Gateway, single AZ: see this file's header for why a
+# non-HA NAT is an accepted corner-cut here (disposable, few-hours
+# validation environment) rather than the two-NAT/two-AZ pattern a
+# production network would need.
+resource "aws_nat_gateway" "webguard" {
+  count         = var.create_staging_bastion_networking ? 1 : 0
+  allocation_id = aws_eip.nat[0].id
+  subnet_id     = aws_subnet.public_nat[0].id
+  depends_on    = [aws_internet_gateway.webguard]
+
+  tags = {
+    Name        = "webguard-${var.environment_name}-nat"
+    Environment = var.environment_name
+    ManagedBy   = "terraform"
+    Purpose     = "staging-bastion-egress"
+  }
+}
+
+resource "aws_route_table" "public_nat" {
+  count  = var.create_staging_bastion_networking ? 1 : 0
+  vpc_id = aws_vpc.webguard.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.webguard[0].id
+  }
+
+  tags = {
+    Name        = "webguard-${var.environment_name}-public-nat"
+    Environment = var.environment_name
+    ManagedBy   = "terraform"
+    Purpose     = "staging-bastion-egress"
+  }
+}
+
+resource "aws_route_table_association" "public_nat" {
+  count          = var.create_staging_bastion_networking ? 1 : 0
+  subnet_id      = aws_subnet.public_nat[0].id
+  route_table_id = aws_route_table.public_nat[0].id
+}
+
+resource "aws_route_table" "private_egress" {
+  count  = var.create_staging_bastion_networking ? 1 : 0
+  vpc_id = aws_vpc.webguard.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.webguard[0].id
+  }
+
+  tags = {
+    Name        = "webguard-${var.environment_name}-private-egress"
+    Environment = var.environment_name
+    ManagedBy   = "terraform"
+    Purpose     = "staging-bastion-egress"
+  }
+}
+
+# Both private subnets route through the same single NAT Gateway.
+# The bastion only ever runs in private_subnet[0] (see
+# provision-staging-bastion.sh), but RDS's own subnet group spans both
+# for its own two-AZ requirement (Terraform, not this route), so both
+# get the egress route for consistency; RDS itself never uses it (it
+# has no outbound need and no security-group egress rule permitting
+# it).
+resource "aws_route_table_association" "private_egress" {
+  count          = var.create_staging_bastion_networking ? 2 : 0
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private_egress[0].id
 }
 
 resource "aws_db_subnet_group" "webguard" {

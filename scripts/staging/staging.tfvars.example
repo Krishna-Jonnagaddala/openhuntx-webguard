@@ -1,0 +1,24 @@
+# Example tfvars for a disposable P1-2 validation staging environment.
+# Copy to staging.tfvars (gitignored, never commit real values), fill in,
+# and pass with `terraform apply -var-file=staging.tfvars`.
+#
+# This overrides two production-safe defaults from variables.tf that are
+# wrong for a throwaway validation instance: deletion_protection defaults
+# to true (correct for production, would block teardown here) and
+# postgres_backup_retention_days defaults to 7 (unnecessary cost for an
+# instance that lives for a day or two).
+
+aws_region         = "eu-west-2"
+environment_name   = "p1-2-staging-validation"
+availability_zones = ["eu-west-2a", "eu-west-2b"]
+
+# Set after scripts/staging/provision-staging-bastion.sh prints it.
+# There is no default in variables.tf on purpose: see that file's own
+# comment on why this configuration provisions no compute of its own.
+application_security_group_id = "REPLACE_WITH_BASTION_SECURITY_GROUP_ID"
+
+postgres_instance_class        = "db.t4g.micro"
+postgres_allocated_storage_gb  = 20
+postgres_backup_retention_days = 1
+postgres_multi_az              = false
+postgres_deletion_protection   = false
