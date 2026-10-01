@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 REQUIRED_DOCUMENTS = {
-    "SECURITY.md": ("# OpenHuntX WebGuard Security Policy", "## Reporting a vulnerability"),
+    "SECURITY.md": ("# WebGuard Security Policy", "## Reporting a vulnerability"),
     "docs/ARCHITECTURE.md": ("# OpenHuntX WebGuard Architecture", "## 6. Trust boundaries"),
     "docs/AUTHORIZATION_MODEL.md": ("# OpenHuntX WebGuard Authorisation Model", "## 15. Request-boundary enforcement"),
     "docs/DATA_CLASSIFICATION.md": ("# OpenHuntX WebGuard Data Classification and Handling", "### Restricted"),
@@ -85,12 +85,18 @@ def verify_readme() -> None:
         if marker in text:
             fail(f"README contains stale marker: {marker!r}")
     required = (
-        "docs/PLATFORM_SCOPE.md",
-        "PostgreSQL-backed",
-        "Current test totals are emitted by `./scripts/verify.sh` and CI.",
+        # The CLI pivot's reviewed baseline: the README must keep pointing
+        # at the legacy-platform index and the CLI's own architecture doc
+        # (not silently drift back to describing the retired SaaS product
+        # as current), must keep the tested-platform claim in sync with
+        # the actual CI matrix, and must not silently drop the open
+        # license/package-name decisions into a default choice.
+        "docs/LEGACY_PLATFORM.md",
+        "docs/CLI_ARCHITECTURE.md",
+        "docs/CASE_STUDY.md",
         "Python 3.11.15, 3.12.13, 3.13.14, and 3.14.6",
-        "docs/ARCHITECTURE.md",
-        "docs/THREAT_MODEL.md",
+        "cli-packaging",
+        "No license chosen yet.",
     )
     for marker in required:
         if marker not in text:

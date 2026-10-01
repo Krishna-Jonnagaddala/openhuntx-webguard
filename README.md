@@ -173,7 +173,7 @@ Isolated lab targets (`--lab --allow-host ...`, e.g. a local OWASP Juice Shop co
 
 ## Tested platforms
 
-- **Linux** (GitHub Actions `ubuntu-24.04`) — Python 3.11.15, 3.12.13, 3.13.14, 3.14.6, exercised on every push via this repository's CI, including a clean wheel-build-and-install smoke test (`cli-packaging` job).
+- **Linux** (GitHub Actions `ubuntu-24.04`) — Python 3.11.15, 3.12.13, 3.13.14, and 3.14.6, exercised on every push via this repository's CI, including a clean wheel-build-and-install smoke test (`cli-packaging` job).
 - **macOS** (Darwin 25.6, Python 3.14.7) — manually verified during this release, including a real `pipx install` from locally built wheels and the full `doctor` → `init` → `scan --lab` → `results list/clean` → `report render` journey from outside the repository checkout.
 - **Windows** — **not tested**. Nothing in the scanner's code is deliberately POSIX-only (it's stdlib `socket`/`ssl`/`pathlib`), but the `0600`/`0700` permission model and symlink-refusal checks rely on POSIX file-mode semantics that behave differently under Windows' ACL model, and no one has actually run it there. Treat Windows as unsupported until someone verifies it.
 
