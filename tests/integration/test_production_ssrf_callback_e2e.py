@@ -396,7 +396,39 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
                 findings_payload = json.loads(response.read())
                 connection.close()
                 self.assertEqual(response.status, 200, findings_payload)
-                return findings_payload["findings"]
+
+                # The scan record, not the job record, carries the
+                # per-check error detail (executor.py's ScanError tuple,
+                # e.g. ssrf_callback_pipeline_unverified): generate and
+                # download the real report through the same HTTP path
+                # M7/Slice 17 already prove, so a caller that needs the
+                # exact error code (not just the overall job state) can
+                # assert on it from real, persisted, checksum-verified
+                # bytes rather than reconstructing it from job state.
+                scan_id = result_payload["scan_id"]
+                report_body = json.dumps({"scan_id": scan_id}).encode()
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "POST", "/v1/reports", body=report_body,
+                    headers={"Authorization": f"Bearer {token.token}", "Content-Type": "application/json", "Content-Length": str(len(report_body))},
+                )
+                response = connection.getresponse()
+                report_created = json.loads(response.read())
+                connection.close()
+                self.assertEqual(response.status, 201, report_created)
+                report_id = report_created["report_id"]
+
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "GET", f"/v1/reports/{report_id}/download", headers={"Authorization": f"Bearer {token.token}"}
+                )
+                response = connection.getresponse()
+                report_bytes = response.read()
+                connection.close()
+                self.assertEqual(response.status, 200)
+                report_errors = json.loads(report_bytes)["errors"]
+
+                return findings_payload["findings"], report_errors
             finally:
                 stop.set()
                 server.shutdown()
@@ -413,7 +445,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         polling-based, cross-process callback correlation actually
         confirms a real out-of-band request."""
 
-        findings = self._run_job_and_get_findings(["active.ssrf.callback"])
+        findings, _report_errors = self._run_job_and_get_findings(["active.ssrf.callback"])
         ssrf_findings = [f for f in findings if f["check_id"].startswith("active.ssrf.callback")]
         self.assertTrue(
             ssrf_findings,
@@ -431,7 +463,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         against the identical vulnerable fixture, even in production
         wiring."""
 
-        findings = self._run_job_and_get_findings([])
+        findings, _report_errors = self._run_job_and_get_findings([])
         self.assertFalse(any(f["check_id"].startswith("active.ssrf.callback") for f in findings), findings)
 
     def test_ssrf_confirmed_despite_a_transient_persistence_failure_within_retry_budget(self) -> None:
@@ -470,7 +502,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
             return real_execute(self_conn, query, params, **kwargs)
 
         with patch.object(psycopg.Connection, "execute", faulty_execute):
-            findings = self._run_job_and_get_findings(["active.ssrf.callback"])
+            findings, _report_errors = self._run_job_and_get_findings(["active.ssrf.callback"])
 
         self.assertTrue(state["failed_once"], "the fault injection must actually have fired at least once")
         ssrf_findings = [f for f in findings if f["check_id"].startswith("active.ssrf.callback")]
@@ -571,7 +603,7 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
         # traced cost once the test stops self-throttling.
         run_started_at = _utc_now()
         with patch.object(psycopg.Connection, "execute", always_faulty_execute):
-            findings = self._run_job_and_get_findings(
+            findings, report_errors = self._run_job_and_get_findings(
                 ["active.ssrf.callback"],
                 completion_timeout_seconds=60,
                 expected_state="completed_with_errors",
@@ -586,6 +618,21 @@ class ProductionSsrfCallbackEndToEndTests(unittest.TestCase):
             confirmed_or_probable, [],
             "must never fabricate a CWE-918 finding for an observation that was never durably persisted",
         )
+
+        # The overall job state (completed_with_errors, asserted via
+        # expected_state above) is necessary but not sufficient: it
+        # would also be true of an unrelated error. The specific code
+        # this fix exists to produce, and the message a user would
+        # actually see explaining what happened, must both be present.
+        unverified_errors = [
+            error for error in report_errors if error["code"] == "ssrf_callback_pipeline_unverified"
+        ]
+        self.assertEqual(
+            len(unverified_errors), 1,
+            f"expected exactly one ssrf_callback_pipeline_unverified error, got: {report_errors}",
+        )
+        self.assertIn("could not be confirmed", unverified_errors[0]["message"])
+        self.assertIn("positive control", unverified_errors[0]["message"])
 
         from webguard_api.postgres_pool import WebGuardPostgresPool
 
