@@ -57,7 +57,13 @@ class PlatformExpansionApiTests(unittest.TestCase):
 
     def test_module_entitlements_empty_for_an_organization_with_no_rows(self) -> None:
         payload = self.service.list_module_entitlements(self.owner, request_id=_rid())
-        self.assertEqual(payload, {"entitlements": []})
+        self.assertEqual(
+            payload,
+            {
+                "entitlements": [],
+                "deployment_availability": {"webguard": True, "soc": True, "compliance": True},
+            },
+        )
 
     def test_module_entitlements_reflects_granted_defaults(self) -> None:
         self.entitlements.grant_default_entitlements(self.owner.organization_id, now=NOW)
