@@ -306,8 +306,9 @@ function StartScanPanel({ targetId }: { targetId: string }) {
         <p className="text-sm text-[var(--color-text-secondary)]">Verify ownership of this asset before scanning it.</p>
       ) : !authorized ? (
         <p className="text-sm text-[var(--color-text-secondary)]">
-          No active authorization currently covers this exact URL. An owner or administrator must assign one
-          before a scan can be issued. The app cannot construct or bypass this requirement.
+          No active authorization currently covers this exact URL. Assigning one is not yet a self-service action
+          in this app, regardless of your own role here -- contact your OpenHuntX representative to have one
+          issued. The app cannot construct or bypass this requirement.
         </p>
       ) : (
         <div>
