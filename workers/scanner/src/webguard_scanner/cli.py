@@ -1827,8 +1827,15 @@ def _doctor_command(args: argparse.Namespace) -> int:
 def _iter_result_files(directory: Path) -> list[Path]:
     if not directory.exists():
         return []
+    # Authorization audit records live beside the reports they belong to.
+    # They are evidence, not scan results: never list them as unreadable
+    # results and never let `results clean` delete them.
     return sorted(
-        (path for path in directory.glob("*.json") if path.is_file()),
+        (
+            path
+            for path in directory.glob("*.json")
+            if path.is_file() and not path.name.endswith(DEFAULT_OWNED_AUDIT_SUFFIX)
+        ),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )

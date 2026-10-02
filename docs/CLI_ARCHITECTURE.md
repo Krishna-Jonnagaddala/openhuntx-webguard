@@ -75,3 +75,13 @@ Everything below was added to `workers/scanner/src/webguard_scanner/cli.py`; not
 - A fail-closed catch-all in `main()`: unhandled exceptions now exit `6` with the exception type and message instead of a raw traceback or (if ever introduced by a future bug) silently reporting success; `Ctrl-C` now exits `130` with a clean message instead of a stack trace.
 
 See the root [README](../README.md) for the full command reference and [`docs/CASE_STUDY.md`](CASE_STUDY.md) for the reasoning behind the broader pivot from a hosted platform to a CLI tool.
+
+## What the wheels contain
+
+Measured by following imports from the `webguard` entry point (`workers/scanner/src/webguard_scanner/cli.py`), not by inspection of names.
+
+The `openhuntx-webguard` wheel has 35 modules; the CLI reaches 21 of them. The other 13 are the active-detection library, which the CLI never calls: `active_candidate_discovery`, `active_detection`, `active_detector_registry`, `attack_surface`, `authorization_crawl`, `callback_broker`, `idor_authorization_detector`, `login_workflow`, `request_template`, `resource_graph`, `sqli_error_detector`, `ssrf_callback_detector`, and `xss_reflected_detector`. (`__main__` only forwards to the CLI.) Only the archived platform layer called them, and the `webguard` command exposes no way to run them.
+
+The `openhuntx-webguard-contracts` wheel has 15 modules; the CLI-reachable code uses definitions from 7 of them: `crawl_checkpoints`, `crawl_scans`, `findings`, `owned_targets`, `report_loader`, `reporting`, and `scans`. The other 7 are definitions from the retired platform that the CLI never uses: `compliance`, `compliance_scope`, `safety_receipts`, `scan_jobs`, `scan_permits`, `scan_schedules`, and `tenancy`. The package's `__init__` imports and re-exports all of them, so they load at import time, but they are inert data types with no behavior the CLI invokes.
+
+None of this is a release blocker: nothing in it runs unless someone imports it directly, and the README says so. Trimming both wheels is a reasonable change before 1.0, but it would reshape a public package interface, so it is deliberately not part of this release.

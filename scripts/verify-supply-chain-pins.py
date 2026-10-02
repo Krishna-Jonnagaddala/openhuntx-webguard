@@ -205,11 +205,20 @@ if "./scripts/install-locked-dependencies.sh" not in workflow:
 if "pip install --upgrade" in workflow:
     fail("CI still performs an unconstrained packaging-tool upgrade")
 
-uses_lines = [
-    line.strip().split("uses:", 1)[1].strip()
-    for line in workflow.splitlines()
-    if line.strip().startswith("uses:")
-]
+USES_LINE = re.compile(r"^\s*(?:-\s+)?uses:\s*(\S+)")
+
+
+def uses_references(text: str) -> list[str]:
+    """Every action reference in the workflow, whether on a `uses:` or `- uses:` line."""
+
+    return [
+        match[1]
+        for line in text.splitlines()
+        if not line.lstrip().startswith("#") and (match := USES_LINE.match(line))
+    ]
+
+
+uses_lines = uses_references(workflow)
 reviewed_actions = {
     f"actions/checkout@{CHECKOUT_SHA}",
     f"actions/setup-python@{SETUP_PYTHON_SHA}",
@@ -217,27 +226,21 @@ reviewed_actions = {
     f"actions/upload-artifact@{UPLOAD_ARTIFACT_SHA}",
     f"hashicorp/setup-terraform@{SETUP_TERRAFORM_SHA}",
 }
-for action in uses_lines:
-    action_ref = action.split("#", 1)[0].strip()
+for action_ref in uses_lines:
     if action_ref not in reviewed_actions:
         fail(f"CI uses an unreviewed GitHub Action: {action_ref}")
 
 # publish.yml is manual-dispatch-only and cannot succeed without PyPI
 # trusted-publisher setup. Its actions go through the same reviewed-SHA
-# discipline as ci.yml, and its structure is checked so that a later edit
-# cannot quietly widen who holds the OIDC publishing permission.
+# discipline as ci.yml, and its structure is checked job by job so that a
+# later edit cannot quietly widen who holds the OIDC publishing permission,
+# let a dry run upload, or point both projects at the same environment.
 publish_workflow = read(".github/workflows/publish.yml")
-publish_uses_lines = [
-    line.strip().split("uses:", 1)[1].strip()
-    for line in publish_workflow.splitlines()
-    if line.strip().startswith("uses:")
-]
 publish_reviewed_actions = reviewed_actions | {
     f"pypa/gh-action-pypi-publish@{PYPI_PUBLISH_SHA}",
     f"actions/download-artifact@{DOWNLOAD_ARTIFACT_SHA}",
 }
-for action in publish_uses_lines:
-    action_ref = action.split("#", 1)[0].strip()
+for action_ref in uses_references(publish_workflow):
     if action_ref not in publish_reviewed_actions:
         fail(f"publish.yml uses an unreviewed GitHub Action: {action_ref}")
 
@@ -246,25 +249,107 @@ for action in publish_uses_lines:
 publish_active = "\n".join(
     line for line in publish_workflow.splitlines() if not line.lstrip().startswith("#")
 )
+if re.search(r"\b(write-all|read-all)\b", publish_active):
+    fail("publish.yml must not use write-all or read-all permissions")
+
 trigger_block = publish_active.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
 if re.findall(r"^  (\w+):", trigger_block, re.MULTILINE) != ["workflow_dispatch"]:
     fail("publish.yml must be triggered by workflow_dispatch only")
+mode_lines = publish_active.splitlines()
+for required in ("          - dry-run", "          - publish", "        default: dry-run"):
+    if required not in mode_lines:
+        fail(f"publish.yml's mode input must contain the line {required.strip()!r}")
+if re.search(r"^          - (?!dry-run$|publish$)\S", trigger_block, re.MULTILINE):
+    fail("publish.yml's mode input must offer exactly dry-run and publish")
 
-if publish_active.count("id-token: write") != 1:
-    fail("publish.yml must grant id-token: write exactly once")
-build_part, _, publish_part = publish_active.partition("\n  publish:\n")
-if not publish_part or "id-token" in build_part:
-    fail("publish.yml may grant id-token only to the publish job, not the build job")
-if "environment: pypi-publish" not in publish_part:
-    fail("publish.yml's publish job must use the pypi-publish environment")
-if "digest-mismatch: error" not in publish_part:
-    fail("publish.yml must make an artifact digest mismatch a hard error")
-if "skip-existing: false" not in publish_part:
-    fail("publish.yml must not skip files that already exist on PyPI")
-if "scripts/verify-release-artifacts.py" not in build_part:
+top_permissions = publish_active.split("\npermissions:\n", 1)[1].split("\n\n", 1)[0]
+if top_permissions != "  contents: read":
+    fail("publish.yml's workflow-level permissions must be exactly contents: read")
+
+jobs_section = publish_active.split("\njobs:\n", 1)[1]
+job_starts = list(re.finditer(r"^  ([A-Za-z0-9_-]+):\s*$", jobs_section, re.MULTILINE))
+publish_jobs = {
+    match[1]: jobs_section[match.end() : job_starts[i + 1].start() if i + 1 < len(job_starts) else len(jobs_section)]
+    for i, match in enumerate(job_starts)
+}
+if set(publish_jobs) != {"build-and-verify", "publish-contracts", "publish-webguard"}:
+    fail(f"publish.yml must have exactly the build, contracts, and webguard jobs, found {sorted(publish_jobs)}")
+
+
+def job_lines(name: str) -> list[str]:
+    return publish_jobs[name].splitlines()
+
+
+def block_after(lines: list[str], header: str) -> list[str]:
+    """The lines indented deeper than `header`, up to the next line that is not."""
+
+    start = lines.index(header) + 1
+    block = []
+    for line in lines[start:]:
+        if not line.startswith(header[: len(header) - len(header.lstrip())] + "  "):
+            break
+        block.append(line)
+    return block
+
+
+def require_job_line(name: str, line: str, why: str) -> None:
+    if line not in job_lines(name):
+        fail(f"publish.yml job {name}: {why} (expected the line {line.strip()!r})")
+
+
+build_job = publish_jobs["build-and-verify"]
+require_job_line("build-and-verify", "    if: github.ref == 'refs/heads/main'", "the build job must only run from main")
+if "id-token" in build_job or "environment:" in build_job:
+    fail("publish.yml's build job must have no id-token permission and no environment")
+if block_after(job_lines("build-and-verify"), "    permissions:") != ["      contents: read"]:
+    fail("publish.yml's build job permissions must be exactly contents: read")
+if "scripts/verify-release-artifacts.py" not in build_job:
     fail("publish.yml's build job must run the release artifact verification")
-if re.search(r"^\s*(pip|python -m pip)\s+wheel", publish_part, re.MULTILINE):
-    fail("publish.yml's publish job must not rebuild the artifacts it uploads")
+if not any(ref.startswith("actions/upload-artifact@") for ref in uses_references(build_job)):
+    fail("publish.yml's build job must hand the artifacts to the publish jobs")
+
+PUBLISH_JOBS = {
+    "publish-contracts": ("pypi-contracts", "contracts", "openhuntx-webguard-contracts"),
+    "publish-webguard": ("pypi-webguard", "webguard", "openhuntx-webguard"),
+}
+publish_upload_guard = (
+    "        if: github.event.inputs.mode == 'publish' && steps.plan.outputs.state == 'absent'"
+)
+for job_name, (environment, distribution, project) in PUBLISH_JOBS.items():
+    text = publish_jobs[job_name]
+    require_job_line(job_name, f"    environment: {environment}", "wrong or missing environment")
+    require_job_line(
+        job_name,
+        "    needs: build-and-verify" if job_name == "publish-contracts" else "      - publish-contracts",
+        "wrong job ordering",
+    )
+    if block_after(job_lines(job_name), "    permissions:") != ["      contents: read", "      id-token: write"]:
+        fail(f"publish.yml job {job_name} must grant exactly contents: read and id-token: write")
+    if f"--distribution {distribution}" not in text:
+        fail(f"publish.yml job {job_name} must stage only the {distribution} distribution")
+    if re.search(r"\bpip(?:3)?\s+wheel\b|-m pip wheel", text):
+        fail(f"publish.yml job {job_name} must not rebuild the artifacts it uploads")
+    pypa_steps = [ref for ref in uses_references(text) if ref.startswith("pypa/gh-action-pypi-publish@")]
+    if len(pypa_steps) != 1:
+        fail(f"publish.yml job {job_name} must have exactly one PyPI upload step")
+    if text.count(publish_upload_guard) != 1:
+        fail(f"publish.yml job {job_name}: the upload step must be guarded by publish mode and an absent file")
+    for required, why in (
+        ("          packages-dir: stage/", "upload only the staged directory"),
+        ("          skip-existing: false", "never skip or overwrite existing files"),
+        ("          attestations: true", "publish attestations"),
+        ("          digest-mismatch: error", "treat an artifact digest mismatch as a hard error"),
+        (f"            --project {project} \\", "check and await its own PyPI project"),
+    ):
+        if required not in text.splitlines():
+            fail(f"publish.yml job {job_name} must {why} (expected the line {required.strip()!r})")
+    if "release-publish.py await" not in text:
+        fail(f"publish.yml job {job_name} must confirm the upload against PyPI by name and checksum")
+
+if publish_active.count("id-token: write") != 2:
+    fail("publish.yml must grant id-token: write to exactly the two publish jobs")
+if re.search(r"environment:\s*pypi-publish\b", publish_active):
+    fail("publish.yml must not reference the retired shared pypi-publish environment")
 
 if "  terraform:" not in workflow:
     fail("CI terraform validation/IaC scan job is missing")

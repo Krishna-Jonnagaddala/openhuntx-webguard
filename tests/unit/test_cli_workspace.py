@@ -162,6 +162,28 @@ class CliWorkspaceTests(unittest.TestCase):
             self.assertEqual(code, cli.EXIT_SUCCESS)
             self.assertIn("[UNREADABLE]", stdout)
 
+    def test_results_commands_leave_authorization_audit_records_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "example.json"
+            audit = Path(directory) / ("example.json" + cli.DEFAULT_OWNED_AUDIT_SUFFIX)
+            cli._write_report(
+                _completed_result("55555555-5555-5555-5555-555555555555"),
+                report,
+                overwrite=False,
+            )
+            audit.write_text("{}", encoding="utf-8")
+
+            _, listing, _ = self._run(["results", "list", "--directory", directory])
+            self.assertIn("example.json", listing)
+            self.assertNotIn("UNREADABLE", listing)
+            self.assertNotIn("authorization-audit", listing)
+
+            code, stdout, _ = self._run(["results", "clean", "--directory", directory, "--yes"])
+            self.assertEqual(code, cli.EXIT_SUCCESS)
+            self.assertIn("Deleted 1 of 1", stdout)
+            self.assertFalse(report.exists())
+            self.assertTrue(audit.exists(), "the audit record must survive `results clean`")
+
     def test_results_clean_without_yes_is_a_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "example.json"

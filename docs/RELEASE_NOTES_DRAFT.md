@@ -37,7 +37,13 @@ The [README](../README.md) quick-start runs as written against a local target.
 
 - Active detection (XSS, SQLi, SSRF-callback confirmation, etc.): present in the scanner library, not wired into the CLI yet
 - Windows support: untested and not supported. Tested on Linux (CI, Python 3.11 to 3.14) and macOS (Python 3.14)
-- Anything from the retired hosted SaaS platform (accounts, a web dashboard, SOC/Compliance modules): archived, not shipped; see [`docs/LEGACY_PLATFORM.md`](LEGACY_PLATFORM.md)
+- The retired hosted SaaS platform (accounts, a web dashboard, the multi-tenant API, SOC and Compliance modules): archived and not shipped; see [`docs/LEGACY_PLATFORM.md`](LEGACY_PLATFORM.md). The two wheels do still contain inert code from it that the `webguard` command never uses: 13 active-detection library modules in `openhuntx-webguard`, and definitions for tenancy, compliance, scan jobs and schedules, permits, and safety receipts in `openhuntx-webguard-contracts`. [`docs/CLI_ARCHITECTURE.md`](CLI_ARCHITECTURE.md) lists exactly which modules the CLI reaches. Trimming them is planned for before 1.0
+
+### Behavior worth knowing
+
+- A target that answers with a redirect is reported as a failed scan (`request/redirect_blocked`, exit 1); WebGuard never follows redirects. Scan the final URL, with an authorization for that exact canonical URL
+- Ctrl-C during a single-page scan exits 130 and writes nothing. During `--crawl` it stops the crawl, saves a partial report with status `cancelled` and the checkpoint if one was requested, and exits 1; `--resume-from` continues from that checkpoint
+- The authorization record is unsigned and SHA-256 fingerprinted, not cryptographically signed
 
 ### Known gaps in this release
 

@@ -299,18 +299,27 @@ def install_and_smoke_test(dist_dir: Path, version: str) -> None:
             [
                 python, "-c",
                 "import webguard_contracts, webguard_scanner; "
-                "print(webguard_contracts.__file__); print(webguard_scanner.__file__)",
+                "print(webguard_contracts.__file__); print(webguard_scanner.__file__); "
+                "print(webguard_contracts.__version__); print(webguard_scanner.__version__)",
             ],
             cwd=workdir,
             env=env,
         ).stdout.split()
-        for module_path in located:
+        for module_path in located[:2]:
             if not Path(module_path).resolve().is_relative_to(environment_dir.resolve()):
                 raise ReleaseCheckError(
                     f"{module_path} was imported from outside the clean environment"
                 )
+        if located[2:] != [version, version]:
+            raise ReleaseCheckError(
+                f"packages report __version__ {located[2:]} but the wheels are {version}"
+            )
 
-        run([webguard, "--version"], cwd=workdir, env=env)
+        reported = run([webguard, "--version"], cwd=workdir, env=env).stdout.strip()
+        if reported != f"webguard {version}":
+            raise ReleaseCheckError(
+                f"`webguard --version` printed {reported!r}, expected 'webguard {version}'"
+            )
         run([webguard, "doctor", "--directory", str(workdir)], cwd=workdir, env=env)
         run([webguard, "init", "--directory", str(workdir)], cwd=workdir, env=env)
 

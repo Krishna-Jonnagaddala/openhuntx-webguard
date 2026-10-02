@@ -1,51 +1,57 @@
 name: Publish to PyPI
 
 # Manual dispatch only: no push, pull_request, or release event starts this.
-# No PyPI credential is stored anywhere. PyPI authenticates the publish job
-# with a short-lived OIDC identity token, so it cannot succeed until both
+# No PyPI credential is stored anywhere. PyPI authenticates each publish job
+# with a short-lived OIDC identity token, so nothing can upload until both
 # PyPI projects have a trusted publisher pointing at this repository, this
-# workflow file, and the pypi-publish environment. docs/RELEASING.md has the
-# exact fields, the release sequence, and the partial-upload recovery.
+# workflow file, and the environment named on that project's job below.
+# docs/RELEASING.md has the exact fields, the release sequence, and recovery.
 #
-# The default mode is dry-run: it builds, validates, hands the artifacts to
-# the publish job, re-verifies them there, and stops before any upload.
-# Run it first to rehearse everything except the upload itself.
+# Three jobs, in order:
+#   build-and-verify   builds both wheels, validates and smoke-tests exactly
+#                      those files, and uploads them as one artifact. It has
+#                      no OIDC permission.
+#   publish-contracts  environment pypi-contracts. Verifies the downloaded
+#                      artifact, then uploads openhuntx-webguard-contracts.
+#   publish-webguard   environment pypi-webguard. Runs only after
+#                      publish-contracts succeeded. Verifies the artifact,
+#                      confirms the contracts file on PyPI by name and
+#                      SHA-256, then uploads openhuntx-webguard.
+# The two publish jobs never rebuild. Each uploads only its own wheel.
+#
+# The default mode is dry-run: every job runs and every check passes or
+# fails exactly as in a real publish, but no upload step runs.
+#
+# Retrying is safe. A file already on PyPI is treated as done only if its
+# filename and SHA-256 match the verified artifact, and any mismatch stops
+# the release. Nothing is ever uploaded over an existing file, and
+# skip-existing stays off. To retry after a partial failure, use "Re-run
+# failed jobs" on the original run, which reuses the same verified artifact.
 #
 # What actually restricts publishing:
-#   - The pypi-publish environment's deployment-branch policy (repository
-#     Settings, Environments), which allows only main. GitHub enforces it on
-#     the server, so it still holds if someone edits this file on another
-#     branch. This is the independent control.
-#   - id-token: write exists only on the publish job, and that job only
-#     receives artifacts the build job already validated.
+#   - Each environment's deployment-branch policy (repository Settings,
+#     Environments) allows only main. GitHub enforces it on the server, so
+#     it still holds if someone edits this file on another branch. This is
+#     the independent control.
+#   - id-token: write exists only on the two publish jobs.
 # The typed confirmation and the github.ref condition on the build job stop
 # a mistaken dispatch early, but anyone able to edit this file on a branch
 # can delete them. Do not count them as protection.
-#
-# Published files cannot be overwritten on PyPI, and a deleted filename can
-# never be reused. Nothing here assumes otherwise: the publish job refuses
-# to upload a version that already exists, uploads the dependency
-# (openhuntx-webguard-contracts) before the package that needs it, and has
-# a webguard-only mode for finishing a release where only the first upload
-# succeeded.
 
 on:
   workflow_dispatch:
     inputs:
       mode:
         description: >-
-          dry-run rehearses everything except the upload. publish uploads
-          both distributions. publish-webguard-only uploads only
-          openhuntx-webguard, for finishing a release after the contracts
-          upload succeeded and the webguard upload failed.
+          dry-run rehearses everything except the uploads. publish uploads
+          the two distributions, contracts first.
         type: choice
         options:
           - dry-run
           - publish
-          - publish-webguard-only
         default: dry-run
       confirm:
-        description: 'Required for publish modes: type "publish". Ignored by dry-run.'
+        description: 'Required for publish mode: type "publish". Ignored by dry-run.'
         required: false
         default: ''
 
@@ -69,7 +75,7 @@ jobs:
       scanner_sha256: ${{ steps.verify.outputs.scanner_sha256 }}
 
     steps:
-      - name: Require the typed confirmation for publish modes
+      - name: Require the typed confirmation for publish mode
         env:
           MODE: ${{ github.event.inputs.mode }}
           CONFIRM: ${{ github.event.inputs.confirm }}
@@ -118,23 +124,29 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Hand the verified files to the publish job
+      - name: Hand the verified files to the publish jobs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-dist
           path: release/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
-  publish:
-    name: Publish the verified artifacts
+  publish-contracts:
+    name: Publish openhuntx-webguard-contracts
     needs: build-and-verify
     runs-on: ubuntu-24.04
-    environment: pypi-publish
+    environment: pypi-contracts
     permissions:
+      contents: read
       id-token: write
 
     steps:
+      - name: Check out the scripts at the dispatched commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Download the artifacts the build job verified
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -142,92 +154,139 @@ jobs:
           path: release
           digest-mismatch: error
 
-      - name: Re-verify the downloaded files and stage one directory per project
+      - name: Verify the manifest and checksums, and stage only the contracts wheel
+        id: stage
         env:
           VERSION: ${{ needs.build-and-verify.outputs.version }}
           CONTRACTS_SHA256: ${{ needs.build-and-verify.outputs.contracts_sha256 }}
           SCANNER_SHA256: ${{ needs.build-and-verify.outputs.scanner_sha256 }}
         run: |
-          set -euo pipefail
-          contracts="openhuntx_webguard_contracts-${VERSION}-py3-none-any.whl"
-          scanner="openhuntx_webguard-${VERSION}-py3-none-any.whl"
+          python3 scripts/release-publish.py stage \
+            --release-dir release --distribution contracts --stage-dir stage \
+            --expect-version "$VERSION" \
+            --expect-contracts-sha256 "$CONTRACTS_SHA256" \
+            --expect-webguard-sha256 "$SCANNER_SHA256" \
+            --github-output "$GITHUB_OUTPUT"
 
-          expected="$(printf '%s\n' release/SHA256SUMS release/dist "release/dist/${contracts}" "release/dist/${scanner}" | sort)"
-          actual="$(find release -mindepth 1 | sort)"
-          if [ "$expected" != "$actual" ]; then
-            echo "Unexpected contents in the downloaded artifact:" >&2
-            echo "$actual" >&2
-            exit 1
-          fi
+      - name: Check what PyPI already holds for this project
+        id: plan
+        env:
+          VERSION: ${{ steps.stage.outputs.version }}
+          FILENAME: ${{ steps.stage.outputs.filename }}
+          SHA256: ${{ steps.stage.outputs.sha256 }}
+        run: |
+          python3 scripts/release-publish.py plan \
+            --project openhuntx-webguard-contracts \
+            --version "$VERSION" --filename "$FILENAME" --sha256 "$SHA256" \
+            --github-output "$GITHUB_OUTPUT"
 
-          (cd release/dist && sha256sum -c ../SHA256SUMS)
-          test "$(sha256sum "release/dist/${contracts}" | cut -d' ' -f1)" = "$CONTRACTS_SHA256"
-          test "$(sha256sum "release/dist/${scanner}" | cut -d' ' -f1)" = "$SCANNER_SHA256"
+      - name: Upload openhuntx-webguard-contracts
+        if: github.event.inputs.mode == 'publish' && steps.plan.outputs.state == 'absent'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1, v1.14.2
+        with:
+          packages-dir: stage/
+          skip-existing: false
+          attestations: true
+          print-hash: true
 
-          mkdir -p stage/contracts stage/webguard
-          cp "release/dist/${contracts}" stage/contracts/
-          cp "release/dist/${scanner}" stage/webguard/
-          test "$(find stage/contracts -type f | wc -l)" -eq 1
-          test "$(find stage/webguard -type f | wc -l)" -eq 1
-          test "$(sha256sum "stage/contracts/${contracts}" | cut -d' ' -f1)" = "$CONTRACTS_SHA256"
-          test "$(sha256sum "stage/webguard/${scanner}" | cut -d' ' -f1)" = "$SCANNER_SHA256"
+      - name: Confirm PyPI holds exactly the verified file
+        if: github.event.inputs.mode == 'publish'
+        env:
+          VERSION: ${{ steps.stage.outputs.version }}
+          FILENAME: ${{ steps.stage.outputs.filename }}
+          SHA256: ${{ steps.stage.outputs.sha256 }}
+        run: |
+          python3 scripts/release-publish.py await \
+            --project openhuntx-webguard-contracts \
+            --version "$VERSION" --filename "$FILENAME" --sha256 "$SHA256" \
+            --timeout 300
 
-      - name: Check what PyPI already has
+  publish-webguard:
+    name: Publish openhuntx-webguard
+    needs:
+      - build-and-verify
+      - publish-contracts
+    runs-on: ubuntu-24.04
+    environment: pypi-webguard
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out the scripts at the dispatched commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the artifacts the build job verified
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dist
+          path: release
+          digest-mismatch: error
+
+      - name: Verify the manifest and checksums, and stage only the CLI wheel
+        id: stage
+        env:
+          VERSION: ${{ needs.build-and-verify.outputs.version }}
+          CONTRACTS_SHA256: ${{ needs.build-and-verify.outputs.contracts_sha256 }}
+          SCANNER_SHA256: ${{ needs.build-and-verify.outputs.scanner_sha256 }}
+        run: |
+          python3 scripts/release-publish.py stage \
+            --release-dir release --distribution webguard --stage-dir stage \
+            --expect-version "$VERSION" \
+            --expect-contracts-sha256 "$CONTRACTS_SHA256" \
+            --expect-webguard-sha256 "$SCANNER_SHA256" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Confirm the contracts dependency is on PyPI with the verified hash
         env:
           MODE: ${{ github.event.inputs.mode }}
-          VERSION: ${{ needs.build-and-verify.outputs.version }}
+          VERSION: ${{ steps.stage.outputs.version }}
+          FILENAME: ${{ steps.stage.outputs.contracts_filename }}
+          SHA256: ${{ steps.stage.outputs.contracts_sha256 }}
         run: |
           set -euo pipefail
-          status() {
-            curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/$1/${VERSION}/json"
-          }
-          contracts="$(status openhuntx-webguard-contracts)"
-          webguard="$(status openhuntx-webguard)"
-          echo "PyPI status for ${VERSION}: openhuntx-webguard-contracts=${contracts} openhuntx-webguard=${webguard} (200 exists, 404 absent)"
+          if [ "$MODE" = "publish" ]; then
+            python3 scripts/release-publish.py await \
+              --project openhuntx-webguard-contracts \
+              --version "$VERSION" --filename "$FILENAME" --sha256 "$SHA256" \
+              --timeout 300
+          else
+            python3 scripts/release-publish.py plan \
+              --project openhuntx-webguard-contracts \
+              --version "$VERSION" --filename "$FILENAME" --sha256 "$SHA256"
+          fi
 
-          for code in "$contracts" "$webguard"; do
-            if [ "$code" != "200" ] && [ "$code" != "404" ]; then
-              echo "PyPI answered ${code}; refusing to guess whether the version exists." >&2
-              exit 1
-            fi
-          done
+      - name: Check what PyPI already holds for this project
+        id: plan
+        env:
+          VERSION: ${{ steps.stage.outputs.version }}
+          FILENAME: ${{ steps.stage.outputs.filename }}
+          SHA256: ${{ steps.stage.outputs.sha256 }}
+        run: |
+          python3 scripts/release-publish.py plan \
+            --project openhuntx-webguard \
+            --version "$VERSION" --filename "$FILENAME" --sha256 "$SHA256" \
+            --github-output "$GITHUB_OUTPUT"
 
-          case "$MODE" in
-            dry-run)
-              echo "Dry run: not uploading anything."
-              ;;
-            publish)
-              if [ "$contracts" != "404" ] || [ "$webguard" != "404" ]; then
-                echo "A version ${VERSION} already exists on PyPI, and files cannot be overwritten. Bump the version instead." >&2
-                exit 1
-              fi
-              ;;
-            publish-webguard-only)
-              if [ "$contracts" != "200" ] || [ "$webguard" != "404" ]; then
-                echo "publish-webguard-only needs contracts ${VERSION} already on PyPI and webguard ${VERSION} absent." >&2
-                exit 1
-              fi
-              ;;
-            *)
-              echo "Unknown mode: $MODE" >&2
-              exit 1
-              ;;
-          esac
+      - name: Upload openhuntx-webguard
+        if: github.event.inputs.mode == 'publish' && steps.plan.outputs.state == 'absent'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1, v1.14.2
+        with:
+          packages-dir: stage/
+          skip-existing: false
+          attestations: true
+          print-hash: true
 
-      - name: Publish openhuntx-webguard-contracts
+      - name: Confirm PyPI holds exactly the verified file
         if: github.event.inputs.mode == 'publish'
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1, v1.14.2
-        with:
-          packages-dir: stage/contracts/
-          skip-existing: false
-          attestations: true
-          print-hash: true
-
-      - name: Publish openhuntx-webguard
-        if: github.event.inputs.mode == 'publish' || github.event.inputs.mode == 'publish-webguard-only'
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1, v1.14.2
-        with:
-          packages-dir: stage/webguard/
-          skip-existing: false
-          attestations: true
-          print-hash: true
+        env:
+          VERSION: ${{ steps.stage.outputs.version }}
+          FILENAME: ${{ steps.stage.outputs.filename }}
+          SHA256: ${{ steps.stage.outputs.sha256 }}
+        run: |
+          python3 scripts/release-publish.py await \
+            --project openhuntx-webguard \
+            --version "$VERSION" --filename "$FILENAME" --sha256 "$SHA256" \
+            --timeout 300

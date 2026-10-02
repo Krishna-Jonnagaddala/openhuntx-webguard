@@ -20,7 +20,7 @@ WebGuard v1 is **passive-only**:
 - produces a deterministic, fingerprint-stable findings report you can diff between runs (`report compare`) to prove remediation
 - never submits forms, executes JavaScript, injects payloads, brute-forces, or follows redirects
 
-The scanner library (`webguard_scanner`) also contains active-detection modules (reflected XSS, SQL error-based injection, SSRF callback confirmation, IDOR, login-workflow analysis), but as of this release they are **not wired into the CLI's `scan` command**. They exist today only inside the archived multi-tenant SaaS orchestration layer (`apps/api/`, see [Project history](#project-history) below), which required a signed execution permit and a callback-receiving service neither of which a local CLI has. Exposing them from the CLI (for example behind an explicit `--active-check` flag, with its own authorization and callback-handling story) is tracked as the main piece of future work. See [Known limitations](#known-limitations--whats-next).
+The scanner library (`webguard_scanner`) also contains active-detection modules (reflected XSS, SQL error-based injection, SSRF callback confirmation, IDOR, login-workflow analysis), but as of this release they are **not wired into the CLI's `scan` command**. They ship in the `openhuntx-webguard` wheel as library code, and the only thing that calls them today is the archived multi-tenant SaaS orchestration layer (`apps/api/`, see [Project history](#project-history) below), which relied on a signed execution permit and a callback-receiving service that a local CLI doesn't have. The `webguard` command never reaches them. Exposing them from the CLI (for example behind an explicit `--active-check` flag, with its own authorization and callback-handling story) is tracked as the main piece of future work. See [Known limitations](#known-limitations--whats-next).
 
 ## Install
 
@@ -167,26 +167,28 @@ Run `webguard <command> --help` or `webguard <command> <subcommand> --help` for 
 | Code | Meaning |
 |---|---|
 | `0` | Success |
-| `1` | Scan failed |
+| `1` | Scan failed, or a crawl was cancelled with Ctrl-C (the partial report is still saved) |
 | `2` | Usage error (bad arguments) |
 | `3` | Preflight failed (authorization/scope/policy rejected before any request was sent) |
-| `4` | Report invalid (failed strict schema/signature validation) |
+| `4` | Report invalid (failed strict schema validation) |
 | `5` | Output failed (couldn't write a file: permissions, existing file without `--overwrite`, disk full) |
 | `6` | Unexpected error (an unhandled exception, reported with its type and message, never silently swallowed) |
 | `7` | `doctor` found a problem with the local environment |
-| `130` | Cancelled (Ctrl-C) |
+| `130` | Ctrl-C during a single-page scan (nothing is written) |
 
 These are stable and intended to be scripted against.
 
+Ctrl-C behaves differently in the two scan modes, on purpose. In a single-page scan there is nothing worth saving, so it prints `webguard: cancelled.`, writes no files, and exits `130`. During `--crawl` it stops the crawl cleanly instead: the partial report is saved with status `cancelled`, a `--checkpoint` file is saved too if you asked for one, and the exit code is `1`. Pass the same checkpoint and key file back with `--resume-from` to continue where the crawl stopped.
+
 ## How it stores things locally
 
-There is no database, background service, or daemon. `webguard init` creates three plain-file directories (`authorizations/`, `scan-results/`, `reports/`) with `0700` permissions; every file `webguard` writes into them is created `0600` (owner read/write only, refusing to follow a symlink at the destination). `webguard results list`/`clean` just read and delete files in a directory you point it at: there's no hidden index to get out of sync.
+There is no database, background service, or daemon. `webguard init` creates three plain-file directories (`authorizations/`, `scan-results/`, `reports/`) with `0700` permissions; every file `webguard` writes into them is created `0600` (owner read/write only, refusing to follow a symlink at the destination). `webguard results list`/`clean` just read and delete files in a directory you point it at: there's no hidden index to get out of sync. They skip `*.authorization-audit.json`, the evidence record a scan with an authorization writes beside its report, so `results clean` never deletes one.
 
 The only network activity is a DNS lookup of the target's hostname and the HTTP(S) requests to that target (in crawl mode, to same-origin pages of it). There is no telemetry, no update check, and no account, and nothing is sent to any other host.
 
 ## Authorization model
 
-Every scan against a real external target requires a self-attested authorization document (`webguard authorization create`): organization, authorized-by, purpose, allowed hosts, an expiry, and a set of effective limits, written out as fingerprinted JSON and re-validated (hostname canonicalization, expiry, exact ID confirmation) at scan time. It is **not cryptographically signed**: there's deliberately no PKI or central identity service behind it. For a tool one person runs locally against targets they assert they're authorized to test, a signed, fingerprinted local record that the scanner refuses to proceed without is the right amount of ceremony; a centrally-attested identity system is the right tool for a multi-tenant service brokering trust between strangers, which is what the archived SaaS layer in `apps/api/` built instead (see below). Don't read "self-attested" as "unenforced": the CLI still fails closed on a missing, expired, mismatched, or non-exact-match authorization before sending a single byte.
+Every scan against a real external target requires a self-attested authorization document (`webguard authorization create`): organization, authorized-by, purpose, allowed hosts, an expiry, and a set of effective limits, written out as fingerprinted JSON and re-validated (hostname canonicalization, expiry, exact ID confirmation) at scan time. It is **not cryptographically signed**: there's deliberately no PKI or central identity service behind it. For a tool one person runs locally against targets they assert they're authorized to test, an unsigned, SHA-256-fingerprinted local record that the scanner refuses to proceed without is the right amount of ceremony; a centrally-attested identity system is the right tool for a multi-tenant service brokering trust between strangers, which is what the archived SaaS layer in `apps/api/` built instead (see below). Don't read "self-attested" as "unenforced": the CLI still fails closed on a missing, expired, mismatched, or non-exact-match authorization before sending a single byte.
 
 Isolated lab targets (`--lab --allow-host ...`, e.g. a local OWASP Juice Shop container) skip the authorization-document requirement entirely, since there is no second party whose authorization needs recording.
 
@@ -212,6 +214,8 @@ No scan of a real third-party target has been performed as part of verifying thi
 
 - Active detection (XSS, SQLi, SSRF-callback confirmation, IDOR, path traversal, command injection, and more) exists in `webguard_scanner` as a library but has no CLI command wiring it up yet.
 - Authorization is self-attested and fingerprinted, not cryptographically signed: there is no delegated-authority verification proving the person running `authorization create` actually has the legal right to authorize testing of the target, only that they asserted it.
+- A target that answers with a redirect is reported as a failed scan (`request/redirect_blocked`, exit `1`), because WebGuard never follows redirects. Scan the final URL, and create its authorization for that exact canonical URL.
+- The wheels carry code the `webguard` command does not use: 13 active-detection library modules in the scanner wheel, and definitions for the retired platform (tenancy, compliance, scan jobs and schedules, permits, safety receipts) in the contracts wheel. They are inert and unsupported, and trimming them is deferred. `docs/CLI_ARCHITECTURE.md` lists exactly which modules are reachable.
 - Not on PyPI yet, and the public `pipx install openhuntx-webguard` path is unverified until it is. See [Project status](#project-status--owner-decisions-still-needed).
 - No license file yet. Same section.
 - Windows is untested.
@@ -229,7 +233,7 @@ The active product is exactly what's in `packages/contracts/` and `workers/scann
 This is pre-release work, not a public release. Source installation works today; everything below is what stands between this and a published package.
 
 - **No license chosen yet.** Nothing in this repository is currently licensed for reuse by anyone other than the copyright holder. This needs an explicit decision before any public use is invited; it is intentionally not silently defaulted here. See [`docs/LICENSE_OPTIONS.md`](docs/LICENSE_OPTIONS.md) for a comparison and a recommendation (MIT), neither of which has been applied. The exact file and metadata changes for either choice are prepared in `scripts/apply-license.py`; running it is the only step left once a license is picked.
-- **Not published to PyPI.** `openhuntx-webguard` and `openhuntx-webguard-contracts` are the two project names the release needs, and both were unclaimed when last checked. Re-check immediately before publishing, since names can be claimed at any time. Publishing is a manual, two-stage workflow (`.github/workflows/publish.yml`) that has never been run; [`docs/RELEASING.md`](docs/RELEASING.md) has the sequence, the PyPI trusted-publisher fields, and what to do if only one of the two packages uploads.
+- **Not published to PyPI.** `openhuntx-webguard` and `openhuntx-webguard-contracts` are the two project names the release needs, and both were unclaimed when last checked. Re-check immediately before publishing, since names can be claimed at any time. Publishing is a manual workflow (`.github/workflows/publish.yml`) that has never been run: a build job with no publishing permission, then one publish job per project, each in its own GitHub environment. [`docs/RELEASING.md`](docs/RELEASING.md) has the sequence, the two trusted-publisher configurations, and how to recover if only one package uploads.
 - **No GitHub release has been cut.**
 
 ## Responsible use

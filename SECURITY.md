@@ -19,10 +19,7 @@ There is no formal backport policy yet; fixes land against `main`.
 
 Do not open a public GitHub issue containing exploit details, credentials, target information, or scan artifacts.
 
-Preferred reporting paths:
-
-1. the repository's private GitHub security-advisory feature, if enabled; or
-2. a direct message to the maintainer.
+Report privately through GitHub: open <https://github.com/openhuntx/openhuntx/security/advisories/new>, or use the "Report a vulnerability" button on the repository's Security tab. Private vulnerability reporting is enabled for this repository, and the report is visible only to the maintainers until they choose to publish an advisory. There is no separate security email address.
 
 Include, if known:
 
