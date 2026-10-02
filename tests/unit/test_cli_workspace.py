@@ -51,6 +51,12 @@ class CliWorkspaceTests(unittest.TestCase):
             self.assertEqual(stderr, "")
             self.assertIn("Created:", stdout)
 
+            # The printed next steps must use flags the parser really has.
+            self.assertIn("--authorization-file", stdout)
+            self.assertIn("--confirm-authorization", stdout)
+            self.assertIn("--lab --allow-host", stdout)
+            self.assertNotIn("--authorization <", stdout)
+
             for subdirectory in ("authorizations", "scan-results", "reports"):
                 target = home / subdirectory
                 self.assertTrue(target.is_dir())

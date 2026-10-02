@@ -1,53 +1,67 @@
 # WebGuard CLI v1 release checklist
 
-A single, finite list. When everything here is checked, v1 is ready to publish, not before, and nothing is added to this list to extend scope. See [`docs/CASE_STUDY.md`](CASE_STUDY.md) for why this exists and the root [README](../README.md) for what the shipped product actually does.
+A finite list. When everything here is checked, v1 is ready to publish; nothing gets added to it to extend scope. [`docs/RELEASING.md`](RELEASING.md) has the step-by-step release sequence, [`docs/CASE_STUDY.md`](CASE_STUDY.md) explains why this project looks the way it does, and the root [README](../README.md) describes what the tool actually does.
+
+CI results are not recorded in this file. A commit cannot contain its own CI result, so the current state of the required checks is on the pull request and in the release handoff.
+
+## Where things stand
+
+Implemented and verified locally, on CI at the previous head, and re-run on every push. Not merged. Not published. In particular:
+
+- **Source installation** (build both wheels, `pipx install`): works today. Run through `pipx` on macOS, and on every pull request in a clean Linux environment by the `cli-packaging` job.
+- **Public PyPI installation** (`pipx install openhuntx-webguard`): unverified until publication. What exists is a simulation: both wheels served from a local PEP 503 index, installed with no `--find-links`, with pip resolving `openhuntx-webguard-contracts==0.1.0` from the wheel's own metadata. That proves the mechanism, not the real index.
+- **Platforms actually tested**: Linux (GitHub Actions `ubuntu-24.04`; unit tests on Python 3.11.15, 3.12.13, 3.13.14, 3.14.6, and the packaging job on 3.13.14) and macOS (Python 3.14.7, by hand). Windows is untested and not supported.
 
 ## Engineering (done)
 
-- [x] Terminal UX complete: `init`, `doctor`, `scan`, `authorization create/validate/inspect`, `report validate/inspect/render/compare/validate-comparison`, `results list/clean`, `--version`, `--help` on every (sub)command
-- [x] Fail-closed top-level exception boundary in `cli.py`'s `main()` (exit `6`), `130` on Ctrl-C
-- [x] Documented, stable exit codes (`0` through `7`, `130`)
-- [x] No mandatory database or background service; local file storage only, `0600`/`0700` permissions, symlink-destination refusal
-- [x] Scanner-engine hardening from `audit/checkpoint1-phase6-exception-network-safety` merged in as this branch's base
-- [x] Focused tests for the new commands (`tests/unit/test_cli_workspace.py`), full existing CLI test suite still green
-- [x] Full local verification gate (`./scripts/verify.sh`) green
-- [x] Authorization path coverage, and exactly what each piece establishes: a real local `--lab` scan against a local HTTP server exercises the full scan/report/results pipeline over real sockets, but `--lab` bypasses the owned-target authorization machinery entirely, so it does not by itself verify the normal (non-lab) authorization path. That path is covered separately: `test_real_owned_scan_writes_audit_before_scanner_and_matches_report` runs a complete, successful, non-expired, exactly-matching authorization through the real `cli.main()` entry point with only the two network-touching functions (DNS resolution, the HTTP scan itself) replaced by deterministic fixtures, proving authorization loading, preflight validation, confirm-ID matching, and audit-before-scan ordering all work; three further tests (`test_malformed_authorization_json_is_rejected_before_dns_resolution`, `test_expired_authorization_is_rejected_before_dns_resolution`, `test_target_mismatch_is_rejected_before_dns_resolution`) assert `validate_target_url.assert_not_called()` to prove those three rejections happen before any DNS lookup, not just before the scan. Independently, outside unit tests, the same three rejections were run against the real installed CLI binary using `*.invalid` hostnames (RFC 2606, guaranteed unresolvable) and completed in ~0.1s with the correct error code rather than a DNS-resolution-failure error, which would be the observable result if a lookup had actually been attempted. None of this scans a real external target; no live authorized-target scan against a real third-party host has been performed.
-- [x] Full-history secret scan (`python scripts/scan-secrets.py`) green
+- [x] Terminal UX: `init`, `doctor`, `scan`, `authorization create/validate/inspect`, `report validate/inspect/render/compare/validate-comparison`, `results list/clean`, `--version`, and `--help` on every command
+- [x] Fail-closed top-level exception boundary in `main()` (exit `6`, and `130` on Ctrl-C); documented, stable exit codes `0` through `7`
+- [x] No database or background service; local files only, `0600`/`0700` permissions, symlink-destination refusal
+- [x] Scanner-engine hardening from `audit/checkpoint1-phase6-exception-network-safety` is this branch's base
+- [x] A malformed, expired, confirmation-mismatched, or target-mismatched authorization is rejected before any DNS lookup; destination validation (resolution, private and reserved address rejection) still runs in full and still gates every connection
+- [x] `init` prints next steps with the real flags (`--authorization-file`, `--confirm-authorization`), covered by a test
+- [x] Full local gate (`./scripts/verify.sh`), full-history secret scan, supply-chain pin check, and governance check all green
+
+What the authorization tests establish, so one result isn't read as covering another:
+
+- A `--lab` scan runs the whole scan, report, and results pipeline over real sockets, but `--lab` skips the authorization machinery entirely. It says nothing about the normal path.
+- `test_real_owned_scan_writes_audit_before_scanner_and_matches_report` runs a valid, exactly-matching authorization through the real `cli.main()` entry point, with only DNS resolution and the HTTP scan replaced by fixtures. It shows authorization loading, preflight, confirmation matching, and audit-before-scan ordering work.
+- Three tests assert `validate_target_url.assert_not_called()` for a malformed, an expired, and a mismatched authorization, which is what shows those rejections happen before DNS rather than merely before the scan.
+- Outside the unit tests, the same rejections were run against the installed CLI using `*.invalid` hostnames (RFC 2606, guaranteed unresolvable). They finished in about 0.1 seconds with the correct error code, where an attempted lookup would have produced a DNS failure.
+- The README's authorization walkthrough runs against `example.com` to `--preflight-only`: it reaches "Owned-target readiness: approved" and sends no HTTP request. Its one network activity is a DNS lookup.
+- No scan of a real third-party target has been performed.
 
 ## Packaging (done)
 
-- [x] `openhuntx-webguard-contracts` and `openhuntx-webguard` build as standalone wheels with `pip wheel` (the scanner package was renamed from `openhuntx-webguard-scanner` to `openhuntx-webguard` once it became the distributed product rather than one component among several; the `webguard` command name is unchanged)
-- [x] Wheel contents verified clean (only `webguard_scanner/*.py` + standard dist-info, no tests/caches/dev artifacts)
-- [x] Clean-environment install verified three ways: `pip install --no-index --find-links dist ...`, a real `pipx install` from local wheels (both outside the repo checkout, and again after the rename), and, more rigorously, a real `pip install openhuntx-webguard --index-url ...` against a hand-built PEP 503 simple index serving the two wheels, with no `--find-links`/`--no-index` at all. The last one is the one that actually proves the eventual `pip install openhuntx-webguard` against real PyPI will auto-resolve `openhuntx-webguard-contracts` as a declared dependency; the wheel's own METADATA carries `Requires-Dist: openhuntx-webguard-contracts==0.1.0`, confirmed by inspecting the built wheel directly.
-- [x] Full documented journey exercised against the installed binary: `doctor` then `init` then `scan --lab` then `results list/clean` then `report render`
-- [x] CI packaging smoke test (`cli-packaging` job) added, building and installing the same way on every push
+- [x] `openhuntx-webguard-contracts` and `openhuntx-webguard` build as standalone wheels (the scanner package was renamed from `openhuntx-webguard-scanner` when it became the distributed product; the `webguard` command is unchanged)
+- [x] `scripts/verify-release-artifacts.py` checks the exact files a release would upload: only the two wheels in the directory, correct names and a shared version in each wheel's own metadata, the contracts pin, a contents allowlist, a clean-environment install, `pip check`, a synthetic CLI scan, and unchanged checksums afterward. It runs in the `cli-packaging` pull-request job and in the publish workflow's build job
+- [x] Wheels are built with `SOURCE_DATE_EPOCH` set to the commit time and are byte-reproducible from a commit on the same toolchain
+- [x] `.github/workflows/publish.yml`: manual dispatch only, defaults to a dry run, builds and verifies in a job with no OIDC permission, then hands the verified files to a separate publish job without rebuilding them; the publish job re-checks checksums, refuses to upload a version PyPI already has, uploads contracts before the CLI, and has a `publish-webguard-only` recovery mode. The `pypi-publish` environment allows only `main`
+- [x] `scripts/verify-supply-chain-pins.py` fails if that workflow gains a trigger other than `workflow_dispatch`, gives the build job `id-token`, rebuilds in the publish job, or uses an action that is not SHA-pinned and reviewed
 
 ## Documentation (done)
 
-- [x] README rewritten for the CLI product: problem/audience, install, quickstart, every command, exit codes, local storage model, authorization model, security trade-offs, tested platforms, known limitations
-- [x] `docs/CLI_ARCHITECTURE.md`: architecture diagram and package-boundary reasoning
-- [x] `docs/LEGACY_PLATFORM.md`: explicit index marking the retired SaaS-era docs as archived, not current
-- [x] `docs/CASE_STUDY.md`: portfolio write-up, including an honest AI-assistance disclosure
-- [x] `CONTRIBUTING.md`, `SECURITY.md` rewritten for the CLI product
-- [x] `examples/`: a reproducible, synthetic, offline demo (no paid infra, no external target)
+- [x] README: install (source now, PyPI later and unverified), a quick-start whose two blocks run verbatim, every command, exit codes, storage model, authorization model, tested platforms, known limitations
+- [x] `docs/RELEASING.md`, `docs/CLI_ARCHITECTURE.md`, `docs/LEGACY_PLATFORM.md`, `docs/CASE_STUDY.md`, `docs/LICENSE_OPTIONS.md`, `docs/RELEASE_NOTES_DRAFT.md`, `CONTRIBUTING.md`, `SECURITY.md`
+- [x] `examples/`: a reproducible, synthetic, offline demo
 
 ## Repository (done)
 
-- [x] Migrated to `openhuntx/openhuntx` with full branch history preserved, original repository untouched
-- [x] Native secret scanning + push protection, Dependabot security updates, vulnerability alerts enabled
-- [x] Required-status-checks ruleset on `main` (matching the pre-migration repository's, plus the new `cli-packaging` check), non-fast-forward and deletion protection
-- [x] Actions SHA-pinning requirement enabled
-- [x] Issue and PR templates added
+- [x] Migrated to `openhuntx/openhuntx` with branch history preserved; the original repository is untouched
+- [x] Secret scanning with push protection, Dependabot security updates, and vulnerability alerts enabled
+- [x] Ruleset on `main`: eleven required checks, non-fast-forward and deletion protection, Actions SHA-pinning required
+- [x] Issue and PR templates
 
 ## Owner decisions (blocking publish, not engineering)
 
-- [ ] **License.** Nothing in this repository is currently licensed for reuse. Pick one before any public "go ahead and use this" claim; see [`docs/LICENSE_OPTIONS.md`](LICENSE_OPTIONS.md) for a comparison and a recommendation (MIT), not yet applied.
-- [ ] **PyPI package name.** `openhuntx-webguard` is the proposed name (already in `workers/scanner/pyproject.toml`); confirm it or pick a different one, then re-check availability right before publishing.
-- [ ] **PyPI publishing credentials/trusted publisher.** `.github/workflows/publish.yml` exists, is manual-dispatch-only, and uses PyPI's trusted-publisher OIDC flow (no API token stored in this repo), but it cannot succeed until that trusted publisher is actually configured on PyPI's side, pointing at this repository and the `pypi-publish` environment. Registering the project name on PyPI and setting that up is a deliberate, separate step from everything else in this checklist.
-- [ ] **First GitHub release / tag.** Not cut. Once the above are decided, tag `v0.1.0` (or whatever version is chosen), review and publish [`docs/RELEASE_NOTES_DRAFT.md`](RELEASE_NOTES_DRAFT.md) as the release notes, and attach the built wheels.
+- [ ] **License.** Nothing in this repository is currently licensed for reuse. Pick one before any public "go ahead and use this" claim; see [`docs/LICENSE_OPTIONS.md`](LICENSE_OPTIONS.md) for the comparison and a recommendation (MIT), not applied. The change is prepared: `python scripts/apply-license.py --license <MIT|Apache-2.0> --holder "<name>" --dry-run` prints the exact diff, and `--apply` writes it. The only inputs are the license and, for MIT, the copyright holder's name.
+- [ ] **Merge.** Pull request review and merge, then check CI on the resulting `main` commit.
+- [ ] **PyPI trusted publishers.** Two pending publishers, one per project name, with the fields listed in [`docs/RELEASING.md`](RELEASING.md). Confirm both names are still unclaimed immediately beforehand.
+- [ ] **Publish.** Authorize the `publish` run, after a clean dry run.
+- [ ] **First GitHub release and tag.** Not cut. After a verified public install, tag `v0.1.0`, publish [`docs/RELEASE_NOTES_DRAFT.md`](RELEASE_NOTES_DRAFT.md) as the notes, and attach the built wheels.
 
-## Explicitly out of scope for v1 (not blockers, just not promised)
+## Explicitly out of scope for v1
 
-- Active detection (XSS/SQLi/SSRF-callback/etc.) wired into the CLI
-- Windows support (untested, not deliberately broken)
-- Any hosted/SaaS functionality (retired; see `docs/LEGACY_PLATFORM.md`)
+- Active detection (XSS, SQLi, SSRF-callback, and the rest) wired into the CLI
+- Windows support
+- Any hosted or SaaS functionality (retired; see `docs/LEGACY_PLATFORM.md`)

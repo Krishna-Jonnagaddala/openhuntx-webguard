@@ -9,6 +9,12 @@ First release of WebGuard as a standalone CLI tool, pivoted from an earlier thre
 ### Install
 
 ```bash
+pipx install openhuntx-webguard
+```
+
+This line belongs in the published notes only after the fresh public install check (step 7 of [`docs/RELEASING.md`](RELEASING.md)) has passed. To install from source instead:
+
+```bash
 git clone https://github.com/openhuntx/openhuntx.git
 cd openhuntx
 python3 -m pip wheel packages/contracts/python -w dist --no-deps
@@ -16,7 +22,7 @@ python3 -m pip wheel workers/scanner -w dist --no-deps
 pipx install dist/openhuntx_webguard-0.1.0-py3-none-any.whl --pip-args="--no-index --find-links dist"
 ```
 
-See the [README](../README.md) for the full quickstart.
+The [README](../README.md) quick-start runs as written against a local target.
 
 ### What's in it
 
@@ -25,11 +31,12 @@ See the [README](../README.md) for the full quickstart.
 - `webguard report validate/inspect/render/compare/validate-comparison`: deterministic findings, a professional HTML report, and remediation-comparison diffing
 - `webguard init`, `webguard doctor`, `webguard results list/clean`: the local workspace and environment-diagnostic commands new in this release
 - Stable, documented exit codes (`0` through `7`, `130`), including a fail-closed top-level exception boundary
+- A malformed, expired, confirmation-mismatched, or out-of-scope authorization is rejected before any DNS lookup
 
 ### What's not in it
 
 - Active detection (XSS, SQLi, SSRF-callback confirmation, etc.): present in the scanner library, not wired into the CLI yet
-- Windows support: untested
+- Windows support: untested and not supported. Tested on Linux (CI, Python 3.11 to 3.14) and macOS (Python 3.14)
 - Anything from the retired hosted SaaS platform (accounts, a web dashboard, SOC/Compliance modules): archived, not shipped; see [`docs/LEGACY_PLATFORM.md`](LEGACY_PLATFORM.md)
 
 ### Known gaps in this release

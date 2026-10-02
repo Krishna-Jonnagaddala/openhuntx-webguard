@@ -1732,20 +1732,32 @@ def _init_command(args: argparse.Namespace) -> int:
     else:
         print("All workspace directories already existed.")
 
+    authorization_file = home / "authorizations" / "example.json"
+    report_file = home / "scan-results" / "example.json"
+
     print()
     print("Next steps:")
+    print("  A lab target on loopback or a private network (no authorization document):")
     print(
-        "  webguard authorization create ... "
-        f"--output {home / 'authorizations' / 'example.json'}"
+        "    webguard scan http://127.0.0.1:8000/ --lab --allow-host 127.0.0.1 "
+        f"--output {report_file}"
+    )
+    print("  A real target you are authorized to assess:")
+    print(
+        "    webguard authorization create https://your-site.example "
+        '--organization "Your Org" --authorized-by "you@your-org.example" '
+        f'--purpose "Describe the assessment" --output {authorization_file}'
     )
     print(
-        "  webguard scan <url> --authorization <authorization-file> "
-        f"--output {home / 'scan-results' / 'example.json'}"
+        "    webguard scan https://your-site.example "
+        f"--authorization-file {authorization_file} "
+        f"--confirm-authorization <authorization-id> --output {report_file}"
     )
+    print("  Then render a report:")
     print(
-        f"  webguard report render {home / 'scan-results' / 'example.json'} "
+        f"    webguard report render {report_file} "
         f"--output {home / 'reports' / 'example.html'} "
-        '--organization "Example, Inc."'
+        '--organization "Your Org"'
     )
 
     return EXIT_SUCCESS

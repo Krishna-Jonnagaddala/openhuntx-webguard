@@ -1,6 +1,6 @@
 # WebGuard
 
-A terminal-only tool for authorized passive web security assessment: point it at a target you own or are authorized to test, and it checks HTTP headers, cookies, CORS, TLS/certificate configuration, and common disclosure issues, then produces a signed-checkpoint-safe, resumable scan report and a professional HTML write-up.
+A terminal-only tool for authorized passive web security assessment: point it at a target you own or are authorized to test, and it checks HTTP headers, cookies, CORS, TLS/certificate configuration, and common disclosure issues, then writes a JSON report and a professional HTML write-up.
 
 > **Status:** active development, pre-1.0. No hosted service, no account, no telemetry. Everything runs on your machine against targets you specify.
 
@@ -24,19 +24,15 @@ The scanner library (`webguard_scanner`) also contains active-detection modules 
 
 ## Install
 
-The distributed package is `openhuntx-webguard`; it installs a single `webguard` command. It depends on one other first-party package, `openhuntx-webguard-contracts` (shared data types, zero third-party dependencies of its own), and nothing else.
+The distributed package is `openhuntx-webguard`; it installs a single `webguard` command. It depends on one other first-party package, `openhuntx-webguard-contracts` (shared data types, zero third-party dependencies of its own), and nothing else. Requires Python 3.11 through 3.14.
 
-**Once both packages are published to PyPI**, installing WebGuard is one command, and pip resolves the contracts dependency automatically like any normal package dependency:
+### From source (available now)
 
-```bash
-pipx install openhuntx-webguard
-```
-
-**Neither package is published yet** (see [Project status / owner decisions](#project-status--owner-decisions-still-needed)), so until that happens, install from locally built wheels instead. This two-wheel build is a stand-in for the real distribution chain above, not the intended end-user experience: it's the exact sequence this repository's own CI (`.github/workflows/ci.yml`, the `cli-packaging` job) runs on every push, and the one verified by a real `pipx install` on macOS during this release.
+Nothing is on PyPI yet, so today you build the two wheels yourself and install them together. This is the sequence this repository's CI (`.github/workflows/ci.yml`, the `cli-packaging` job) runs on every pull request, and the one that was run through a real `pipx install` on macOS:
 
 ```bash
-git clone <this-repository-url>
-cd openhuntx-webguard
+git clone https://github.com/openhuntx/openhuntx.git
+cd openhuntx
 
 python3 -m pip wheel packages/contracts/python -w dist --no-deps
 python3 -m pip wheel workers/scanner -w dist --no-deps
@@ -45,64 +41,85 @@ pipx install dist/openhuntx_webguard-0.1.0-py3-none-any.whl \
   --pip-args="--no-index --find-links dist"
 ```
 
-`--find-links dist` is what lets pip resolve the `openhuntx-webguard-contracts` dependency from the second local wheel instead of PyPI; once that package is published, `--pip-args` goes away entirely and plain `pipx install openhuntx-webguard` is the whole installation.
+`--find-links dist` is what lets pip find `openhuntx-webguard-contracts` in the second wheel instead of on PyPI.
 
-Requires Python 3.11 through 3.14.
+### From PyPI (not available yet, unverified)
+
+Once both packages are published, installation is meant to be one command, with pip resolving the contracts dependency on its own:
+
+```bash
+pipx install openhuntx-webguard
+```
+
+Until publication that command fails with "no matching distribution", and it has never been run against the real PyPI. What has been verified is the mechanism it relies on: both wheels, served from a local PEP 503 package index, installed with no `--find-links`, and pip pulled in `openhuntx-webguard-contracts==0.1.0` from the wheel's own metadata. `docs/RELEASING.md` has the release sequence, including the fresh-install check that closes this gap after publication.
 
 ## Quickstart
 
+Every command in these two blocks runs as written (they are executed verbatim as part of release verification), assuming `webguard` is installed. Nothing here touches a host you don't control.
+
+### 1. Scan a local target
+
+This sets up a throwaway web server on your own machine, scans it, renders a report, and diffs two scans. `--lab` with an explicit `--allow-host` is the supported way to scan a loopback or private-network target, and it needs no authorization document.
+
 ```bash
-# 1. Check your environment (no network calls, just Python version,
-#    package versions, write permissions, and free disk space).
+webguard init --directory webguard-demo
+cd webguard-demo
 webguard doctor
 
-# 2. Scaffold a local workspace: authorizations/, scan-results/, reports/,
-#    each created with 0700 permissions.
-webguard init
+mkdir site
+echo '<h1>demo</h1>' > site/index.html
+python3 -m http.server 8931 --bind 127.0.0.1 --directory site > /dev/null 2>&1 &
+SERVER_PID=$!
+sleep 1
 
-# 3a. Scanning your own machine or an isolated lab target (e.g. a local
-#     OWASP Juice Shop instance)? Use --lab with an explicit allowlist,
-#     no authorization document required.
-webguard scan http://127.0.0.1:3000/ --lab --allow-host 127.0.0.1 \
-  --output scan-results/lab.json
+webguard scan http://127.0.0.1:8931/ --lab --allow-host 127.0.0.1 \
+  --output scan-results/demo.json
+webguard results list
+webguard report render scan-results/demo.json \
+  --output reports/demo.html --organization "Demo"
 
-# 3b. Scanning a real external target you are authorized to assess?
-#     Create a self-attested, fingerprinted authorization record first,
-#     then scan with it and the exact authorization ID as confirmation.
+webguard scan http://127.0.0.1:8931/ --lab --allow-host 127.0.0.1 \
+  --output scan-results/demo-rescan.json
+webguard report compare scan-results/demo.json scan-results/demo-rescan.json \
+  --output reports/demo-comparison.json
+
+kill "$SERVER_PID"
+webguard results clean --yes
+```
+
+### 2. The authorization flow for a real target
+
+Scanning anything that is not a lab target needs an authorization document and an exact confirmation of its ID. Run this in the same shell, from the `webguard-demo` directory the first block left you in. It walks through that flow against `example.com`, IANA's reserved documentation domain, and stops at `--preflight-only`: it checks the authorization, the HTTPS requirement, and that the host resolves to public addresses, then prints "No HTTP request was sent." The one network activity is a DNS lookup of the hostname.
+
+```bash
+AUTH_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+
 webguard authorization create https://example.com \
+  --authorization-id "$AUTH_ID" \
   --organization "Example, Inc." \
   --authorized-by "you@example.com" \
-  --purpose "Quarterly external header/TLS review" \
+  --purpose "Walkthrough of the authorization flow" \
   --output authorizations/example.json
+
+webguard authorization validate authorizations/example.json
+
 webguard scan https://example.com \
   --authorization-file authorizations/example.json \
-  --confirm-authorization <authorization-id-from-the-file> \
-  --output scan-results/example.json
-
-# 4. See what's stored locally.
-webguard results list
-webguard results list --json   # machine-readable
-
-# 5. Render a shareable HTML report.
-webguard report render scan-results/example.json \
-  --output reports/example.html \
-  --organization "Example, Inc."
-
-# 6. Re-scan later and prove what changed.
-webguard report compare scan-results/example.json scan-results/example-rescan.json \
-  --output reports/remediation-comparison.json
-
-# 7. Clean up old local results (dry run by default; --yes to delete).
-webguard results clean --older-than-days 30
+  --confirm-authorization "$AUTH_ID" \
+  --preflight-only
 ```
+
+To scan for real, create the authorization for a site you own or are authorized to assess, then run the same `scan` command without `--preflight-only` and with `--output scan-results/your-site.json`. `webguard scan --help` lists the crawl, checkpoint, and limit options.
 
 ### Terminal demo
 
+The first scan from the block above, as printed except that the seven `web.tls.*` skip lines are collapsed into one (the scan ID and timings differ on every run):
+
 ```
-$ webguard scan http://127.0.0.1:8921/ --lab --allow-host 127.0.0.1 --output scan-results/example.json
-Scan ID: c4fb8d27-3d16-4145-90a7-a97eb69817e0
+$ webguard scan http://127.0.0.1:8931/ --lab --allow-host 127.0.0.1 --output scan-results/demo.json
+Scan ID: d90de307-8e25-4fbb-a8a3-522dd24e2406
 Status: completed
-Target: http://127.0.0.1:8921/
+Target: http://127.0.0.1:8931/
 Engine: webguard-native 0.1.0
 Connected addresses: 127.0.0.1
 HTTP statuses: 200
@@ -110,16 +127,18 @@ Requests: 1 attempted, 1 succeeded
 Coverage: 80.0%
 Findings: 5
 Errors: 0
-- [LOW] Server header exposes software version information (web.disclosure.server.version)
+- [LOW] Referrer-Policy header missing (web.headers.referrer_policy.missing)
 - [MEDIUM] Content-Security-Policy header missing (web.headers.csp.missing)
+- [LOW] Server header exposes software version information (web.disclosure.server.version)
 - [MEDIUM] Clickjacking frame protection missing (web.headers.frame_protection.missing)
 - [LOW] X-Content-Type-Options header missing (web.headers.x_content_type_options.missing)
-- [LOW] Referrer-Policy header missing (web.headers.referrer_policy.missing)
-- [ATTEMPT 1] succeeded: 127.0.0.1, HTTP 200, 3 ms
-Saved report: scan-results/example.json
+- [SKIPPED] web.headers.hsts: HSTS applies only to HTTPS responses and was not evaluated for this HTTP target.
+- [SKIPPED] web.tls.*: TLS and certificate analysis applies only to HTTPS targets (7 checks skipped).
+- [ATTEMPT 1] succeeded: 127.0.0.1, HTTP 200, 2 ms
+Saved report: scan-results/demo.json
 ```
 
-A full, reproducible synthetic example (the exact commands above run against a static local HTTP server, plus the resulting JSON report and rendered HTML) lives in [`examples/`](examples/). No paid infrastructure or external target is needed to reproduce it; see [`examples/README.md`](examples/README.md).
+A second, committed example lives in [`examples/`](examples/): a small synthetic server, the unedited JSON report a scan of it produced, and the rendered HTML. No paid infrastructure or external target is needed to reproduce it; see [`examples/README.md`](examples/README.md).
 
 ## Every command
 
@@ -163,7 +182,7 @@ These are stable and intended to be scripted against.
 
 There is no database, background service, or daemon. `webguard init` creates three plain-file directories (`authorizations/`, `scan-results/`, `reports/`) with `0700` permissions; every file `webguard` writes into them is created `0600` (owner read/write only, refusing to follow a symlink at the destination). `webguard results list`/`clean` just read and delete files in a directory you point it at: there's no hidden index to get out of sync.
 
-Nothing is sent anywhere except the HTTP(S) request to the target you ask it to scan. There is no telemetry, no update check, no account, and no network call of any kind besides that one.
+The only network activity is a DNS lookup of the target's hostname and the HTTP(S) requests to that target (in crawl mode, to same-origin pages of it). There is no telemetry, no update check, and no account, and nothing is sent to any other host.
 
 ## Authorization model
 
@@ -181,15 +200,19 @@ Isolated lab targets (`--lab --allow-host ...`, e.g. a local OWASP Juice Shop co
 
 ## Tested platforms
 
-- **Linux** (GitHub Actions `ubuntu-24.04`): Python 3.11.15, 3.12.13, 3.13.14, and 3.14.6, exercised on every push via this repository's CI, including a clean wheel-build-and-install smoke test (`cli-packaging` job).
-- **macOS** (Darwin 25.6, Python 3.14.7): manually verified during this release, including a real `pipx install` from locally built wheels and the full `doctor` → `init` → `scan --lab` → `results list/clean` → `report render` journey from outside the repository checkout.
-- **Windows**: **not tested**. Nothing in the scanner's code is deliberately POSIX-only (it's stdlib `socket`/`ssl`/`pathlib`), but the `0600`/`0700` permission model and symlink-refusal checks rely on POSIX file-mode semantics that behave differently under Windows' ACL model, and no one has actually run it there. Treat Windows as unsupported until someone verifies it.
+The wheels are pure Python (`py3-none-any`), but "pure Python" is not a test result. This is what has actually been run:
+
+- **Linux** (GitHub Actions, `ubuntu-24.04`): the full unit suite on Python 3.11.15, 3.12.13, 3.13.14, and 3.14.6 on every pull request, plus the `cli-packaging` job on Python 3.13.14 only, which builds both wheels, installs them into a clean virtual environment, runs `pip check`, and drives the installed CLI through a synthetic scan.
+- **macOS** (Darwin 25.6, Python 3.14.7, run by hand): a real `pipx install` from locally built wheels, then the quick-start above from outside the repository checkout.
+- **Windows**: not tested, and not supported. Nothing in the scanner is deliberately POSIX-only, but the `0600`/`0700` file permissions and the symlink-refusal checks depend on POSIX file-mode behavior that Windows handles differently, and nobody has run it there.
+
+No scan of a real third-party target has been performed as part of verifying this release. The authorization flow is covered by unit tests with the network edges replaced by fixtures, by rejection runs against unresolvable `.invalid` hostnames, and by the `--preflight-only` walkthrough above, which stops before any HTTP request.
 
 ## Known limitations / what's next
 
 - Active detection (XSS, SQLi, SSRF-callback confirmation, IDOR, path traversal, command injection, and more) exists in `webguard_scanner` as a library but has no CLI command wiring it up yet.
 - Authorization is self-attested and fingerprinted, not cryptographically signed: there is no delegated-authority verification proving the person running `authorization create` actually has the legal right to authorize testing of the target, only that they asserted it.
-- No PyPI package yet. See [Project status](#project-status--owner-decisions-still-needed).
+- Not on PyPI yet, and the public `pipx install openhuntx-webguard` path is unverified until it is. See [Project status](#project-status--owner-decisions-still-needed).
 - No license file yet. Same section.
 - Windows is untested.
 - `results clean --older-than-days` and `list` work on one flat directory; there's no cross-directory or recursive index.
@@ -203,11 +226,11 @@ The active product is exactly what's in `packages/contracts/` and `workers/scann
 
 ## Project status / owner decisions still needed
 
-This is pre-release engineering work, not a public release:
+This is pre-release work, not a public release. Source installation works today; everything below is what stands between this and a published package.
 
-- **No license chosen yet.** Nothing in this repository is currently licensed for reuse by anyone other than the copyright holder. This needs an explicit decision before any public use is invited; it is intentionally not silently defaulted here. See [`docs/LICENSE_OPTIONS.md`](docs/LICENSE_OPTIONS.md) for a comparison and a recommendation (MIT), neither of which has been applied.
-- **Not published to PyPI.** `openhuntx-webguard` is the proposed distribution name (the `pyproject.toml` in `workers/scanner` already uses it); `webguard` and `webguard-cli` were also unclaimed as of this release if a different name is preferred. Re-check availability immediately before actually publishing, since names can be claimed at any time.
-- **No GitHub release has been cut.** Install today by building from source as shown above.
+- **No license chosen yet.** Nothing in this repository is currently licensed for reuse by anyone other than the copyright holder. This needs an explicit decision before any public use is invited; it is intentionally not silently defaulted here. See [`docs/LICENSE_OPTIONS.md`](docs/LICENSE_OPTIONS.md) for a comparison and a recommendation (MIT), neither of which has been applied. The exact file and metadata changes for either choice are prepared in `scripts/apply-license.py`; running it is the only step left once a license is picked.
+- **Not published to PyPI.** `openhuntx-webguard` and `openhuntx-webguard-contracts` are the two project names the release needs, and both were unclaimed when last checked. Re-check immediately before publishing, since names can be claimed at any time. Publishing is a manual, two-stage workflow (`.github/workflows/publish.yml`) that has never been run; [`docs/RELEASING.md`](docs/RELEASING.md) has the sequence, the PyPI trusted-publisher fields, and what to do if only one of the two packages uploads.
+- **No GitHub release has been cut.**
 
 ## Responsible use
 

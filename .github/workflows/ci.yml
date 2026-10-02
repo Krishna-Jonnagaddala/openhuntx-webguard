@@ -97,47 +97,13 @@ jobs:
       - name: Build the contracts and scanner wheels
         run: |
           set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           mkdir -p dist
           python -m pip wheel packages/contracts/python -w dist --no-deps
           python -m pip wheel workers/scanner -w dist --no-deps
 
-      - name: Install the built wheels into a clean virtual environment
-        run: |
-          set -euo pipefail
-          python -m venv /tmp/webguard-clean-venv
-          /tmp/webguard-clean-venv/bin/pip install \
-            --no-index \
-            --find-links dist \
-            openhuntx-webguard
-
-      - name: Exercise the installed CLI outside the repository checkout
-        run: |
-          set -euo pipefail
-          WEBGUARD=/tmp/webguard-clean-venv/bin/webguard
-          WORKDIR="$(mktemp -d)"
-          cd "$WORKDIR"
-
-          "$WEBGUARD" --version
-          "$WEBGUARD" doctor
-          "$WEBGUARD" init
-
-          mkdir www
-          echo "<html><body>ci packaging smoke test</body></html>" > www/index.html
-          python3 -m http.server 8930 --directory www &
-          SERVER_PID=$!
-          sleep 1
-
-          "$WEBGUARD" scan http://127.0.0.1:8930/ \
-            --lab --allow-host 127.0.0.1 \
-            --output scan-results/ci.json
-          "$WEBGUARD" results list
-          "$WEBGUARD" results list --json
-          "$WEBGUARD" report render scan-results/ci.json \
-            --output reports/ci.html \
-            --organization "CI Packaging Smoke Test"
-          "$WEBGUARD" results clean --yes
-
-          kill "$SERVER_PID"
+      - name: Validate the wheels, install them into a clean environment, and smoke-test the CLI
+        run: python scripts/verify-release-artifacts.py --dist dist --checksums-out SHA256SUMS
 
   authorised-lab-integration:
     name: Authorised Juice Shop integration

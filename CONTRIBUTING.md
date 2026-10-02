@@ -33,6 +33,7 @@ If you change anything under `workers/scanner/src/webguard_scanner/cli.py`, add 
 - Keep PRs scoped to one change. A bug fix doesn't need an accompanying refactor.
 - Add a test for behavior you add or fix.
 - Run `./scripts/verify.sh` before opening the PR; CI will run it again, but a red CI run on a draft slows everyone down.
+- If your change touches `pyproject.toml` files or packaging, build the wheels and run `python scripts/verify-release-artifacts.py --dist <dir> --checksums-out <file>` (the `cli-packaging` CI job does the same).
 - If your change touches `.github/workflows/ci.yml`, also run `python scripts/verify-supply-chain-pins.py`. It enforces pinned, reviewed action SHAs and an exact count of CI jobs/runners, and will fail loudly (correctly) if you add a job without updating it.
 
 ## Security issues

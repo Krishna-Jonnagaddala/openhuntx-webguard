@@ -32,6 +32,7 @@ SETUP_NODE_SHA = "820762786026740c76f36085b0efc47a31fe5020"  # v7.0.0
 UPLOAD_ARTIFACT_SHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"  # v7.0.1
 SETUP_TERRAFORM_SHA = "dfe3c3f87815947d99a8997f908cb6525fc44e9e"  # v4.0.1
 PYPI_PUBLISH_SHA = "dc37677b2e1c63e2034f94d8a5b11f265b73ba33"  # release/v1, v1.14.2
+DOWNLOAD_ARTIFACT_SHA = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"  # v8.0.1
 TRIVY_VERSION = "0.74.0"
 TRIVY_LINUX_AMD64_SHA256 = (
     "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
@@ -222,9 +223,9 @@ for action in uses_lines:
         fail(f"CI uses an unreviewed GitHub Action: {action_ref}")
 
 # publish.yml is manual-dispatch-only and cannot succeed without PyPI
-# trusted-publisher setup that does not exist yet, but its one
-# third-party action still goes through the same reviewed-SHA discipline
-# as everything in ci.yml.
+# trusted-publisher setup. Its actions go through the same reviewed-SHA
+# discipline as ci.yml, and its structure is checked so that a later edit
+# cannot quietly widen who holds the OIDC publishing permission.
 publish_workflow = read(".github/workflows/publish.yml")
 publish_uses_lines = [
     line.strip().split("uses:", 1)[1].strip()
@@ -233,15 +234,37 @@ publish_uses_lines = [
 ]
 publish_reviewed_actions = reviewed_actions | {
     f"pypa/gh-action-pypi-publish@{PYPI_PUBLISH_SHA}",
+    f"actions/download-artifact@{DOWNLOAD_ARTIFACT_SHA}",
 }
 for action in publish_uses_lines:
     action_ref = action.split("#", 1)[0].strip()
     if action_ref not in publish_reviewed_actions:
         fail(f"publish.yml uses an unreviewed GitHub Action: {action_ref}")
-if "on.push" in publish_workflow or re.search(r"^\s*push:\s*$", publish_workflow, re.MULTILINE):
-    fail("publish.yml must stay manual-dispatch-only, not trigger on push")
-if re.search(r"^\s*release:\s*$", publish_workflow, re.MULTILINE):
-    fail("publish.yml must stay manual-dispatch-only, not trigger on release events")
+
+# Structural checks look at active YAML only, so prose in comments (which
+# does mention id-token and the triggers) cannot satisfy or trip them.
+publish_active = "\n".join(
+    line for line in publish_workflow.splitlines() if not line.lstrip().startswith("#")
+)
+trigger_block = publish_active.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+if re.findall(r"^  (\w+):", trigger_block, re.MULTILINE) != ["workflow_dispatch"]:
+    fail("publish.yml must be triggered by workflow_dispatch only")
+
+if publish_active.count("id-token: write") != 1:
+    fail("publish.yml must grant id-token: write exactly once")
+build_part, _, publish_part = publish_active.partition("\n  publish:\n")
+if not publish_part or "id-token" in build_part:
+    fail("publish.yml may grant id-token only to the publish job, not the build job")
+if "environment: pypi-publish" not in publish_part:
+    fail("publish.yml's publish job must use the pypi-publish environment")
+if "digest-mismatch: error" not in publish_part:
+    fail("publish.yml must make an artifact digest mismatch a hard error")
+if "skip-existing: false" not in publish_part:
+    fail("publish.yml must not skip files that already exist on PyPI")
+if "scripts/verify-release-artifacts.py" not in build_part:
+    fail("publish.yml's build job must run the release artifact verification")
+if re.search(r"^\s*(pip|python -m pip)\s+wheel", publish_part, re.MULTILINE):
+    fail("publish.yml's publish job must not rebuild the artifacts it uploads")
 
 if "  terraform:" not in workflow:
     fail("CI terraform validation/IaC scan job is missing")
